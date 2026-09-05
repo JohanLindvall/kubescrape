@@ -18,6 +18,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -117,7 +118,7 @@ func (s *Scraper) clientFor(ctx context.Context, t kubemeta.ScrapeTarget, timeou
 	// in, so omitting it made the effective timeout depend on which target
 	// happened to build the cached client first.
 	key := lp(t.TLSServerName) + lp(caPEM) + lp(certPEM) + lp(keyPEM) +
-		lp(fmt.Sprint(t.InsecureSkipVerify)) + lp(timeout.String())
+		lp(strconv.FormatBool(t.InsecureSkipVerify)) + lp(timeout.String())
 
 	s.tlsMu.Lock()
 	if c, ok := s.tlsClients[key]; ok {

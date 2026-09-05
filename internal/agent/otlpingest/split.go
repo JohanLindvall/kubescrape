@@ -135,7 +135,9 @@ func (g *metricGrouper) route(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.M
 }
 
 // metricPointCount is the number of data points on m, across its type (0 for
-// MetricTypeEmpty).
+// MetricTypeEmpty), without touching them. The regrouper, the empty-metric
+// prune and the decoded-size estimate all count through it; the estimate used
+// to keep an identical copy under another name.
 func metricPointCount(m pmetric.Metric) int {
 	switch m.Type() {
 	case pmetric.MetricTypeGauge:
@@ -367,7 +369,8 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 	g.srcResource.CopyTo(rm.Resource())
 	rm.SetSchemaUrl(g.srcSchema)
 	g.cache.splitCopied += g.srcSize
-	if id == overflowID {
+	switch {
+	case id == overflowID:
 		// These points describe objects this push could not afford a group for.
 		// The copied resource is the SENDER's, and its identity names the
 		// exporter — leaving it here labels every refused object's points with
@@ -376,7 +379,7 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 		// resource is a visible gap, a confidently wrong one is not.
 		g.stripIDAttrs(rm.Resource().Attributes())
 		stripSenderIdentity(rm.Resource().Attributes())
-	} else if id != "" {
+	case id != "":
 		g.cache.splitGroups++
 		// One same-object predicate for the whole enricher (Enricher.sameObject):
 		// this used to be a local copy that disagreed with the auto-mode
@@ -417,7 +420,7 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 			return rm
 		}
 		g.enricher.mergeAttrs(g.enricher.builtAttrs(g.ctx, g.cache, id).built, rm.Resource().Attributes())
-	} else if g.resToken == "" {
+	case g.resToken == "":
 		// No ID anywhere for these points: the opt-in peer-IP fallback still
 		// attributes them to the pushing pod (resolved once per request). The
 		// outcome — peer_ip, peer_ip_rejected or unresolved — is counted inside

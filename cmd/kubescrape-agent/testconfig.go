@@ -13,7 +13,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -262,7 +264,7 @@ func runConfigCase(cfg agentConfig, scrubber *logscrub.Scrubber, extractor *loga
 		fired := firedMetricNames(set)
 		for _, want := range tc.Expect.Metrics {
 			if !fired[*logsMetricsPrefix+want] && !fired[want] {
-				fail("metric %q did not observe the line (fired: %v)", want, keys(fired))
+				fail("metric %q did not observe the line (fired: %v)", want, slices.Sorted(maps.Keys(fired)))
 			}
 		}
 	}
@@ -281,14 +283,6 @@ func firedMetricNames(set *metrics.DynamicMetricSet) map[string]bool {
 	defer cancel()
 	_ = set.Export(ctx, sink, 0)
 	return sink.names
-}
-
-func keys(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
 }
 
 // captureLogs counts records "exported" by the transform wrapper.

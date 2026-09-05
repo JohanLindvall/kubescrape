@@ -98,6 +98,7 @@ func TestTokensDoesNotHoldTheLockAcrossALogWrite(t *testing.T) {
 			name:   "recovery",
 			needle: "succeeded again",
 			arm: func(t *testing.T, r *Rotating, c *clock, path string) {
+				t.Helper()
 				if err := os.Remove(path); err != nil {
 					t.Fatal(err)
 				}

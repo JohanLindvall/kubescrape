@@ -2,7 +2,7 @@ package journald
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -180,7 +180,7 @@ func (o *recordingOpener) opener(all []rawEntry) openFunc {
 		}
 		var err error
 		if first {
-			err = fmt.Errorf("injected read error")
+			err = errors.New("injected read error")
 		}
 		return &erroringSource{entries: kept, err: err}, nil
 	}

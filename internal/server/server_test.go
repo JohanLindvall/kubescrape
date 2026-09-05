@@ -52,6 +52,7 @@ func closedChan() <-chan struct{} {
 }
 
 func testServer(t *testing.T, st *store.Store, ready <-chan struct{}) *httptest.Server {
+	t.Helper()
 	return testServerWithServices(t, st, services.NewIndex(), ready)
 }
 

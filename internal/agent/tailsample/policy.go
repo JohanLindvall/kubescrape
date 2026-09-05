@@ -451,8 +451,8 @@ type regexCache struct {
 	m   map[string]bool
 }
 
-func newRegexCache(max int) *regexCache {
-	return &regexCache{max: max, m: make(map[string]bool, min(max, 64))}
+func newRegexCache(limit int) *regexCache {
+	return &regexCache{max: limit, m: make(map[string]bool, min(limit, 64))}
 }
 
 func (c *regexCache) get(s string) (bool, bool) {

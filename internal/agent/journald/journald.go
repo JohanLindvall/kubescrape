@@ -14,6 +14,7 @@ package journald
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -29,6 +30,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
+	"github.com/JohanLindvall/kubescrape/internal/clip"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
@@ -431,7 +433,7 @@ func (r *Reader) stream(ctx context.Context) error {
 				case err := <-readErr:
 					return fmt.Errorf("reading journal: %w", err)
 				default:
-					return fmt.Errorf("journal source ended")
+					return errors.New("journal source ended")
 				}
 			}
 			body, origLen := r.sanitize(e.message, e.unit)
@@ -478,7 +480,7 @@ const utf8Replacement = "�"
 // the cut. Same lesson as logscrub's secretKVCandidate: the admission IS the
 // cost.
 //
-// Hand back a reslice of the original. logchain.TruncateRunes ends in s[:n],
+// Hand back a reslice of the original. clip.Runes ends in s[:n],
 // which pins the WHOLE journal message for the life of the batch while
 // batchBytes counts only the truncated length — so MaxBatchBytes, documented
 // as "a soft bound that keeps a batch from growing large in memory", bounded
@@ -500,9 +502,9 @@ func (r *Reader) sanitize(msg, unit string) (body string, origLen int) {
 		}
 		// A replacement rune is wider than the byte it replaces, so a message
 		// that fit before validation need not fit after it.
-		return logchain.TruncateRunes(msg, r.cfg.MaxEntryBytes), raw
+		return clip.Runes(msg, r.cfg.MaxEntryBytes), raw
 	}
-	cut := logchain.TruncateRunes(msg, r.cfg.MaxEntryBytes)
+	cut := clip.Runes(msg, r.cfg.MaxEntryBytes)
 	if !utf8.ValidString(cut) {
 		// Only the SURVIVING bytes are probed here (the cut already happened),
 		// so an over-cap message whose invalid bytes were all past the cut
@@ -513,7 +515,7 @@ func (r *Reader) sanitize(msg, unit string) (body string, origLen int) {
 		r.reportDefect(defectInvalidUTF8, unit)
 		// Fresh allocation, so the second cut aliases only itself; clone below
 		// is then a cheap copy of at most MaxEntryBytes.
-		cut = logchain.TruncateRunes(strings.ToValidUTF8(cut, utf8Replacement), r.cfg.MaxEntryBytes)
+		cut = clip.Runes(strings.ToValidUTF8(cut, utf8Replacement), r.cfg.MaxEntryBytes)
 	}
 	return strings.Clone(cut), raw
 }

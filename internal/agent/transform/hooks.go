@@ -17,6 +17,7 @@ package transform
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -68,7 +69,7 @@ func (a roAttrsView) String() string        { return "attributes" }
 func (a roAttrsView) Type() string          { return "attributes" }
 func (a roAttrsView) Freeze()               {}
 func (a roAttrsView) Truth() starlark.Bool  { return a.m.Len() > 0 }
-func (a roAttrsView) Hash() (uint32, error) { return 0, fmt.Errorf("attributes are unhashable") }
+func (a roAttrsView) Hash() (uint32, error) { return 0, errors.New("attributes are unhashable") }
 func (a roAttrsView) Get(k starlark.Value) (starlark.Value, bool, error) {
 	return attrsView(a).Get(k)
 }
@@ -176,7 +177,7 @@ func (o *targetObj) String() string        { return "target" }
 func (o *targetObj) Type() string          { return "target" }
 func (o *targetObj) Freeze()               {}
 func (o *targetObj) Truth() starlark.Bool  { return true }
-func (o *targetObj) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+func (o *targetObj) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 
 func (o *targetObj) AttrNames() []string {
 	return []string{"drop", "labels", "monitor", "namespace", "path", "pod", "source", "url"}
@@ -210,7 +211,7 @@ func (o *targetObj) SetField(name string, v starlark.Value) error {
 	}
 	s, ok := starlark.AsString(v)
 	if !ok {
-		return fmt.Errorf("path must be a string")
+		return errors.New("path must be a string")
 	}
 	if s == "" || s[0] != '/' {
 		s = "/" + s
@@ -227,11 +228,11 @@ func (s stringMapView) String() string        { return "labels" }
 func (s stringMapView) Type() string          { return "labels" }
 func (s stringMapView) Freeze()               {}
 func (s stringMapView) Truth() starlark.Bool  { return len(s.m) > 0 }
-func (s stringMapView) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+func (s stringMapView) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 func (s stringMapView) Get(k starlark.Value) (starlark.Value, bool, error) {
 	key, ok := starlark.AsString(k)
 	if !ok {
-		return nil, false, fmt.Errorf("label key must be a string")
+		return nil, false, errors.New("label key must be a string")
 	}
 	v, found := s.m[key]
 	if !found {
@@ -242,7 +243,7 @@ func (s stringMapView) Get(k starlark.Value) (starlark.Value, bool, error) {
 func (s stringMapView) Has(k starlark.Value) (bool, error) {
 	key, ok := starlark.AsString(k)
 	if !ok {
-		return false, fmt.Errorf("label key must be a string")
+		return false, errors.New("label key must be a string")
 	}
 	_, found := s.m[key]
 	return found, nil
@@ -310,7 +311,7 @@ func (v *traceView) String() string        { return "trace" }
 func (v *traceView) Type() string          { return "trace" }
 func (v *traceView) Freeze()               {}
 func (v *traceView) Truth() starlark.Bool  { return true }
-func (v *traceView) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+func (v *traceView) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 
 func (v *traceView) AttrNames() []string { return []string{"span_count", "spans", "trace_id"} }
 
@@ -332,7 +333,7 @@ func (s *sampleSpans) String() string        { return "spans" }
 func (s *sampleSpans) Type() string          { return "spans" }
 func (s *sampleSpans) Freeze()               {}
 func (s *sampleSpans) Truth() starlark.Bool  { return len(s.spans) > 0 }
-func (s *sampleSpans) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+func (s *sampleSpans) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 func (s *sampleSpans) Len() int              { return len(s.spans) }
 func (s *sampleSpans) Iterate() starlark.Iterator {
 	return &sampleSpanIter{spans: s.spans}
@@ -362,7 +363,7 @@ func (o *sampleSpanObj) String() string        { return "span" }
 func (o *sampleSpanObj) Type() string          { return "span" }
 func (o *sampleSpanObj) Freeze()               {}
 func (o *sampleSpanObj) Truth() starlark.Bool  { return true }
-func (o *sampleSpanObj) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+func (o *sampleSpanObj) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 
 func (o *sampleSpanObj) AttrNames() []string {
 	return []string{"attributes", "duration_ms", "kind", "name", "resource", "status_code"}

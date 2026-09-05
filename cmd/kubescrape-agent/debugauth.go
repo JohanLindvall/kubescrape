@@ -76,6 +76,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
+	"github.com/JohanLindvall/kubescrape/internal/clip"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/peerip"
@@ -249,14 +250,9 @@ func (g *debugGuard) reject(w http.ResponseWriter, r *http.Request, reason strin
 // newlines), so the only thing left to worry about is length.
 const maxLoggedHostBytes = 128
 
-// debugLogHost renders the Host for the refusal line, cut to a sane length with
-// the cut made visible.
-func debugLogHost(host string) string {
-	if len(host) <= maxLoggedHostBytes {
-		return host
-	}
-	return host[:maxLoggedHostBytes] + "...(truncated)"
-}
+// debugLogHost renders the Host for the refusal line, cut to a sane length on a
+// rune boundary with the cut made visible.
+func debugLogHost(host string) string { return clip.Marked(host, maxLoggedHostBytes, "...(truncated)") }
 
 // debugLocalPeer reports whether the connection came from the pod's own network
 // namespace. Loopback is what `kubectl port-forward` produces: the kubelet

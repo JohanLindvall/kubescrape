@@ -831,17 +831,6 @@ const (
 	SelfLookupError  = "error"   // not resolved; the error is returned to the poller
 )
 
-// RegisterSelfMetadata exposes whether this process has resolved the pod it
-// runs in, whose attributes it stamps on the metrics it generates about itself
-// (-self-attributes). Both binaries register it whenever the lookup RUNS, and
-// only then: a registered gauge means "this process is trying", so a 0 always
-// means unresolved and never "the feature is off".
-//
-// Without it an unattributed process is invisible: the agent's failed lookups
-// were indistinguishable from any other in kubescrape_metadata_requests_total,
-// and the metadata service's own lookup touches no counter at all — so "my
-// agents' own metrics carry no pod" is unalertable, and the symptom (a missing
-// label on one job) is easy to read as a dashboard problem.
 // RegisterMonitorsRejected publishes kubescrape_monitors_rejected — the count
 // of monitors whose CURRENT object does not parse, by kind — from the index's
 // own state (servicemonitors.Index.Rejected, adapted by the caller to the
@@ -880,6 +869,17 @@ func RegisterMonitorsRejected(rejected func() map[string]int) {
 		})
 }
 
+// RegisterSelfMetadata exposes whether this process has resolved the pod it
+// runs in, whose attributes it stamps on the metrics it generates about itself
+// (-self-attributes). Both binaries register it whenever the lookup RUNS, and
+// only then: a registered gauge means "this process is trying", so a 0 always
+// means unresolved and never "the feature is off".
+//
+// Without it an unattributed process is invisible: the agent's failed lookups
+// were indistinguishable from any other in kubescrape_metadata_requests_total,
+// and the metadata service's own lookup touches no counter at all — so "my
+// agents' own metrics carry no pod" is unalertable, and the symptom (a missing
+// label on one job) is easy to read as a dashboard problem.
 func RegisterSelfMetadata(resolved func() bool) {
 	Registry.GaugeFunc("kubescrape_self_metadata_resolved",
 		"1 when this process has resolved its own pod's metadata for -self-attributes, 0 while it has not.",
@@ -1325,6 +1325,8 @@ var (
 // connection, or the -debug-token-file bearer token) and the gate is counted:
 // a refusal an operator cannot see is a refusal that gets configured away, and
 // an ACCEPTED read leaves no other trace than a throttled attach line.
+
+// DebugRefused counts those refusals, by reason.
 var DebugRefused = Registry.CounterVec("kubescrape_debug_refused_total",
 	"Requests for the agent's data-bearing debug surfaces (/debug/otlp, /debug/otlp/ui, /debug/tailer) that "+
 		"were refused, by reason. no_token = no -debug-token-file is configured, so these are served only to a "+

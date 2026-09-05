@@ -67,6 +67,7 @@ func benchMetricEnvelope(records, resources int) []byte {
 
 // reportPerRecord normalizes a batch-per-op benchmark to per-record cost.
 func reportPerRecord(b *testing.B, records int) {
+	b.Helper()
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(records), "ns/record")
 }
 
@@ -137,6 +138,7 @@ func BenchmarkDecodeRecord(b *testing.B) {
 func BenchmarkConvertLogs(b *testing.B) {
 	env := benchLogEnvelope(100, 10)
 	run := func(b *testing.B, r *Reader) {
+		b.Helper()
 		recs := r.decode([][]byte{env})
 		if len(recs) != 100 {
 			b.Fatalf("decoded records = %d, want 100", len(recs))

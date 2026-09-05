@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -56,7 +57,7 @@ func benchStore(b *testing.B, n int) (*Store, map[string]LogPos, string) {
 // directory fsync.
 func BenchmarkSetLogs(b *testing.B) {
 	for _, n := range []int{100, 1000, 3000} {
-		b.Run(fmt.Sprint(n), func(b *testing.B) {
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
 			s, m, key := benchStore(b, n)
 			i := 0
 			b.ReportAllocs()
@@ -78,7 +79,7 @@ func BenchmarkSetLogs(b *testing.B) {
 // copy SetLogs makes of a map its caller drops on return.
 func BenchmarkSetLogsOwned(b *testing.B) {
 	for _, n := range []int{100, 1000, 3000} {
-		b.Run(fmt.Sprint(n), func(b *testing.B) {
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
 			s, m, key := benchStore(b, n)
 			i := 0
 			b.ReportAllocs()
@@ -100,7 +101,7 @@ func BenchmarkSetLogsOwned(b *testing.B) {
 // is the marshal and the hash — no fsync, no rename.
 func BenchmarkSetLogsUnchanged(b *testing.B) {
 	for _, n := range []int{100, 3000} {
-		b.Run(fmt.Sprint(n), func(b *testing.B) {
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
 			s, m, _ := benchStore(b, n)
 			if err := s.SetLogs(m); err != nil {
 				b.Fatal(err)
@@ -119,7 +120,7 @@ func BenchmarkSetLogsUnchanged(b *testing.B) {
 // be attributed.
 func BenchmarkMarshal(b *testing.B) {
 	for _, n := range []int{100, 3000} {
-		b.Run(fmt.Sprint(n), func(b *testing.B) {
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
 			s, m, _ := benchStore(b, n)
 			if err := s.SetLogs(m); err != nil {
 				b.Fatal(err)

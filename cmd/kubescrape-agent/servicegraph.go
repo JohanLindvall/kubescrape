@@ -225,7 +225,7 @@ func (p *pipelines) buildOwnerChain(ctx context.Context, proc *servicegraph.Proc
 	// when their spans were buffered and hold nothing (otlpexport/owned.go).
 	out, ok := p.out.(servicegraph.TracesExporter)
 	if !ok {
-		return nil, fmt.Errorf("exporter does not support traces")
+		return nil, errors.New("exporter does not support traces")
 	}
 	chain := out
 	if cfg := p.fileCfg.TailSampling; cfg.Enabled() { // nil-receiver safe

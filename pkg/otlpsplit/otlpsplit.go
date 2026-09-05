@@ -33,6 +33,7 @@ import (
 // proto size (attributes and framing included, not just bodies), keeps every
 // producer safe in one place; producers that already chunk under the cap
 // (promscrape, the ingest batcher) never trip the split.
+
 // DefaultMaxBytes is a safe per-payload cap: comfortably under the OTLP
 // collector's 4 MiB default gRPC receive limit, with margin for framing.
 const DefaultMaxBytes = 4<<20 - 256<<10 // 3.75 MiB

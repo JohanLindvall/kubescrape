@@ -49,7 +49,7 @@
 package servicegraph
 
 import (
-	"fmt"
+	"errors"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -186,7 +186,7 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if c.MaxItems < 0 || c.MaxCardinality < 0 {
-		return fmt.Errorf("maxItems and maxCardinality must not be negative")
+		return errors.New("maxItems and maxCardinality must not be negative")
 	}
 	return cumagg.ValidateBuckets("histogramBuckets", c.HistogramBuckets)
 }

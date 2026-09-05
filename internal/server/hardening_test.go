@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -343,7 +344,7 @@ func TestServerConcurrentLoad(t *testing.T) {
 		st.UpsertPod(&corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: podName(p), Namespace: "default",
-				UID: types.UID(fmt.Sprintf("load-uid-%d", p)), ResourceVersion: fmt.Sprint(rv),
+				UID: types.UID(fmt.Sprintf("load-uid-%d", p)), ResourceVersion: strconv.Itoa(rv),
 				Annotations: map[string]string{"prometheus.io/scrape": "true", "prometheus.io/port": "8080"},
 			},
 			Spec: corev1.PodSpec{NodeName: "load-node", Containers: []corev1.Container{{Name: "app", Image: "img"}}},

@@ -31,6 +31,7 @@ const (
 )
 
 func benchApply(b *testing.B, line string) {
+	b.Helper()
 	// One record, re-cleared per iteration: Apply's cost is the parse plus the
 	// attribute puts, and a fresh pdata record per iteration would measure
 	// pdata's allocator instead.

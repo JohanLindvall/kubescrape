@@ -110,7 +110,7 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 	// into a metric literally named the prefix — and two such rules silently
 	// shared one series.
 	if d.Name == "" {
-		return nil, fmt.Errorf("metric rule has no name")
+		return nil, errors.New("metric rule has no name")
 	}
 	name := cfg.namePrefix + d.Name
 	if kind == kindHistogram {
@@ -125,9 +125,9 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 		if len(d.Buckets) == 0 {
 			streams = len(defaultBuckets) + 1
 		}
-		if cap := cardinalityCap(d.MaxCardinality); cap*streams > maxStreamCap {
+		if series := cardinalityCap(d.MaxCardinality); series*streams > maxStreamCap {
 			return nil, fmt.Errorf("metric %q: maxCardinality %d x %d buckets = %d bucket slots, above the %d-slot budget — lower maxCardinality or use fewer buckets",
-				d.Name, cap, streams, cap*streams, maxStreamCap)
+				d.Name, series, streams, series*streams, maxStreamCap)
 		}
 	}
 	if existing, ok := shared[name]; ok {
@@ -145,8 +145,8 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 		if kind == kindHistogram && len(d.Buckets) > 0 && !slices.Equal(existing.buckets[:len(existing.buckets)-1], d.Buckets) {
 			return nil, fmt.Errorf("metric %q declared with conflicting buckets", d.Name)
 		}
-		if cap := cardinalityCap(d.MaxCardinality); d.MaxCardinality != 0 && cap != existing.maxSize {
-			return nil, fmt.Errorf("metric %q declared with conflicting maxCardinality (%d, already %d)", d.Name, cap, existing.maxSize)
+		if series := cardinalityCap(d.MaxCardinality); d.MaxCardinality != 0 && series != existing.maxSize {
+			return nil, fmt.Errorf("metric %q declared with conflicting maxCardinality (%d, already %d)", d.Name, series, existing.maxSize)
 		}
 		if secs := expirationSeconds(age); d.MaxAge != "" && secs != existing.expiration {
 			return nil, fmt.Errorf("metric %q declared with conflicting maxAge (%ds, already %ds)", d.Name, secs, existing.expiration)

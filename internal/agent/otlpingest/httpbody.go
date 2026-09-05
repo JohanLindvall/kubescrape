@@ -41,7 +41,6 @@ import (
 	"os"
 	"syscall"
 	"time"
-	"unicode/utf8"
 
 	"github.com/klauspost/compress/gzip"
 
@@ -49,6 +48,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/clip"
 )
 
 var (
@@ -118,14 +118,14 @@ type BodyReader struct {
 // are not summable: a stranger's malformed push and a sibling shard's are
 // different events with different responses, and a label on one series invites
 // exactly the aggregation that erases the distinction.
-func NewBodyReader(max int64) *BodyReader { return &BodyReader{max: max} }
+func NewBodyReader(limit int64) *BodyReader { return &BodyReader{max: limit} }
 
-func newBodyReader(max int64, budget *byteBudget, log *slog.Logger) *BodyReader {
+func newBodyReader(limit int64, budget *byteBudget, log *slog.Logger) *BodyReader {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &BodyReader{
-		max:     max,
+		max:     limit,
 		budget:  budget,
 		observe: true,
 		log:     log,
@@ -238,22 +238,12 @@ func (br *BodyReader) noteRejected(r *http.Request, err error) {
 // The value still has to REACH the operator — a wrong Content-Type IS the
 // diagnosis — so it is clipped rather than dropped, and clipped on a rune
 // boundary so a cut UTF-8 sequence does not become a replacement character in
-// whatever reads the line. promscrape has the same function for the same reason
-// on the scrape side (target-supplied there, sender-supplied here); they are
-// not shared because neither package should import the other for a five-line
-// bound, and the constants are free to differ.
+// whatever reads the line. promscrape bounds target-supplied values the same
+// way (sender-supplied here); the bound is each package's own and the cut is
+// internal/clip's.
 const maxLoggedValueBytes = 96
 
-func clipForLog(v string) string {
-	if len(v) <= maxLoggedValueBytes {
-		return v
-	}
-	cut := maxLoggedValueBytes
-	for cut > 0 && !utf8.RuneStart(v[cut]) {
-		cut--
-	}
-	return v[:cut] + "…"
-}
+func clipForLog(v string) string { return clip.Ellipsis(v, maxLoggedValueBytes) }
 
 // noteMalformed counts a body that READ cleanly and then did not decode as OTLP
 // protobuf. It is the same door and the same reason as a body that would not

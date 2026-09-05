@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/JohanLindvall/kubescrape/internal/clip"
 )
 
 // RegistrySeries is one registered metric's current state.
@@ -254,11 +256,8 @@ func (r *Registry) noteLabelParseError(metric, labels string, err error) {
 
 // truncLabelString bounds what a log line carries from a corrupt label string.
 func truncLabelString(s string) string {
-	const max = 256
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "…"
+	const maxLoggedLabelBytes = 256
+	return clip.Ellipsis(s, maxLoggedLabelBytes)
 }
 
 // pairs converts a key-sorted label set into the exported pair form.

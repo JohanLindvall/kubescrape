@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -60,7 +61,7 @@ func TestConcurrentChurnInvariants(t *testing.T) {
 					default:
 					}
 					rv++
-					pod := makePod(podUID(w, p), podName(w, p), node(w), fmt.Sprint(rv), map[string]string{"app": contID(w, p)})
+					pod := makePod(podUID(w, p), podName(w, p), node(w), strconv.Itoa(rv), map[string]string{"app": contID(w, p)})
 					pod.Status.PodIP = podIP(w, p)
 					s.UpsertPod(pod)
 					writes.Add(1)

@@ -5,12 +5,12 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/cumagg"
+	"github.com/JohanLindvall/kubescrape/internal/clip"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -279,20 +279,9 @@ const maxLoggedValueBytes = 96
 // cut on a rune boundary so a clipped UTF-8 sequence does not become a
 // replacement character in whatever reads the line.
 //
-// promscrape and otlpingest each carry this function for the same reason
-// (target-supplied there, sender-supplied here) and deliberately do not share
-// it: neither package should import another for a five-line bound, and the
-// constants are free to differ. This is the third copy under the same rule.
-func clipForLog(v string) string {
-	if len(v) <= maxLoggedValueBytes {
-		return v
-	}
-	cut := maxLoggedValueBytes
-	for cut > 0 && !utf8.RuneStart(v[cut]) {
-		cut--
-	}
-	return v[:cut] + "…"
-}
+// promscrape and otlpingest bound their target- and sender-supplied values the
+// same way; the bound is each package's own and the cut is internal/clip's.
+func clipForLog(v string) string { return clip.Ellipsis(v, maxLoggedValueBytes) }
 
 // reportUnnamed is the context half of kubescrape_service_graph_unnamed_spans_total.
 // The counter says requests are missing from the graph; only a line can say
@@ -360,7 +349,10 @@ func (p *Processor) SweepAll() { p.sweepDue(p.now()) }
 // wait is always positive — Config.wait parses it under config.Positive and
 // falls back to DefaultWait).
 func (p *Processor) sweepDue(now time.Time) {
-	for p.store.expire(now, sweepBudget) == sweepBudget {
+	for {
+		if p.store.expire(now, sweepBudget) < sweepBudget {
+			return
+		}
 	}
 }
 

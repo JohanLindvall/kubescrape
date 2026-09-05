@@ -3,7 +3,7 @@ package promscrape
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,7 +12,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -20,6 +19,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
+	"github.com/JohanLindvall/kubescrape/internal/clip"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/promdur"
@@ -306,7 +306,7 @@ func (s *Scraper) authToken(ctx context.Context, ref string) (string, error) {
 	}
 	s.authMu.Unlock()
 	if s.cfg.Auth == nil {
-		return "", fmt.Errorf("no auth source configured")
+		return "", errors.New("no auth source configured")
 	}
 	token, err := s.cfg.Auth.ScrapeAuth(ctx, ref)
 	if err != nil {
@@ -495,20 +495,11 @@ func (s *Scraper) warnOnce(key, msg string, args ...any) {
 const maxLoggedValueBytes = 96
 
 // clipForLog renders a target-supplied value for a log attribute: bounded, and
-// cut on a rune boundary so a clipped UTF-8 sequence does not become a
-// replacement character in whatever reads the line. It is the counterpart of
-// the key rule above — the value cannot be part of the KEY, so this is how it
-// still reaches the operator.
-func clipForLog(v string) string {
-	if len(v) <= maxLoggedValueBytes {
-		return v
-	}
-	cut := maxLoggedValueBytes
-	for cut > 0 && !utf8.RuneStart(v[cut]) {
-		cut--
-	}
-	return v[:cut] + "…"
-}
+// cut on a rune boundary (internal/clip) so a clipped UTF-8 sequence does not
+// become a replacement character in whatever reads the line. It is the
+// counterpart of the key rule above — the value cannot be part of the KEY, so
+// this is how it still reaches the operator.
+func clipForLog(v string) string { return clip.Ellipsis(v, maxLoggedValueBytes) }
 
 // warnTarget identifies a target for warnOnce by the CONFIGURATION that
 // produced it, never by its URL.
@@ -1011,7 +1002,7 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget, tim
 
 	var cb chunker
 	if sp := s.splitterFor(t.Pod); sp != nil {
-		cb = newSplitBatcher(s, ctx, t, sp, time.Now())
+		cb = newSplitBatcher(ctx, s, t, sp, time.Now())
 	} else {
 		cb = newBatcher(func(res pcommon.Resource) {
 			s.fillTargetResource(res, t.URL, &t.Pod, t.Service)
@@ -1057,7 +1048,7 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget, tim
 				"target served the protobuf exposition although this agent asked for text; refusing to decode it",
 				"url", t.URL, "monitor", t.Monitor, "contentType", clipForLog(contentType), "flag", "-scrape-native-histograms")
 			return 0, classify(reasonProtoRefused,
-				fmt.Errorf("target served protobuf but native histograms are not enabled"))
+				errors.New("target served protobuf but native histograms are not enabled"))
 		}
 		return s.scrapeProto(ctx, resp.Body, cb, relabel, t.URL, warnKey)
 	}

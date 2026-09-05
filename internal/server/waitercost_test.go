@@ -123,14 +123,17 @@ func TestParkedLookupCostFitsItsBudget(t *testing.T) {
 	// cannot. (It replaced a bare "the poll must be under half the budget",
 	// which was a proxy for this and said nothing about what the other half had
 	// to cover.)
-	if want := (base + parkedStackAllowance + maxAdmittedHead) * marginNum / marginDen; want > store.WaiterCostBytes {
+	// The ARITHMETIC (expectedAdmittedHead), not the measurement: the budget
+	// must cover the widest head any supported net/http admits, and the harness
+	// test fails if a release ever admits more than the arithmetic says.
+	if want := (base + parkedStackAllowance + expectedAdmittedHead) * marginNum / marginDen; want > store.WaiterCostBytes {
 		t.Fatalf("an ordinary agent poll parks at %d B of heap, and with %d B of stack and one whole %d-byte "+
 			"admissible head it needs %d B of budget once the margin is applied, against the %d B "+
 			"store.WaiterCostBytes carries: the cap has no headroom left for what a sender can add to a poll",
-			base, parkedStackAllowance, maxAdmittedHead, want, store.WaiterCostBytes)
+			base, parkedStackAllowance, expectedAdmittedHead, want, store.WaiterCostBytes)
 	}
 
-	for _, shape := range hostileShapes() {
+	for _, shape := range hostileShapes(t) {
 		t.Run(shape.name, func(t *testing.T) {
 			// The floor, measured HERE: adjacent to the shape and in the same
 			// warm process, because it is subtracted from the shape and a floor
@@ -278,7 +281,7 @@ const goroutineSlack = 16
 func FuzzParkedLookupRetainsNothingButItsValidator(f *testing.F) {
 	const id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	f.Add("/v1/containers/"+id+"?wait=600s", ordinaryPollHeaders)
-	for _, s := range hostileShapes() {
+	for _, s := range hostileShapes(f) {
 		f.Add(s.target(id), s.block)
 	}
 	// Shapes worth handing the fuzzer as starting points.
@@ -297,7 +300,7 @@ func FuzzParkedLookupRetainsNothingButItsValidator(f *testing.F) {
 			t.Skip("memory measurement is meaningless under -race")
 		}
 		head := "GET " + target + " HTTP/1.1\r\nHost: h\r\n" + block + "\r\n"
-		if len(head) > maxAdmittedHead {
+		if len(head) > maxAdmittedHead(t) {
 			// Over what the server admits even on the connection shape that
 			// admits the most (maxAdmittedHead): net/http answers 431 without
 			// reading it, and nothing parks.
@@ -341,10 +344,11 @@ const ordinaryPollHeaders = "User-Agent: kubescrape-agent/1.0\r\n" +
 // nothing about it parks or allocates.
 const keepAlivePrelude = "GET /healthz HTTP/1.1\r\nHost: h\r\n\r\n"
 
-// maxAdmittedHead is the largest request head this server actually serves, and
-// it is NOT maxHeaderBytes, nor maxHeaderBytes plus net/http's documented 4 KiB
-// slop. Three terms, of which only the first two are visible from
-// Server.initialReadLimitSize:
+// expectedAdmittedHead is the ARITHMETIC of the largest request head this
+// server serves — what the net/http this file was written against (Go 1.26)
+// admits behind keepAlivePrelude — and it is NOT maxHeaderBytes, nor
+// maxHeaderBytes plus net/http's documented 4 KiB slop. Three terms, of which
+// only the first two are visible from Server.initialReadLimitSize:
 //
 //	maxHeaderBytes                        8192   the configured bound
 //	+ net/http's bufio slop               4096   initialReadLimitSize adds it
@@ -375,11 +379,62 @@ const keepAlivePrelude = "GET /healthz HTTP/1.1\r\nHost: h\r\n\r\n"
 // right, because that size is always admitted; asserting a refusal one byte
 // above it is not, and failed three runs in ten.
 //
-// So the wire term of a parked lookup is ~16 KB, not ~12 KB, and every shape
-// here is sized against it (TestTheHarnessMeasuresEveryHeadTheServerAdmits
-// checks both directions against the real listener rather than trusting this
-// arithmetic).
-const maxAdmittedHead = maxHeaderBytes + 4096 + 4096 - len(keepAlivePrelude)
+// So the wire term of a parked lookup is ~16 KB, not ~12 KB. The BUDGET is
+// derived from this arithmetic; the SHAPES are sized from maxAdmittedHead, the
+// same quantity MEASURED against the real listener, and
+// TestTheHarnessMeasuresEveryHeadTheServerAdmits is where the two are held
+// together: a release admitting MORE than the arithmetic fails it (the budget
+// would be under-derived), one admitting LESS is reported and the shapes
+// follow the measurement — Go 1.27 charges the buffered remainder, and admits
+// one bufio buffer less than this.
+const expectedAdmittedHead = maxHeaderBytes + 4096 + 4096 - len(keepAlivePrelude)
+
+// admissionOnce/admissionSize back maxAdmittedHead: one measurement per test
+// binary, since every shape in this file and the fuzz seeds are sized from it.
+var (
+	admissionOnce sync.Once
+	admissionSize int
+)
+
+// maxAdmittedHead is the largest request head this package's real listener
+// admits behind keepAlivePrelude, measured once per process rather than read
+// off expectedAdmittedHead. The arithmetic is probed first — when it holds the
+// measurement is one dial — and searched for otherwise, so a Go release that
+// moves net/http's uncharged buffer moves every shape with it instead of
+// turning each into a 431 that parks nothing.
+func maxAdmittedHead(t testing.TB) int {
+	t.Helper()
+	admissionOnce.Do(func() { admissionSize = measureAdmittedHead(t) })
+	return admissionSize
+}
+
+func measureAdmittedHead(t testing.TB) int {
+	t.Helper()
+	admitted, stop := admissionProbe(t)
+	defer stop()
+	if admitted(expectedAdmittedHead) {
+		return expectedAdmittedHead
+	}
+	// Under the arithmetic: find the largest head that IS admitted. The low end
+	// is a head any release must admit (well inside the configured
+	// maxHeaderBytes); the invariant is lo admitted, hi refused.
+	lo, hi := maxHeaderBytes-4096, expectedAdmittedHead
+	if !admitted(lo) {
+		t.Fatalf("a %d-byte head behind a %d-byte prelude is refused, under the %d maxHeaderBytes this "+
+			"server is configured to admit", lo, len(keepAlivePrelude), maxHeaderBytes)
+	}
+	for hi-lo > 1 {
+		if mid := (lo + hi) / 2; admitted(mid) {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	// The admission's last byte is a race (see expectedAdmittedHead): a head
+	// one over the true admission is admitted sometimes, so back off past it to
+	// a size that is admitted always.
+	return lo - 2
+}
 
 // refusedHead is a head this server refuses however the reads land, and it is
 // what the high direction below probes instead of maxAdmittedHead+1.
@@ -395,7 +450,7 @@ const maxAdmittedHead = maxHeaderBytes + 4096 + 4096 - len(keepAlivePrelude)
 // shape can admit more than maxHeaderBytes+4096+4096+1 = 16385, and this sits a
 // further 4061 bytes clear of that ceiling while still failing on any drift
 // that moves the admission by a buffer or more.
-const refusedHead = maxAdmittedHead + 4096
+const refusedHead = expectedAdmittedHead + 4096
 
 // The harness's shapes are only worth what their wire bound is worth: a bound
 // below the server's real admission hides a whole class of request from BOTH
@@ -408,63 +463,18 @@ const refusedHead = maxAdmittedHead + 4096
 // maxAdmittedHead) and the version of this test that pinned it exactly failed
 // three runs in ten.
 func TestTheHarnessMeasuresEveryHeadTheServerAdmits(t *testing.T) {
-	srv := newAPI(store.New(time.Minute), time.Second).HTTPServer(":0")
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() { _ = srv.Serve(ln) }()
-	t.Cleanup(func() { _ = srv.Close() })
+	admitted, stop := admissionProbe(t)
+	defer stop()
 
-	// A head of exactly n bytes for an id an empty store answers 404 for
-	// without parking, padded out with one header value.
-	head := func(n int) string {
-		req := fmt.Sprintf("GET /v1/containers/%064x?wait=0 HTTP/1.1\r\nHost: h\r\nX-P: \r\n\r\n", 1)
-		if n < len(req) {
-			t.Fatalf("cannot build a %d-byte head; the shortest is %d", n, len(req))
-		}
-		return strings.Replace(req, "X-P: ", "X-P: "+strings.Repeat("p", n-len(req)), 1)
+	measured := maxAdmittedHead(t)
+	if measured < maxHeaderBytes {
+		t.Fatalf("this server admits at most %d bytes of head behind a %d-byte prelude, under the %d "+
+			"maxHeaderBytes it is configured to admit", measured, len(keepAlivePrelude), maxHeaderBytes)
 	}
-	// admitted reports whether a head of n bytes reaches a handler when it
-	// arrives behind keepAlivePrelude on the same connection.
-	//
-	// It dials through retryingDialer for the reason given there: this is the
-	// check that the shapes are sized against the server's REAL admission, and
-	// a skip on a neighbour's socket churn would delete it while reporting the
-	// same green as a run that made it.
-	dialer := &retryingDialer{t: t, addr: ln.Addr().String(), need: 1}
-	t.Cleanup(dialer.report)
-	admitted := func(n int) bool {
-		c := dialer.dial()
-		defer func() { _ = c.Close() }()
-		// An RST teardown, as in parkAndMeasure: the binary search below dials
-		// tens of times and the ephemeral range is shared with every other test
-		// in the package.
-		if tcp, ok := c.(*net.TCPConn); ok {
-			_ = tcp.SetLinger(0)
-		}
-		_ = c.SetDeadline(time.Now().Add(30 * time.Second))
-		if _, err := c.Write([]byte(keepAlivePrelude + head(n))); err != nil {
-			t.Fatalf("write: %v", err)
-		}
-		br := bufio.NewReader(c)
-		first, err := http.ReadResponse(br, nil)
-		if err != nil {
-			t.Fatalf("the prelude was not answered: %v", err)
-		}
-		_ = first.Body.Close()
-		resp, err := http.ReadResponse(br, nil)
-		if err != nil {
-			t.Fatalf("no response to the %d-byte head behind the prelude: %v", n, err)
-		}
-		_ = resp.Body.Close()
-		return resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge
-	}
-
-	if !admitted(maxAdmittedHead) {
+	if !admitted(measured) {
 		t.Fatalf("a %d-byte head behind a %d-byte prelude is refused, so the shapes measured here are "+
 			"sized ABOVE what this server admits: they 431 instead of parking and the cost measurement is "+
-			"of nothing", maxAdmittedHead, len(keepAlivePrelude))
+			"of nothing", measured, len(keepAlivePrelude))
 	}
 	if admitted(refusedHead) {
 		// Search for what the admission actually is, so the failure carries the
@@ -490,13 +500,79 @@ func TestTheHarnessMeasuresEveryHeadTheServerAdmits(t *testing.T) {
 			}
 		}
 		// "at least": the last byte of the admission is the background-read
-		// race described at maxAdmittedHead, so the search can land either side
-		// of it.
+		// race described at expectedAdmittedHead, so the search can land either
+		// side of it.
 		t.Fatalf("this server admits a head of at least %d bytes behind a %d-byte prelude, %d over the %d "+
-			"maxAdmittedHead is sized for: every shape here is sized against that constant, so a whole "+
-			"class of admissible request — the widest one there is — is measured by neither half of this "+
-			"argument", lo, len(keepAlivePrelude), lo-maxAdmittedHead, maxAdmittedHead)
+			"expectedAdmittedHead is sized for: the waiter budget is derived from that arithmetic, so a "+
+			"whole class of admissible request — the widest one there is — is covered by neither half of "+
+			"this argument", lo, len(keepAlivePrelude), lo-expectedAdmittedHead, expectedAdmittedHead)
 	}
+	if measured < expectedAdmittedHead {
+		t.Logf("this server admits %d-byte heads behind a %d-byte prelude, %d under the %d the arithmetic "+
+			"at expectedAdmittedHead describes: a Go release moved net/http's uncharged buffer, and the "+
+			"shapes are sized from the measurement rather than the arithmetic",
+			measured, len(keepAlivePrelude), expectedAdmittedHead-measured, expectedAdmittedHead)
+	}
+}
+
+// admissionProbe starts a real listener and returns a probe reporting whether
+// a head of n bytes reaches a handler when it arrives behind keepAlivePrelude
+// on the same connection, plus the function that stops the listener.
+//
+// It dials through retryingDialer for the reason given there: this is the
+// check that the shapes are sized against the server's REAL admission, and a
+// skip on a neighbour's socket churn would delete it while reporting the same
+// green as a run that made it.
+func admissionProbe(t testing.TB) (admitted func(n int) bool, stop func()) {
+	t.Helper()
+	srv := newAPI(store.New(time.Minute), time.Second).HTTPServer(":0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+
+	// A head of exactly n bytes for an id an empty store answers 404 for
+	// without parking, padded out with one header value.
+	head := func(n int) string {
+		req := fmt.Sprintf("GET /v1/containers/%064x?wait=0 HTTP/1.1\r\nHost: h\r\nX-P: \r\n\r\n", 1)
+		if n < len(req) {
+			t.Fatalf("cannot build a %d-byte head; the shortest is %d", n, len(req))
+		}
+		return strings.Replace(req, "X-P: ", "X-P: "+strings.Repeat("p", n-len(req)), 1)
+	}
+	dialer := &retryingDialer{t: t, addr: ln.Addr().String(), need: 1}
+	admitted = func(n int) bool {
+		c := dialer.dial()
+		defer func() { _ = c.Close() }()
+		// An RST teardown, as in parkAndMeasure: the binary search dials tens
+		// of times and the ephemeral range is shared with every other test in
+		// the package.
+		if tcp, ok := c.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = c.SetDeadline(time.Now().Add(30 * time.Second))
+		if _, err := c.Write([]byte(keepAlivePrelude + head(n))); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		br := bufio.NewReader(c)
+		first, err := http.ReadResponse(br, nil)
+		if err != nil {
+			t.Fatalf("the prelude was not answered: %v", err)
+		}
+		_ = first.Body.Close()
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			t.Fatalf("no response to the %d-byte head behind the prelude: %v", n, err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge
+	}
+	stop = func() {
+		dialer.report()
+		_ = srv.Close()
+	}
+	return admitted, stop
 }
 
 // retryingDialer opens the connections this file measures on, surviving the
@@ -534,7 +610,7 @@ func TestTheHarnessMeasuresEveryHeadTheServerAdmits(t *testing.T) {
 // Retries are counted rather than swallowed, so a run that was slowed by a
 // neighbour says so in its log instead of looking like a slow measurement.
 type retryingDialer struct {
-	t    *testing.T
+	t    testing.TB
 	addr string
 	// need is how many connections the caller will ask for, for the failure
 	// message only.
@@ -639,11 +715,11 @@ func headerValue(block, key string) string {
 	return ""
 }
 
-func hostileShapes() []hostileShape {
+func hostileShapes(t testing.TB) []hostileShape {
 	// What a client may actually send, on the connection shape that admits the
 	// most of it (maxAdmittedHead), less the request line and the framing every
 	// shape carries.
-	const room = maxAdmittedHead - 300
+	room := maxAdmittedHead(t) - 300
 
 	return []hostileShape{{
 		name:   "widest distinct-key block",
@@ -806,10 +882,10 @@ func parkAndMeasure(t *testing.T, n int, shape hostileShape) (perWaiter int) {
 		// parks per ID, and an over-length id degrades to a non-blocking miss.
 		req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: h\r\n%s\r\n",
 			shape.target(fmt.Sprintf("%064x", i)), shape.block)
-		if len(req) > maxAdmittedHead {
+		if limit := maxAdmittedHead(t); len(req) > limit {
 			t.Fatalf("this shape's head is %d bytes, over the %d this server admits behind a %d-byte "+
 				"prelude: it would be answered with a 431 and never park, so the measurement would be "+
-				"of nothing", len(req), maxAdmittedHead, len(keepAlivePrelude))
+				"of nothing", len(req), limit, len(keepAlivePrelude))
 		}
 		// One write, so the prelude and the request under measurement are in
 		// the socket together: that is what leaves part of the second head
@@ -825,21 +901,46 @@ func parkAndMeasure(t *testing.T, n int, shape hostileShape) (perWaiter int) {
 	// answered instead of parked (a 431, a 400) never gets here — which is the
 	// point: these are all inside the byte bound, so they PARK, and the cost of
 	// parking is what is under test.
+	//
+	// The one answer that is not a failure is a 431 for the WHOLE shape: a head
+	// this net/http refuses before any handler runs cannot cost a parked lookup
+	// anything, so there is nothing to measure. Go 1.27 charges each header
+	// FIELD against maxHeaderBytes and refuses the many-line shapes 1.26
+	// admitted; the shapes stay, sized for the release the budget was derived
+	// on, and a release that refuses one skips it by name rather than failing a
+	// budget nothing exceeded. Probed early, after two seconds with nothing
+	// parked, so a refused shape does not cost the whole deadline.
+	firstConnSays := func() string {
+		// The prelude's own 200 comes first on every connection; what matters
+		// is whatever follows it, which is empty when the lookup parked and a
+		// status line when it did not.
+		_ = conns[0].SetReadDeadline(time.Now().Add(time.Second))
+		br := bufio.NewReader(conns[0])
+		if resp, err := http.ReadResponse(br, nil); err == nil {
+			_ = resp.Body.Close()
+		}
+		var probe [256]byte
+		m, _ := br.Read(probe[:])
+		return string(probe[:m])
+	}
 	deadline := time.Now().Add(30 * time.Second)
+	probeAt := time.Now().Add(2 * time.Second)
+	probed := ""
 	for st.BlockedLookups() < n {
-		if time.Now().After(deadline) {
-			// The prelude's own 200 comes first on every connection; what
-			// matters is whatever follows it, which is empty when the lookup
-			// parked and a status line when it did not.
-			_ = conns[0].SetReadDeadline(time.Now().Add(time.Second))
-			br := bufio.NewReader(conns[0])
-			if resp, err := http.ReadResponse(br, nil); err == nil {
-				_ = resp.Body.Close()
+		now := time.Now()
+		if probed == "" && st.BlockedLookups() == 0 && now.After(probeAt) {
+			if probed = firstConnSays(); strings.HasPrefix(probed, "HTTP/1.1 431 ") {
+				t.Skipf("this net/http refuses the shape outright (431 before any handler runs), so it cannot "+
+					"cost a parked lookup anything and there is nothing to measure; the first connection says %q",
+					probed)
 			}
-			var probe [256]byte
-			m, _ := br.Read(probe[:])
+		}
+		if now.After(deadline) {
+			if probed == "" {
+				probed = firstConnSays()
+			}
 			t.Fatalf("only %d of %d requests parked; after the prelude's response the first connection "+
-				"says %q", st.BlockedLookups(), n, probe[:m])
+				"says %q", st.BlockedLookups(), n, probed)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

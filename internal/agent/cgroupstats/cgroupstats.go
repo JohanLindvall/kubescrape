@@ -1102,7 +1102,9 @@ func (s *Sampler) Root() string { return s.root }
 // the flag values. An operator who asked for something the constructor refused
 // to honour otherwise has only a WARN line to correlate against, and the line
 // that says what the pipeline is doing said something else.
-func (s *Sampler) Interval() time.Duration         { return s.interval }
+func (s *Sampler) Interval() time.Duration { return s.interval }
+
+// DiscoverInterval is the effective discovery period; see Interval.
 func (s *Sampler) DiscoverInterval() time.Duration { return s.discoverEvery }
 
 // Run samples until ctx is done, exporting every exportEvery.

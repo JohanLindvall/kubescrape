@@ -221,7 +221,7 @@ func TestHelpAndUnitOnPerObjectResources(t *testing.T) {
 		}
 		target := testTarget("http://ksm:8080/metrics")
 		target.Pod.Name = "ksm-abc"
-		cb := newSplitBatcher(s, context.Background(), target, sp[0], time.Unix(2, 0))
+		cb := newSplitBatcher(context.Background(), s, target, sp[0], time.Unix(2, 0))
 		convertBody(t, cb, `# HELP kube_pod_info Information about pod.
 # TYPE kube_pod_info gauge
 kube_pod_info{namespace="ns1",pod="p1"} 1
@@ -240,7 +240,7 @@ kube_pod_info{namespace="ns1",pod="p2"} 1
 	})
 
 	t.Run("cadvisor", func(t *testing.T) {
-		cb := newCadvisorBatcher(s, time.Unix(2, 0), context.Background())
+		cb := newCadvisorBatcher(context.Background(), s, time.Unix(2, 0))
 		convertBody(t, cb, `# HELP container_cpu_usage_seconds_total Cumulative cpu time consumed.
 # TYPE container_cpu_usage_seconds_total counter
 container_cpu_usage_seconds_total{namespace="ns1",pod="pod1",container="app",id="/kubepods/burstable/pod`+uid1+`/`+appCID+`"} 12.5

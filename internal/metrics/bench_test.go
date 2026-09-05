@@ -201,7 +201,7 @@ func BenchmarkExport(b *testing.B) {
 	res := benchResource()
 	for i := 0; i < 100; i++ {
 		attrs := map[string]string{
-			"level": "info", "http_status": fmt.Sprintf("%d", 200+i%5), "method": "GET",
+			"level": "info", "http_status": strconv.Itoa(200 + i%5), "method": "GET",
 		}
 		set.Add(nil, func(k string) string { return attrs[k] }, res, "")
 	}

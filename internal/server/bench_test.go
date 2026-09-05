@@ -55,7 +55,7 @@ func (f targetsFixture) build(t testing.TB) *Server {
 			ObjectMeta: metav1.ObjectMeta{
 				Name: fmt.Sprintf("web-%d", i), Namespace: "prod",
 				UID: types.UID(fmt.Sprintf("pod-uid-%d", i)), ResourceVersion: "1",
-				Labels: map[string]string{"app": "web", "pod-template-hash": fmt.Sprintf("%d", i%8)},
+				Labels: map[string]string{"app": "web", "pod-template-hash": strconv.Itoa(i % 8)},
 				Annotations: map[string]string{
 					"prometheus.io/scrape":         "true",
 					"prometheus.io/port":           "9090",
@@ -136,6 +136,7 @@ func (f targetsFixture) build(t testing.TB) *Server {
 // a benchmark that leaves it still is measuring a request no conforming client
 // can send.
 func benchTargets(b *testing.B, f targetsFixture, conditional bool, advance time.Duration) {
+	b.Helper()
 	s := f.build(b)
 	now := time.Now()
 	s.now = func() time.Time { return now }

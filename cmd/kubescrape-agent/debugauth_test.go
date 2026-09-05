@@ -9,7 +9,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -354,19 +353,19 @@ func TestARebindingBrowserPageCannotReadTheStream(t *testing.T) {
 // The Host check must not cost the operator anything: every shape a client that
 // dialled the port directly can send still reads the stream with no flag set.
 func TestEveryLoopbackHostFormStillReadsTheStream(t *testing.T) {
-	srv, _ := tapServer(t, "", false)
+	srv, tap := tapServer(t, "", false)
 	_, port, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	for _, host := range []string{
-		fmt.Sprintf("localhost:%s", port),
-		fmt.Sprintf("127.0.0.1:%s", port),
-		fmt.Sprintf("[::1]:%s", port),
-		fmt.Sprintf("127.0.0.7:%s", port), // the whole 127/8, which is what a stray bind uses
-		"localhost",                       // a client that omits the port
-		"localhost.",                      // fully qualified
+		"localhost:" + port,
+		"127.0.0.1:" + port,
+		"[::1]:" + port,
+		"127.0.0.7:" + port, // the whole 127/8, which is what a stray bind uses
+		"localhost",         // a client that omits the port
+		"localhost.",        // fully qualified
 	} {
 		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/debug/otlp?signal=logs", nil)
 		req.Host = host
@@ -379,6 +378,22 @@ func TestEveryLoopbackHostFormStillReadsTheStream(t *testing.T) {
 			t.Errorf("Host %q got %d, want 200: the rebinding fix broke a legitimate port-forward", host,
 				resp.StatusCode)
 		}
+		// Six streams against a subscriber cap of four: the server notices a
+		// closed client body asynchronously, so the next request must not race
+		// the previous stream's detach into a 503 (it did, under Go 1.27).
+		waitForStreams(t, tap, 0)
+	}
+}
+
+// waitForStreams waits for the tap's attached-stream count to reach n.
+func waitForStreams(t *testing.T, tap *debugtap.Tap, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for tap.Streams() != n {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d streams still attached after 5s, want %d", tap.Streams(), n)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

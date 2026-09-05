@@ -19,13 +19,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
-// resolveMetadata builds the file's resource attributes. Plain files resolve
-// from the source's static attributes plus node metadata (immediately, except
-// while a CONFIGURED node-info provider has not yielded its first value — see
-// resolvePlain); containerd files fetch pod metadata from the service (backing
-// off between attempts), and are not consumed until it is available — the data
-// waits on disk, nothing is lost.
-// metadata resolution backoff bounds: the first retry is quick (a container
+// Metadata resolution backoff bounds: the first retry is quick (a container
 // genuinely racing the API server resolves within a second or two), the cap
 // keeps a permanently unresolvable file down to one blocking call a minute.
 const (
@@ -58,6 +52,12 @@ func jitterMetaBackoff(d time.Duration) time.Duration {
 	return d + time.Duration(rand.Int64N(int64(d/4)+1))
 }
 
+// resolveMetadata builds the file's resource attributes. Plain files resolve
+// from the source's static attributes plus node metadata (immediately, except
+// while a CONFIGURED node-info provider has not yielded its first value — see
+// resolvePlain); containerd files fetch pod metadata from the service (backing
+// off between attempts), and are not consumed until it is available — the data
+// waits on disk, nothing is lost.
 func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 	if !f.source.containerd {
 		return t.resolvePlain(f)

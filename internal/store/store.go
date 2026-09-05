@@ -624,35 +624,33 @@ func (s *Store) releaseIPLocked(rec *record, ip string) {
 // them here and bypass the ipSeq ordering.
 func (s *Store) claimOneIPLocked(rec *record, ip string, oldIPs []string) {
 	s.addClaimantLocked(ip, rec)
-	{
-		if !containsStr(oldIPs, ip) {
-			// This pod ACQUIRED the address now. The sequence orders genuine
-			// acquisitions so a later one beats an earlier one below.
-			s.ipSeq++
-			rec.ipSeq = s.ipSeq
-		}
-		cur := s.byPodIP[ip]
-		switch {
-		case cur == nil || cur == rec:
-			s.byPodIP[ip] = rec
-		case rec.terminating && !cur.terminating:
-			// A draining pod keeps reporting its now-recycled IP; it yields.
-		case !rec.terminating && cur.terminating:
-			s.byPodIP[ip] = rec
-		case rec.ipSeq > cur.ipSeq:
-			// Last acquisition wins — including a late-scheduled older pod
-			// legitimately taking a freed address.
-			s.noteContested(rec, cur)
-			s.byPodIP[ip] = rec
-		default:
-			// rec is merely RE-ASSERTING an address it already held while a
-			// later pod legitimately took it. Plain last-write-wins let any
-			// unrelated update to a stale pod (a node-lifecycle condition on a
-			// NotReady node, a resurrect after DeletePod, a transient podIP
-			// blip) steal the mapping from the live owner and mis-attribute
-			// every peer-IP lookup until that pod finally went away.
-			s.noteContested(rec, cur)
-		}
+	if !containsStr(oldIPs, ip) {
+		// This pod ACQUIRED the address now. The sequence orders genuine
+		// acquisitions so a later one beats an earlier one below.
+		s.ipSeq++
+		rec.ipSeq = s.ipSeq
+	}
+	cur := s.byPodIP[ip]
+	switch {
+	case cur == nil || cur == rec:
+		s.byPodIP[ip] = rec
+	case rec.terminating && !cur.terminating:
+		// A draining pod keeps reporting its now-recycled IP; it yields.
+	case !rec.terminating && cur.terminating:
+		s.byPodIP[ip] = rec
+	case rec.ipSeq > cur.ipSeq:
+		// Last acquisition wins — including a late-scheduled older pod
+		// legitimately taking a freed address.
+		s.noteContested(rec, cur)
+		s.byPodIP[ip] = rec
+	default:
+		// rec is merely RE-ASSERTING an address it already held while a
+		// later pod legitimately took it. Plain last-write-wins let any
+		// unrelated update to a stale pod (a node-lifecycle condition on a
+		// NotReady node, a resurrect after DeletePod, a transient podIP
+		// blip) steal the mapping from the live owner and mis-attribute
+		// every peer-IP lookup until that pod finally went away.
+		s.noteContested(rec, cur)
 	}
 }
 

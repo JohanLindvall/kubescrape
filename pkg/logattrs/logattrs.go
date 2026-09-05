@@ -20,6 +20,7 @@ import (
 // Target selects where an extracted attribute lands.
 type Target string
 
+// The three targets: the log record (the default), its scope, its resource.
 const (
 	TargetLog      Target = "log"      // the log record (default)
 	TargetScope    Target = "scope"    // the scope

@@ -11,6 +11,7 @@ package azurediag
 // strings are N clients however few hubs they name.
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -95,7 +96,7 @@ func ResolveSources(spec SourceSpec, log *slog.Logger) ([]KafkaConfig, error) {
 			out = append(out, k)
 		}
 	default:
-		return nil, fmt.Errorf("azure event hubs: set -azure-eventhub-namespace or -azure-eventhub-connection-string-file")
+		return nil, errors.New("azure event hubs: set -azure-eventhub-namespace or -azure-eventhub-connection-string-file")
 	}
 
 	// An explicit topic list applies to EVERY credential, which is meaningful
@@ -119,7 +120,7 @@ func ResolveSources(spec SourceSpec, log *slog.Logger) ([]KafkaConfig, error) {
 // SourceName identifies this consumer in a log line or a readiness gate:
 // the namespace host and what it consumes there. Stable across restarts, so
 // a pending gate names the same hub every time.
-func (k KafkaConfig) SourceName() string {
+func (k *KafkaConfig) SourceName() string {
 	ns := "?"
 	if len(k.Brokers) > 0 {
 		ns = hostOnly(k.Brokers[0])

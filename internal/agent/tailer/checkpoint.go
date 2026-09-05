@@ -39,7 +39,7 @@ func (t *Tailer) saveCheckpoints() {
 	cps := make(map[string]checkpoint, len(t.files))
 	if !t.lastListingOK {
 		for path, cp := range t.cfg.Positions.Logs() {
-			cps[path] = checkpoint(cp)
+			cps[path] = cp
 		}
 	}
 	// Stored entries not yet matched to a discovered file survive the rebuild.

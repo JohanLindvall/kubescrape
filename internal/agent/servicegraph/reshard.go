@@ -23,6 +23,7 @@ package servicegraph
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -191,7 +192,7 @@ func (c *ReshardConfig) Validate() error {
 			return fmt.Errorf("serviceGraphShards.statefulSet is set but replicas is %d", c.Replicas)
 		}
 		if c != nil && c.Replicas > 0 && c.StatefulSet == "" && len(c.Endpoints) == 0 {
-			return fmt.Errorf("serviceGraphShards.replicas is set but statefulSet is empty")
+			return errors.New("serviceGraphShards.replicas is set but statefulSet is empty")
 		}
 		return nil
 	}
@@ -204,7 +205,7 @@ func (c *ReshardConfig) Validate() error {
 		return fmt.Errorf("serviceGraphShards.port %d out of range", c.Port)
 	}
 	if c.TokensPerShard < 0 {
-		return fmt.Errorf("serviceGraphShards.tokensPerShard must not be negative")
+		return errors.New("serviceGraphShards.tokensPerShard must not be negative")
 	}
 	for i, e := range c.Endpoints {
 		if strings.TrimSpace(e) == "" {
@@ -285,7 +286,7 @@ func (c *ReshardConfig) shardTargets() ([]shardTarget, error) {
 			ns = selfmeta.Namespace()
 		}
 		if ns == "" {
-			return nil, fmt.Errorf("serviceGraphShards.namespace is empty and this pod's own namespace could not be resolved ($POD_NAMESPACE or the ServiceAccount projection)")
+			return nil, errors.New("serviceGraphShards.namespace is empty and this pod's own namespace could not be resolved ($POD_NAMESPACE or the ServiceAccount projection)")
 		}
 	}
 	return c.targets(ns), nil

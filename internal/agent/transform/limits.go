@@ -518,7 +518,7 @@ func extend(xl *starlark.List, y starlark.Value) (int64, error) {
 // operator's actual mistake (the range) rather than the materialising call.
 func boundedRange() *starlark.Builtin {
 	inner := starlark.Universe["range"].(*starlark.Builtin)
-	return starlark.NewBuiltin("range", func(th *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	return starlark.NewBuiltin("range", func(th *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 		if err := budgetOf(th).overtime(); err != nil {
 			return nil, positioned(th, err)
 		}
@@ -543,7 +543,7 @@ func boundedRange() *starlark.Builtin {
 // strings) falls straight through to the library.
 func boundedInt() *starlark.Builtin {
 	inner := starlark.Universe["int"].(*starlark.Builtin)
-	return starlark.NewBuiltin("int", func(th *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	return starlark.NewBuiltin("int", func(th *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 		if err := budgetOf(th).overtime(); err != nil {
 			return nil, positioned(th, err)
 		}
@@ -588,7 +588,7 @@ func boundedMaterialiser(name string) *starlark.Builtin {
 	if !ok {
 		panic("transform: no universe builtin named " + name) // a starlark-go upgrade removed it
 	}
-	return starlark.NewBuiltin(name, func(th *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	return starlark.NewBuiltin(name, func(th *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 		bud := budgetOf(th)
 		if err := bud.overtime(); err != nil {
 			return nil, positioned(th, err)

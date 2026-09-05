@@ -2,7 +2,7 @@ package tailer
 
 import (
 	"context"
-	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -176,7 +176,7 @@ func BenchmarkIngestFlush(b *testing.B) {
 			}
 			b.StopTimer()
 			tl.flush(ctx)
-			if got := fmt.Sprint(len(tl.batch)); got != "0" {
+			if got := strconv.Itoa(len(tl.batch)); got != "0" {
 				b.Fatalf("batch not flushed: %s", got)
 			}
 		})

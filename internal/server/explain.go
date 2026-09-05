@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/JohanLindvall/kubescrape/internal/clip"
 	"github.com/JohanLindvall/kubescrape/internal/scrape"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -246,10 +247,10 @@ func (b *explainBudget) room(inList int) bool {
 // hide records n entries this budget refused.
 func (b *explainBudget) hide(n int) { b.hidden += n }
 
-// clip keeps the prefix of v the budget allows, returning what it refused. It
-// is the same decision as room for a list that is already built (the port
+// clipList keeps the prefix of v the budget allows, returning what it refused.
+// It is the same decision as room for a list that is already built (the port
 // verdicts, which the internal/scrape mirrors produce whole).
-func clip[T any](b *explainBudget, v []T) ([]T, int) {
+func clipList[T any](b *explainBudget, v []T) ([]T, int) {
 	room := min(b.perList, b.perDoc-b.used)
 	if room < 0 {
 		room = 0
@@ -263,13 +264,10 @@ func clip[T any](b *explainBudget, v []T) ([]T, int) {
 	return v[:room], len(v) - room
 }
 
-// clipValue bounds an echoed annotation value; see maxExplainValueBytes.
-func clipValue(v string) string {
-	if len(v) <= maxExplainValueBytes {
-		return v
-	}
-	return v[:maxExplainValueBytes] + "…(truncated)"
-}
+// clipValue bounds an echoed annotation value (see maxExplainValueBytes), on a
+// rune boundary: the document is JSON, and a bare byte cut put an invalid
+// string into it.
+func clipValue(v string) string { return clip.Marked(v, maxExplainValueBytes, "…(truncated)") }
 
 // mergeCeilingRef is what an endpoint's note carries when the ceiling it hit
 // has ALREADY been spelled out for its URL. The full wordings live in
@@ -395,7 +393,7 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 	monBudget := explainBudget{perList: maxExplainMonitors, perDoc: maxExplainMonitorsPerDoc}
 	var ceilings explainCeilings
 
-	doc.DeclaredPorts, doc.DeclaredPortsNotShown = clip(&declaredBudget, scrape.DeclaredPorts(pod))
+	doc.DeclaredPorts, doc.DeclaredPortsNotShown = clipList(&declaredBudget, scrape.DeclaredPorts(pod))
 	doc.PortEntries, doc.PortAnnotated = scrape.ExplainPodPorts(pod)
 
 	// The same request-scoped snapshots nodeTargets takes.
@@ -443,7 +441,7 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 	// Clipped AFTER the verdicts are written, never before: the ceiling's
 	// refusals land on the TAIL of the list, so clipping first would hide
 	// exactly the entries the notes exist for.
-	doc.PortEntries, doc.PortEntriesNotShown = clip(&portBudget, doc.PortEntries)
+	doc.PortEntries, doc.PortEntriesNotShown = clipList(&portBudget, doc.PortEntries)
 	for _, svc := range matched {
 		// Whether this Service is LISTED. The derivation below runs either
 		// way — a Service that opts the pod in still contributes its targets,
@@ -464,7 +462,7 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 			}
 		}
 		noteCapped(es.PortEntries, refused, d.podBytes)
-		es.PortEntries, es.PortEntriesNotShown = clip(&portBudget, es.PortEntries)
+		es.PortEntries, es.PortEntriesNotShown = clipList(&portBudget, es.PortEntries)
 		for _, sme := range monitored[svc.UID] {
 			// Same rule: the endpoint is offered, merged and counted whatever
 			// the budget says — only the VERDICT may be left out.

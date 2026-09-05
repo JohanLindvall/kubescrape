@@ -327,7 +327,7 @@ type summaryBatcher struct {
 	volLabels []Label
 }
 
-func newSummaryBatcher(s *Scraper, ctx context.Context, url string, scrape time.Time) *summaryBatcher {
+func newSummaryBatcher(ctx context.Context, s *Scraper, url string, scrape time.Time) *summaryBatcher {
 	sb := &summaryBatcher{
 		s:         s,
 		ctx:       ctx,

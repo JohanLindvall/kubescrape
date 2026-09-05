@@ -11,9 +11,11 @@ import "context"
 // internal/agent/events or internal/leader, the ENTIRE Kubernetes client stays
 // out of the binary — 412 k8s.io/sigs.k8s.io packages, half the shipped
 // agent's code, for a pipeline that only ever runs in the one-replica
-// singleton Deployment. Measured on the shipped shape
-// (-trimpath -ldflags="-s -w", TAGS=journald,azure): 59,141,096 bytes with the
-// tag, 29,095,624 without it — 28.65 MiB, 50.8%.
+// singleton Deployment. Measured on the shipped shape (-trimpath
+// -ldflags="-s -w", CGO_ENABLED=1, go1.26.6, re-measured 2026-08-29):
+// 59,157,640 bytes with the tag, 26,268,328 without it — 31.37 MiB, 55.6%.
+// buildtags.go carries the measurement and its history; this figure must
+// track that one.
 //
 // The Makefile's TAGS default puts the tag back, so `make build` and
 // `make image` are unchanged; a bare `go build` lands here.

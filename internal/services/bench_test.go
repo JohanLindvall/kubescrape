@@ -13,6 +13,7 @@ package services
 
 import (
 	"fmt"
+	"strconv"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -79,7 +80,7 @@ func BenchmarkInNamespacesChurn(b *testing.B) {
 		ix.Upsert(&corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "svc-000001", Namespace: "team-0", UID: types.UID("uid-team-0-199"),
-				ResourceVersion: fmt.Sprintf("%d", rv), Labels: map[string]string{"team": "obs"},
+				ResourceVersion: strconv.Itoa(rv), Labels: map[string]string{"team": "obs"},
 			},
 			Spec: corev1.ServiceSpec{Selector: map[string]string{"app": "app-199"}},
 		})

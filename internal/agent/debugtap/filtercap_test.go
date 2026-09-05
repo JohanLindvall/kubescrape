@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -45,7 +46,7 @@ func TestAttrFilterCountIsBounded(t *testing.T) {
 	}
 	// The refusal must name the limit: a refusal that reads as a bug gets
 	// configured away, and this one is the operator's own debugging endpoint.
-	if msg := string(body[:n]); !strings.Contains(msg, fmt.Sprint(maxAttrFilters)) {
+	if msg := string(body[:n]); !strings.Contains(msg, strconv.Itoa(maxAttrFilters)) {
 		t.Errorf("refusal does not name the limit: %q", msg)
 	}
 	// And it must cost NOTHING per export: the subscribe happens after this
@@ -140,7 +141,7 @@ func TestAttrFilterSizeIsBounded(t *testing.T) {
 	if r2.StatusCode != http.StatusBadRequest {
 		t.Fatalf("eight 100 KiB globs = %d, want 400", r2.StatusCode)
 	}
-	if msg := string(body[:n]); !strings.Contains(msg, fmt.Sprint(maxAttrFilterBytes)) {
+	if msg := string(body[:n]); !strings.Contains(msg, strconv.Itoa(maxAttrFilterBytes)) {
 		t.Errorf("refusal does not name the limit: %q", msg)
 	}
 	if got := tap.active.Load(); got != 0 {

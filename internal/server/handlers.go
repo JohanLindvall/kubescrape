@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/validate/content"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/clip"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/peerip"
@@ -585,21 +586,8 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 					// worth reporting, attributed to the monitor whose
 					// material is actually served (which may be a merged
 					// contributor's, not the URL holder's).
-					rep := scrape.MergeMonitorEndpoint(held, sme.monitor, sme.endpoint)
-					d.charge(rep.Bytes)
-					if rep.AuthAdopted {
-						d.adoptedAuth(url, sme.monitor)
-					}
-					if rep.AuthConflict {
-						s.reportAuthConflict("servicemonitor", d.servingAuth(url, held.Monitor), sme.monitor, url)
-					}
-					if rep.RelabelCapped {
-						s.reportRelabelCapped("servicemonitor", sme.monitor, url)
-					}
-					if rep.ContributorsCapped {
-						s.reportContributorsCapped("servicemonitor", sme.monitor, url,
-							d.firstContribCap("servicemonitor", url))
-					}
+					s.noteMergedEndpoint(&d, "servicemonitor", sme.monitor, url, held,
+						scrape.MergeMonitorEndpoint(held, sme.monitor, sme.endpoint))
 					continue
 				}
 				for _, t := range scrape.MonitorTargets(np.Pod, svc, sme.monitor, *sme.endpoint) {
@@ -616,21 +604,8 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 					continue
 				}
 				if held, taken := d.monitorHolder(url); taken {
-					rep := scrape.MergeMonitorEndpoint(held, pm.name, ep)
-					d.charge(rep.Bytes)
-					if rep.AuthAdopted {
-						d.adoptedAuth(url, pm.name)
-					}
-					if rep.AuthConflict {
-						s.reportAuthConflict("podmonitor", d.servingAuth(url, held.Monitor), pm.name, url)
-					}
-					if rep.RelabelCapped {
-						s.reportRelabelCapped("podmonitor", pm.name, url)
-					}
-					if rep.ContributorsCapped {
-						s.reportContributorsCapped("podmonitor", pm.name, url,
-							d.firstContribCap("podmonitor", url))
-					}
+					s.noteMergedEndpoint(&d, "podmonitor", pm.name, url, held,
+						scrape.MergeMonitorEndpoint(held, pm.name, ep))
 					continue
 				}
 				for _, t := range scrape.PodMonitorTargets(np.Pod, pm.name, *ep) {
@@ -1034,6 +1009,28 @@ func (d *targetDedup) servingAuth(url, holder string) string {
 	return holder
 }
 
+// noteMergedEndpoint records what a merge into a URL's holder did and could not
+// do — the byte charge, an adopted credential, and the three reportable
+// verdicts (auth conflict, relabel chain capped, contributor list capped). One
+// function for the ServiceMonitor and PodMonitor doors: they used to spell the
+// same five checks twice, which is how one door gains a verdict the other
+// lacks.
+func (s *Server) noteMergedEndpoint(d *targetDedup, kind, monitor, url string, held *kubemeta.ScrapeTarget, rep scrape.MergeReport) {
+	d.charge(rep.Bytes)
+	if rep.AuthAdopted {
+		d.adoptedAuth(url, monitor)
+	}
+	if rep.AuthConflict {
+		s.reportAuthConflict(kind, d.servingAuth(url, held.Monitor), monitor, url)
+	}
+	if rep.RelabelCapped {
+		s.reportRelabelCapped(kind, monitor, url)
+	}
+	if rep.ContributorsCapped {
+		s.reportContributorsCapped(kind, monitor, url, d.firstContribCap(kind, url))
+	}
+}
+
 // monitorHolder returns the MONITOR-derived target already holding a URL, when
 // there is one: an incoming monitor endpoint for that URL merges into it
 // instead of being materialised. It is the cheap check the caller makes BEFORE
@@ -1239,18 +1236,9 @@ const (
 const maxLoggedPortBytes = 96
 
 // clipPort renders a CR-supplied port spelling for a log attribute: bounded,
-// and cut on a rune boundary so a clipped UTF-8 sequence does not reach the
-// log pipeline as a replacement character.
-func clipPort(v string) string {
-	if len(v) <= maxLoggedPortBytes {
-		return v
-	}
-	cut := maxLoggedPortBytes
-	for cut > 0 && !utf8.RuneStart(v[cut]) {
-		cut--
-	}
-	return v[:cut] + "…"
-}
+// and cut on a rune boundary (internal/clip) so a clipped UTF-8 sequence does
+// not reach the log pipeline as a replacement character.
+func clipPort(v string) string { return clip.Ellipsis(v, maxLoggedPortBytes) }
 
 // reportUnresolvedEndpoint warns that a monitor endpoint names a port the pod
 // its selector matched does not declare, so that pod produces no target for it.
@@ -1629,7 +1617,12 @@ func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
 	// is the API server's own for a name used as a path segment (content.
 	// IsPathSegmentName, which validation/path now merely aliases): "/", "%",
 	// "." and ".." are exactly what re-cutting needs.
-	for what, v := range map[string]string{"namespace": ns, "name": name, "key": key} {
+	// In PATH order, never off a map: a request with two bad segments must be
+	// refused for the same one every time, so the 400 body an operator reads
+	// (and a test of it) names one segment rather than whichever the map
+	// yielded first.
+	for _, seg := range [...]struct{ what, v string }{{"namespace", ns}, {"name", name}, {"key", key}} {
+		what, v := seg.what, seg.v
 		if errs := content.IsPathSegmentName(v); len(errs) > 0 {
 			// Counted with the other refusals: no agent this repo ships can
 			// produce one (the ref comes from a monitor CR, whose fields are
@@ -1754,13 +1747,12 @@ func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
 // the segment arrives from a URL path bounded only by the request-head limit,
 // and a log line is the one place a 16 KB value costs something in every
 // direction at once. The truncation is marked, so a clipped value is never
-// mistaken for the whole one.
+// mistaken for the whole one, and made on a rune boundary (internal/clip): the
+// segment is the caller's bytes, and a bare byte cut put half a rune on the
+// line.
 func clipSegment(v string) string {
-	const max = 253
-	if len(v) <= max {
-		return v
-	}
-	return v[:max] + "…(truncated)"
+	const maxLoggedSegmentBytes = 253
+	return clip.Marked(v, maxLoggedSegmentBytes, "…(truncated)")
 }
 
 // waitBudget determines how long a container lookup may block: MaxWait by
@@ -1784,7 +1776,7 @@ func (s *Server) waitBudget(r *http.Request) (time.Duration, error) {
 		// duration clamp below apply — clamping by TRUNCATED whole seconds here
 		// would turn a sub-second maxWait into 0 (non-blocking) for ?wait=1.
 		if secs < 0 {
-			return 0, fmt.Errorf("wait parameter must not be negative")
+			return 0, errors.New("wait parameter must not be negative")
 		}
 		if secs > int(math.MaxInt64/int64(time.Second)) {
 			d = s.maxWait
@@ -1793,7 +1785,7 @@ func (s *Server) waitBudget(r *http.Request) (time.Duration, error) {
 		}
 	}
 	if d < 0 {
-		return 0, fmt.Errorf("wait parameter must not be negative")
+		return 0, errors.New("wait parameter must not be negative")
 	}
 	if d > s.maxWait {
 		d = s.maxWait

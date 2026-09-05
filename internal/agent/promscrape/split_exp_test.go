@@ -28,7 +28,7 @@ func TestSplitBatcherExponential(t *testing.T) {
 	}
 	target := testTarget("http://ksm:8080/metrics")
 	target.Pod.Name = "ksm-abc"
-	cb := newSplitBatcher(s, context.Background(), target, sp[0], time.Unix(2, 0))
+	cb := newSplitBatcher(context.Background(), s, target, sp[0], time.Unix(2, 0))
 
 	cb.addExponential("kube_pod_latency", expPoint{
 		labels: []Label{{Name: "namespace", Value: "ns1"}, {Name: "pod", Value: "p1"}, {Name: "code", Value: "200"}},

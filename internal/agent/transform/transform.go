@@ -34,6 +34,7 @@ package transform
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -331,7 +332,7 @@ func (w *Wrapper) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 func (w *Wrapper) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	if p := w.program.Load(); p != nil && p.traces != nil {
 		if w.nextTraces == nil {
-			return fmt.Errorf("trace transform configured but the exporter does not support traces")
+			return errors.New("trace transform configured but the exporter does not support traces")
 		}
 		out := td
 		if !HandedOff(ctx) {
@@ -356,7 +357,7 @@ func (w *Wrapper) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	// script actually exists, so a logs-only transforms file never forces the
 	// trace path to need a traces-capable downstream.
 	if w.nextTraces == nil {
-		return fmt.Errorf("exporter does not support traces")
+		return errors.New("exporter does not support traces")
 	}
 	return w.nextTraces.ExportTraces(ctx, td)
 }

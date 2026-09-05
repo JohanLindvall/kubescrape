@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -15,14 +16,14 @@ import (
 // bursts.
 func BenchmarkDeletePodWithManyPods(b *testing.B) {
 	for _, n := range []int{1000, 10000} {
-		b.Run(fmt.Sprint(n), func(b *testing.B) {
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
 			s := New(time.Minute)
 			for i := 0; i < n; i++ {
-				s.UpsertPod(ipPod(fmt.Sprint(i), "p-"+fmt.Sprint(i), fmt.Sprintf("10.%d.%d.%d", i/65536, (i/256)%256, i%256)))
+				s.UpsertPod(ipPod(strconv.Itoa(i), "p-"+strconv.Itoa(i), fmt.Sprintf("10.%d.%d.%d", i/65536, (i/256)%256, i%256)))
 			}
 			i := 0
 			for b.Loop() {
-				uid := fmt.Sprint(i % n)
+				uid := strconv.Itoa(i % n)
 				s.DeletePod(types.UID(uid))
 				s.UpsertPod(ipPod(uid, "p-"+uid, fmt.Sprintf("10.%d.%d.%d", (i%n)/65536, ((i%n)/256)%256, (i%n)%256)))
 				i++
@@ -36,14 +37,14 @@ func BenchmarkDeletePodWithManyPods(b *testing.B) {
 func TestIPClaimantsDoNotLeak(t *testing.T) {
 	s := New(time.Minute)
 	for i := 0; i < 200; i++ {
-		uid := fmt.Sprint(i)
+		uid := strconv.Itoa(i)
 		s.UpsertPod(ipPod(uid, "p-"+uid, "10.0.0.5")) // all claim ONE address
 	}
 	if got := len(s.ipClaimants["10.0.0.5"]); got != 200 {
 		t.Fatalf("claimants = %d, want 200", got)
 	}
 	for i := 0; i < 200; i++ {
-		s.DeletePod(types.UID(fmt.Sprint(i)))
+		s.DeletePod(types.UID(strconv.Itoa(i)))
 	}
 	if got := len(s.ipClaimants); got != 0 {
 		t.Fatalf("ipClaimants retained %d addresses after every claimant was deleted: %v", got, s.ipClaimants)

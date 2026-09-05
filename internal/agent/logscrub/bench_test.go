@@ -32,6 +32,7 @@ const (
 )
 
 func benchScrub(b *testing.B, line string, wantChanged bool) {
+	b.Helper()
 	s, err := New(Config{Builtin: []string{"defaults"}})
 	if err != nil {
 		b.Fatal(err)

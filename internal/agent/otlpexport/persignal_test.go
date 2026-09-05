@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -190,5 +191,21 @@ func writePEM(t *testing.T, path string, b *pem.Block) {
 	}
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Validate walks the three signals in a FIXED order, so a section with two
+// mistakes is refused for the same one on every run (the walk used to range a
+// map, and a test of the wording could only pin whichever came first).
+func TestExportConfigValidateRefusesSignalsInOrder(t *testing.T) {
+	cfg := &ExportConfig{
+		Logs:   &ExportOverride{Protocol: "carrier-pigeon"},
+		Traces: &ExportOverride{Compression: "brotli"},
+	}
+	for range 20 {
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "export.logs.protocol") {
+			t.Fatalf("Validate = %v, want the logs override refused first", err)
+		}
 	}
 }

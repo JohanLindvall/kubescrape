@@ -15,7 +15,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -540,7 +539,7 @@ func TestEncodeFailureIsReportedOnce(t *testing.T) {
 	h := &recordingHandler{}
 	s := New(Config{Log: slog.New(h)})
 	for range 5 {
-		s.reportEncodeFailure("metadata response", fmt.Errorf("json: unsupported type: chan int"))
+		s.reportEncodeFailure("metadata response", errors.New("json: unsupported type: chan int"))
 	}
 	lines := h.matching("encoding a response failed")
 	if len(lines) != 1 {
@@ -569,5 +568,21 @@ func TestUnencodableTellsTheValueFromTheConnection(t *testing.T) {
 	}
 	if !unencodable(err) {
 		t.Errorf("an unserialisable value was not classified as one: %v", err)
+	}
+}
+
+// Two bad segments are refused for the FIRST one in path order, every time:
+// the segments used to be walked off a map, so the 400 named whichever the
+// map yielded first.
+func TestScrapeAuthBadSegmentsAreRefusedInPathOrder(t *testing.T) {
+	srv, _ := authFixture(t, erroringSecrets{value: "v"}, servicemonitors.NewIndex())
+	for range 20 {
+		status, body := get(t, srv.URL+"/v1/scrape-auth/x%2Fy/creds/x%2Fy", "Bearer "+testScrapeToken)
+		if status != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", status)
+		}
+		if !strings.Contains(body, "invalid namespace") {
+			t.Fatalf("body = %q, want the namespace refused first", body)
+		}
 	}
 }

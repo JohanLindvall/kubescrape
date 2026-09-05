@@ -466,7 +466,7 @@ func duplicateNameNote(pod kubemeta.Pod, name string, resolved int32, remedy nam
 	// answers (see containerPortByName). Claiming the comparison there would be
 	// telling an operator their sidecar port is what Kubernetes routes to.
 	_, regularHasIt := portByName(pod, name, true)
-	agrees := ""
+	var agrees string
 	if regularHasIt {
 		agrees = ", which is what a Service's named targetPort, a monitor endpoint and the EndpointSlice controller all resolve to"
 	} else {

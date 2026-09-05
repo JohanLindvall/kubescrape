@@ -36,6 +36,7 @@ func benchTrace(spans int) Trace {
 }
 
 func benchDecide(b *testing.B, tr Trace, policies ...PolicyConfig) {
+	b.Helper()
 	e := mustNew(b, policies...)
 	e.Decide(tr) // warm anything cacheable (the regex cache)
 	b.ReportAllocs()

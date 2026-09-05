@@ -119,7 +119,7 @@ func cadvisorPodResource(t *testing.T, pod kubemeta.Pod) map[string]any {
 	t.Helper()
 	exp := &captureExporter{}
 	s := newSummaryScraper(t, "http://unused", &mirrorMetaSource{pod: pod}, exp)
-	cb := newCadvisorBatcher(s, summaryScrape, context.Background())
+	cb := newCadvisorBatcher(context.Background(), s, summaryScrape)
 	row := "# TYPE container_memory_working_set_bytes gauge\n" +
 		`container_memory_working_set_bytes{namespace="kube-system",pod="kube-apiserver-node1",id="` + staticPodSlice + `"} 1073741824` + "\n"
 	if _, err := s.parseAndExport(context.Background(), strings.NewReader(row), false, false, cb, pipelineCadvisor, "u"); err != nil {

@@ -14,6 +14,7 @@ package promscrape
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -123,7 +124,7 @@ func (s *Scraper) parseProtoAndExport(ss *scrapeSession, body io.Reader) (malfor
 	for {
 		n, rerr := binary.ReadUvarint(br)
 		if rerr != nil {
-			if rerr == io.EOF {
+			if errors.Is(rerr, io.EOF) {
 				break
 			}
 			return malformed, rerr

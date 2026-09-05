@@ -352,7 +352,7 @@ type splitDest struct {
 
 type kv struct{ key, value string }
 
-func newSplitBatcher(s *Scraper, ctx context.Context, t kubemeta.ScrapeTarget, sp *Splitter, scrape time.Time) *splitBatcher {
+func newSplitBatcher(ctx context.Context, s *Scraper, t kubemeta.ScrapeTarget, sp *Splitter, scrape time.Time) *splitBatcher {
 	b := &splitBatcher{
 		s: s, ctx: ctx, target: t, sp: sp,
 		defaultPrefix: attrs.ServiceName(t.Pod),

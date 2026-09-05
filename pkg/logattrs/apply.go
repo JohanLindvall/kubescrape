@@ -22,7 +22,7 @@ func Put(m pcommon.Map, attrs []Attr) {
 			} else {
 				m.PutDouble(a.Key, v)
 			}
-		case int64: // per the Attr contract; DecodeAny yields float64 today
+		case int64: // per the Attr contract: decodeScalar yields int64 for an integral token
 			m.PutInt(a.Key, v)
 		}
 	}
@@ -62,10 +62,10 @@ func Key(attrs []Attr) string {
 			}
 			b.WriteByte('f')
 			b.WriteString(strconv.FormatFloat(v, 'g', -1, 64))
-		case int64: // per the Attr contract; DecodeAny yields float64 today,
-			// but Put already honors int64 and a producer following the
-			// contract must not have its values silently dropped from the
-			// grouping key (two sets differing only in an int64 would merge).
+		case int64: // per the Attr contract: decodeScalar yields int64 for an
+			// integral token, Put honors it, and a value must not be silently
+			// dropped from the grouping key (two sets differing only in an
+			// int64 would merge).
 			b.WriteByte('i')
 			b.WriteString(strconv.FormatInt(v, 10))
 		}

@@ -166,7 +166,7 @@ func TestSummaryContainerResourceMatchesTheCadvisorRow(t *testing.T) {
 
 	cadvisorExp := &captureExporter{}
 	cs := newSummaryScraper(t, "http://unused", &fakeMetaSource{}, cadvisorExp)
-	cb := newCadvisorBatcher(cs, summaryScrape, context.Background())
+	cb := newCadvisorBatcher(context.Background(), cs, summaryScrape)
 	// container_fs_usage_bytes is the cadvisor row this pipeline's rootfs point
 	// sits beside, and a gauge, so the two flatten the same way.
 	row := fmt.Sprintf("# TYPE container_fs_usage_bytes gauge\n"+
@@ -432,7 +432,7 @@ func TestSummaryNodeInstanceDoesNotCollideWithNodeMetrics(t *testing.T) {
 	s := newSummaryScraper(t, "http://unused", &fakeMetaSource{}, exp)
 
 	summaryRes := pcommon.NewResource()
-	newSummaryBatcher(s, context.Background(), "https://node1:10250"+summaryPath, summaryScrape).fillNodeResource(summaryRes)
+	newSummaryBatcher(context.Background(), s, "https://node1:10250"+summaryPath, summaryScrape).fillNodeResource(summaryRes)
 
 	nodeRes := pcommon.NewResource()
 	nodeRes.Attributes().PutStr("service.name", "kubelet")
@@ -945,7 +945,7 @@ func TestSummaryByteEstimateTracksTheEncodedSize(t *testing.T) {
 	s.cfg.BatchPoints = 1 << 30
 	s.cfg.BatchBytes = 1 << 30
 
-	sb := newSummaryBatcher(s, context.Background(), "https://node1:10250"+summaryPath, summaryScrape)
+	sb := newSummaryBatcher(context.Background(), s, "https://node1:10250"+summaryPath, summaryScrape)
 	body := denseSummary(110, 2, 2)
 	if err := sb.addNode(body); err != nil {
 		t.Fatal(err)
@@ -1142,7 +1142,7 @@ func (m *mirrorMetaSource) Container(ctx context.Context, id string, wait time.D
 func TestSummaryStaticPodJoinsTheCadvisorRow(t *testing.T) {
 	cadvisorExp := &captureExporter{}
 	cs := newSummaryScraper(t, "http://unused", &mirrorMetaSource{pod: apiserverMirrorPod}, cadvisorExp)
-	cb := newCadvisorBatcher(cs, summaryScrape, context.Background())
+	cb := newCadvisorBatcher(context.Background(), cs, summaryScrape)
 	// A static pod's cgroup carries that same kubelet-minted UID, in the undashed
 	// form cgroupid reads as a pod uid alongside the canonical one. This row
 	// resolves through its container id regardless — an id is an id — which is

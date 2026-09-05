@@ -526,6 +526,7 @@ func TestSplitterInstancePrefix(t *testing.T) {
 	body := "# TYPE kube_pod_info gauge\n" +
 		`kube_pod_info{namespace="ns1",pod="pod1",uid="` + uid1 + `",node="node9"} 1` + "\n"
 	run := func(t *testing.T, sp []*Splitter) pmetric.ResourceMetrics {
+		t.Helper()
 		srv := serveBody(t, body)
 		target := testTarget(srv.URL) // owner Deployment "dep1" -> service.name dep1
 		target.Pod.Name = "ksm-abc"
@@ -1210,7 +1211,7 @@ func TestSplitBatcherRoutingIsAllocationFree(t *testing.T) {
 	})
 	target := testTarget("http://ksm:8080/metrics")
 	target.Pod.Name = "ksm-abc"
-	cb := newSplitBatcher(s, context.Background(), target, sp[0], time.Unix(2, 0))
+	cb := newSplitBatcher(context.Background(), s, target, sp[0], time.Unix(2, 0))
 
 	// Two described objects of one family, visited alternately: every call is a
 	// last-seen memo MISS and a map HIT, which is the steady state of a

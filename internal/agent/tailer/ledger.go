@@ -691,11 +691,10 @@ func (l *ledger) reset() {
 	l.streams = nil
 }
 
-// newTail starts a fresh tail segment and returns its id.
-func (l *ledger) newTail() int {
+// newTail starts a fresh tail segment (l.tail is its id).
+func (l *ledger) newTail() {
 	l.segSeq++
 	l.tail = l.segSeq
-	return l.tail
 }
 
 // segmentByID resolves a recorded (non-tail) segment; nil for the tail, for

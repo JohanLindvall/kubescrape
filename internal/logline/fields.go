@@ -70,6 +70,8 @@ type Fields struct {
 	parsed bool
 }
 
+// Reset points the Fields at a new line, forgetting the previous parse; the
+// backing slices are kept (the per-line path must not allocate).
 func (lf *Fields) Reset(line string) {
 	lf.line = line
 	lf.parsed = false
@@ -124,10 +126,10 @@ func (ki *KeyIndex) Add(key string) {
 }
 
 // Empty reports whether no rule reads any line field.
-func (ki KeyIndex) Empty() bool { return len(ki.keys) == 0 }
+func (ki *KeyIndex) Empty() bool { return len(ki.keys) == 0 }
 
 // Get returns the value of key from the line, parsing it on first use.
-func (ki KeyIndex) Get(lf *Fields, key string) string {
+func (ki *KeyIndex) Get(lf *Fields, key string) string {
 	if ki.Empty() {
 		return ""
 	}
@@ -159,7 +161,7 @@ func (ki KeyIndex) Get(lf *Fields, key string) string {
 // so unifying it would mean inventing a rule here and keeping the twin
 // extractor in pkg/logattrs (which has the identical asymmetry, for the
 // identical reason) in step with it forever. It is written down instead.
-func (ki KeyIndex) Parse(lf *Fields) {
+func (ki *KeyIndex) Parse(lf *Fields) {
 	if t := strings.TrimSpace(lf.line); strings.HasPrefix(t, "{") {
 		// Read-only view: GetPaths only reads the buffer; its outputs alias it.
 		buf := unsafe.Slice(unsafe.StringData(t), len(t))

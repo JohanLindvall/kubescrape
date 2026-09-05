@@ -195,6 +195,8 @@ var logsMarshaler = &plog.JSONMarshaler{}
 var metricsMarshaler = &pmetric.JSONMarshaler{}
 var tracesMarshaler = &ptrace.JSONMarshaler{}
 
+// ExportLogs offers the payload to the attached log streams (one atomic load
+// when there are none) and forwards it unchanged.
 func (t *Tap) ExportLogs(ctx context.Context, ld plog.Logs) error {
 	if t.active.Load() > 0 {
 		t.offer(sigLogs, func(sub *subscriber) ([]byte, *renderFailure) { return t.renderLogs(ld, sub) })
@@ -202,6 +204,7 @@ func (t *Tap) ExportLogs(ctx context.Context, ld plog.Logs) error {
 	return t.inner.ExportLogs(ctx, ld)
 }
 
+// ExportMetrics is ExportLogs for metrics.
 func (t *Tap) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 	if t.active.Load() > 0 {
 		t.offer(sigMetrics, func(sub *subscriber) ([]byte, *renderFailure) { return t.renderMetrics(md, sub) })
@@ -209,6 +212,8 @@ func (t *Tap) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 	return t.inner.ExportMetrics(ctx, md)
 }
 
+// ExportTraces is ExportLogs for traces; it fails when the wrapped chain has
+// no trace capability, after the streams have seen the payload.
 func (t *Tap) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	if t.active.Load() > 0 {
 		t.offer(sigTraces, func(sub *subscriber) ([]byte, *renderFailure) { return t.renderTraces(td, sub) })
@@ -394,6 +399,11 @@ func (t *Tap) subscribe(sig signal, filters []attrFilter, sample float64) (*subs
 		t.mu.Unlock()
 	}
 }
+
+// Streams reports how many debug streams are attached. Tests drive the
+// subscriber cap through it; it is not a metric, because an attached stream is
+// a person and the attach line already names them.
+func (t *Tap) Streams() int { return int(t.active.Load()) }
 
 // oldestStream reports how long the longest-held stream has been attached, and
 // how many are attached. Zero streams reports a zero age.

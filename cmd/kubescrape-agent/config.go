@@ -11,7 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -463,7 +463,7 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// the file is readable and non-empty is checked at the real start, where
 	// it is equally fatal.
 	if *serviceGraphOn && strings.TrimSpace(*serviceGraphToken) == "" {
-		return fmt.Errorf("-service-graph requires -service-graph-token-file: the shard's span receiver is reachable from every pod in the cluster and must not be unauthenticated")
+		return errors.New("-service-graph requires -service-graph-token-file: the shard's span receiver is reachable from every pod in the cluster and must not be unauthenticated")
 	}
 	// A shard with no listener at all receives nothing, pairs nothing, and
 	// reports READY forever (the gate is satisfied by the receiver binding, and
@@ -554,7 +554,7 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// startServiceGraph's "configured but ignored" warning is already the right
 	// report.
 	if *serviceGraphOn && cfg.TailSampling.Enabled() && cfg.TailSampling.UsesScript() && !prog.HasSample() {
-		return fmt.Errorf("tailSampling: a `type: script` policy requires -transforms-file with a sample: section defining decide(trace)")
+		return errors.New("tailSampling: a `type: script` policy requires -transforms-file with a sample: section defining decide(trace)")
 	}
 	return nil
 }
@@ -1026,16 +1026,7 @@ func validateRoute(exp *otlpexport.ExportConfig, i int, rt route.Route) (otlpexp
 // a tenant's telemetry to a collector nobody configured.
 func routeExportConfig(exp *otlpexport.ExportConfig, rt route.Route) (otlpexport.Config, error) {
 	rcfg := exp.ApplyBase(baseExportConfig())
-	if len(rt.Headers) > 0 {
-		merged := make(map[string]string, len(rcfg.Headers)+len(rt.Headers))
-		for k, v := range rcfg.Headers {
-			merged[k] = v
-		}
-		for k, v := range rt.Headers {
-			merged[k] = v
-		}
-		rcfg.Headers = merged
-	}
+	rcfg.Headers = otlpexport.MergeHeaders(rcfg.Headers, rt.Headers)
 	if rt.Endpoint != "" {
 		// A route naming its OWN endpoint does not inherit the default chain's
 		// credentials. Those authenticate this deployment to ITS collector, and
@@ -1342,6 +1333,9 @@ func exportOverride(exp *otlpexport.ExportConfig, signal string) *otlpexport.Exp
 	return nil
 }
 
+// gateMetadata is satisfied by the first successful node-metadata fetch.
+const gateMetadata = "metadata-service"
+
 // readiness tracks the startup gates /readyz reports on.
 //
 // A DaemonSet rolling update advances only when the new pod reports ready, so
@@ -1353,9 +1347,6 @@ func exportOverride(exp *otlpexport.ExportConfig, signal string) *otlpexport.Exp
 // Gates are registered at startup and satisfied as each becomes true; /readyz
 // is 200 only when none are pending, and reports the pending ones so the
 // failure is diagnosable from the probe alone.
-// gateMetadata is satisfied by the first successful node-metadata fetch.
-const gateMetadata = "metadata-service"
-
 type readiness struct {
 	mu    sync.Mutex
 	gates map[string]bool
@@ -1397,7 +1388,7 @@ func (r *readiness) pending() []string {
 			out = append(out, name)
 		}
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }
 
@@ -1480,6 +1471,6 @@ func (r *readiness) names() []string {
 	for name := range r.gates {
 		out = append(out, name)
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }

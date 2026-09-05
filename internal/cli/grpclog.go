@@ -21,7 +21,8 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"unicode/utf8"
+
+	"github.com/JohanLindvall/kubescrape/internal/clip"
 
 	"google.golang.org/grpc/grpclog"
 )
@@ -55,19 +56,14 @@ const maxGRPCMessageBytes = 2 << 10
 // clipMessage cuts a rendered grpc message to maxGRPCMessageBytes, on a rune
 // boundary (half a rune is a replacement character in whatever reads the line)
 // and marked with the original length, so a clipped record can be told from a
-// short one and the size of what was clipped is still the diagnosis. Same shape
-// as promscrape's clipForLog and servicemonitors' clipValue; it is spelled here
-// rather than shared because internal/cli must stay importable by both mains
-// with no dependency of its own.
+// short one and the size of what was clipped is still the diagnosis. The cut
+// is internal/clip's — a leaf package, so internal/cli stays importable by both
+// mains without a dependency of its own.
 func clipMessage(s string) string {
 	if len(s) <= maxGRPCMessageBytes {
 		return s
 	}
-	cut := maxGRPCMessageBytes
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return fmt.Sprintf("%s… (grpc message clipped; %d bytes)", s[:cut], len(s))
+	return fmt.Sprintf("%s… (grpc message clipped; %d bytes)", clip.Runes(s, maxGRPCMessageBytes), len(s))
 }
 
 // grpcLogger adapts grpc's LoggerV2 onto an *slog.Logger.

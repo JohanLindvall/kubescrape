@@ -205,7 +205,7 @@ func (s *Scraper) convertSummary(ctx context.Context, url string, body []byte, s
 	// scrape and the next cycle re-fetches from the kubelet — so the transform
 	// wrapper may run its script in place instead of deep-copying the payload.
 	ctx = transform.Handoff(ctx)
-	sb := newSummaryBatcher(s, ctx, url, scrape)
+	sb := newSummaryBatcher(ctx, s, url, scrape)
 	defer sb.report()
 
 	if err := sb.addNode(body); err != nil {

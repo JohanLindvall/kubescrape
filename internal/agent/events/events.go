@@ -472,26 +472,26 @@ func (r *Reader) shutdownBudget() time.Duration {
 	return d
 }
 
-// newerRV reports whether a is a later resourceVersion than b. Kubernetes
-// treats these as opaque, but etcd's are decimal integers, so compare
-// numerically where both parse and fall back to keeping what we have (the
-// conservative direction: never move the position backwards on a guess).
-// noteSeen advances the in-process resume point. Unlike committed.ResourceVersion
-// this is NOT ack-gated: it only decides where a cold restart of the watch
-// resumes within one process lifetime, and resuming too early costs duplicates
-// while resuming too late loses events outright.
 // replaySlack widens the relist replay boundary. It absorbs the second
 // truncation of metav1.Time plus modest node clock skew; anything it lets
 // through a second time is a duplicate, which the pipeline already tolerates,
 // while anything it excludes is lost outright.
 const replaySlack = time.Minute
 
+// noteSeen advances the in-process resume point. Unlike committed.ResourceVersion
+// this is NOT ack-gated: it only decides where a cold restart of the watch
+// resumes within one process lifetime, and resuming too early costs duplicates
+// while resuming too late loses events outright.
 func (r *Reader) noteSeen(rv string) {
 	if rv != "" && newerRV(rv, r.seenRV) {
 		r.seenRV = rv
 	}
 }
 
+// newerRV reports whether a is a later resourceVersion than b. Kubernetes
+// treats these as opaque, but etcd's are decimal integers, so compare
+// numerically where both parse and fall back to keeping what we have (the
+// conservative direction: never move the position backwards on a guess).
 func newerRV(a, b string) bool {
 	if b == "" {
 		return true
@@ -1538,7 +1538,7 @@ var osHostname = func() (string, error) {
 // lowercases before the rules see it, so the config surface reads lowercase
 // too.
 func severityOf(eventType string) (plog.SeverityNumber, string) {
-	if strings.EqualFold(eventType, string(corev1.EventTypeWarning)) {
+	if strings.EqualFold(eventType, corev1.EventTypeWarning) {
 		return plog.SeverityNumberWarn, "warn"
 	}
 	return plog.SeverityNumberInfo, "info"

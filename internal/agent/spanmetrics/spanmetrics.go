@@ -27,7 +27,7 @@ package spanmetrics
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"log/slog"
 	"sort"
 	"strings"
@@ -129,7 +129,7 @@ func (c Config) Validate() error {
 		return err
 	}
 	if c.MaxCardinality < 0 {
-		return fmt.Errorf("maxCardinality must not be negative")
+		return errors.New("maxCardinality must not be negative")
 	}
 	// Shared with servicegraph's identical histogramBuckets check —
 	// cumagg.ValidateBuckets carries the why (non-increasing ExplicitBounds

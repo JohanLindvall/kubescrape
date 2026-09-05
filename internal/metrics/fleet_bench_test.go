@@ -49,6 +49,7 @@ var (
 // benchFleet observes into a set whose db holds pods x 32 combinations,
 // walking a file's worth of lines per pod before moving on.
 func benchFleet(b *testing.B, pods int) {
+	b.Helper()
 	setTimeForTest(time.Unix(1_700_400_000, 0))
 	defer testEpoch.Store(0)
 	set := benchRules(b)
@@ -108,6 +109,7 @@ func BenchmarkDynamicAddFleet(b *testing.B) {
 // sample carries the whole bucket distribution: one map probe, then the counts
 // fold.
 func benchFleetHistogram(b *testing.B, pods int) {
+	b.Helper()
 	setTimeForTest(time.Unix(1_700_400_400, 0))
 	defer testEpoch.Store(0)
 	set := benchHistogramRules(b)

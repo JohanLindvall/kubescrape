@@ -31,8 +31,8 @@ type genCache[V any] struct {
 	max  int
 }
 
-func newGenCache[V any](max int) *genCache[V] {
-	c := &genCache[V]{max: max}
+func newGenCache[V any](limit int) *genCache[V] {
+	c := &genCache[V]{max: limit}
 	c.cur.Store(&sync.Map{})
 	return c
 }

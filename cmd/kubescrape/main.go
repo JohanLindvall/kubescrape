@@ -1236,15 +1236,6 @@ func monitorAllowed(allowNS map[string]bool, kind string, u *unstructured.Unstru
 	return false
 }
 
-// monitoringResources lists which monitoring.coreos.com resources the
-// cluster serves (servicemonitors and podmonitors may be installed
-// independently). The group/version existing is not enough: another
-// monitoring.coreos.com/v1 CRD (e.g. PrometheusRule alone) registers the
-// group while servicemonitor LISTs would fail forever, wedging readiness
-// behind an informer that can never sync — hence per-RESOURCE answers.
-// A missing group/version is reported as an empty set and no
-// error — that is an answer ("nothing is installed"), not a failure to reach
-// the API server, and only the latter should be fatal to the caller.
 // The kind label every monitor metric shares. Constants because three series
 // families key on them (parse errors, fields ignored, monitors rejected) from
 // two files, and a drifted literal would split one kind across two labels.
@@ -1271,6 +1262,15 @@ func monitorsRejectedHook(monitors *servicemonitors.Index, haveSM, havePM bool) 
 	}
 }
 
+// monitoringResources lists which monitoring.coreos.com resources the
+// cluster serves (servicemonitors and podmonitors may be installed
+// independently). The group/version existing is not enough: another
+// monitoring.coreos.com/v1 CRD (e.g. PrometheusRule alone) registers the
+// group while servicemonitor LISTs would fail forever, wedging readiness
+// behind an informer that can never sync — hence per-RESOURCE answers.
+// A missing group/version is reported as an empty set and no
+// error — that is an answer ("nothing is installed"), not a failure to reach
+// the API server, and only the latter should be fatal to the caller.
 func monitoringResources(d discovery.DiscoveryInterface) (map[string]bool, error) {
 	list, err := d.ServerResourcesForGroupVersion(servicemonitors.GVR.GroupVersion().String())
 	if err != nil {

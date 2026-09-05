@@ -53,6 +53,7 @@ func TestEventCountersArePublishedAtZero(t *testing.T) {
 // written to, every series below must be ABSENT before publishMetrics and
 // present after it.
 func probePublishedSeries(t *testing.T) {
+	t.Helper()
 	want := []point{
 		{name: "kubescrape_events_exported_total"},
 		{name: "kubescrape_events_dropped_batches_total"},

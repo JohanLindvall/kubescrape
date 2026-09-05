@@ -107,7 +107,7 @@ type cgroupPair struct {
 	podContainer bool
 }
 
-func newCadvisorBatcher(s *Scraper, scrape time.Time, ctx context.Context) *cadvisorBatcher {
+func newCadvisorBatcher(ctx context.Context, s *Scraper, scrape time.Time) *cadvisorBatcher {
 	cb := &cadvisorBatcher{
 		s:          s,
 		ctx:        ctx,

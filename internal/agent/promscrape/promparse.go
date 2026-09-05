@@ -2,8 +2,9 @@ package promscrape
 
 import "github.com/JohanLindvall/kubescrape/pkg/promparse"
 
-// The exposition parser lives in pkg/promparse (it is useful on its own — a
-// constant-memory Prometheus text/OpenMetrics parser). These aliases keep the
+// Sample is pkg/promparse's sample, and Label, Exemplar and MetricType are its
+// siblings: the exposition parser lives there (it is useful on its own — a
+// constant-memory Prometheus text/OpenMetrics parser), and the aliases keep the
 // scrape pipeline reading in its own vocabulary rather than qualifying every
 // Sample and Label.
 type (
@@ -13,6 +14,7 @@ type (
 	MetricType = promparse.MetricType
 )
 
+// The parser's sample roles and memo bounds, aliased for the same reason.
 const (
 	RoleGauge           = promparse.RoleGauge
 	RoleCounter         = promparse.RoleCounter

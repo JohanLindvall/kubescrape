@@ -24,6 +24,7 @@ import (
 // requests, and returns it with the clock parked so nothing expires under the
 // measurement.
 func steadyStore(b *testing.B, live int, dims []string) *Processor {
+	b.Helper()
 	p := NewProcessor(Config{MaxItems: live * 4, Wait: "10s", Dimensions: dims}, discardLog())
 	p.SetSink(&countSink{})
 	now := t0

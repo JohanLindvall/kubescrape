@@ -494,11 +494,15 @@ func (r *Rotating) Tokens() []string {
 			}
 		}
 	}
-	var out []string
-	if r.prev != "" && now.Before(r.prevUntil) {
-		out = []string{r.cur, r.prev}
-	} else {
-		out = []string{r.cur}
+	if r.prev != "" && !now.Before(r.prevUntil) {
+		// Past the grace the predecessor is a revoked credential, and a
+		// revoked credential is not something to keep in memory for the
+		// process lifetime — nor to hand out, however harmlessly.
+		r.prev, r.prevUntil = "", time.Time{}
+	}
+	out := []string{r.cur}
+	if r.prev != "" {
+		out = append(out, r.prev)
 	}
 	r.mu.Unlock()
 

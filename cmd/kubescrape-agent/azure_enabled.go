@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/azurediag"
@@ -26,7 +27,7 @@ func validateAzureFlags() error {
 		return err
 	}
 	if *azureOn && *azureNamespace == "" && *azureConnFile == "" {
-		return fmt.Errorf("-azure-diagnostics is set but neither -azure-eventhub-namespace nor -azure-eventhub-connection-string-file is")
+		return errors.New("-azure-diagnostics is set but neither -azure-eventhub-namespace nor -azure-eventhub-connection-string-file is")
 	}
 	// The SHAPE half of the multi-source rules, so -check-config catches it.
 	// The rest of ResolveSources reads the connection-string files, which a

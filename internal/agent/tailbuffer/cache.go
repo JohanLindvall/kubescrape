@@ -76,8 +76,8 @@ type decision struct {
 	stale   bool
 }
 
-func newDecisionCache(max int, ttl time.Duration) *decisionCache {
-	return &decisionCache{max: max, ttl: ttl, m: make(map[pcommon.TraceID]*decision, min(max, 1024))}
+func newDecisionCache(limit int, ttl time.Duration) *decisionCache {
+	return &decisionCache{max: limit, ttl: ttl, m: make(map[pcommon.TraceID]*decision, min(limit, 1024))}
 }
 
 // get returns the remembered verdict, if there is a live one. An entry past the

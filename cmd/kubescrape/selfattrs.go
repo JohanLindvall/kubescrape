@@ -13,6 +13,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
@@ -45,7 +46,7 @@ func selfResolver(st *store.Store, resolver server.MetadataResolver) func(contex
 		ns := selfmeta.Namespace()
 		if ns == "" {
 			obs.SelfMetadataLookups.WithLabelValues(obs.SelfLookupError).Inc()
-			return nil, fmt.Errorf("no namespace ($POD_NAMESPACE or the ServiceAccount projection)")
+			return nil, errors.New("no namespace ($POD_NAMESPACE or the ServiceAccount projection)")
 		}
 		host, err := os.Hostname()
 		if err != nil {

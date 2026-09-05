@@ -3,10 +3,9 @@ package otlpingest
 import (
 	"context"
 	"errors"
-	"strconv"
-
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -493,34 +492,73 @@ func (g *logsGRPC) Export(ctx context.Context, req plogotlp.ExportRequest) (plog
 		return plogotlp.ExportResponse{}, err
 	}
 	defer release()
-	err = grpcExport(ctx, func(ctx context.Context) error {
-		ld := req.Logs()
-		// Admission first (ingest: hook, per resource, pre-enrichment).
-		g.s.admitLogs(ld)
-		// Reserved plumbing keys die before anything reads them (reserved.go).
-		g.s.sanitizeLogs(ld)
-		g.s.cfg.Enricher.EnrichLogs(ctx, ld)
-		// logAttributes + logs.rules + logMetrics, AFTER enrichment
-		// (logchain.go); a payload filtered to nothing is acked without a send.
-		cc, forward := g.s.applyLogChain(ld)
-		if !forward {
-			cc.commit() // acked without a send: the drops are final
-			return nil
-		}
-		// Handoff (logs and metrics only, never traces — the tier's tap reads
-		// a forwarded trace AFTER the export): on failure the decoded ld dies
-		// with this RPC and the sender's retry re-decodes retransmitted bytes,
-		// so the transform seam may run in place instead of deep-copying.
-		if err := g.s.cfg.Exporter.ExportLogs(transform.Handoff(ctx), ld); err != nil {
-			return err // NOT counted: the sender will resend these very records
-		}
-		cc.commit()
-		return nil
-	})
+	err = grpcExport(ctx, func(ctx context.Context) error { return g.s.forwardLogs(ctx, req.Logs()) })
 	if err != nil {
 		return plogotlp.ExportResponse{}, err
 	}
 	return plogotlp.NewExportResponse(), nil
+}
+
+// forwardLogs is the enrich-and-forward step for a decoded logs push, shared
+// by the gRPC and HTTP arms (each used to spell it, and the two had drifted by
+// a comment already). ctx carries the connection's peer address. In order:
+// admission (the ingest: hook, per resource, pre-enrichment), the reserved
+// strip (reserved.go), enrichment, then logAttributes + logs.rules +
+// logMetrics AFTER enrichment (logchain.go) — a payload filtered to nothing is
+// acked without a send, its drops final — and the export.
+//
+// The export takes transform.Handoff (logs and metrics only, never traces —
+// the tier's tap reads a forwarded trace AFTER the export): on failure the
+// decoded payload dies with this request and the sender's retry re-decodes
+// retransmitted bytes, so the transform seam may run in place instead of
+// deep-copying. A failed export is NOT counted: the sender will resend these
+// very records.
+func (s *Server) forwardLogs(ctx context.Context, ld plog.Logs) error {
+	s.admitLogs(ld)
+	s.sanitizeLogs(ld)
+	s.cfg.Enricher.EnrichLogs(ctx, ld)
+	cc, forward := s.applyLogChain(ld)
+	if !forward {
+		cc.commit()
+		return nil
+	}
+	if err := s.cfg.Exporter.ExportLogs(transform.Handoff(ctx), ld); err != nil {
+		return err
+	}
+	cc.commit()
+	return nil
+}
+
+// forwardMetrics is forwardLogs' metrics sibling: admission, then the
+// point-less metrics die before anything downstream pays to carry them
+// (emptymetrics.go) — a push emptied by either is acked without a send — then
+// the reserved strip, enrichment and the export under the same Handoff.
+func (s *Server) forwardMetrics(ctx context.Context, in pmetric.Metrics) error {
+	s.admitMetrics(in)
+	s.pruneEmptyMetrics(in)
+	if in.ResourceMetrics().Len() == 0 {
+		return nil
+	}
+	s.sanitizeMetrics(in)
+	md := s.cfg.Enricher.EnrichMetrics(ctx, in)
+	return s.cfg.Exporter.ExportMetrics(transform.Handoff(ctx), md)
+}
+
+// forwardTraces is the traces sibling. The loop guard (rejectTraces) runs
+// FIRST, before admission and the reserved strip — a refused payload must cost
+// no lookup and move no counter — and the export takes NO Handoff: the tier's
+// tap reads a forwarded trace after the export.
+func (s *Server) forwardTraces(ctx context.Context, td ptrace.Traces) error {
+	if err := s.rejectTraces(ctx, td); err != nil {
+		return err
+	}
+	s.admitTraces(td)
+	if td.ResourceSpans().Len() == 0 {
+		return nil
+	}
+	s.sanitizeTraces(td)
+	s.cfg.Enricher.EnrichTraces(ctx, td)
+	return s.cfg.Traces.ExportTraces(ctx, td)
 }
 
 type metricsGRPC struct {
@@ -537,22 +575,7 @@ func (g *metricsGRPC) Export(ctx context.Context, req pmetricotlp.ExportRequest)
 		return pmetricotlp.ExportResponse{}, err
 	}
 	defer release()
-	err = grpcExport(ctx, func(ctx context.Context) error {
-		in := req.Metrics()
-		g.s.admitMetrics(in) // admission first (ingest: hook, pre-enrichment)
-		// Metrics with no data points die here, before anything downstream
-		// pays to carry them (emptymetrics.go).
-		g.s.pruneEmptyMetrics(in)
-		if in.ResourceMetrics().Len() == 0 {
-			return nil // everything rejected or empty: acked without a send
-		}
-		// Reserved plumbing keys die before anything reads them (reserved.go).
-		g.s.sanitizeMetrics(in)
-		md := g.s.cfg.Enricher.EnrichMetrics(ctx, in)
-		// Handoff: same reasoning as the logs arm — a failed forward drops the
-		// decoded object and the sender retransmits bytes.
-		return g.s.cfg.Exporter.ExportMetrics(transform.Handoff(ctx), md)
-	})
+	err = grpcExport(ctx, func(ctx context.Context) error { return g.s.forwardMetrics(ctx, req.Metrics()) })
 	if err != nil {
 		return pmetricotlp.ExportResponse{}, err
 	}
@@ -647,21 +670,7 @@ func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (
 		return ptraceotlp.ExportResponse{}, err
 	}
 	defer release()
-	err = grpcExport(ctx, func(ctx context.Context) error {
-		td := req.Traces()
-		if err := g.s.rejectTraces(ctx, td); err != nil {
-			return err
-		}
-		g.s.admitTraces(td) // admission after the loop guard, pre-enrichment
-		if td.ResourceSpans().Len() == 0 {
-			return nil // everything rejected: acked without a send
-		}
-		// Reserved plumbing keys die before anything reads them (reserved.go);
-		// after the loop guard, since a refused payload needs no sanitizing.
-		g.s.sanitizeTraces(td)
-		g.s.cfg.Enricher.EnrichTraces(ctx, td)
-		return g.s.cfg.Traces.ExportTraces(ctx, td)
-	})
+	err = grpcExport(ctx, func(ctx context.Context) error { return g.s.forwardTraces(ctx, req.Traces()) })
 	if err != nil {
 		return ptraceotlp.ExportResponse{}, err
 	}
@@ -764,24 +773,9 @@ func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 		return decodedLogsSize(req.Logs()), nil
 	}
 	s.servePush(w, r, "logs", decode, func(ctx context.Context) (ProtoMarshaler, error) {
-		ld := req.Logs()
-		s.admitLogs(ld) // admission first (ingest: hook, pre-enrichment)
-		// Reserved plumbing keys die before anything reads them (reserved.go).
-		s.sanitizeLogs(ld)
-		s.cfg.Enricher.EnrichLogs(ctx, ld)
-		// logAttributes + logs.rules + logMetrics, AFTER enrichment
-		// (logchain.go); a payload filtered to nothing is acked without a send.
-		cc, forward := s.applyLogChain(ld)
-		if !forward {
-			cc.commit() // acked without a send: the drops are final
-			return plogotlp.NewExportResponse(), nil
+		if err := s.forwardLogs(ctx, req.Logs()); err != nil {
+			return nil, err
 		}
-		// Handoff: as on the gRPC arm — the decoded push dies with a failed
-		// request, and the sender's retry re-decodes retransmitted bytes.
-		if err := s.cfg.Exporter.ExportLogs(transform.Handoff(ctx), ld); err != nil {
-			return nil, err // NOT counted: the sender will resend these very records
-		}
-		cc.commit()
 		return plogotlp.NewExportResponse(), nil
 	})
 }
@@ -795,18 +789,7 @@ func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 		return decodedMetricsSize(req.Metrics()), nil
 	}
 	s.servePush(w, r, "metrics", decode, func(ctx context.Context) (ProtoMarshaler, error) {
-		in := req.Metrics()
-		s.admitMetrics(in) // admission first (ingest: hook, pre-enrichment)
-		// Metrics with no data points die here (emptymetrics.go).
-		s.pruneEmptyMetrics(in)
-		if in.ResourceMetrics().Len() == 0 {
-			return pmetricotlp.NewExportResponse(), nil // all rejected or empty: acked
-		}
-		// Reserved plumbing keys die before anything reads them (reserved.go).
-		s.sanitizeMetrics(in)
-		md := s.cfg.Enricher.EnrichMetrics(ctx, in)
-		// Handoff: as on the gRPC arm.
-		if err := s.cfg.Exporter.ExportMetrics(transform.Handoff(ctx), md); err != nil {
+		if err := s.forwardMetrics(ctx, req.Metrics()); err != nil {
 			return nil, err
 		}
 		return pmetricotlp.NewExportResponse(), nil
@@ -822,19 +805,7 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 		return decodedTracesSize(req.Traces()), nil
 	}
 	s.servePush(w, r, "traces", decode, func(ctx context.Context) (ProtoMarshaler, error) {
-		td := req.Traces()
-		if err := s.rejectTraces(ctx, td); err != nil {
-			return nil, err
-		}
-		s.admitTraces(td) // admission after the loop guard, pre-enrichment
-		if td.ResourceSpans().Len() == 0 {
-			return ptraceotlp.NewExportResponse(), nil // all rejected: acked
-		}
-		// Reserved plumbing keys die before anything reads them (reserved.go);
-		// after the loop guard, since a refused payload needs no sanitizing.
-		s.sanitizeTraces(td)
-		s.cfg.Enricher.EnrichTraces(ctx, td)
-		if err := s.cfg.Traces.ExportTraces(ctx, td); err != nil {
+		if err := s.forwardTraces(ctx, req.Traces()); err != nil {
 			return nil, err
 		}
 		return ptraceotlp.NewExportResponse(), nil

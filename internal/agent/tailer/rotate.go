@@ -151,6 +151,7 @@ func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what str
 // Otherwise (truncation, copytruncate, or a rename with nothing buffered) the
 // pipeline is flushed and reset as before — carrying makes no sense when the
 // content was replaced.
+//
 // drained reports whether the pre-rotation drain of the old inode completed.
 // A rename rotation whose drain ABORTED (mid-drain flush failure) is still
 // completed rather than abandoned — see the aborted branch below.
@@ -297,15 +298,16 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed, drained bool) {
 	// forever without a positions store). The new hop's own lines ARE live
 	// (the drain re-read them after any rewind), so preserving the captured
 	// value is exact.
-	if _, buffered := f.watermark(); renamed && buffered && wasFed {
-		// A group straddles the rotation: carry the pipeline into the new
-		// inode. Buffered items keep their segment-qualified positions — no
-		// re-basing, no generation — and the fresh tail id below makes the
-		// new inode's bytes unambiguous. (Only when the older segments are
-		// fed: with unfed segments owed, the buffered fragments would sit in
-		// the pipeline AHEAD of the older lines feedSegments must replay
-		// first — flush the group split instead of joining it out of order.)
-	} else {
+	// carry: a group straddles the rotation, so the pipeline is carried into
+	// the new inode. Buffered items keep their segment-qualified positions —
+	// no re-basing, no generation — and the fresh tail id below makes the new
+	// inode's bytes unambiguous. (Only when the older segments are fed: with
+	// unfed segments owed, the buffered fragments would sit in the pipeline
+	// AHEAD of the older lines feedSegments must replay first — flush the
+	// group split instead of joining it out of order.)
+	_, buffered := f.watermark()
+	carry := renamed && buffered && wasFed
+	if !carry {
 		// ledger.reset zeroes every segment's fedTo because it is written for
 		// the PURGE case (rewind): the lines it names were discarded unemitted,
 		// so the replay must start over from `committed`. stopPipeline does the
@@ -535,6 +537,7 @@ func (t *Tailer) chargeGoneStall(f *file, gen int, progressBefore int64) bool {
 // retired — an unrecoverable segment kept on the list can never reach its
 // `to` and would wedge retirement (fd budget, settledGone, the checkpoint)
 // forever.
+//
 // retired reports whether the failure was PERMANENT (the segment was given up
 // on and removed); false means transient and the segment stays on the list for
 // another sweep.

@@ -65,7 +65,7 @@ type Table struct {
 	now    func() time.Time
 }
 
-// New creates a table holding at most max keys.
+// New creates a table holding at most limit keys.
 //
 // window is how long a key stays suppressed after it logs. ZERO means "once per
 // process": the key is never allowed again, which is right for a complaint
@@ -74,11 +74,11 @@ type Table struct {
 // A POSITIVE window re-warns at that cadence, which is right for a condition an
 // operator may fix out of band and want confirmation about (the metadata
 // service's unresolvable Secret refs).
-func New(max int, window time.Duration) *Table {
-	if max < 1 {
-		max = 1
+func New(limit int, window time.Duration) *Table {
+	if limit < 1 {
+		limit = 1
 	}
-	return &Table{seen: make(map[string]time.Time), max: max, window: window, now: time.Now}
+	return &Table{seen: make(map[string]time.Time), max: limit, window: window, now: time.Now}
 }
 
 // Allow reports whether key may log now, and records that it did.

@@ -705,7 +705,6 @@ func (b *batcher) remember(name string, m pmetric.Metric) {
 	b.lastName, b.lastMetric, b.lastOK = name, m, true
 }
 
-// addNumber emits a gauge or (monotonic cumulative) sum data point.
 // expHistBytes estimates one exponential histogram point's encoded size.
 func expHistBytes(p *expPoint) int {
 	// 9 bytes/bucket (max sint64 varint) not 3: a busy cumulative counter's
@@ -764,6 +763,7 @@ func fillExponentialPoint(dp pmetric.ExponentialHistogramDataPoint, p expPoint) 
 	dp.Negative().BucketCounts().FromRaw(p.neg)
 }
 
+// addNumber emits a gauge or (monotonic cumulative) sum data point.
 func (b *batcher) addNumber(s Sample, monotonic bool) {
 	m, ok := b.metricByName(s.Name)
 	if !ok {
@@ -814,9 +814,6 @@ func (b *batcher) addHistogram(family string, acc *histAcc) {
 	b.bytes += histBytes(acc)
 }
 
-// fillHistogramPoint converts accumulated cumulative buckets into the OTLP
-// shape: bounds exclude +Inf, bucket counts are de-cumulated, the overflow
-// bucket is derived from the total count.
 // cmpFloat orders two floats for slices.SortFunc; a non-capturing comparator
 // keeps the sort closure off the heap (unlike sort.Slice, which also boxes the
 // slice and swaps via reflection).
@@ -831,6 +828,9 @@ func cmpFloat(a, b float64) int {
 	}
 }
 
+// fillHistogramPoint converts accumulated cumulative buckets into the OTLP
+// shape: bounds exclude +Inf, bucket counts are de-cumulated, the overflow
+// bucket is derived from the total count.
 func fillHistogramPoint(dp pmetric.HistogramDataPoint, acc *histAcc) {
 	slices.SortFunc(acc.buckets, func(a, b cumBucket) int { return cmpFloat(a.le, b.le) })
 	// Deduplicate repeated le values (keep the last occurrence).

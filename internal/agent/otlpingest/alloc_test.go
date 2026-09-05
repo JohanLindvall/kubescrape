@@ -7,7 +7,7 @@ package otlpingest
 
 import (
 	"context"
-	"fmt"
+	"strconv"
 	"testing"
 
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
@@ -28,7 +28,7 @@ func autoDecisionPush(points int) pmetric.Metrics {
 		dp := dps.AppendEmpty()
 		dp.SetIntValue(1)
 		dp.Attributes().PutStr("k8s.pod.uid", "pod-uid-1")
-		dp.Attributes().PutStr("le", fmt.Sprint(i))
+		dp.Attributes().PutStr("le", strconv.Itoa(i))
 	}
 	return md
 }

@@ -115,17 +115,21 @@ func NewRegistry() *Registry { return &Registry{} }
 // writers of one value, exactly as two handles on the same registered metric
 // always were.
 //
+// Every Registry series folds with actionSet (a counter and a histogram
+// accumulate; a gauge sets) — the windowed aggregations are the log-derived
+// store's, so the action is not a parameter here.
+//
 // A repeat under a name already registered with a DIFFERENT shape panics: the
 // two cannot both be rendered, registrations are code-driven and run at
 // startup, and silently serving one shape to a call site that asked for the
 // other is the failure this dedupe exists to prevent. Func-ness is part of
 // that shape (Registry.funcNames): a mixed name would render on the push and
 // not on the scrape, so it is a conflict even when kind and action agree.
-func (r *Registry) add(name, desc string, kind seriesKind, action gaugeAction, buckets []float64, funcBacked bool) *series {
+func (r *Registry) add(name, desc string, kind seriesKind, buckets []float64, funcBacked bool) *series {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if s, ok := r.byName[name]; ok {
-		if s.kind != kind || s.action != action || !s.sameBuckets(kind, buckets) {
+		if s.kind != kind || s.action != actionSet || !s.sameBuckets(kind, buckets) {
 			panic("metrics: " + name + " re-registered with a different type, action or buckets")
 		}
 		if r.funcNames[name] != funcBacked {
@@ -134,7 +138,7 @@ func (r *Registry) add(name, desc string, kind seriesKind, action gaugeAction, b
 		return s
 	}
 	s := newSeries(seriesSpec{
-		name: name, desc: desc, kind: kind, action: action,
+		name: name, desc: desc, kind: kind, action: actionSet,
 		expiration: registryExpiration, buckets: buckets, drops: &r.drops,
 	})
 	if r.byName == nil {
@@ -153,27 +157,27 @@ func (r *Registry) add(name, desc string, kind seriesKind, action gaugeAction, b
 
 // Counter registers a monotonic counter.
 func (r *Registry) Counter(name, desc string) *RegCounter {
-	return &RegCounter{newBound(r.add(name, desc, kindCounter, actionSet, nil, false), nil)}
+	return &RegCounter{newBound(r.add(name, desc, kindCounter, nil, false), nil)}
 }
 
 // CounterVec registers a labeled monotonic counter.
 func (r *Registry) CounterVec(name, desc string, labelNames ...string) *RegCounterVec {
 	return &RegCounterVec{vec[RegCounter]{
-		s: r.add(name, desc, kindCounter, actionSet, nil, false), keys: labelNames,
+		s: r.add(name, desc, kindCounter, nil, false), keys: labelNames,
 		wrap: func(b bound) *RegCounter { return &RegCounter{b} },
 	}}
 }
 
 // Gauge registers a set-latest gauge.
 func (r *Registry) Gauge(name, desc string) *RegGauge {
-	return &RegGauge{newBound(r.add(name, desc, kindGauge, actionSet, nil, false), nil)}
+	return &RegGauge{newBound(r.add(name, desc, kindGauge, nil, false), nil)}
 }
 
 // addFunc is the one constructor behind the four func-metric registrations:
 // a series of the given kind plus a gaugeFunc entry evaluated at export time.
 // labelName/fnVec carry the labeled (Vec) form; fn the scalar one.
 func (r *Registry) addFunc(name, desc string, kind seriesKind, labelName string, fn func() float64, fnVec func() map[string]float64) {
-	s := r.add(name, desc, kind, actionSet, nil, true)
+	s := r.add(name, desc, kind, nil, true)
 	r.mu.Lock()
 	r.funcs = append(r.funcs, &gaugeFunc{s: s, fn: fn, labelName: labelName, fnVec: fnVec})
 	r.mu.Unlock()
@@ -237,7 +241,7 @@ func (r *Registry) HistogramVec(name, desc string, buckets []float64, labelNames
 		}
 	}
 	return &RegHistogramVec{vec[RegHistogram]{
-		s: r.add(name, desc, kindHistogram, actionSet, buckets, false), keys: labelNames,
+		s: r.add(name, desc, kindHistogram, buckets, false), keys: labelNames,
 		wrap: func(b bound) *RegHistogram { return &RegHistogram{b} },
 	}}
 }

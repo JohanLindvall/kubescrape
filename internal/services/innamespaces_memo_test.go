@@ -9,6 +9,7 @@ package services
 
 import (
 	"fmt"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -216,7 +217,7 @@ func TestInNamespacesMemoUnderConcurrentChange(t *testing.T) {
 	}
 	for i := range 500 {
 		ix.Upsert(memoService("prod", fmt.Sprintf("svc-%02d", i%20), fmt.Sprintf("uid-%d", i%20),
-			fmt.Sprintf("%d", i+2), 80))
+			strconv.Itoa(i+2), 80))
 		if i%7 == 0 {
 			ix.Delete("prod", types.UID(fmt.Sprintf("uid-%d", i%20)))
 		}

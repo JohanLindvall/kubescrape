@@ -84,7 +84,7 @@ func BenchmarkSplitConvert(b *testing.B) {
 	b.SetBytes(int64(len(input)))
 	b.ReportAllocs()
 	for b.Loop() {
-		cb := newSplitBatcher(s, context.Background(), target, sp[0], time.Unix(2, 0))
+		cb := newSplitBatcher(context.Background(), s, target, sp[0], time.Unix(2, 0))
 		conv := newConverter(cb, nil)
 		p := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20})
 		_, err := p.Parse(strings.NewReader(input), func(smp Sample) error {
@@ -143,7 +143,7 @@ func BenchmarkCadvisorConvert(b *testing.B) {
 			b.SetBytes(int64(len(input)))
 			b.ReportAllocs()
 			for b.Loop() {
-				cb := newCadvisorBatcher(s, time.Unix(2, 0), context.Background())
+				cb := newCadvisorBatcher(context.Background(), s, time.Unix(2, 0))
 				conv := newConverter(cb, nil)
 				p := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20})
 				_, err := p.Parse(strings.NewReader(input), func(smp Sample) error {
@@ -292,6 +292,7 @@ func TestFilterSessionAllocationBudget(t *testing.T) {
 // histogram family: `metrics` label sets of 12 buckets each, the shape
 // -scrape-native-histograms puts EVERY classic family of every target on.
 func protoHistBody(tb testing.TB, metrics int) []byte {
+	tb.Helper()
 	bounds := []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, math.Inf(1)}
 	fam := &dto.MetricFamily{
 		Name: ptr("http_request_duration_seconds"), Help: ptr("Request latency."), Unit: ptr("seconds"),
@@ -318,6 +319,7 @@ const protoBenchMetrics = 500
 
 // protoBenchScraper feeds one protobuf exposition through the protobuf front.
 func protoBenchScrape(tb testing.TB, s *Scraper, body []byte) {
+	tb.Helper()
 	cb := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
 	ss := s.newScrapeSession(context.Background(), cb, pipelineTargets, "t", "t", nil, true)
 	if _, err := s.parseProtoAndExport(ss, bytes.NewReader(body)); err != nil {

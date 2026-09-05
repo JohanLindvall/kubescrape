@@ -25,7 +25,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"unicode/utf8"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -34,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
+	"github.com/JohanLindvall/kubescrape/internal/clip"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -503,18 +503,10 @@ const maxIgnoredValueBytes = 48
 
 // clipValue renders a tenant-supplied value for a report entry, cut at
 // maxIgnoredValueBytes with an ellipsis so a reader can tell a clipped value
-// from a short one. Cut on a rune boundary: the entry is written into a log
-// record and a JSON document, and half a rune is a mojibake byte in both.
-func clipValue(s string) string {
-	if len(s) <= maxIgnoredValueBytes {
-		return s
-	}
-	cut := maxIgnoredValueBytes
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut] + "..."
-}
+// from a short one. Cut on a rune boundary (internal/clip): the entry is
+// written into a log record and a JSON document, and half a rune is a mojibake
+// byte in both.
+func clipValue(s string) string { return clip.Marked(s, maxIgnoredValueBytes, "...") }
 
 // relabelLabelBytes is what ONE sourceLabels entry costs beyond its own
 // characters: its JSON framing in the served node-targets document (two quotes
@@ -1323,28 +1315,28 @@ func (ix *Index) Rejected() (serviceMonitors, podMonitors int) {
 // allocations per request, scaling with the REFS — an endpoint that also names
 // a tlsConfig ca/cert/keySecret is four of them — against 0 allocations once
 // the answer is held.
-func (x *Index) AuthSecretRefs() AuthRefs {
+func (ix *Index) AuthSecretRefs() AuthRefs {
 	// Read the token BEFORE the build, exactly as server.monitoredServices
 	// does: a mutation landing during the harvest is then recorded as unbuilt
 	// and rebuilds on the next call, rather than being stamped as
 	// already-included and lost until some unrelated change moves the token.
 	// Getting this backwards on THIS map would leave a removed monitor's secret
 	// reachable.
-	gen := x.Generation()
-	x.authMu.Lock()
-	defer x.authMu.Unlock()
-	if !x.authValid || x.authGen != gen {
-		x.authRefs = x.buildAuthSecretRefs()
-		x.authGen, x.authValid = gen, true
+	gen := ix.Generation()
+	ix.authMu.Lock()
+	defer ix.authMu.Unlock()
+	if !ix.authValid || ix.authGen != gen {
+		ix.authRefs = ix.buildAuthSecretRefs()
+		ix.authGen, ix.authValid = gen, true
 	}
-	return x.authRefs
+	return ix.authRefs
 }
 
 // buildAuthSecretRefs harvests the allowlist from scratch.
-func (x *Index) buildAuthSecretRefs() AuthRefs {
-	x.authBuilds.Add(1)
-	x.mu.RLock()
-	defer x.mu.RUnlock()
+func (ix *Index) buildAuthSecretRefs() AuthRefs {
+	ix.authBuilds.Add(1)
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
 	out := map[string]struct{}{}
 	add := func(eps []Endpoint) {
 		for i := range eps {
@@ -1365,10 +1357,10 @@ func (x *Index) buildAuthSecretRefs() AuthRefs {
 			}
 		}
 	}
-	for _, m := range x.monitors {
+	for _, m := range ix.monitors {
 		add(m.Endpoints)
 	}
-	for _, m := range x.podMonitors {
+	for _, m := range ix.podMonitors {
 		add(m.Endpoints)
 	}
 	return AuthRefs{refs: out}

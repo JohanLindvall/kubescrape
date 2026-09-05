@@ -503,7 +503,7 @@ func (s *Scraper) scrapeCadvisor(ctx context.Context) (int, error) {
 	}
 	defer drainClose(resp.Body)
 
-	cb := newCadvisorBatcher(s, time.Now(), ctx)
+	cb := newCadvisorBatcher(ctx, s, time.Now())
 	return s.parseAndExport(ctx, resp.Body, false, false, cb, pipelineCadvisor, url)
 }
 

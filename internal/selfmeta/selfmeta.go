@@ -145,15 +145,15 @@ func Poll[T any](ctx context.Context, resolve func(context.Context) (*T, error),
 			// indistinguishable from a resolution that later succeeded, and
 			// this lookup is the one whose failure has no other symptom than
 			// missing attributes on somebody else's dashboard.
-			n := failures.Add(1)
-			if n == 1 {
+			switch n := failures.Add(1); {
+			case n == 1:
 				firstFailure = time.Now()
 				reWarn.Allow(reWarnInterval) // claim the slot the Warn below occupies
 				log.Warn("resolving "+what+" failed; retrying", "error", err)
-			} else if reWarn.Allow(reWarnInterval) {
+			case reWarn.Allow(reWarnInterval):
 				log.Warn("resolving "+what+" is still failing", "error", err,
 					"attempts", n, "since", time.Since(firstFailure).Round(time.Second))
-			} else {
+			default:
 				log.Debug("resolving "+what, "error", err)
 			}
 			return nil

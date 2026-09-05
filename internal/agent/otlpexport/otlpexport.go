@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -117,6 +119,11 @@ type Client struct {
 	// rather than per call; nil withholds the raw path entirely.
 	protoCodec encoding.CodecV2
 
+	// headerKV is cfg.Headers flattened for metadata.AppendToOutgoingContext,
+	// key-sorted so the outgoing metadata reads the same on every export. Built
+	// once here: grpcAuth used to nest one context per header per export.
+	headerKV []string
+
 	// HTTP transport.
 	httpClient *http.Client
 	logsURL    string
@@ -169,7 +176,7 @@ func (cfg Config) Validate() error {
 		return fmt.Errorf("compression level %d (want 0-9)", cfg.CompressionLevel)
 	}
 	if cfg.Endpoint == "" {
-		return fmt.Errorf("no endpoint")
+		return errors.New("no endpoint")
 	}
 	// The mTLS pair, checked HERE and not only in buildTLS. It is a pure-shape
 	// rule (two strings, no file touched) that New refuses at startup, so
@@ -254,6 +261,9 @@ func New(cfg Config) (*Client, error) {
 		gzipLevel: effectiveGzipLevel(cfg.CompressionLevel),
 		health: NewFailureReporter(nil, "the OTLP collector",
 			"endpoint", cfg.Endpoint, "protocol", cfg.Protocol),
+	}
+	for _, k := range slices.Sorted(maps.Keys(cfg.Headers)) {
+		c.headerKV = append(c.headerKV, k, cfg.Headers[k])
 	}
 	if cfg.BearerTokenFile != "" {
 		// Not read here: a collector credential that is not yet projected must
@@ -651,8 +661,8 @@ func (c *Client) grpcAuth(ctx context.Context) (context.Context, error) {
 	if err != nil {
 		return nil, err
 	}
-	for k, v := range c.cfg.Headers {
-		ctx = metadata.AppendToOutgoingContext(ctx, k, v)
+	if len(c.headerKV) > 0 {
+		ctx = metadata.AppendToOutgoingContext(ctx, c.headerKV...)
 	}
 	if token == "" {
 		return ctx, nil

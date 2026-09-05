@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -575,7 +576,7 @@ func chartValuePaths(t *testing.T) map[string][]string {
 						// this flag was one it had to see. Silently skipping
 						// what the scan cannot read is how a green check comes
 						// to mean nothing.
-						path = unresolved + filepath.Base(f) + ":" + fmt.Sprint(n+1)
+						path = unresolved + filepath.Base(f) + ":" + strconv.Itoa(n+1)
 					}
 					if !slices.Contains(out[flag], path) {
 						out[flag] = append(out[flag], path)

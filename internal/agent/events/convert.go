@@ -39,9 +39,10 @@ func (r *Reader) ingest(ctx context.Context, e *corev1.Event) {
 	sev, sevText := severityOf(e.Type)
 	key, res := r.resource(ctx, e)
 
+	when := eventTime(e)
 	ent := entry{
-		body: body, ts: eventTime(e), severity: sev, sevText: sevText,
-		resKey: key, res: res, rv: e.ResourceVersion, when: eventTime(e),
+		body: body, ts: when, severity: sev, sevText: sevText,
+		resKey: key, res: res, rv: e.ResourceVersion, when: when,
 		attrs: eventAttrs(e),
 		okey:  obsKey{uid: string(e.UID), rv: e.ResourceVersion},
 	}

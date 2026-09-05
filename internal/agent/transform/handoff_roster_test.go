@@ -35,7 +35,7 @@ var handoffMarkers = map[string]struct {
 	"internal/agent/promscrape/cadvisor.go": {1, []string{"agent/promscrape"}},
 	"internal/agent/promscrape/summary.go":  {1, []string{"agent/promscrape"}},
 	"internal/agent/cumagg/cumagg.go":       {1, []string{"agent/cumagg"}},
-	"internal/agent/otlpingest/server.go":   {4, []string{"agent/otlpingest"}},
+	"internal/agent/otlpingest/server.go":   {2, []string{"agent/otlpingest"}},
 	// Six marks, two producers: obs.Registry and the logMetrics set
 	// (internal/metrics), plus the cgroup sampler's export loop and its final
 	// export. Both are marked at the call site because that is what knows the

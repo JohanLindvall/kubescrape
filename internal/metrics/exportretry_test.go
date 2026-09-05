@@ -9,6 +9,7 @@ package metrics
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -242,7 +243,7 @@ func TestRetryPileIsBoundedBySamples(t *testing.T) {
 	// one generation (~4000 samples), crossing maxRetainedSamples (50k)
 	// within ~13 failures.
 	for i := 0; i < 4000; i++ {
-		set.Add(nil, labelsFrom(map[string]string{"m": "1", "id": fmt.Sprint(i)}),
+		set.Add(nil, labelsFrom(map[string]string{"m": "1", "id": strconv.Itoa(i)}),
 			res(map[string]string{"k8s.pod.name": fmt.Sprintf("p%d", i%4)}), "")
 	}
 	for i := 0; i < 20; i++ {

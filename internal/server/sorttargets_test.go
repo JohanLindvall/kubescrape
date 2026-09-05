@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"sort"
+	"strconv"
 	"testing"
 
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -107,11 +108,11 @@ func TestPermuteTargetsAppliesTheIndex(t *testing.T) {
 		n := len(idx)
 		s := make([]kubemeta.ScrapeTarget, n)
 		for i := range s {
-			s[i].Address = fmt.Sprintf("%d", i)
+			s[i].Address = strconv.Itoa(i)
 		}
 		want := make([]string, n)
 		for i, from := range idx {
-			want[i] = fmt.Sprintf("%d", from)
+			want[i] = strconv.Itoa(int(from))
 		}
 		permuteTargets(s, append([]int32(nil), idx...))
 		for i := range s {

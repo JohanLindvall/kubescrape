@@ -2,7 +2,7 @@ package journald
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -36,7 +36,7 @@ func (c *captureExporter) ExportLogs(_ context.Context, ld plog.Logs) error {
 	c.tries++
 	if c.failures > 0 {
 		c.failures--
-		return fmt.Errorf("injected export failure")
+		return errors.New("injected export failure")
 	}
 	c.batches = append(c.batches, ld)
 	return nil

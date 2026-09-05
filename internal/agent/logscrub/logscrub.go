@@ -15,6 +15,7 @@
 package logscrub
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -719,7 +720,7 @@ func New(cfg Config) (*Scrubber, error) {
 		s.patterns = append(s.patterns, p)
 	}
 	if len(s.patterns) == 0 {
-		return nil, fmt.Errorf("logScrubbing configured with no patterns (set builtin: [defaults] or add rules)")
+		return nil, errors.New("logScrubbing configured with no patterns (set builtin: [defaults] or add rules)")
 	}
 	return &s, nil
 }

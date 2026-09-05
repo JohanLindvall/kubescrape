@@ -33,6 +33,7 @@ func parseAllMode(t *testing.T, input string, openMetrics, exemplars bool) []Sam
 }
 
 func parseAll(t *testing.T, input string) []Sample {
+	t.Helper()
 	return parseAllMode(t, input, false, false)
 }
 

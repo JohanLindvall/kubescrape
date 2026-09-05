@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -66,7 +67,7 @@ func TestTLSCacheEvictionIsReportedOutsideTheLock(t *testing.T) {
 		t.Errorf("cache holds %d clients, want <= %d", got, maxTLSClients)
 	}
 	out := buf.String()
-	for _, want := range []string{"bounded scrape cache", "cache=\"per-target TLS clients\"", "entries=" + fmt.Sprint(maxTLSClients)} {
+	for _, want := range []string{"bounded scrape cache", "cache=\"per-target TLS clients\"", "entries=" + strconv.Itoa(maxTLSClients)} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the TLS cache eviction was not reported (%q missing):\n%s", want, out)
 		}
@@ -103,7 +104,7 @@ func TestRelabelCacheEvictionIsReported(t *testing.T) {
 		t.Fatalf("points = %d, want 1 (the scrape must still work — an eviction costs work, not data)", exp.points())
 	}
 	out := buf.String()
-	for _, want := range []string{"bounded scrape cache", "cache=\"compiled metricRelabelings chains\"", "entries=" + fmt.Sprint(maxRelabelChains)} {
+	for _, want := range []string{"bounded scrape cache", "cache=\"compiled metricRelabelings chains\"", "entries=" + strconv.Itoa(maxRelabelChains)} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the relabel cache eviction was not reported (%q missing):\n%s", want, out)
 		}

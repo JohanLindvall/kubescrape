@@ -13,6 +13,7 @@ package transform
 // marked elements (and emptied groups) after the run.
 
 import (
+	"errors"
 	"fmt"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -51,7 +52,7 @@ func (a attrsView) String() string        { return "attributes" }
 func (a attrsView) Type() string          { return "attributes" }
 func (a attrsView) Freeze()               {}
 func (a attrsView) Truth() starlark.Bool  { return a.m.Len() > 0 }
-func (a attrsView) Hash() (uint32, error) { return 0, fmt.Errorf("attributes are unhashable") }
+func (a attrsView) Hash() (uint32, error) { return 0, errors.New("attributes are unhashable") }
 
 func toStarlark(v pcommon.Value) starlark.Value {
 	switch v.Type() {
@@ -77,7 +78,7 @@ func fromStarlark(dst pcommon.Value, v starlark.Value) error {
 	case starlark.Int:
 		i, ok := x.Int64()
 		if !ok {
-			return fmt.Errorf("integer out of range")
+			return errors.New("integer out of range")
 		}
 		dst.SetInt(i)
 	case starlark.Float:
@@ -93,7 +94,7 @@ func fromStarlark(dst pcommon.Value, v starlark.Value) error {
 func (a attrsView) Get(k starlark.Value) (starlark.Value, bool, error) {
 	key, ok := starlark.AsString(k)
 	if !ok {
-		return nil, false, fmt.Errorf("attribute key must be a string")
+		return nil, false, errors.New("attribute key must be a string")
 	}
 	v, found := a.m.Get(key)
 	if !found {
@@ -117,7 +118,7 @@ func (a attrsView) Get(k starlark.Value) (starlark.Value, bool, error) {
 func (a attrsView) Has(k starlark.Value) (bool, error) {
 	key, ok := starlark.AsString(k)
 	if !ok {
-		return false, fmt.Errorf("attribute key must be a string")
+		return false, errors.New("attribute key must be a string")
 	}
 	_, found := a.m.Get(key)
 	return found, nil
@@ -127,7 +128,7 @@ func (a attrsView) Has(k starlark.Value) (bool, error) {
 func (a attrsView) SetKey(k, v starlark.Value) error {
 	key, ok := starlark.AsString(k)
 	if !ok {
-		return fmt.Errorf("attribute key must be a string")
+		return errors.New("attribute key must be a string")
 	}
 	if v == starlark.None {
 		a.m.Remove(key)
@@ -162,7 +163,7 @@ func convertible(v starlark.Value) error {
 		return nil
 	case starlark.Int:
 		if _, ok := x.Int64(); !ok {
-			return fmt.Errorf("integer out of range")
+			return errors.New("integer out of range")
 		}
 		return nil
 	default:
@@ -179,7 +180,7 @@ func (d dropFn) String() string        { return "drop" }
 func (d dropFn) Type() string          { return "builtin_function_or_method" }
 func (d dropFn) Freeze()               {}
 func (d dropFn) Truth() starlark.Bool  { return true }
-func (d dropFn) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+func (d dropFn) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 func (d dropFn) CallInternal(*starlark.Thread, starlark.Tuple, []starlark.Tuple) (starlark.Value, error) {
 	d.mark()
 	return starlark.None, nil
@@ -196,7 +197,7 @@ func (b *logBatch) String() string        { return "log_batch" }
 func (b *logBatch) Type() string          { return "log_batch" }
 func (b *logBatch) Freeze()               {}
 func (b *logBatch) Truth() starlark.Bool  { return true }
-func (b *logBatch) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+func (b *logBatch) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 
 // Iterate walks the batch's (resource, scope, record) positions lazily.
 //
@@ -255,7 +256,7 @@ func (r *logRecord) String() string        { return "log_record" }
 func (r *logRecord) Type() string          { return "log_record" }
 func (r *logRecord) Freeze()               {}
 func (r *logRecord) Truth() starlark.Bool  { return true }
-func (r *logRecord) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+func (r *logRecord) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 
 func (r *logRecord) AttrNames() []string {
 	return []string{
@@ -302,21 +303,21 @@ func (r *logRecord) SetField(name string, v starlark.Value) error {
 	case "body":
 		s, ok := starlark.AsString(v)
 		if !ok {
-			return fmt.Errorf("body must be a string")
+			return errors.New("body must be a string")
 		}
 		r.lr.Body().SetStr(s)
 		return nil
 	case "severity_text":
 		s, ok := starlark.AsString(v)
 		if !ok {
-			return fmt.Errorf("severity_text must be a string")
+			return errors.New("severity_text must be a string")
 		}
 		r.lr.SetSeverityText(s)
 		return nil
 	case "severity_number":
 		n, ok := v.(starlark.Int)
 		if !ok {
-			return fmt.Errorf("severity_number must be an int")
+			return errors.New("severity_number must be an int")
 		}
 		i, _ := n.Int64()
 		r.lr.SetSeverityNumber(plog.SeverityNumber(i))
@@ -360,7 +361,7 @@ func (b *traceBatch) String() string        { return "trace_batch" }
 func (b *traceBatch) Type() string          { return "trace_batch" }
 func (b *traceBatch) Freeze()               {}
 func (b *traceBatch) Truth() starlark.Bool  { return true }
-func (b *traceBatch) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+func (b *traceBatch) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 
 // Iterate walks the batch positionally — see logBatch.Iterate.
 func (b *traceBatch) Iterate() starlark.Iterator {
@@ -404,7 +405,7 @@ func (s *spanObj) String() string        { return "span" }
 func (s *spanObj) Type() string          { return "span" }
 func (s *spanObj) Freeze()               {}
 func (s *spanObj) Truth() starlark.Bool  { return true }
-func (s *spanObj) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+func (s *spanObj) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 
 func (s *spanObj) AttrNames() []string {
 	return []string{
@@ -466,7 +467,7 @@ func (s *spanObj) SetField(name string, v starlark.Value) error {
 	if name == "name" {
 		str, ok := starlark.AsString(v)
 		if !ok {
-			return fmt.Errorf("name must be a string")
+			return errors.New("name must be a string")
 		}
 		s.sp.SetName(str)
 		return nil
@@ -485,7 +486,7 @@ func (b *metricBatch) String() string        { return "metric_batch" }
 func (b *metricBatch) Type() string          { return "metric_batch" }
 func (b *metricBatch) Freeze()               {}
 func (b *metricBatch) Truth() starlark.Bool  { return true }
-func (b *metricBatch) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+func (b *metricBatch) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 
 // Iterate walks the batch positionally — see logBatch.Iterate.
 func (b *metricBatch) Iterate() starlark.Iterator {
@@ -529,7 +530,7 @@ func (m *metricObj) String() string        { return "metric" }
 func (m *metricObj) Type() string          { return "metric" }
 func (m *metricObj) Freeze()               {}
 func (m *metricObj) Truth() starlark.Bool  { return true }
-func (m *metricObj) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+func (m *metricObj) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 
 func (m *metricObj) AttrNames() []string {
 	return []string{"datapoints", "description", "drop", "emit_metric", "name", "resource", "route", "type", "unit"}
@@ -576,8 +577,8 @@ func (m *metricObj) Attr(name string) (starlark.Value, error) {
 		// marker and silently un-drop the metric. (Metadata is a real OTLP
 		// field, but a marked metric is pruned whole before export, so the
 		// marker never reaches the wire.) Logs/spans mark in an attribute, so
-		// drop() is already
-		// order-independent for them; this makes it so for metrics too.
+		// drop() is already order-independent for them; this makes it so for
+		// metrics too.
 		return dropFn{mark: func() { m.m.Metadata().PutBool(DropMarker, true) }}, nil
 	}
 	return nil, nil
@@ -612,7 +613,7 @@ func (d *datapoints) String() string        { return "datapoints" }
 func (d *datapoints) Type() string          { return "datapoints" }
 func (d *datapoints) Freeze()               {}
 func (d *datapoints) Truth() starlark.Bool  { return d.Len() > 0 }
-func (d *datapoints) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+func (d *datapoints) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 
 // Len makes len(m.datapoints) work and lets a script skip empty metrics.
 // One five-way switch, one owner: engine.go's dataPointCount.
@@ -670,7 +671,7 @@ func (p *dpObj) String() string        { return "datapoint" }
 func (p *dpObj) Type() string          { return "datapoint" }
 func (p *dpObj) Freeze()               {}
 func (p *dpObj) Truth() starlark.Bool  { return true }
-func (p *dpObj) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+func (p *dpObj) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 
 func (p *dpObj) AttrNames() []string { return []string{"attributes", "drop", "value"} }
 
@@ -700,19 +701,19 @@ func (p *dpObj) SetField(name string, v starlark.Value) error {
 		return fmt.Errorf("cannot set %s", name)
 	}
 	if !p.scalar {
-		return fmt.Errorf("cannot set value on a %s data point", "bucketed")
+		return errors.New("cannot set value on a bucketed data point")
 	}
 	switch x := v.(type) {
 	case starlark.Int:
 		i, ok := x.Int64()
 		if !ok {
-			return fmt.Errorf("value out of int64 range")
+			return errors.New("value out of int64 range")
 		}
 		p.num.SetIntValue(i)
 	case starlark.Float:
 		p.num.SetDoubleValue(float64(x))
 	default:
-		return fmt.Errorf("value must be a number")
+		return errors.New("value must be a number")
 	}
 	return nil
 }
@@ -754,13 +755,13 @@ func emitFn(res pcommon.Resource, em MetricEmitter) starlark.Value {
 		case starlark.Int:
 			i, ok := x.Int64()
 			if !ok {
-				return nil, fmt.Errorf("emit_metric: value out of range")
+				return nil, errors.New("emit_metric: value out of range")
 			}
 			f = float64(i)
 		case starlark.Float:
 			f = float64(x)
 		default:
-			return nil, fmt.Errorf("emit_metric: value must be a number")
+			return nil, errors.New("emit_metric: value must be a number")
 		}
 		var lbls map[string]string
 		if lblDict != nil {
@@ -768,7 +769,7 @@ func emitFn(res pcommon.Resource, em MetricEmitter) starlark.Value {
 			for _, kv := range lblDict.Items() {
 				k, ok := starlark.AsString(kv[0])
 				if !ok {
-					return nil, fmt.Errorf("emit_metric: label keys must be strings")
+					return nil, errors.New("emit_metric: label keys must be strings")
 				}
 				v, ok := starlark.AsString(kv[1])
 				if !ok {

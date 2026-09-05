@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -335,7 +336,7 @@ func TestAddConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(g int) {
 			defer wg.Done()
-			status := fmt.Sprintf("%d", 200+g)
+			status := strconv.Itoa(200 + g)
 			lookup := func(k string) string {
 				switch k {
 				case "level":

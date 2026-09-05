@@ -77,7 +77,7 @@ func (k *KafkaConfig) Resolve(log *slog.Logger) error {
 		k.Mechanism = connectionStringMechanism(k.ConnectionStringFile)
 	} else {
 		if host == "" {
-			return fmt.Errorf("azure event hubs: set -azure-eventhub-namespace or -azure-eventhub-connection-string-file")
+			return errors.New("azure event hubs: set -azure-eventhub-namespace or -azure-eventhub-connection-string-file")
 		}
 		k.Mechanism = managedIdentitySource(strings.TrimSuffix(hostOnly(host), ":9093"), k.ClientID, k.TenantID, nil, log).mechanism()
 	}
@@ -276,7 +276,8 @@ func pollResult(fetches kgo.Fetches, log *slog.Logger, warn *logdedupe.Table) (m
 		// A FATAL error is logged unconditionally: it closes and rebuilds the
 		// client, which is a transition an operator must see every time. A
 		// scoped one is a persisting state (see kafkaSource.fetchWarn).
-		if isFatal := fatalFetchErr(fe); isFatal {
+		isFatal := fatalFetchErr(fe)
+		if isFatal {
 			log.Warn("event hubs fetch failed for the whole namespace; the consumer is closed and rebuilt with freshly read credentials",
 				"topic", fe.Topic, "partition", fe.Partition, "error", fe.Err)
 		} else if allow, saturated := warnAllow(warn, fe); allow {
@@ -290,7 +291,7 @@ func pollResult(fetches kgo.Fetches, log *slog.Logger, warn *logdedupe.Table) (m
 					"maxKeys", fetchWarnKeys)
 			}
 		}
-		if fatal == nil && fatalFetchErr(fe) {
+		if fatal == nil && isFatal {
 			fatal = fmt.Errorf("event hubs fetch (topic %q partition %d): %w", fe.Topic, fe.Partition, fe.Err)
 		}
 	}

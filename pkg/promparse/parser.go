@@ -40,6 +40,7 @@ import (
 // MetricType is the declared type of a metric family (# TYPE line).
 type MetricType int
 
+// The family types a # TYPE line declares; TypeUntyped is a family without one.
 const (
 	TypeUntyped MetricType = iota
 	TypeCounter
@@ -57,11 +58,17 @@ const (
 	RoleGauge SampleRole = iota
 	// RoleCounter covers counter samples (with or without _total suffix).
 	RoleCounter
+	// RoleHistogramBucket is a histogram's _bucket series (one per le).
 	RoleHistogramBucket
+	// RoleHistogramSum is a histogram's _sum series.
 	RoleHistogramSum
+	// RoleHistogramCount is a histogram's _count series.
 	RoleHistogramCount
+	// RoleSummaryQuantile is a summary's quantile series (one per quantile).
 	RoleSummaryQuantile
+	// RoleSummarySum is a summary's _sum series.
 	RoleSummarySum
+	// RoleSummaryCount is a summary's _count series.
 	RoleSummaryCount
 )
 
@@ -156,7 +163,7 @@ const (
 	maxInternedValueLen = 128
 )
 
-// maxLabelsPerSample bounds the label count of ONE sample line. The
+// MaxLabelsPerSample bounds the label count of ONE sample line. The
 // duplicate-name check in parseLabels is a linear scan over the labels seen so
 // far, run on every appended pair — O(labels²) for one line — and the label
 // count is otherwise bounded only by MaxLineBytes (≈116k 5-byte labels in the
@@ -507,7 +514,7 @@ func (p *Parser) parseFrom(br *bufio.Reader, emit func(Sample) error) (malformed
 		// parses as a smaller, entirely plausible number, and a caller that
 		// keeps what was converted before an abort then ships it as real. Only
 		// a clean EOF completes an unterminated final line.
-		truncated := rerr != nil && rerr != io.EOF
+		truncated := rerr != nil && !errors.Is(rerr, io.EOF)
 		if tooLong || (truncated && len(line) > 0) {
 			malformed++
 			// Attributed here rather than folded into the total alone: a body
@@ -529,7 +536,7 @@ func (p *Parser) parseFrom(br *bufio.Reader, emit func(Sample) error) (malformed
 			}
 		}
 		if rerr != nil {
-			if rerr == io.EOF {
+			if errors.Is(rerr, io.EOF) {
 				return malformed, nil
 			}
 			return malformed, rerr
@@ -571,13 +578,13 @@ func (p *Parser) readLine(br *bufio.Reader) (line []byte, tooLong bool, err erro
 		} else {
 			tooLong = true
 		}
-		switch rerr {
-		case nil:
+		switch {
+		case rerr == nil:
 			if tooLong {
 				return nil, true, nil
 			}
 			return trimEOL(p.scratch), false, nil
-		case bufio.ErrBufferFull:
+		case errors.Is(rerr, bufio.ErrBufferFull):
 			continue
 		default:
 			if tooLong {
@@ -868,7 +875,8 @@ func (p *Parser) parseSample(line []byte) (Sample, bool) {
 		}
 	}
 	if s.Name == "" {
-		for i = 0; i < len(line) && line[i] != '{' && line[i] != ' ' && line[i] != '\t'; i++ {
+		for i < len(line) && line[i] != '{' && line[i] != ' ' && line[i] != '\t' {
+			i++
 		}
 		if i == 0 {
 			// No bare name. The Prometheus 3 quoted form carries the name as
@@ -1136,12 +1144,13 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV) ([]byte
 			name = v
 			rest = skipSpaceTab(rem)
 		} else {
-			i := 0
+			var i int
 			if n := len(last.name); n > 0 && n < len(rest) && rest[n] == '=' && string(rest[:n]) == last.name {
 				name = last.name
 				i = n
 			} else {
-				for i = 0; i < len(rest) && rest[i] != '=' && rest[i] != ' ' && rest[i] != '\t'; i++ {
+				for i < len(rest) && rest[i] != '=' && rest[i] != ' ' && rest[i] != '\t' {
+					i++
 				}
 				if i == 0 {
 					return nil, false

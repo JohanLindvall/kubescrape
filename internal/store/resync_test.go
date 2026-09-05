@@ -15,16 +15,20 @@ import (
 // with labels, annotations, owner references and two containers — the fields
 // kubeconvert.FromPod deep-copies.
 func resyncPod(rv string) *corev1.Pod {
+	// Two named values rather than a two-literal return: gofmt 1.26 and 1.27
+	// indent that return differently, and no formatting satisfies both.
 	c := func(name, id string) (corev1.Container, corev1.ContainerStatus) {
-		return corev1.Container{
-				Name:  name,
-				Image: "registry.example.com/" + name + ":v1.2.3",
-				Ports: []corev1.ContainerPort{{Name: "metrics", ContainerPort: 9090}},
-			}, corev1.ContainerStatus{
-				Name:        name,
-				ContainerID: "containerd://" + id,
-				State:       corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
-			}
+		container := corev1.Container{
+			Name:  name,
+			Image: "registry.example.com/" + name + ":v1.2.3",
+			Ports: []corev1.ContainerPort{{Name: "metrics", ContainerPort: 9090}},
+		}
+		status := corev1.ContainerStatus{
+			Name:        name,
+			ContainerID: "containerd://" + id,
+			State:       corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+		}
+		return container, status
 	}
 	app, appSt := c("app", "aaaa1111")
 	side, sideSt := c("sidecar", "bbbb2222")

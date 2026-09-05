@@ -602,7 +602,7 @@ func (s *sink[T]) enqueue(v T) error {
 		// forever with every buffer metric flat. Count it with the other
 		// non-capacity refusals and classify it permanent.
 		obs.BufferEnqueueErrors.WithLabelValues(s.kind).Inc()
-		return fmt.Errorf("%w: %v", errUnmarshalable, err)
+		return fmt.Errorf("%w: %w", errUnmarshalable, err)
 	}
 	err = s.buf.add(data)
 	switch {
@@ -1191,6 +1191,11 @@ func (s *sink[T]) trySend(ctx context.Context, send func(context.Context) error,
 	}
 }
 
+// errUnmarshalable marks a payload that cannot serialize for the disk buffer:
+// permanent by definition — retrying cannot change the payload's own
+// encodability.
+var errUnmarshalable = errors.New("payload does not marshal")
+
 // IsPermanent reports whether err is a definitive collector rejection that
 // retrying cannot fix (bad payload, unimplemented signal). Everything
 // ambiguous is transient. Deliberately transient despite the OTLP spec
@@ -1209,11 +1214,6 @@ func (s *sink[T]) trySend(ctx context.Context, send func(context.Context) error,
 // sweep goroutine, and with it log shipping for every file on the node -
 // while the counter added for exactly this class stayed at 0. ErrFull is
 // deliberately NOT here: that one drains.
-// errUnmarshalable marks a payload that cannot serialize for the disk buffer:
-// permanent by definition — retrying cannot change the payload's own
-// encodability.
-var errUnmarshalable = errors.New("payload does not marshal")
-
 func IsPermanent(err error) bool {
 	if errors.Is(err, diskqueue.ErrRecordTooLarge) || errors.Is(err, errUnmarshalable) {
 		return true

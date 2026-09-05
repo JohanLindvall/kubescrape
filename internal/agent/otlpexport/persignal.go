@@ -12,6 +12,7 @@ package otlpexport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -64,9 +65,13 @@ func (c *ExportConfig) Validate() error {
 		return nil
 	}
 	if (c.ClientCertFile == "") != (c.ClientKeyFile == "") {
-		return fmt.Errorf("clientCertFile and clientKeyFile must be set together")
+		return errors.New("clientCertFile and clientKeyFile must be set together")
 	}
-	for name, o := range map[string]*ExportOverride{"logs": c.Logs, "metrics": c.Metrics, "traces": c.Traces} {
+	// In signal order, never off a map: a section with two mistakes must name
+	// the same one on every run, or a fixed error is followed by a different one
+	// the previous run hid — and a test of the wording can only pin one.
+	for _, sig := range c.overrides() {
+		name, o := sig.name, sig.override
 		if o == nil {
 			continue
 		}
@@ -103,16 +108,7 @@ func (o *ExportOverride) merged(base Config) Config {
 	if o.Protocol != "" {
 		out.Protocol = o.Protocol
 	}
-	if len(o.Headers) > 0 {
-		merged := make(map[string]string, len(base.Headers)+len(o.Headers))
-		for k, v := range base.Headers {
-			merged[k] = v
-		}
-		for k, v := range o.Headers {
-			merged[k] = v
-		}
-		out.Headers = merged
-	}
+	out.Headers = MergeHeaders(base.Headers, o.Headers)
 	if o.BearerTokenFile != "" {
 		out.BearerTokenFile = o.BearerTokenFile
 	}
@@ -196,21 +192,47 @@ func (c *ExportConfig) ApplyBase(base Config) Config {
 	if c == nil {
 		return base
 	}
-	if len(c.Headers) > 0 {
-		merged := make(map[string]string, len(base.Headers)+len(c.Headers))
-		for k, v := range base.Headers {
-			merged[k] = v
-		}
-		for k, v := range c.Headers {
-			merged[k] = v
-		}
-		base.Headers = merged
-	}
+	base.Headers = MergeHeaders(base.Headers, c.Headers)
 	if c.ClientCertFile != "" {
 		base.ClientCertFile = c.ClientCertFile
 		base.ClientKeyFile = c.ClientKeyFile
 	}
 	return base
+}
+
+// MergeHeaders overlays over onto base, per key, into a FRESH map — the base is
+// shared by every destination derived from it and must not be written through.
+// With nothing to overlay the base is returned as is (nil stays nil). One
+// function for the three places a header layer is applied: the section's base
+// additions (ApplyBase), a per-signal override (merged) and a routing route's
+// own headers (cmd/kubescrape-agent's routeExportConfig), which each spelled
+// the same seven lines.
+func MergeHeaders(base, over map[string]string) map[string]string {
+	if len(over) == 0 {
+		return base
+	}
+	merged := make(map[string]string, len(base)+len(over))
+	for k, v := range base {
+		merged[k] = v
+	}
+	for k, v := range over {
+		merged[k] = v
+	}
+	return merged
+}
+
+// signalOverride pairs a per-signal override with the name the section spells
+// it by, so a walk over the three is in a FIXED order.
+type signalOverride struct {
+	name     string
+	override *ExportOverride
+}
+
+// overrides lists the section's per-signal overrides in signal order (logs,
+// metrics, traces), nil entries included: every walk over "the three signals"
+// goes through this so none of them can iterate a map.
+func (c *ExportConfig) overrides() []signalOverride {
+	return []signalOverride{{"logs", c.Logs}, {"metrics", c.Metrics}, {"traces", c.Traces}}
 }
 
 // BuildExporter builds the export stack's bottom layer from the flag-derived

@@ -468,7 +468,7 @@ func run() error {
 	flag.Parse()
 
 	if *nodeName == "" {
-		return fmt.Errorf("node name is required (set -node-name or $NODE_NAME)")
+		return errors.New("node name is required (set -node-name or $NODE_NAME)")
 	}
 	ingestMode := otlpingest.MetricsMode(*ingestMetrics)
 	switch ingestMode {
@@ -482,7 +482,7 @@ func run() error {
 		return fmt.Errorf("invalid -logs-unknown-files %q (want auto, end or start)", *logsUnknownFiles)
 	}
 	if *ingestOn && *ingestGRPC == "" && *ingestHTTP == "" {
-		return fmt.Errorf("-ingest is set but both -ingest-grpc-endpoint and -ingest-http-endpoint are empty")
+		return errors.New("-ingest is set but both -ingest-grpc-endpoint and -ingest-http-endpoint are empty")
 	}
 	// From the tagged file pair: a build without the `events` tag does not link
 	// the package that defines what -events-start means (see buildtags.go).
@@ -1769,8 +1769,6 @@ func startNodeInfo(ctx context.Context, meta *metaclient.Client, nodeName string
 	})
 }
 
-// buildAttrs assembles the per-pipeline resource-attribute builders from the
-// config file and the flags; flag statics override config statics.
 // shutdownDrain bounds the wait for the producers to stop. It plus the
 // tailer's own budget and the final exports has to fit inside the pod's
 // terminationGracePeriodSeconds, which the manifests set explicitly.

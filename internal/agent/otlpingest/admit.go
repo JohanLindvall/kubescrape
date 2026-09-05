@@ -194,28 +194,11 @@ func decodedMetricsSize(md pmetric.Metrics) int64 {
 			// only after they are resident).
 			n += int64(ms.Len()) * decodedItemBytes
 			for k := 0; k < ms.Len(); k++ {
-				n += int64(metricPoints(ms.At(k))) * decodedItemBytes
+				n += int64(metricPointCount(ms.At(k))) * decodedItemBytes
 			}
 		}
 	}
 	return n
-}
-
-// metricPoints counts one metric's data points without touching them.
-func metricPoints(m pmetric.Metric) int {
-	switch m.Type() {
-	case pmetric.MetricTypeGauge:
-		return m.Gauge().DataPoints().Len()
-	case pmetric.MetricTypeSum:
-		return m.Sum().DataPoints().Len()
-	case pmetric.MetricTypeHistogram:
-		return m.Histogram().DataPoints().Len()
-	case pmetric.MetricTypeExponentialHistogram:
-		return m.ExponentialHistogram().DataPoints().Len()
-	case pmetric.MetricTypeSummary:
-		return m.Summary().DataPoints().Len()
-	}
-	return 0
 }
 
 func decodedTracesSize(td ptrace.Traces) int64 {
@@ -361,15 +344,15 @@ const maxPresizeBytes = 64 << 10
 // because the loop needs a final short read to see EOF, and an exactly-sized
 // buffer would double for it.
 //
-// max is the reader's own cap (16 MiB for application pushes, 4 MiB on the
+// limit is the reader's own cap (16 MiB for application pushes, 4 MiB on the
 // trace tier's internal hop) rather than a constant: the two receivers offer
 // different limits deliberately.
-func readAllCapped(r io.Reader, hint, max int64) ([]byte, error) {
-	if hint > max {
+func readAllCapped(r io.Reader, hint, limit int64) ([]byte, error) {
+	if hint > limit {
 		// An over-cap declaration is rejected once the read confirms it, but
 		// the read still happens: never size past what the LimitReader will
 		// hand over.
-		hint = max
+		hint = limit
 	}
 	start := hint
 	if start > maxPresizeBytes {

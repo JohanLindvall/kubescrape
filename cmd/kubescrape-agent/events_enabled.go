@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"k8s.io/client-go/kubernetes"
@@ -48,7 +49,7 @@ func (p *pipelines) startEvents(ctx context.Context) error {
 		ns = leader.Namespace()
 	}
 	if ns == "" {
-		return fmt.Errorf("events: no namespace for the lease and position ConfigMap; set -events-lease-namespace or $POD_NAMESPACE (downward API)")
+		return errors.New("events: no namespace for the lease and position ConfigMap; set -events-lease-namespace or $POD_NAMESPACE (downward API)")
 	}
 	reader := events.New(events.Config{
 		Client:          client,

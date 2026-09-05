@@ -20,6 +20,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -58,7 +59,7 @@ func (f fleetFixture) build(t testing.TB) *Server {
 					Name: fmt.Sprintf("web-%d", n), Namespace: ns,
 					UID: types.UID(fmt.Sprintf("pod-uid-%d", n)), ResourceVersion: "1",
 					Labels: map[string]string{
-						"app": "web", "pod-template-hash": fmt.Sprintf("%d", n%8),
+						"app": "web", "pod-template-hash": strconv.Itoa(n % 8),
 						"app.kubernetes.io/instance": fmt.Sprintf("rel-%d", n%16),
 					},
 					Annotations: map[string]string{

@@ -49,6 +49,7 @@ type MatchContext struct {
 	trueHashes, falseHashes []uint64
 }
 
+// Reset forgets the memoized results: once per line, before the selectors run.
 func (c *MatchContext) Reset() {
 	c.trueHashes = c.trueHashes[:0]
 	c.falseHashes = c.falseHashes[:0]
@@ -67,6 +68,7 @@ func (c *MatchContext) Cached(hash uint64) (result, known bool) {
 	return false, false
 }
 
+// Store records a selector's result under its hash for the rest of the line.
 func (c *MatchContext) Store(hash uint64, result bool) {
 	if result {
 		c.trueHashes = append(c.trueHashes, hash)

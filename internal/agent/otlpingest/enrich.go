@@ -293,10 +293,6 @@ func (e *Enricher) warnLookupBudget(exhausted string, bound int) {
 		"exhausted", exhausted, "budget", bound)
 }
 
-// warnWaitBudget is the wait variant: the third allowance degrades the least —
-// past it lookups still run and still resolve already-posted ids, they just no
-// longer park in the metadata service's waiter map for ids that may never
-// appear.
 // noteSplitCapped reports the point-split degradation: past either bound the
 // remaining objects' points fold onto the sender's own resource UNENRICHED, so
 // their series keep flowing and quietly describe the wrong object — the
@@ -349,6 +345,10 @@ func (e *Enricher) noteLookupFailed(err error) {
 		"error", err)
 }
 
+// warnWaitBudget is the wait variant: the third allowance degrades the least —
+// past it lookups still run and still resolve already-posted ids, they just no
+// longer park in the metadata service's waiter map for ids that may never
+// appear.
 func (e *Enricher) warnWaitBudget() {
 	if !e.waitWarnGate.Allow(lookupBudgetWarnEvery) {
 		return

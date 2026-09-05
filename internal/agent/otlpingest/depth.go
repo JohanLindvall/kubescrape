@@ -138,8 +138,8 @@ func checkNesting(b []byte) error {
 // length), so a leaf string shorter than 2x(max-depth) cannot possibly carry
 // them. That prune is what keeps ordinary log bodies from being re-scanned.
 //
-// Its own recursion is bounded by max for the same reason the bound exists.
-func nestingOver(b []byte, depth, max int) bool {
+// Its own recursion is bounded by limit for the same reason the bound exists.
+func nestingOver(b []byte, depth, limit int) bool {
 	for len(b) > 0 {
 		key, n := consumeVarint(b)
 		if n == 0 {
@@ -210,13 +210,13 @@ func nestingOver(b []byte, depth, max int) bool {
 			}
 			sub := b[:ln]
 			b = b[ln:]
-			if depth+1 > max {
+			if depth+1 > limit {
 				return true
 			}
-			if len(sub) < 2*(max-depth) {
+			if len(sub) < 2*(limit-depth) {
 				continue // too short to hold the levels that would break the bound
 			}
-			if nestingOver(sub, depth+1, max) {
+			if nestingOver(sub, depth+1, limit) {
 				return true
 			}
 		default: // 6, 7: reserved

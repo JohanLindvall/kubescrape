@@ -144,7 +144,7 @@ func TestSplitBatcherMemosAreBoundedByBytes(t *testing.T) {
 		Targets: staticTargets{}, Exporter: &captureExporter{}, StartTime: time.Now(),
 		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
 	})
-	b := newSplitBatcher(s, context.Background(), target, sp[0], time.Now())
+	b := newSplitBatcher(context.Background(), s, target, sp[0], time.Now())
 
 	labels := []Label{{Name: "namespace", Value: "ns1"}, {Name: "pod", Value: "pod1"}}
 	_, rule, _ := b.route("kube_pod_info", labels)

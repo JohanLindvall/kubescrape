@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/bits"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -72,13 +73,7 @@ type MetricsConfig struct {
 // MetricsConfig.Pipelines). An empty map compiles to nil: keep everything.
 func NewMetricFilters(pipelines map[string][]FilterRule) (*MetricFilters, error) {
 	for name := range pipelines {
-		ok := false
-		for _, want := range filterPipelineNames {
-			if name == want {
-				ok = true
-			}
-		}
-		if !ok {
+		if !slices.Contains(filterPipelineNames, name) {
 			// Derived from the list rather than spelled out beside it: the two had
 			// to be edited together, which is exactly the pairing a new pipeline
 			// forgets.
@@ -86,7 +81,7 @@ func NewMetricFilters(pipelines map[string][]FilterRule) (*MetricFilters, error)
 		}
 	}
 	compile := func(pipeline string) (*MetricFilter, error) {
-		rules := append(append([]FilterRule(nil), pipelines["all"]...), pipelines[pipeline]...)
+		rules := slices.Concat(pipelines["all"], pipelines[pipeline])
 		return newMetricFilter(rules)
 	}
 	var out MetricFilters

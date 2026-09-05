@@ -22,7 +22,7 @@ func sanitizer(maxEntry int) *Reader {
 	return New(Config{MaxEntryBytes: maxEntry})
 }
 
-// A truncated body must be CLONED, not resliced. logchain.TruncateRunes ends
+// A truncated body must be CLONED, not resliced. clip.Runes ends
 // in s[:n], which pins the whole original message for the life of the batch
 // while batchBytes counts only the truncated length — so MaxBatchBytes, the
 // "soft bound that keeps a batch from growing large in memory", bounded
@@ -144,6 +144,7 @@ func TestSanitizeRepairsAndCaps(t *testing.T) {
 // rebuild pass) and the over-cap path (validate the cut, not the message).
 func BenchmarkSanitize(b *testing.B) {
 	run := func(b *testing.B, maxEntry int, msg string) {
+		b.Helper()
 		r := sanitizer(maxEntry)
 		b.ReportAllocs()
 		b.SetBytes(int64(len(msg)))

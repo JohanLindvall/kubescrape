@@ -73,7 +73,7 @@ func (s *DynamicMetricSet) Run(ctx context.Context, exp Exporter, interval time.
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		s.noteExport(s.Export(ctx, exp, maxBytes))
+		s.noteExport(s.export(ctx, exp, maxBytes))
 		select {
 		case <-ctx.Done():
 			return
@@ -94,7 +94,16 @@ func (s *DynamicMetricSet) Run(ctx context.Context, exp Exporter, interval time.
 // cost. Nothing here is the RATE: the samples that survived are retained (and
 // re-offered), and the ones that did not move
 // kubescrape_log_metrics_dropped_undelivered_total.
-func (s *DynamicMetricSet) noteExport(err error) {
+//
+// dropped is how many resources this cycle's flushes threw away because the
+// collector rejected their chunk PERMANENTLY, and the wording branches on it:
+// the retention claim is true of a transient failure and FALSE of a permanent
+// rejection, whose samples are already gone and already counted. Saying it
+// unconditionally put an Error ("dropping a permanently rejected
+// log-metrics chunk") and a Warn ("the undelivered samples are retained")
+// about the same cycle in one log, and an operator who read the Warn stopped
+// chasing the drop.
+func (s *DynamicMetricSet) noteExport(dropped int, err error) {
 	s.exportMu.Lock()
 	if err != nil {
 		s.exportFailures++
@@ -110,11 +119,17 @@ func (s *DynamicMetricSet) noteExport(err error) {
 			s.exportWarn.Allow(reWarnInterval)
 		}
 		if n == 1 || s.exportWarn.Allow(reWarnInterval) {
+			if dropped > 0 {
+				s.logger().Warn("exporting log metrics failed; part of the payload was rejected PERMANENTLY and those observations are LOST, "+
+					"and any remaining undelivered samples are retained and re-offered",
+					"error", err, "attempts", n, "since", since, "resources", dropped)
+				return
+			}
 			s.logger().Warn("exporting log metrics failed; the undelivered samples are retained and re-offered",
 				"error", err, "attempts", n, "since", since)
 			return
 		}
-		s.logger().Debug("exporting log metrics failed", "error", err, "attempts", n)
+		s.logger().Debug("exporting log metrics failed", "error", err, "attempts", n, "resources", dropped)
 		return
 	}
 	n, since := s.exportFailures, time.Duration(0)
@@ -169,8 +184,24 @@ type seriesSamples struct {
 // points). Output is chunked per resource to stay under maxBytes (0 = a single
 // payload). Rules sharing a series export it once.
 func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes int) error {
+	_, err := s.export(ctx, exp, maxBytes)
+	return err
+}
+
+// export is Export, additionally reporting how many resources were dropped
+// because the collector rejected their chunk PERMANENTLY.
+//
+// That second return exists for the log line and nothing else: a permanent
+// rejection is LOSS, and noteExport's transition Warn used to assert "the
+// undelivered samples are retained and re-offered" for every non-nil error —
+// so one cycle emitted an Error saying a chunk was dropped and a Warn saying
+// the samples were kept, and the Warn is the line the throttle guarantees an
+// operator sees first and repeatedly. It is a return value rather than a field
+// so a concurrent Export (main.go's shutdown flush runs one beside Run's) can
+// never have its outcome narrated by the other's cycle.
+func (s *DynamicMetricSet) export(ctx context.Context, exp Exporter, maxBytes int) (int, error) {
 	if s == nil {
-		return nil
+		return 0, nil
 	}
 	s.exportMu.Lock()
 	defer s.exportMu.Unlock()
@@ -196,6 +227,9 @@ func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes in
 	// chunk names the resources rendered into md since the last flush, so a
 	// failed send retains exactly those and not the ones that landed.
 	var chunk []string
+	// droppedPermanently accumulates what the permanent branch below threw
+	// away, for the caller's narration.
+	droppedPermanently := 0
 	flush := func() {
 		if md.ResourceMetrics().Len() == 0 {
 			return
@@ -211,7 +245,8 @@ func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes in
 				// the pile grew. Drop it counted, the way every other producer
 				// classifies (the tailer's advanceBatch, the buffer's drain).
 				s.drops.addRetained(uint64(len(chunk)))
-				s.log.Error("dropping a permanently rejected log-metrics chunk",
+				droppedPermanently += len(chunk)
+				s.logger().Error("dropping a permanently rejected log-metrics chunk",
 					"resources", len(chunk), "error", err)
 			} else {
 				s.retain(byResource, chunk)
@@ -245,7 +280,7 @@ func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes in
 		size += rmSize
 	}
 	flush()
-	return firstErr
+	return droppedPermanently, firstErr
 }
 
 // WithPermanentClassifier installs the export-error classifier (nil = every

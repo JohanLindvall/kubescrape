@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -21,10 +22,12 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 )
 
-// ExportOverride is one signal's destination overrides; every empty/nil field
-// inherits the base (flag-built) config. Headers MERGE over the base's (the
-// override winning per key) — replacing wholesale would silently drop a
-// base tenancy header the moment a signal override added an unrelated one.
+// ExportOverride is one signal's destination overrides. An empty/nil field
+// inherits, but WHAT it inherits depends on whether the override names its own
+// endpoint — see signalConfig, which owns that rule. Headers MERGE over what
+// is inherited (the override winning per key) — replacing wholesale would
+// silently drop a base tenancy header the moment a signal override added an
+// unrelated one.
 type ExportOverride struct {
 	Endpoint           string            `json:"endpoint,omitempty"`
 	Protocol           string            `json:"protocol,omitempty"`
@@ -99,16 +102,66 @@ func (c *ExportConfig) Validate() error {
 	return nil
 }
 
-// merged overlays o onto base and returns the per-signal client config.
-func (o *ExportOverride) merged(base Config) Config {
-	out := base
-	if o.Endpoint != "" {
+// signalConfig derives ONE signal's client config from the FLAG base plus this
+// section: the section's own base additions (headers, client certificate)
+// apply first, then the override's fields.
+//
+// A signal naming its OWN endpoint does NOT inherit the FLAG base's
+// destination credentials. transport.go states the rule this implements: the
+// bearer token, the CA bundle and the skip-verify decision that reach this
+// process through -otlp-bearer-token-file / -otlp-tls-ca-file /
+// -otlp-tls-insecure-skip-verify describe the deployment's OWN collector, and
+// the whole point of the `export` section is naming a DIFFERENT host —
+// typically a third-party SaaS backend. Copying the base wholesale and
+// overwriting only what the override sets presented the collector's bearer
+// token and mTLS client certificate to that backend on every export, and
+// carried insecureSkipVerify=true over so the third party's certificate was
+// not verified either, with no per-signal field that could have opted out.
+// So the destination is rebuilt on Config.TransportOnly — the one spelling of
+// the transport-vs-destination partition, shared with routeExportConfig and
+// the reshard hop — and every credential is taken from the override or left
+// unset. cmd/kubescrape-agent's routeExportConfig takes the same decision for
+// the identical shape.
+//
+// Two deliberate carryovers, both argued rather than convenient:
+//
+//   - The SECTION's own base additions — `export.headers` and
+//     `export.clientCertFile`/`clientKeyFile` — still apply. They are not
+//     inherited from a field left empty: they are declared in the same
+//     `export:` block, at every-signal scope, by the author who named this
+//     endpoint, and the documented collectorless example relies on exactly
+//     that (one tenancy header and one mTLS identity towards three backends).
+//     Neither has a flag, so nothing collector-scoped can arrive this way; an
+//     override's own headers still merge over them and its own client
+//     certificate still replaces them.
+//   - Insecure (plaintext gRPC) is carried from the flag base unless the
+//     override sets it. Plaintext-ness is transport to the named host, not a
+//     credential, and a bool zero value here would flip every own-endpoint
+//     signal written against a plaintext in-cluster collector to TLS on
+//     upgrade — routeExportConfig's argument, verbatim.
+//
+// An override REPEATING the base endpoint names the same destination, so
+// nothing crosses a boundary there and the base applies unchanged.
+func (c *ExportConfig) signalConfig(o *ExportOverride, flagBase Config) Config {
+	out := c.ApplyBase(flagBase)
+	if o == nil {
+		return out
+	}
+	if o.Endpoint != "" && o.Endpoint != flagBase.Endpoint {
+		// Rebuild: transport tuning, plus the section's own additions applied
+		// onto nothing, plus the plaintext decision. Everything else — the
+		// endpoint, the token, the CA, the trust decision — comes from the
+		// override below or stays unset.
+		out = c.ApplyBase(flagBase.TransportOnly())
+		out.Insecure = flagBase.Insecure
+		out.Endpoint = o.Endpoint
+	} else if o.Endpoint != "" {
 		out.Endpoint = o.Endpoint
 	}
 	if o.Protocol != "" {
 		out.Protocol = o.Protocol
 	}
-	out.Headers = MergeHeaders(base.Headers, o.Headers)
+	out.Headers = MergeHeaders(out.Headers, o.Headers)
 	if o.BearerTokenFile != "" {
 		out.BearerTokenFile = o.BearerTokenFile
 	}
@@ -129,6 +182,28 @@ func (o *ExportOverride) merged(base Config) Config {
 		out.ClientKeyFile = o.ClientKeyFile
 	}
 	return out
+}
+
+// droppedBaseCredentials names the FLAGS whose values signalConfig refuses to
+// carry to o's own endpoint, in a fixed order. Empty when the override
+// inherits (no endpoint of its own, or the base's), when the flag carries
+// nothing, or when the override supplies its own — so the caller's warning
+// fires only where behaviour actually differs from a naive merge.
+func droppedBaseCredentials(o *ExportOverride, flagBase Config) []string {
+	if o == nil || o.Endpoint == "" || o.Endpoint == flagBase.Endpoint {
+		return nil
+	}
+	var dropped []string
+	if flagBase.BearerTokenFile != "" && o.BearerTokenFile == "" {
+		dropped = append(dropped, "-otlp-bearer-token-file")
+	}
+	if flagBase.CAFile != "" && o.CAFile == "" {
+		dropped = append(dropped, "-otlp-tls-ca-file")
+	}
+	if flagBase.InsecureSkipVerify && o.InsecureSkipVerify == nil {
+		dropped = append(dropped, "-otlp-tls-insecure-skip-verify")
+	}
+	return dropped
 }
 
 // PerSignal routes each signal to its own Client; a nil per-signal client
@@ -160,15 +235,24 @@ func (c *ExportConfig) ValidateAgainst(base Config) error {
 	}
 	merged := c.ApplyBase(base)
 	if c != nil {
-		for _, s := range []struct {
-			name string
-			o    *ExportOverride
-		}{{"logs", c.Logs}, {"metrics", c.Metrics}, {"traces", c.Traces}} {
-			if s.o == nil {
+		for _, sig := range c.overrides() {
+			if sig.override == nil {
 				continue
 			}
-			if err := s.o.merged(merged).Validate(); err != nil {
-				return fmt.Errorf("export.%s: %w", s.name, err)
+			if err := c.signalConfig(sig.override, base).Validate(); err != nil {
+				return fmt.Errorf("export.%s: %w", sig.name, err)
+			}
+			// Said out loud on the one seam BOTH -check-config and every real
+			// start cross (validateConfig calls this): an own-endpoint signal
+			// silently losing the flag base's collector credentials would
+			// otherwise surface only as a transient export failure against a
+			// backend the operator believes is authenticated. Warn, not refuse
+			// — dropping the credential IS the correct destination, and the
+			// override has a field for every one of them.
+			if dropped := droppedBaseCredentials(sig.override, base); len(dropped) > 0 {
+				slog.Default().Warn("this export destination names its own endpoint, so the flag base's collector credentials are NOT presented to it",
+					"signal", sig.name, "endpoint", sig.override.Endpoint, "flag", strings.Join(dropped, ","),
+					"note", "they authenticate this deployment to ITS collector and this is a different host; set bearerTokenFile / caFile / insecureSkipVerify on the export."+sig.name+" override itself if this destination needs them")
 			}
 		}
 	}
@@ -204,7 +288,7 @@ func (c *ExportConfig) ApplyBase(base Config) Config {
 // shared by every destination derived from it and must not be written through.
 // With nothing to overlay the base is returned as is (nil stays nil). One
 // function for the three places a header layer is applied: the section's base
-// additions (ApplyBase), a per-signal override (merged) and a routing route's
+// additions (ApplyBase), a per-signal override (signalConfig) and a routing route's
 // own headers (cmd/kubescrape-agent's routeExportConfig), which each spelled
 // the same seven lines.
 func MergeHeaders(base, over map[string]string) map[string]string {
@@ -242,14 +326,16 @@ func BuildExporter(base Config, cfg *ExportConfig) (*PerSignal, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	base = cfg.ApplyBase(base)
 	ps := &PerSignal{}
 	var err error
+	// base stays the FLAG base: signalConfig needs to tell the section's own
+	// additions from the flag credentials, which an up-front ApplyBase would
+	// have already fused.
 	build := func(name string, o *ExportOverride) (*Client, error) {
 		if o == nil {
 			return nil, nil
 		}
-		c, err := New(o.merged(base))
+		c, err := New(cfg.signalConfig(o, base))
 		if err != nil {
 			return nil, fmt.Errorf("export.%s: %w", name, err)
 		}
@@ -276,7 +362,7 @@ func BuildExporter(base Config, cfg *ExportConfig) (*PerSignal, error) {
 	// and the base may legitimately be plaintext while every real destination
 	// is TLS.
 	if ps.Logs == nil || ps.Metrics == nil || ps.Traces == nil {
-		if ps.Default, err = New(base); err != nil {
+		if ps.Default, err = New(cfg.ApplyBase(base)); err != nil {
 			ps.closeBuilt()
 			return nil, err
 		}

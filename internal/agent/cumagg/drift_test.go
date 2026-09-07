@@ -101,7 +101,7 @@ func (c *captureExporter) ExportMetrics(_ context.Context, md pmetric.Metrics) e
 // is: the property is that the two agree, and each package can only see its own
 // half of a shared render path.
 func TestBothTraceTierFamiliesCarryAScopeVersion(t *testing.T) {
-	sg := servicegraph.NewRegistry(servicegraph.Config{})
+	sg := servicegraph.NewRegistry(servicegraph.Config{}, nil)
 	sg.Record(servicegraph.Edge{
 		ClientService: "frontend", ServerService: "checkout",
 		ClientSeconds: 0.15, ServerSeconds: 0.05,

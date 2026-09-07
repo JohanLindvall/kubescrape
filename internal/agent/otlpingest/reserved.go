@@ -195,23 +195,54 @@ func (e *Enricher) SenderIdentityStrip() []string {
 // information is one line naming the key.
 const reservedWarnEvery = time.Minute
 
-// stripReserved removes each reserved PLUMBING key present in m, counting and
-// (per key, throttled) warning every removal. keys is the operator-wired list,
-// so a clean map costs one probe per configured key and allocates nothing — the
-// element walk runs per record/point/span and must stay free.
+// removeAll deletes EVERY entry keyed k from m and returns how many it removed.
+//
+// It exists because pcommon.Map.Remove is SINGLE-SHOT: it returns at the first
+// match. An OTLP attribute list is a repeated field, not a map — nothing on the
+// wire forbids the same key twice, and pdata's decoder keeps both copies — so a
+// single Remove leaves a survivor, and every consumer downstream reads through
+// Get, which is FIRST-wins. That is the whole strip defeated by sending the
+// attribute twice: a surviving k8s.namespace.name picks another tenant's
+// endpoint and X-Scope-OrgID in route.match, a surviving script marker selects
+// any configured route outright, and a surviving drop marker masquerades as an
+// operator-intended transform drop. The counter and the warn still fired once,
+// so the strip looked successful.
+//
+// The loop is allocation-free and, on the overwhelmingly common clean map, is
+// exactly the one probe the single-shot form cost: the element walk runs per
+// record/point/span and must stay free. Remove swaps the last entry into the
+// hole, so repeated calls converge.
+func removeAll(m pcommon.Map, k string) int {
+	n := 0
+	for m.Remove(k) {
+		n++
+	}
+	return n
+}
+
+// stripReserved removes each reserved PLUMBING key present in m — EVERY
+// occurrence of it (removeAll) — counting each one and (per key, throttled)
+// warning. keys is the operator-wired list, so a clean map costs one probe per
+// configured key and allocates nothing.
+//
+// The count is per OCCURRENCE, which is what
+// kubescrape_ingest_reserved_stripped_total's help already promised: a sender
+// that repeats a key is doing the one thing this strip exists to stop, and a
+// count of one for it would understate exactly the case worth finding.
 //
 // Warn is the right level here and only here: these keys are kubescrape's own
 // markers, which no SDK and no conformant sender has any reason to emit, so a
 // single occurrence is a fact an operator wants told.
 func (s *Server) stripReserved(m pcommon.Map, keys []string) {
 	for _, k := range keys {
-		if !m.Remove(k) {
+		n := removeAll(m, k)
+		if n == 0 {
 			continue
 		}
-		obs.IngestReservedStripped.WithLabelValues(k).Inc()
+		obs.IngestReservedStripped.WithLabelValues(k).Add(float64(n))
 		if allow, _ := s.reservedWarns.Allow(k); allow {
 			s.log.Warn("ingest: a sender shipped an attribute reserved for kubescrape's own plumbing; stripped at receipt so wire data cannot steer routing or masquerade as an operator-intended drop",
-				"key", k)
+				"key", k, "occurrences", n)
 		}
 	}
 }
@@ -238,10 +269,14 @@ func (s *Server) stripReserved(m pcommon.Map, keys []string) {
 // and it must not depend on the log level.
 func (s *Server) stripIdentity(m pcommon.Map, keys []string) {
 	for _, k := range keys {
-		if !m.Remove(k) {
+		// EVERY occurrence, for the reason spelled out at removeAll: a single
+		// surviving k8s.namespace.name is the tenancy crossing this strip
+		// exists to close, and route.match reads it first-wins.
+		n := removeAll(m, k)
+		if n == 0 {
 			continue
 		}
-		obs.IngestIdentityStripped.WithLabelValues(k).Inc()
+		obs.IngestIdentityStripped.WithLabelValues(k).Add(float64(n))
 		if !s.log.Enabled(context.Background(), slog.LevelDebug) {
 			continue
 		}
@@ -278,8 +313,11 @@ func (s *Server) sanitizeLogs(ld plog.Logs) {
 }
 
 // sanitizeTraces strips the reserved plumbing keys and the sender's identity
-// claim from a pushed traces payload. It runs AFTER the RejectTraces guard — a refused payload needs no
-// sanitizing — and before enrichment, like its siblings.
+// claim from a pushed traces payload. It runs AFTER the RejectTraces guard — a
+// refused payload needs no sanitizing, and the guard refuses on a marker this
+// would otherwise have removed — and, like its siblings, BEFORE admission and
+// enrichment: the ingest: hook must not decide on a claim the receiver is about
+// to delete (ServerConfig.Admit).
 func (s *Server) sanitizeTraces(td ptrace.Traces) {
 	ra := s.cfg.ReservedAttrs
 	if ra.empty() {

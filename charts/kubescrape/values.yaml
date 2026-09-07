@@ -1,7 +1,19 @@
 image:
   repository: ghcr.io/johanlindvall/kubescrape
-  tag: ""            # defaults to .Chart.AppVersion
-  pullPolicy: IfNotPresent
+  # PIN THIS. It defaults to .Chart.AppVersion, which is `latest` — a FLOATING
+  # tag, and a floating tag makes an upgrade unobservable: re-pushing `:latest`
+  # renders byte-identical workload specs (the image string does not change, and
+  # the only rollout-forcing annotation hashes the CONFIG), so `helm upgrade`
+  # rolls nothing, and the `version=` field on the startup log line is the only
+  # place the running build is stated at all. A released version, or a
+  # `@sha256:...` digest, is what makes the deployed binary a fact.
+  tag: ""
+  # Empty follows Kubernetes' own rule rather than overriding it: `Always` while
+  # the resolved tag is `latest`, `IfNotPresent` once it is pinned. With a
+  # floating tag IfNotPresent is the trap — every node that already cached
+  # `latest` keeps running the old binary through a rollout restart. Pin `tag`
+  # and this costs nothing.
+  pullPolicy: ""
 
 # (Go runtime and process metrics are always served on the -metrics-listen port
 # below — see `metrics.enabled`. The former `runtimeMetrics` value configured a
@@ -136,6 +148,19 @@ service:
   # into a Secret named <release>-scrape-auth, re-reading the live Secret on
   # upgrade so the token survives `helm upgrade`.
   #
+  # THAT READ-BACK NEEDS A LIVE CLUSTER. Helm's `lookup` returns nothing
+  # without an API connection — every `helm template` and every `--dry-run`,
+  # which is how template-rendering GitOps (Argo CD, Flux rendering with
+  # `helm template`) produces its manifests — so on that path the generator
+  # mints a DIFFERENT token on every render: permanently OutOfSync, rewritten
+  # each sync, and once the sync cadence outruns the kubelet's Secret
+  # projection refresh the agents are presenting a token two rotations old
+  # (401 on /v1/scrape-auth, up=0 on every secret-backed monitor, chart looking
+  # correct). Under that kind of GitOps set `value` (from a sealed/external
+  # Secret) or `existingSecret`; `autoGenerate: false` turns the silent
+  # rotation into a render failure naming both, which is the setting to pick
+  # when nobody will remember this paragraph.
+  #
   # Rotation needs NO restart, of the service or of the agents: updating the
   # Secret is sufficient. The service re-reads the file about once a minute and
   # keeps accepting the PREVIOUS token for a 5-minute grace window, and the
@@ -145,6 +170,10 @@ service:
     existingSecret: ""   # use a Secret you manage instead of the generated one
     key: token           # key within the Secret (mounted at /etc/kubescrape/scrape-auth/<key>)
     value: ""            # literal token to put in the generated Secret
+    # false = refuse to render rather than generate a token that would differ
+    # on the next render (see the paragraph above); requires value or
+    # existingSecret.
+    autoGenerate: true
   # Extra ClusterRole rules appended verbatim.
   extraRules: []
   # Less-common service flags go here (scrapeAuthSecrets above already passes
@@ -340,10 +369,23 @@ agent:
   # Read the systemd journal natively (libsystemd, via cgo). The default image
   # ships libsystemd.
   #
-  # Enabling this adds the /run/log/journal hostPath mount to the DaemonSet,
-  # because a node whose journal is VOLATILE (systemd Storage=volatile, or auto
-  # with no /var/log/journal) keeps it there and nowhere under the /var/log
-  # mount that carries the persistent one. dir "" reads BOTH, which is what you
+  # Enabling this adds TWO hostPath mounts to the DaemonSet, one for each
+  # journal layout — a node has one or the other and the chart cannot tell:
+  #
+  #   /run/log/journal  — a node whose journal is VOLATILE (systemd
+  #     Storage=volatile, or auto with no /var/log/journal) keeps it there and
+  #     nowhere under the /var/log mount that carries the persistent one.
+  #   /etc/machine-id   — the PERSISTENT journal (the Debian/Ubuntu/RHEL
+  #     default) is unreadable without it. libsystemd is opened with
+  #     SD_JOURNAL_LOCAL_ONLY, under which it reads /var/log/journal/<id> only
+  #     when <id> is the CONTAINER's own machine id, and this image ships no
+  #     /etc/machine-id — so /var/log alone gives a reader that starts, blocks
+  #     and exports zero records. /run/log/journal is exempt from that rule,
+  #     which is exactly why the volatile case works without it and the
+  #     persistent case silently does not. Promtail, Alloy and fluent-bit all
+  #     require the same mount.
+  #
+  # dir "" reads BOTH, which is what you
   # want; setting dir restricts the reader to that ONE directory, and a
   # directory holding no journal files makes the reader start cleanly, wait
   # forever and export nothing (it warns at startup — but /readyz stays 200 and
@@ -456,6 +498,34 @@ agent:
     enabled: false
     grpcEndpoint: ":4317"       # empty disables gRPC
     httpEndpoint: ":4318"       # empty disables HTTP (/v1/logs, /v1/metrics)
+    # HOW AN APPLICATION ADDRESSES THIS. With hostPort off, the listeners are
+    # reachable at the agent's pod IP and nothing else — the DaemonSet sets no
+    # hostNetwork and the chart renders no Service for it — so there is no
+    # stable address to put in OTEL_EXPORTER_OTLP_ENDPOINT.
+    #
+    # Do NOT reach for a ClusterIP Service over the DaemonSet: it round-robins
+    # a push to some other node's agent, which silently defeats
+    # `peerIpFallback` (the connection's source address no longer names a pod
+    # that agent's node hosts) and invalidates the node-local reasoning behind
+    # `-ingest-max-in-flight`. The trace tier is the opposite case and does
+    # ship a Service — traces MUST leave the node.
+    #
+    # true binds grpcEndpoint's and httpEndpoint's ports on the NODE, and an
+    # SDK then addresses its own node through the downward API:
+    #
+    #   env:
+    #     - name: NODE_IP
+    #       valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+    #     - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    #       value: "http://$(NODE_IP):4318"
+    #
+    # It is off by default because a hostPort claims that port on EVERY node —
+    # 4317/4318 are the OTLP defaults, so a collector DaemonSet or another
+    # agent already holding them makes these pods unschedulable — and because
+    # it widens the listeners' reach from the pod network to the node's own
+    # addresses, which `allowFrom` below does not cover (a NetworkPolicy does
+    # not filter traffic arriving on a hostPort). Set it deliberately.
+    hostPort: false
     metricsMode: auto           # resource | datapoint | auto
     # Attribute telemetry with no container id / pod uid to the pod owning the
     # connection's source address (opt-in; hostNetwork senders never resolve).

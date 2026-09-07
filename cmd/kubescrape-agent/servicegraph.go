@@ -39,6 +39,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -81,23 +82,13 @@ const gateServiceGraphIngest = "service-graph-ingest"
 // metric export loop. Off unless -service-graph.
 func (p *pipelines) startServiceGraph(ctx context.Context) error {
 	if !*serviceGraphOn {
-		// A configured section that silently does nothing is indistinguishable
-		// from one that is working, so each of them says so once.
-		if p.fileCfg.ServiceGraph != nil {
-			p.log.Warn("serviceGraph configured but ignored: this process is not the trace tier (-service-graph=false)")
-		}
-		if cfg := p.fileCfg.TraceSampling; cfg != nil && cfg.Enabled() {
-			p.log.Warn("traceSampling configured but ignored: traces are received by the trace tier (-service-graph), and this process is not it")
-		}
-		if p.fileCfg.ServiceGraphShards != nil {
-			p.log.Warn("serviceGraphShards configured but ignored: the shard ring is read only by the trace tier (-service-graph), and this process is not it")
-		}
-		if p.fileCfg.TailSampling.Enabled() { // nil-receiver safe
-			p.log.Warn("tailSampling configured but ignored: a trace can only be judged where all of its spans are, which is the trace tier (-service-graph), and this process is not it")
-		}
-		if *spanMetrics {
-			p.log.Warn("-ingest-span-metrics ignored: span metrics are derived from received traces, and traces are received by the trace tier (-service-graph), which this process is not")
-		}
+		// The "configured but ignored" warnings for the four tier-only sections
+		// and -ingest-span-metrics used to live here. They are configWarnings'
+		// now: a start reached them and -check-config did not, which is exactly
+		// the divergence configWarnings' doc comment promises cannot happen —
+		// and the dry run is where an operator asks whether a section of the
+		// ConfigMap shared by the DaemonSet, the singleton and the tier is
+		// being applied.
 		return nil
 	}
 	var cfg servicegraph.Config
@@ -126,12 +117,22 @@ func (p *pipelines) startServiceGraph(ctx context.Context) error {
 	go tok.Run(ctx)
 
 	proc := servicegraph.NewProcessor(cfg, p.log)
-	reg := servicegraph.NewRegistry(cfg)
+	reg := servicegraph.NewRegistry(cfg, p.log)
 	// Before the first Consume, as the package requires: the sink is read on
 	// the pairing path under the store's mutex.
 	proc.SetSink(reg)
+	// ONE snapshot per export, not four. RegisterServiceGraphStats turns this
+	// into four independent gauge registrations, and the metrics Registry
+	// evaluates them back to back in one loop — so an unmemoised closure took
+	// the PAIRING mutex four times per export (edgeStore.stats() locks it) and
+	// published four separately-sampled readings of a struct whose whole point
+	// is that it is one instant: a completed count from before a pairing beside
+	// a virtual-node count from after it. The window is far shorter than any
+	// export or scrape interval and far longer than the microseconds between
+	// the four evaluations of one of them.
+	sgStats := &sgStatsMemo{stats: proc.Stats}
 	obs.RegisterServiceGraphStats(func() obs.ServiceGraphStat {
-		st := proc.Stats()
+		st := sgStats.get()
 		return obs.ServiceGraphStat{
 			Pending:     st.Items,
 			Completed:   st.Completed,
@@ -1020,10 +1021,39 @@ func shardRingReachesThisShard(cfg servicegraph.ReshardConfig) error {
 	return nil
 }
 
-// tierListener is one address the trace tier binds, with the flag that named it.
-type tierListener struct {
+// sgStatsMemoWindow is how long one pairing-store snapshot serves. It only has
+// to span ONE export or scrape — the four gauges are evaluated microseconds
+// apart inside a single loop — and it must stay far below the shortest
+// plausible interval, so two consecutive exports never share a reading.
+const sgStatsMemoWindow = 100 * time.Millisecond
+
+// sgStatsMemo serves one servicegraph.Stats snapshot to the four gauges that
+// make up a single self-metrics export or /metrics scrape.
+type sgStatsMemo struct {
+	stats func() servicegraph.Stats
+
+	mu   sync.Mutex
+	at   time.Time
+	last servicegraph.Stats
+}
+
+func (m *sgStatsMemo) get() servicegraph.Stats {
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.at.IsZero() || now.Sub(m.at) >= sgStatsMemoWindow {
+		m.last, m.at = m.stats(), now
+	}
+	return m.last
+}
+
+// listenAddr is one address this process will bind, with the flag that named it.
+type listenAddr struct {
 	flag string
 	addr string
+	// note is appended to a collision message this listener is part of, where
+	// losing the bind race is not the only thing wrong with the pair.
+	note string
 }
 
 // tierListeners are the addresses this process will bind for the trace tier, in
@@ -1031,37 +1061,76 @@ type tierListener struct {
 // they are actually served (-service-graph-ingest): a dry run that refused a
 // collision with a listener the start never binds would be stricter than the
 // start, which CrashLoops just as hard as being laxer.
-func tierListeners() []tierListener {
-	out := []tierListener{
-		{"-service-graph-listen", *serviceGraphListen},
-		{"-service-graph-http-listen", *serviceGraphHTTPListen},
+func tierListeners() []listenAddr {
+	// The internal hop carries the note because a collision involving it is the
+	// one that means more than a lost race: an internal hop addressed to an
+	// application port would also re-enrich and re-shard on every pass.
+	const internalNote = " The internal hop and the application ports must be different ports — an internal hop addressed to an application port would also re-enrich and re-shard on every pass."
+	out := []listenAddr{
+		{flag: "-service-graph-listen", addr: *serviceGraphListen, note: internalNote},
+		{flag: "-service-graph-http-listen", addr: *serviceGraphHTTPListen, note: internalNote},
 	}
 	if *serviceGraphIngest {
 		out = append(out,
-			tierListener{"-service-graph-ingest-grpc", *serviceGraphIngestGRPC},
-			tierListener{"-service-graph-ingest-http", *serviceGraphIngestHTTP})
+			listenAddr{flag: "-service-graph-ingest-grpc", addr: *serviceGraphIngestGRPC},
+			listenAddr{flag: "-service-graph-ingest-http", addr: *serviceGraphIngestHTTP})
 	}
 	return out
 }
 
-// serviceGraphListenersDistinct refuses two of the tier's listeners configured
-// on one address.
+// processListeners are ALL the addresses this process will bind, given the flags
+// as they stand — the health/debug port, the two observability ports, the ingest
+// pair when -ingest is on, and the tier's up to four when -service-graph is.
 //
-// The tier binds up to four, from four independent flags — and the chart renders
-// three of them from values, so `serviceGraph.port: 4317` (warned against in
-// values.yaml prose, enforced nowhere) puts the INTERNAL receiver on the
-// application gRPC port. The two servers start concurrently, so whichever binds
+// Every listener, not just the tier's, because the collision this refuses is not
+// a tier property: -ingest and -service-graph-ingest default to the SAME
+// :4317/:4318 (one is the node agent's logs-and-metrics receiver, the other the
+// tier's trace receiver), and -pprof-listen typed onto -metrics-listen's :9090
+// is the same mistake with no feature flag involved at all. Nothing composes
+// them today in a shipped manifest, which is exactly why an operator who does
+// deserves the dry run rather than a restart loop.
+func processListeners() []listenAddr {
+	out := []listenAddr{
+		{flag: "-listen", addr: *listen},
+		{flag: "-metrics-listen", addr: *metricsListen},
+		{flag: "-pprof-listen", addr: *pprofListen},
+	}
+	if *ingestOn {
+		out = append(out,
+			listenAddr{flag: "-ingest-grpc-endpoint", addr: *ingestGRPC},
+			listenAddr{flag: "-ingest-http-endpoint", addr: *ingestHTTP})
+	}
+	if *serviceGraphOn {
+		out = append(out, tierListeners()...)
+	}
+	return out
+}
+
+// listenersDistinct refuses two of this process's listeners configured on one
+// address.
+//
+// The tier alone binds up to four, from four independent flags — and the chart
+// renders three of them from values, so `serviceGraph.port: 4317` (warned
+// against in values.yaml prose, enforced nowhere) puts the INTERNAL receiver on
+// the application gRPC port. The servers start concurrently, so whichever binds
 // second dies with `address already in use` and takes the process with it; which
 // one that is varies between restarts. Loud, but only at the real start —
-// refused here, beside the ring cross-check, because this is the other place
-// that knows more than one listener exists.
-func serviceGraphListenersDistinct() error {
-	ls := tierListeners()
+// refused here, beside the ring cross-check, because this is the place that
+// knows more than one listener exists.
+func listenersDistinct() error {
+	ls := processListeners()
 	for i := range ls {
 		for _, other := range ls[i+1:] {
 			if sameListenAddr(ls[i].addr, other.addr) {
-				return fmt.Errorf("%s and %s are both %q: the tier binds them concurrently, so whichever loses the race fails with `address already in use` and takes the process down. The internal hop and the application ports must be different ports — an internal hop addressed to an application port would also re-enrich and re-shard on every pass",
-					ls[i].flag, other.flag, ls[i].addr)
+				// One copy of a note the two sides share (both internal tier
+				// listeners collide with each other as readily as with an
+				// application port).
+				note := ls[i].note
+				if other.note != note {
+					note += other.note
+				}
+				return fmt.Errorf("%s and %s are both %q: this process binds them concurrently, so whichever loses the race fails with `address already in use` and takes the process down, and which one that is varies between restarts.%s",
+					ls[i].flag, other.flag, ls[i].addr, note)
 			}
 		}
 	}

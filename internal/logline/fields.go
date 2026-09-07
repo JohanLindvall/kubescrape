@@ -106,15 +106,26 @@ type KeyIndex struct {
 	want  map[string]int
 }
 
-// Add registers one referenced field key (idempotent; the empty key and the
-// synthetic LineKey are skipped — LineKey is never a line FIELD). The literal
-// "1" is NOT special here: it is a value-DSL constant (metricRule.readValue
-// short-circuits it before consulting values), and skipping it in the shared
-// index silently deadened a selector or label legitimately reading a field
-// named "1" — the classification belongs at the value call site
-// (buildKeyIndex), not in the index every key kind shares.
+// Add registers one referenced field key (idempotent; the empty key and BOTH
+// synthetic keys are skipped — neither is ever a line FIELD). LineKey is the
+// raw line, resolved by ResolveKey before any lookup; SeverityKey is the
+// record's ENRICHED severity, resolved only through the caller's attribute
+// lookup (logchain.Resolver.RuleFn). Registering SeverityKey made it a
+// JSON/logfmt PATH as well, and ResolveKey is value-based, so a record with no
+// severity — the plain-source and ingest case, where logchain.RecordSeverity
+// returns "" — fell through to the line and let a tenant writing
+// `{"__severity__":"error"}` in its own body satisfy (or dodge) an operator's
+// keep/drop severity rule. Skipping it also keeps a rule set whose only
+// selector key is the severity from forcing a JSON/logfmt scan of every line
+// for a field that must never exist.
+//
+// The literal "1" is NOT special here: it is a value-DSL constant
+// (metricRule.readValue short-circuits it before consulting values), and
+// skipping it in the shared index silently deadened a selector or label
+// legitimately reading a field named "1" — the classification belongs at the
+// value call site (buildKeyIndex), not in the index every key kind shares.
 func (ki *KeyIndex) Add(key string) {
-	if key == "" || key == LineKey {
+	if key == "" || key == LineKey || key == SeverityKey {
 		return
 	}
 	if _, ok := ki.want[key]; ok {

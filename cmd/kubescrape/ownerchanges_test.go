@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/JohanLindvall/kubescrape/internal/owners"
 )
@@ -21,10 +22,26 @@ func partial(rv string, labels, annotations map[string]string) *metav1.PartialOb
 	}}
 }
 
+// owned is partial() plus the owner references the object itself carries — the
+// field owners.Resolve FOLLOWS to append a pod's grandparent (a ReplicaSet's
+// Deployment, a Job's CronJob).
+func owned(rv string, refs ...metav1.OwnerReference) *metav1.PartialObjectMetadata {
+	p := partial(rv, map[string]string{"app": "web"}, nil)
+	p.OwnerReferences = refs
+	return p
+}
+
+func ownerRef(kind, name, uid string, controller bool) metav1.OwnerReference {
+	return metav1.OwnerReference{
+		APIVersion: "apps/v1", Kind: kind, Name: name, UID: types.UID(uid),
+		Controller: &controller,
+	}
+}
+
 // The one that matters. Everything these informers serve is UID + labels +
-// annotations (owners.Resolver.clusterScoped/Resolve via kubemeta.CopyMeta),
-// and UID is immutable — so an update touching neither map cannot change any
-// response, and must not advance the token.
+// annotations + owner references (owners.Resolver.clusterScoped/Resolve via
+// kubemeta.CopyMeta), and UID is immutable — so an update touching none of
+// those cannot change any response, and must not advance the token.
 //
 // A resourceVersion comparison is NOT sufficient for that, which is the trap
 // this test exists to hold shut: the API server changes the resourceVersion on
@@ -64,6 +81,21 @@ func TestStatusOnlyUpdatesDoNotAdvanceTheOwnerToken(t *testing.T) {
 			old:  partial("100", nil, nil),
 			new:  partial("101", map[string]string{}, map[string]string{}),
 		},
+		{
+			// The owner-reference compare must not be a resourceVersion
+			// compare in disguise: an identical chain, re-delivered.
+			name: "an unchanged owner chain",
+			old:  owned("100", ownerRef("Deployment", "web", "dep-uid", true)),
+			new:  owned("101", ownerRef("Deployment", "web", "dep-uid", true)),
+		},
+		{
+			// blockOwnerDeletion is not served by anything, so a
+			// garbage-collector rewrite of it must not invalidate the fleet's
+			// memos.
+			name: "blockOwnerDeletion flipped",
+			old:  owned("100", withBlock(ownerRef("Deployment", "web", "dep-uid", true), false)),
+			new:  owned("101", withBlock(ownerRef("Deployment", "web", "dep-uid", true), true)),
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			before := c.Generation()
@@ -95,6 +127,33 @@ func TestServedChangesAdvanceTheOwnerToken(t *testing.T) {
 			partial("101", nil, map[string]string{"team": "sre"})},
 		{"an annotation added", partial("100", nil, nil),
 			partial("101", nil, map[string]string{"team": "obs"})},
+		// The owner-reference cases. owners.Resolve reads the CACHED OWNER
+		// OBJECT's OwnerReferences to append the followed parent, so an
+		// ownerReferences-only rewrite of a ReplicaSet or Job changes the
+		// Owners chain of every pod it owns — and with it attrs.ServiceName,
+		// hence half the Prometheus job of every series the fleet exports for
+		// that workload. Nothing else bumps: the pods are untouched, so the
+		// store's generation does not move either, and the node-targets memo
+		// answered 304 with a full max-age indefinitely.
+		{"an owner reference removed", owned("100", ownerRef("Deployment", "web", "dep-uid", true)),
+			owned("101")},
+		{"an owner reference added (re-adoption)", owned("100"),
+			owned("101", ownerRef("Deployment", "web", "dep-uid", true))},
+		{"the owner was recreated under its old name (new UID)",
+			owned("100", ownerRef("Deployment", "web", "dep-uid", true)),
+			owned("101", ownerRef("Deployment", "web", "dep-uid-2", true))},
+		{"the owner reference was renamed",
+			owned("100", ownerRef("Deployment", "web", "dep-uid", true)),
+			owned("101", ownerRef("Deployment", "api", "dep-uid", true))},
+		{"the owner reference changed kind",
+			owned("100", ownerRef("Deployment", "web", "dep-uid", true)),
+			owned("101", ownerRef("StatefulSet", "web", "dep-uid", true))},
+		{"the controller flag was cleared",
+			owned("100", ownerRef("Deployment", "web", "dep-uid", true)),
+			owned("101", ownerRef("Deployment", "web", "dep-uid", false))},
+		{"two references were reordered (the chain is emitted in their order)",
+			owned("100", ownerRef("Deployment", "web", "a", true), ownerRef("Deployment", "api", "b", false)),
+			owned("101", ownerRef("Deployment", "api", "b", false), ownerRef("Deployment", "web", "a", true))},
 		{
 			// Neither side is the type the metadata informer delivers. The
 			// token must move rather than assume: an unrecognised shape is not
@@ -131,4 +190,10 @@ func TestServedChangesAdvanceTheOwnerToken(t *testing.T) {
 	if c.Generation() == before {
 		t.Error("delete did not advance the token")
 	}
+}
+
+// withBlock sets blockOwnerDeletion, which nothing serves.
+func withBlock(ref metav1.OwnerReference, block bool) metav1.OwnerReference {
+	ref.BlockOwnerDeletion = &block
+	return ref
 }

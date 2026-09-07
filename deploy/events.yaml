@@ -26,12 +26,13 @@ metadata:
   name: kubescrape-events
 rules:
   # The only cluster-wide grant, and it lands on this ServiceAccount alone.
+  # list+watch on core/v1 events is the whole of what the reader does — the
+  # initial LIST (re-run paginated on a relist) plus one WATCH, through
+  # CoreV1().Events(). No single-object Get, and no EventsV1(), so `get` and an
+  # `events.k8s.io` mirror rule would be grants nothing exercises.
   - apiGroups: [""]
     resources: ["events"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["events.k8s.io"]
-    resources: ["events"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -140,6 +141,19 @@ spec:
       containers:
         - name: events
           image: ghcr.io/johanlindvall/kubescrape:latest
+          # `:latest` with IfNotPresent, and both halves are deliberate here
+          # while being a real hazard in production: re-pushing the tag leaves
+          # this manifest byte-identical, so `kubectl apply` rolls nothing, and
+          # a manual rollout restart then reuses the `latest` layer every node
+          # already cached — a successful-looking upgrade running the old
+          # binary, with the startup line's `version=` as the only evidence.
+          # It stays because hack/e2e.sh applies these files against an image
+          # `kind load`ed from the working tree, which exists in no registry:
+          # `Always` would either fail the pull or fetch a PUBLISHED :latest
+          # over the build under test. Pin the tag to a release or an
+          # `@sha256:` digest for a real deployment (the Helm chart's
+          # `image.tag`), and the pull policy stops mattering. See
+          # docs/CONFIGURATION.md, "Accepted security residuals".
           imagePullPolicy: IfNotPresent
           command: ["/kubescrape-agent"]
           args:

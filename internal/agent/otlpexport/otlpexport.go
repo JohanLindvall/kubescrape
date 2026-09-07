@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/textproto"
 	"os"
 	"slices"
 	"strings"
@@ -62,6 +63,15 @@ type Config struct {
 	ClientKeyFile  string
 	// Headers are static headers sent on every export (HTTP request headers /
 	// gRPC metadata) — e.g. a multi-tenant collector's X-Scope-OrgID.
+	//
+	// The transport's own headers WIN, on both protocols: the OTLP framing
+	// (Content-Type, Content-Encoding) and the bearer credential are applied
+	// after this map on the HTTP arm and appended after it on the gRPC one.
+	// Validate refuses the keys where that precedence would be a silent
+	// surprise rather than a rule — the framing keys outright, and
+	// Authorization when a BearerTokenFile is also set (two credentials for
+	// one destination, which the two transports resolved differently: HTTP
+	// replaced the token, gRPC sent both).
 	Headers map[string]string
 	// BearerTokenFile is re-read every minute and sent as
 	// "Authorization: Bearer <token>". Empty disables.
@@ -178,6 +188,9 @@ func (cfg Config) Validate() error {
 	if cfg.Endpoint == "" {
 		return errors.New("no endpoint")
 	}
+	if err := validateHeaders(cfg); err != nil {
+		return err
+	}
 	// The mTLS pair, checked HERE and not only in buildTLS. It is a pure-shape
 	// rule (two strings, no file touched) that New refuses at startup, so
 	// leaving it out of Validate broke the one promise this function makes: a
@@ -204,6 +217,38 @@ func (cfg Config) Validate() error {
 		}
 		if cfg.Protocol == "http" && strings.HasPrefix(cfg.Endpoint, "http://") {
 			return fmt.Errorf("%s is set but endpoint %q is plain http; use https://", material, cfg.Endpoint)
+		}
+	}
+	return nil
+}
+
+// validateHeaders refuses the static header keys the transport owns.
+//
+// Two different failures, one door. The FRAMING keys (Content-Type,
+// Content-Encoding, Content-Length) describe the OTLP protobuf body this
+// client just built: a configured Content-Type made every HTTP export a 415,
+// which IsPermanent classifies as a rejection, so the buffered drain dropped
+// the backlog after maxDrainCycles — a total, silent loss from one map entry.
+// AUTHORIZATION is legitimate on its own (a collector wanting Basic auth has
+// no other spelling here; -otlp-bearer-token-file only writes Bearer), so it
+// is refused only BESIDE a bearer token file: two credentials for one
+// destination, which the transports resolved differently — HTTP's Set
+// replaced the rotating token with the static value, so rotation was silently
+// inert, while gRPC appended both and left the collector to pick.
+//
+// Keys are compared canonically (HTTP header names are case-insensitive, and
+// gRPC lowercases metadata keys on the wire), and the walk is sorted so a map
+// with two offending keys names the same one on every run.
+func validateHeaders(cfg Config) error {
+	for _, k := range slices.Sorted(maps.Keys(cfg.Headers)) {
+		switch textproto.CanonicalMIMEHeaderKey(k) {
+		case "Content-Type", "Content-Encoding", "Content-Length":
+			return fmt.Errorf("header %q is set by the OTLP transport itself and cannot be overridden by a static header; remove it", k)
+		case "Authorization":
+			if cfg.BearerTokenFile != "" {
+				return fmt.Errorf("header %q is set alongside a bearer token file (%s): that is two credentials for one destination — keep the token file, or drop it and send the header alone",
+					k, cfg.BearerTokenFile)
+			}
 		}
 	}
 	return nil
@@ -377,8 +422,17 @@ func buildTLS(cfg Config) (*tls.Config, error) {
 	return tlsCfg, nil
 }
 
-// Close tears down the connection.
+// Close tears down the connection — on BOTH protocols. The HTTP arm owns its
+// own http.Transport (16 idle connections per host, a 90s IdleConnTimeout), so
+// a Client dropped without this left pooled sockets and their TLS sessions open
+// with nothing left that could ever close them: BuildExporter's midway failure
+// and PerSignal.Close both discard the Client entirely. Today the process exits
+// straight afterwards so nothing outlives it for long, but "tears down the
+// connection" has to be true of the protocol this deployment actually runs.
 func (c *Client) Close() error {
+	if c.httpClient != nil {
+		c.httpClient.CloseIdleConnections()
+	}
 	if c.conn != nil {
 		return c.conn.Close()
 	}
@@ -509,6 +563,17 @@ func (c *Client) sendTracesOnce(ctx context.Context, td ptrace.Traces) error {
 // parts are counted: one part is the ordinary case and must not read as a
 // split. The split itself is not logged per payload — the rate is the whole
 // story, and a producer that batches too large does it on every export.
+//
+// The unit is the ATTEMPT, not the payload, and both counters say so in their
+// help text. It cannot be otherwise at this seam: the split is a pure function
+// of the payload and is re-derived per try, while the retries that multiply it
+// live above — the tailer's exportWithRetry, ExportMetrics' own Retry loop and
+// the buffered drain's laps — none of which this client can see, and only a
+// per-payload identity (the drain's stuck-payload hash) could dedupe across.
+// So an oversize count is the RATE of "this producer keeps building a record
+// nothing can ship", read against kubescrape_export_requests_total, and never
+// a count of records lost. obs.ExportDuration already documents the same unit
+// for the same reason.
 //
 // What the split could NOT rescue is a different matter and does get a line.
 // Both reasons ship a part the collector will reject, and the FRAMING one is a
@@ -813,15 +878,20 @@ func (c *Client) httpPost(ctx context.Context, url string, body []byte, out *[]b
 		// Released HERE, never by net/http: see pooledBody.
 		defer pb.release()
 	}
+	// Static headers FIRST, the transport's own after — the gRPC arm appends
+	// the credential last too, and the two must not resolve the same config
+	// differently. Validate refuses the keys where this precedence would
+	// otherwise surprise, so in practice nothing here overwrites anything;
+	// this is the ordering that keeps that true if a key ever slips past.
+	for k, v := range c.cfg.Headers {
+		req.Header.Set(k, v)
+	}
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	if compressed {
 		req.Header.Set("Content-Encoding", "gzip")
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	for k, v := range c.cfg.Headers {
-		req.Header.Set(k, v)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

@@ -328,10 +328,16 @@ func (g *metricGrouper) scope(sm pmetric.ScopeMetrics, scopeIdx int, id string) 
 var senderIdentityAttrs = attrs.SenderIdentityKeys()
 
 // stripSenderIdentity removes the sender's own identity from a resource that is
-// about to be re-labelled as a described object's.
+// about to be re-labelled as a described object's — EVERY occurrence of each
+// key (removeAll), because pcommon.Map.Remove stops at the first match and an
+// OTLP attribute list may legally repeat one. overwriteAttrs then Puts the
+// described object's value, which pdata writes into the FIRST entry, so a
+// survivor would ride the wire beside it as a second value for the same key —
+// the sender's identity on an object it merely describes, which is the one
+// thing this function exists to prevent.
 func stripSenderIdentity(a pcommon.Map) {
 	for _, k := range senderIdentityAttrs {
-		a.Remove(k)
+		removeAll(a, k)
 	}
 }
 
@@ -456,13 +462,16 @@ func (g *metricGrouper) putIDAttr(a pcommon.Map, token string) {
 	}
 }
 
-// stripIDAttrs removes the configured container-ID/pod-UID attribute keys.
+// stripIDAttrs removes the configured container-ID/pod-UID attribute keys —
+// every occurrence, for removeAll's reason: putIDAttr re-stamps the canonical
+// one afterwards, and a survivor would leave the described object naming two
+// different containers.
 func (g *metricGrouper) stripIDAttrs(a pcommon.Map) {
 	for _, k := range g.enricher.containerIDKeys {
-		a.Remove(k)
+		removeAll(a, k)
 	}
 	for _, k := range g.enricher.podUIDKeys {
-		a.Remove(k)
+		removeAll(a, k)
 	}
 }
 

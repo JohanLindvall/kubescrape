@@ -53,6 +53,49 @@ func TestTruncatedBodyDoesNotPinTheWholeMessage(t *testing.T) {
 	}
 }
 
+// The OTHER truncating branch — under the cap raw, over it once the invalid
+// bytes widened into U+FFFD — pins the VALIDATED COPY rather than the raw
+// message, so the alias check above cannot see it (the body never aliases what
+// the caller handed in). What it costs is measured directly: the bytes the
+// batch really holds against the bytes batchBytes charges it for, which is the
+// accounting MaxBatchBytes is built on. Each 3-byte replacement grows the
+// validated string past the cap, and flushRetry keeps the batch in place for a
+// whole collector outage.
+func TestUnderCapInvalidBodyDoesNotPinTheValidatedCopy(t *testing.T) {
+	const (
+		maxEntry = 1 << 10
+		messages = 4096
+	)
+	r := sanitizer(maxEntry)
+	// 1000 raw bytes, under the cap — but 500 separate invalid runs, each
+	// widening to three bytes, so the validated string is 2000 bytes and the
+	// truncating branch fires.
+	msg := strings.Repeat("a\xff", 500)
+	if len(msg) > maxEntry {
+		t.Fatalf("fixture is %d bytes: it must be UNDER the cap before validation", len(msg))
+	}
+
+	bodies := make([]string, 0, messages)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	accounted := 0
+	for range messages {
+		body, _ := r.sanitize(msg, "unit.service")
+		accounted += len(body) // exactly what ingest adds to batchBytes
+		bodies = append(bodies, body)
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	live := after.HeapAlloc - before.HeapAlloc
+	runtime.KeepAlive(bodies)
+
+	if accounted == 0 || live > uint64(accounted)*3/2 {
+		t.Fatalf("the batch holds %d live bytes for %d accounted: the truncated body still pins the validated copy, so MaxBatchBytes bounds a fraction of the real memory",
+			live, accounted)
+	}
+}
+
 // The cut has to come BEFORE the validation, not after it: strings.ToValidUTF8
 // walks the whole string and, on invalid input, builds a replacement copy of
 // it, so a 4 MiB journal message cost a 4 MiB allocation and a full rune-by-rune

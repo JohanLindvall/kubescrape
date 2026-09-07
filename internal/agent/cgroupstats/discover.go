@@ -100,7 +100,16 @@ func (s *Sampler) walk() (found []containerDir, complete, ok bool) {
 		// missing mount and a silent pipeline, that one is a directory the
 		// sampler could not read inside an otherwise working hierarchy.
 		s.c.listErrRoot.Inc()
-		s.log.Warn("cgroup discovery failed", "root", s.root, "error", err)
+		// Throttled for the same reason as the partial-listing arm below: a
+		// root that becomes unlistable AFTER a successful startup check (the
+		// bind mount lost, remounted, or relabelled) is a persisting STATE,
+		// not an event, so an unthrottled line is one identical complaint per
+		// discovery pass — four a minute per node at the default cadence,
+		// sixty at the floor — multiplied by the fleet. The counter carries
+		// the rate; the line only has to say it once.
+		if s.rootWarn.Allow(readWarnEvery) {
+			s.log.Warn("cgroup discovery failed (throttled)", "root", s.root, "error", err)
+		}
 		return nil, false, false
 	}
 	if !complete {
@@ -123,7 +132,16 @@ func (s *Sampler) reconcile(found []containerDir, complete bool) {
 		s.seen[d.id] = struct{}{}
 		base := len(filepath.Base(d.path))
 		if c, ok := s.tracked[d.id]; ok {
-			if d.path != c.dir && base < c.baseLen {
+			// A GONE container is never re-pointed. Its descriptors are
+			// already released and it is holding one thing only — the window
+			// markGone preserved, which is the OOM-killed container's last
+			// seconds — and repointLocked would spend three descriptors on it
+			// and reset exactly that window, so the next export would emit
+			// nothing and, for a container never yet described, charge the
+			// too_short counter that is supposed to be evidence about
+			// short-lived containers. c.gone is never cleared, so the entry
+			// simply waits for the export that retires it.
+			if !c.gone && d.path != c.dir && base < c.baseLen {
 				s.repointLocked(c, d, base)
 			}
 			continue
@@ -335,7 +353,13 @@ func (s *Sampler) track(id string, now time.Time) {
 	// refused entry is asked about again and again while the containers behind
 	// it in the queue never are).
 	p.lastTry = now
-	if len(s.tracked) >= s.maxTracked {
+	// Only LIVE entries are charged. A gone container's three descriptors were
+	// released by markGone and the entry lingers in s.tracked purely to carry
+	// its final window to the next export — up to a whole -scrape-interval —
+	// so counting it here refuses a real container a descriptor budget nobody
+	// is holding. Same rule, same reason, as maxContainers' own doc gives for
+	// taking pending entries back out of this cap.
+	if s.liveTrackedLocked() >= s.maxTracked {
 		s.c.cappedTracked.Inc()
 		if !s.cappedFDs {
 			s.cappedFDs = true

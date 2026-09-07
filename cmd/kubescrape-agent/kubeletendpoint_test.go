@@ -36,6 +36,12 @@ func TestKubeletBaseBracketsOnlyAnIPv6Literal(t *testing.T) {
 		{"bare IPv6 with no port", "https://fd00:10::5", "https://[fd00:10::5]"},
 		{"bare IPv6 with a path", "https://fd00:10::5:10250/", "https://[fd00:10::5]:10250/"},
 		{"empty disables the kubelet scrapes and stays empty", "", ""},
+		// Ports of 1-4 digits are also legal hextets, so the whole authority
+		// still parses as an address — see TestKubeletBaseReadsAShortPortAsAPort.
+		{"bare IPv6, 4-digit port", "https://fd00:10::5:8443", "https://[fd00:10::5]:8443"},
+		{"bare IPv6, 3-digit port", "https://fd00::1:443", "https://[fd00::1]:443"},
+		{"bare IPv6 loopback, 3-digit port", "https://::1:443", "https://[::1]:443"},
+		{"bare IPv6, 4-digit port and a path", "https://fd00::1:4317/metrics", "https://[fd00::1]:4317/metrics"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := kubeletBase(tc.in)
@@ -146,5 +152,55 @@ func TestKubeletScrapeReachesAnIPv6KubeletEndpoint(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the IPv6 kubelet was never asked for anything: every request died in net/url before it was issued")
+	}
+}
+
+// A trailing all-decimal group is read as a PORT, not as the last hextet of an
+// address. The two readings both succeed on `fd00::1:8443` — 1-4 digits is a
+// legal port AND a legal hextet — and the address-only one used to win, so an
+// IPv6 node with the kubelet on any port below 10000 got
+// `https://[fd00::1:8443]` back with err=nil: -check-config printed `config is
+// valid` and all three kubelet scrapes then dialled a host that does not exist,
+// on the scheme's default port, every cycle forever. The shipped :10250 is five
+// digits, which is the only reason this was ever survivable.
+func TestKubeletBaseReadsAShortPortAsAPort(t *testing.T) {
+	for _, in := range []string{
+		"https://fd00::1:8443", "https://fd00::1:9090", "https://fd00::1:4317",
+		"https://fd00::1:443", "https://fd00:10::5:8443", "https://::1:443",
+	} {
+		got, err := kubeletBase(in)
+		if err != nil {
+			t.Fatalf("kubeletBase(%q) = %v", in, err)
+		}
+		host, port, err := net.SplitHostPort(strings.TrimPrefix(got, "https://"))
+		if err != nil {
+			t.Fatalf("kubeletBase(%q) = %q, which carries no port at all: %v", in, got, err)
+		}
+		wantPort := in[strings.LastIndex(in, ":")+1:]
+		if port != wantPort {
+			t.Errorf("kubeletBase(%q) = %q: port %q, want %q — the port was folded into the address", in, got, port, wantPort)
+		}
+		if net.ParseIP(host) == nil {
+			t.Errorf("kubeletBase(%q) = %q: host %q is not an address", in, got, host)
+		}
+	}
+}
+
+// The port-less reading is still reachable, both ways: a trailing group that is
+// not all decimal digits, and the bracketed spelling an operator can always
+// fall back to.
+func TestKubeletBaseStillAcceptsAPortLessIPv6Address(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"https://fd00:10::5", "https://[fd00:10::5]"},
+		{"https://fd00::abcd", "https://[fd00::abcd]"},
+		{"https://[fd00::1:8443]", "https://[fd00::1:8443]"}, // the address really was meant
+	} {
+		got, err := kubeletBase(tc.in)
+		if err != nil {
+			t.Fatalf("kubeletBase(%q) = %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Errorf("kubeletBase(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

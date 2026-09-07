@@ -143,6 +143,9 @@
             },
             "value": {
               "type": "string"
+            },
+            "autoGenerate": {
+              "type": "boolean"
             }
           },
           "additionalProperties": false
@@ -317,6 +320,10 @@
             },
             "httpEndpoint": {
               "type": "string"
+            },
+            "hostPort": {
+              "type": "boolean",
+              "description": "bind the ingest ports on the node so an SDK can reach its own node's agent via status.hostIP; off by default (a hostPort claims the port on every node and is not covered by allowFrom)"
             },
             "metricsMode": {
               "type": "string"

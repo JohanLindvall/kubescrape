@@ -18,6 +18,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
 func TestAttrFilter(t *testing.T) {
@@ -656,5 +657,71 @@ func TestPlainResolveDefersUntilNodeInfoAvailable(t *testing.T) {
 	defer exp.mu.Unlock()
 	if exp.resAttrs["k8s.node.name"] != "node1" {
 		t.Fatalf("node attribute missing after deferred resolve: %v", exp.resAttrs)
+	}
+}
+
+// ensureOpen's in-place-truncation arm — the file shrank below `committed`
+// while we held no fd (a restart before the first open, an -logs-idle-close
+// release, or a rewind whose Seek failed and dropped the handle) — restarts the
+// file at zero, so it is a NEW INCARNATION and must be treated as one. It used
+// to reuse the tail id, keep f.exportedHighs live against it and carry the old
+// pipeline, which is the window read.go's sibling `replaced` arm clears
+// explicitly ("a withheld exportedHigh from that incarnation was later
+// re-offered and applied here"); and it did all that in silence, with
+// kubescrape_log_rotations_total and every log line flat, so an operator saw a
+// file restart from zero with nothing anywhere saying why.
+func TestAnInPlaceTruncationFoundAtOpenStartsANewIncarnation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, logName)
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	tl.cfg.FingerprintBytes = 8 // short, so the truncated file's head still matches
+
+	writeLines(t, path, strings.Repeat("x", 400))
+	f := &file{
+		path:     path,
+		source:   &compiledSource{name: "containers", containerd: true},
+		resolved: true,
+		resource: pcommon.NewResource(),
+	}
+	tl.newPipeline(f)
+	tl.files[path] = f
+
+	// Adopt the file's identity, then release the fd the way idle-close does.
+	if err := tl.ensureOpen(f); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.f.Close()
+	f.f = nil
+	f.committed = 401
+	f.exportedHighs = map[int]int64{f.tail: 401}
+	tailBefore := f.tail
+
+	// The writer truncates in place, below our committed offset, keeping the
+	// head — so the identity still matches and only the size says what happened.
+	if err := os.Truncate(path, 16); err != nil {
+		t.Fatal(err)
+	}
+	rotations := obs.LogRotations.Value()
+	if err := tl.ensureOpen(f); err != nil {
+		t.Fatal(err)
+	}
+
+	if f.committed != 0 || f.readPos != 0 {
+		t.Fatalf("committed=%d readPos=%d, want 0/0 after an in-place truncation below the commit frontier",
+			f.committed, f.readPos)
+	}
+	if f.tail == tailBefore {
+		t.Fatalf("tail id %d reused across a truncation: the replacement's bytes are attributed to the "+
+			"incarnation that is gone, so a batched entry (or a withheld high) from it still commits against them",
+			f.tail)
+	}
+	if len(f.exportedHighs) != 0 {
+		t.Fatalf("exportedHighs = %v, want empty: those positions name bytes the truncation destroyed, and "+
+			"re-offering them advances `committed` past content this file never read", f.exportedHighs)
+	}
+	if got := obs.LogRotations.Value() - rotations; got != 1 {
+		t.Fatalf("kubescrape_log_rotations_total moved by %v, want 1: handleRotation's truncated arm counts the "+
+			"same physical event, and this door left it invisible", got)
 	}
 }

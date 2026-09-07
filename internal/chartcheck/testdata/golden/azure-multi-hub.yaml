@@ -334,7 +334,7 @@ spec:
       containers:
         - name: agent
           image: ghcr.io/johanlindvall/kubescrape:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command: ["/kubescrape-agent"]
           args:
             - -metadata-endpoint=http://kubescrape.monitoring
@@ -472,7 +472,7 @@ spec:
       containers:
         - name: events
           image: ghcr.io/johanlindvall/kubescrape:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command: ["/kubescrape-agent"]
           args:
             # Every per-node pipeline off: this replica only runs the
@@ -586,7 +586,7 @@ spec:
       containers:
         - name: kubescrape
           image: ghcr.io/johanlindvall/kubescrape:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

@@ -49,6 +49,7 @@ type pmSpec struct {
 func (s *pmSpec) labelSelector() *metav1.LabelSelector { return &s.Selector }
 func (s *pmSpec) nsSelector() namespaceSelector        { return s.NamespaceSelector }
 func (s *pmSpec) endpointSpecs() []endpointSpec        { return s.PodMetricsEndpoints }
+func (s *pmSpec) endpointsField() string               { return "podMetricsEndpoints" }
 func (s *pmSpec) monitorIgnored() []string             { return s.ignored() }
 
 // ParsePodMonitor converts an unstructured PodMonitor. The skeleton —

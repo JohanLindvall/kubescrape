@@ -92,10 +92,19 @@ func SetupLogging(level string) (*slog.Logger, error) {
 //     so nothing looks broken. A key containing a quote survives with the quotes
 //     embedded in the key NAME, which is a key nobody will ever grep for.
 //
-// So keys are sanitized (safeKey) at the three doors they arrive through:
-// attributes (through the ReplaceAttr hook, which covers With/WithAttrs too),
-// WithGroup names, and inline slog.Group names — the last in Handle, because
-// ReplaceAttr is documented as not being called for Attrs of kind Group.
+// So keys are sanitized (safeKey) at every door they arrive through. ReplaceAttr
+// covers ordinary attribute keys, wherever they come from (a record's own args,
+// With, WithAttrs) — but it is documented as NOT being called for Attrs of kind
+// Group, and slog flattens a group into a KEY PREFIX ("g.k=v"), so a group name
+// is a key by another name and reaches the record through three doors of its
+// own: WithGroup (covered in WithGroup), an inline slog.Group in a call
+// (covered in Handle), and a slog.Group passed to With/WithAttrs (covered in
+// WithAttrs). The two that take Attrs (Handle, WithAttrs) sanitize at every
+// DEPTH, because a group nested under a safe one contributes its own segment of
+// the flattened key: both scans recurse, which a top-level-only scan did not, and
+// `slog.Group("ok", slog.Group("bad key", …))` rendered `"ok.bad key.x"=v` —
+// one attribute silently becoming two wrong pairs, the exact failure this
+// wrapper exists to make impossible.
 // Sanitizing is deliberately visible: an unsafe byte becomes '_', so a mangled
 // key shows up in a grep for the concept rather than corrupting the record.
 //
@@ -114,7 +123,24 @@ func NewLogfmtHandler(w io.Writer, level slog.Leveler) slog.Handler {
 // key sanitization is the embedded handler's.
 type logfmtHandler struct{ slog.Handler }
 
+// WithAttrs sanitizes group names among the attrs a logger carries. ReplaceAttr
+// covers the ordinary keys here, but never a group's own name, and these attrs
+// are pre-formatted once at With() time and then written into every record the
+// derived logger emits — so an unsafe name that slips through corrupts a key on
+// every line rather than on one. A new slice is built only when a name actually
+// needs rewriting; the caller's slice is never modified.
 func (h logfmtHandler) WithAttrs(as []slog.Attr) slog.Handler {
+	for _, a := range as {
+		if !hasUnsafeGroupName(a) {
+			continue
+		}
+		out := make([]slog.Attr, len(as))
+		for i, a := range as {
+			out[i] = safeGroupNames(a)
+		}
+		as = out
+		break
+	}
 	return logfmtHandler{h.Handler.WithAttrs(as)}
 }
 
@@ -124,14 +150,14 @@ func (h logfmtHandler) WithGroup(name string) slog.Handler {
 	return logfmtHandler{h.Handler.WithGroup(safeKey(name))}
 }
 
-// Handle sanitizes inline slog.Group names — the one door ReplaceAttr does not
-// cover. The scan is skipped entirely unless a group attr is present with an
-// unsafe name, so the overwhelmingly common record (no groups at all; this repo
-// uses none) pays one Kind check per attribute and rebuilds nothing.
+// Handle sanitizes the group names of a record's own attrs — one of the three
+// group doors ReplaceAttr does not cover. Nothing is rebuilt unless a group
+// name somewhere in the record is unsafe, so the overwhelmingly common record
+// (no groups at all; this repo uses none) pays one Kind check per attribute.
 func (h logfmtHandler) Handle(ctx context.Context, r slog.Record) error {
 	unsafe := false
 	r.Attrs(func(a slog.Attr) bool {
-		if a.Value.Kind() == slog.KindGroup && safeKey(a.Key) != a.Key {
+		if hasUnsafeGroupName(a) {
 			unsafe = true
 			return false
 		}
@@ -146,6 +172,27 @@ func (h logfmtHandler) Handle(ctx context.Context, r slog.Record) error {
 		return true
 	})
 	return h.Handler.Handle(ctx, out)
+}
+
+// hasUnsafeGroupName reports whether a is a group needing a rewrite — its own
+// name, or the name of a group nested anywhere beneath it. The recursion is the
+// point: slog renders a nested group as "outer.inner.key", so a name at ANY
+// depth is a segment of a key on the line, and a scan that looked only at the
+// top level left `slog.Group("ok", slog.Group("bad key", …))` to corrupt the
+// record. It answers false for a non-group attr, whose key is ReplaceAttr's.
+func hasUnsafeGroupName(a slog.Attr) bool {
+	if a.Value.Kind() != slog.KindGroup {
+		return false
+	}
+	if safeKey(a.Key) != a.Key {
+		return true
+	}
+	for _, sub := range a.Value.Group() {
+		if hasUnsafeGroupName(sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // safeGroupNames rewrites unsafe group names, recursing into nested groups.

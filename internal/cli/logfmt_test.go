@@ -235,6 +235,80 @@ func TestGroupNamesAreSanitizedToo(t *testing.T) {
 	}
 }
 
+// A group name is a key by another name — slog flattens it into the key prefix
+// — so it has to be sanitized at every DEPTH and through every door, not just
+// the top level of a record. Two doors were open: Handle's scan looked only at
+// a record's top-level attrs, and WithAttrs looked at nothing at all (its
+// ordinary keys go through ReplaceAttr, which slog documents as never being
+// called for an Attr of kind Group). Both rendered a quoted key — `"ok.bad
+// key.x"=v` and `"bad key.y"=w` — which the reader below then splits into two
+// wrong pairs, which is precisely the corruption this whole file exists to
+// prove impossible.
+func TestGroupNamesAreSanitizedAtEveryDepthAndEveryDoor(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		log  func(*slog.Logger)
+		want string
+	}{
+		{
+			// A safe group name hiding an unsafe one: the door Handle's
+			// top-level scan walked straight past.
+			name: "nested under a safe group",
+			log:  func(l *slog.Logger) { l.Info("m", slog.Group("ok", slog.Group("bad key", "x", "v"))) },
+			want: "ok.bad_key.x",
+		},
+		{
+			name: "group passed to With",
+			log:  func(l *slog.Logger) { l.With(slog.Group("bad key", "y", "w")).Info("m") },
+			want: "bad_key.y",
+		},
+		{
+			name: "group nested under a safe one passed to With",
+			log: func(l *slog.Logger) {
+				l.With(slog.Group("ok", slog.Group("bad key", "z", "q"))).Info("m")
+			},
+			want: "ok.bad_key.z",
+		},
+		{
+			// WithGroup and an inline group interleave, and the whole
+			// flattened prefix must be safe.
+			name: "WithGroup then a nested inline group",
+			log: func(l *slog.Logger) {
+				l.WithGroup("bad one").Info("m", slog.Group("ok", slog.Group("bad two", "k", "v")))
+			},
+			want: "bad_one.ok.bad_two.k",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var buf bytes.Buffer
+			tc.log(slog.New(NewLogfmtHandler(&buf, slog.LevelDebug)))
+			line := bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
+			got := pairs(t, line)
+			// pairs validates and re-reads the line the way a consumer does,
+			// so a corrupted key shows up here as an extra pair, not as a
+			// funny-looking one.
+			if len(got) != 4 || got[3][0] != tc.want {
+				t.Errorf("got %v, want one attribute keyed %q (line %q)", got, tc.want, line)
+			}
+		})
+	}
+}
+
+// The sanitizing rewrite is a COPY: slog.Handler's contract is that WithAttrs
+// neither retains nor modifies the caller's slice, and the caller here is
+// ordinary logging code that may well be reusing the attrs it passed.
+func TestWithAttrsDoesNotRewriteTheCallersAttrs(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	as := []slog.Attr{slog.String("node", "n1"), slog.Group("bad key", slog.String("y", "w"))}
+	_ = NewLogfmtHandler(&buf, slog.LevelDebug).WithAttrs(as)
+	if as[1].Key != "bad key" {
+		t.Errorf("WithAttrs sanitized the caller's own slice in place: %q", as[1].Key)
+	}
+}
+
 // WithAttrs is pre-formatted at With() time rather than per record, so it takes
 // a different path through TextHandler and needs its own case.
 func TestWithAttrsRoundTrips(t *testing.T) {

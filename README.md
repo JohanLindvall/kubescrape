@@ -241,10 +241,13 @@ deployment that runs the binary.
 The address is taken from the connection and **never** from a header
 (`X-Forwarded-For` is caller-controlled, and this endpoint hands out whatever
 pod owns the address it is given). A forwarding header is still *read* — but
-only as evidence, never as a source: a request carrying `Forwarded`,
+only as evidence, never as a source: a request carrying `Forwarded`, `Via`,
 `X-Forwarded-For` or `X-Real-Ip` is answered `404`, because the header says
 the connection's address may no longer be the caller's, and a wrong identity
-here is stamped on every one of that agent's records. Resolution otherwise
+here is stamped on every one of that agent's records. Its *presence* is the
+whole effect — an empty value counts, since the value is never read — and
+`Via` is in the list because it is the one RFC 9110 requires a forwarding
+proxy to add. Resolution otherwise
 goes through the same live-only pod-IP index as `/v1/pod-ips`, so a caller on
 hostNetwork — sharing the node IP — or behind an address-rewriting hop also
 gets a `404` rather than someone else's identity. Every `404` falls back to a
@@ -1099,9 +1102,14 @@ log-metric and rules counters by the number of retries it spans (the attempts
 themselves are `kubescrape_journal_export_failures_total`).
 `-journald-units` restricts to specific units and `-journald-dir` reads a
 non-default journal directory. The host journal must be **mounted into the
-container** (`/var/log/journal` and/or `/run/log/journal`) — the chart does
-this behind `agent.journald.enabled`; without it the reader starts, reports
-ready and collects nothing, which the agent now warns about at startup. `-enrich`
+container** (`/var/log/journal` and/or `/run/log/journal`) — **and, for the
+persistent journal, the node's `/etc/machine-id` with it**, because libsystemd
+opens with `SD_JOURNAL_LOCAL_ONLY` and under that flag reads
+`/var/log/journal/<id>` only when `<id>` is the *container's* own machine id,
+which this image does not ship. The chart mounts all three behind
+`agent.journald.enabled`; without them the reader starts, reports ready and
+collects nothing, which the agent warns about at startup, naming which of the
+two is missing. `-enrich`
 (default true) applies the same per-line enrichment here as to container logs; an
 explicit level found in the message wins over the journal priority.
 
@@ -1188,7 +1196,13 @@ and `/v1/metrics`). **Traces go to the trace tier instead** (below): pairing a
 service-graph edge and sampling a trace as a unit both need every span of that
 trace in one process, which a per-node receiver never has, so a sender pointed
 here for traces gets an immediate Unimplemented / 404 rather than an ack for
-spans that could never have become an edge.
+spans that could never have become an edge. **"Local" is literal, and as
+shipped it needs one value**: the listeners bind on the agent's pod IP with no
+`hostNetwork` and no Service in front, so give an application an address with
+`agent.ingest.hostPort: true` and the downward API's `status.hostIP` — never a
+ClusterIP Service over the DaemonSet, which round-robins the push to another
+node's agent and silently defeats the peer-IP fallback
+([how an application addresses the local agent](docs/CONFIGURATION.md#how-an-application-addresses-the-local-agent)).
 For each pushed resource it finds a container ID (`container.id` /
 `k8s.container.id`, keys configurable) or a pod UID (`k8s.pod.uid`), resolves
 the metadata service (a container ID pins the exact incarnation), and merges

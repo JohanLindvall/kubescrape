@@ -458,7 +458,7 @@ pipeline is off, never that it is healthy.
 
 ## Accepted security residuals
 
-An adversarial review of this repo's own security work found four things that
+An adversarial review of this repo's own security work found five things that
 were argued about and **left in place**. They are written here, in the document
 an operator reads, rather than only in the comment at the code that leaves
 them — a residual nobody can find is indistinguishable from one nobody thought
@@ -575,7 +575,31 @@ same commit are therefore not guaranteed to produce the same image. Pin the base
 if reproducibility or base-layer CVE tracking matters to you; `make image` is
 deliberately a developer convenience, not a release pipeline.
 
-**A fifth, smaller one is documented at its flag rather than here**: with
+**5. The DEPLOYED image floats too, and `deploy/*.yaml` pins `IfNotPresent`
+over it.** Residual 4 is about what goes *into* an image; this one is about
+which image a cluster runs. Every hand-written manifest under `deploy/` says
+`image: ghcr.io/johanlindvall/kubescrape:latest` with
+`imagePullPolicy: IfNotPresent`, and the chart's `appVersion` is `latest`. A
+floating tag makes an upgrade **unobservable**: re-pushing `:latest` leaves the
+rendered Deployment/DaemonSet specs byte-identical (the image string does not
+change, and the only rollout-forcing annotation hashes the *config*), so
+`helm upgrade` or `kubectl apply` rolls nothing at all; and under `IfNotPresent`
+a manual `kubectl rollout restart` then starts pods that reuse the `latest`
+layer every node already cached. The operator sees a successful upgrade with the
+old binary running, and the `version=` field on the startup log line is the only
+place the truth is stated.
+
+The CHART now closes half of it: `image.pullPolicy` defaults to empty and the
+render follows Kubernetes' own rule — `Always` while the resolved tag is
+`latest`, `IfNotPresent` once you pin one — so a floating tag at least pulls.
+`deploy/*.yaml` deliberately keeps `IfNotPresent`, because those manifests are
+what `hack/e2e.sh` applies against a `kind load`ed image that exists in no
+registry, and `Always` there would either fail the pull or fetch a *published*
+`:latest` over the build under test. **What you should do**: set `image.tag` to
+a released version or an `@sha256:` digest (chart), or edit the four `image:`
+lines (deploy). At that point the pull policy question disappears with it.
+
+**A sixth, smaller one is documented at its flag rather than here**: with
 `-debug-token-file` set, the `/debug/otlp/ui` page cannot present the token from
 its own `fetch`, so the UI is reachable through a port-forward or a
 header-adding proxy but not by pasting a token into the page. A token is
@@ -662,8 +686,9 @@ and somewhere else:
   by cause: `no_pod` (the connection's source address owns no live pod —
   EXPECTED and permanent under hostNetwork and behind SNAT, where the by-name
   fallback takes over), `forwarded` (the request carried
-  `Forwarded`/`X-Forwarded-For`/`X-Real-Ip`, so the connection's address is no
-  longer evidence about the caller and the route refuses rather than guessing)
+  `Forwarded`/`Via`/`X-Forwarded-For`/`X-Real-Ip` — presence alone, an empty
+  value included — so the connection's address is no longer evidence about the
+  caller and the route refuses rather than guessing)
   and `unparseable_peer` (should not happen; warned).
 * `kubescrape_index_name_reuse_total{kind}` — an object arrived under a
   namespace/name a DIFFERENT, still-live UID held. The guard keeps served data
@@ -821,9 +846,28 @@ export:
                       # connection is refused at startup rather than silently unused
 ```
 
-Empty/omitted fields inherit the flag base (`endpoint`, `protocol`,
-`headers`, `bearerTokenFile`, `caFile`, `insecure`, `insecureSkipVerify`,
-`compression`, `clientCertFile`/`clientKeyFile` are overridable per signal).
+Every field is overridable per signal (`endpoint`, `protocol`, `headers`,
+`bearerTokenFile`, `caFile`, `insecure`, `insecureSkipVerify`, `compression`,
+`clientCertFile`/`clientKeyFile`), and what an omitted one inherits depends on
+whether the override **names its own endpoint**:
+
+- **No endpoint of its own** (or the flag base's own endpoint repeated) — the
+  signal still goes to the flag base destination, so it inherits the flag base
+  wholesale, credentials included.
+- **Its own endpoint** — a **different host**, so the flag base's *collector*
+  credentials are **not** carried: `-otlp-bearer-token-file`,
+  `-otlp-tls-ca-file` and `-otlp-tls-insecure-skip-verify` are dropped, and
+  each is taken from the override or left unset. Presenting the in-cluster
+  collector's bearer token (or its CA/trust decision) to a third-party backend
+  is a credential crossing a trust boundary because a field was left empty —
+  the same rule the `routing` section applies to a route naming its own
+  endpoint. A start (and `-check-config`) **warns**, naming the signal, the
+  endpoint and which flags were dropped. What the own-endpoint case *does*
+  keep is the `export` section's own base additions — `export.headers` and
+  `export.clientCertFile`/`clientKeyFile`, both declared in this block at
+  every-signal scope and neither reachable from a flag — plus `insecure`
+  (plaintext-ness is transport to the named host, not a credential).
+
 The flag endpoint remains the **fallback** for any signal without an
 override; when all three are overridden it is unreachable and no client is
 built for it, so a collectorless deployment need not point `-otlp-endpoint`
@@ -975,6 +1019,35 @@ pipeline; syslog priorities map to OTLP severities; `syslog.identifier`,
 what separates `kernel`/`stdout`/`syslog` streams sharing a unit — become
 record attributes).
 
+**The persistent journal needs `/etc/machine-id` mounted, and nothing else
+reports its absence.** libsystemd is opened with `SD_JOURNAL_LOCAL_ONLY`, and
+under that flag it reads a `/var/log/journal/<id>` directory only when `<id>`
+equals the **container's own** machine id (`sd_id128_get_machine()`, i.e.
+`/etc/machine-id`). The kubescrape image ships no `/etc/machine-id`, so an agent
+that mounts the node's `/var/log` and nothing else opens the journal
+successfully, blocks on entries that can never arrive, answers `/readyz` 200 and
+exports zero records — with no counter moving, an untouched counter never being
+exported at all. `/run/log/journal` is exempt from the rule, which is why a
+volatile-journal node works without the mount and a persistent one (the
+Debian/Ubuntu/RHEL default) silently does not, and why a kind-based end-to-end
+test never sees it. Promtail, Alloy and fluent-bit all carry the same mount.
+
+```yaml
+volumeMounts:
+  - {name: machineid, mountPath: /etc/machine-id, readOnly: true}
+volumes:
+  - name: machineid
+    hostPath: {path: /etc/machine-id, type: File}   # File, not FileOrCreate
+```
+
+`type: File` and not `FileOrCreate`: an *empty* `/etc/machine-id` fails
+`sd_id128_get_machine()` exactly as an absent one does, so creating one would
+hand the agent a mount that looks right and reads nothing. The alternative, if
+mounting it is impossible, is `-journald-dir=/var/log/journal` — that goes
+through `sd_journal_open_directory`, which takes no `LOCAL_ONLY` flag and reads
+the directory outright, at the cost of the volatile journal (an explicit
+directory is opened *alone*).
+
 > **Upgrade note.** Journal records now carry an instrumentation-scope name —
 > `otel_scope_name=github.com/JohanLindvall/kubescrape/agent/journald` — where
 > earlier releases shipped an empty one. Every other producer named its scope;
@@ -1005,7 +1078,7 @@ record attributes).
 
 | Flag | Default | Description |
 |---|---|---|
-| `-journald-dir` | — | read a specific journal directory; empty opens the default system journal, which already covers the volatile one. **What the pipeline actually needs is the host journal MOUNTED into the container** — `/var/log/journal` (persistent) and/or `/run/log/journal` (volatile). The chart does it behind `agent.journald.enabled`; a hand-rolled manifest must add it, or the reader starts, reports ready and collects nothing. The agent now WARNs at startup when the resolved journal holds no readable files |
+| `-journald-dir` | — | read a specific journal directory; empty opens the default system journal, which already covers the volatile one. **What the pipeline actually needs is the host journal MOUNTED into the container** — `/var/log/journal` (persistent) and/or `/run/log/journal` (volatile) — **plus the node's `/etc/machine-id` for the persistent half** (see below). The chart mounts all three behind `agent.journald.enabled`; a hand-rolled manifest must add them, or the reader starts, reports ready and collects nothing. The agent WARNs at startup when the resolved journal holds no readable files, and says which of the two is missing |
 | `-journald-units` | — | comma-separated units (matched on `_SYSTEMD_UNIT`); empty reads everything |
 | `-journald-batch-size` | `1024` | flush after this many entries |
 | `-journald-max-batch-bytes` | `1048576` | flush before a batch's summed message bytes exceed this |
@@ -1071,9 +1144,12 @@ or `replicas > 1`, never double-ships.
 | `-events-lease-namespace` | — | namespace for the Lease and the ConfigMap; empty uses this pod's own (`$POD_NAMESPACE` via the downward API, else the ServiceAccount projection) |
 | `-kubeconfig` | — | kubeconfig for the watch; empty uses the in-cluster config (only read with `-events`) |
 
-RBAC: `get`/`list`/`watch` on `events` (both `""` and `events.k8s.io`)
-cluster-wide, plus `get`/`create`/`update` on `leases` and `configmaps` in
-the reader's own namespace.
+RBAC: `list`/`watch` on core (`""`) `events` cluster-wide — the reader is
+core/v1 only and does exactly one LIST (paginated on a relist) plus one WATCH,
+so it needs neither `get` nor the `events.k8s.io` mirror — plus
+`get`/`create`/`update` on `leases` and `configmaps` in the reader's own
+namespace, name-scoped to the one Lease and the one ConfigMap the flags above
+name (`create` excepted: RBAC ignores `resourceNames` there).
 
 **Records.** The body is the event message, with `k8s.event.reason`,
 `k8s.event.action`, `k8s.event.type`, `k8s.event.count`, `k8s.event.name`,
@@ -1155,7 +1231,13 @@ webhook-injected federated token file + `$AZURE_CLIENT_ID`/`$AZURE_TENANT_ID`
 — in the chart, setting `azure.clientId` annotates the ServiceAccount and
 labels the pod so the webhook injects them), else **IMDS** (system-assigned,
 or user-assigned via `-azure-client-id`). Tokens are cached and refreshed
-ahead of expiry; a token-endpoint blip serves the still-valid cached token.
+ahead of expiry; a token-endpoint blip serves the still-valid cached token,
+and a failed fetch is not re-attempted for 30s (never past the cached token's
+own expiry) so an unreachable endpoint does not put a round trip in front of
+every new Kafka connection. When the consumer is rebuilt after a fetch error
+that only a new client can clear, the cached token is dropped with it — so
+fixing a wrong role assignment takes effect at the next rebuild rather than at
+the token's next expiry, which can be the better part of an hour away.
 Both protocols are implemented directly (two small HTTP exchanges) — no
 Azure SDK dependency. On the Azure side the identity needs the **Azure Event
 Hubs Data Receiver** role on the namespace (or hub); a connection string
@@ -1452,6 +1534,14 @@ attributes, with the line's own JSON/logfmt fields as fallback; `__line__`
 matches the whole raw body and `__severity__` the enriched severity text
 (lowercased) — so "drop debug logs" needs no per-app parsing config.
 
+Both synthetic keys are resolved BEFORE the line-field fallback and are never
+looked for as line fields themselves. That matters for `__severity__`: a
+record can legitimately have no severity at all (a plain, non-containerd
+source, or a `-ingest` push that sets neither `severityText` nor a
+severity number), and if the key fell through to the line, a workload writing
+`{"__severity__":"error"}` in its own JSON could satisfy — or dodge — an
+operator's rule from data it controls.
+
 Selector escaping: `matchRegexp` values are **RE2 patterns passed to the
 engine verbatim** — backslash is the regex escape, so `\d` is a digit class
 and `\\` a literal backslash, exactly as in any Go regex. `match` values are
@@ -1673,6 +1763,25 @@ count and sum (no quantiles); `counter` emits a monotonic sum (with synthetic
 zero baseline points). Rules sharing a `name` share one underlying series (and
 must agree on type/action).
 
+> **A NEGATIVE value is refused on `counter` and `summary`.** Those two export a
+> monotonic cumulative stream — a counter is an OTLP Sum with
+> `IsMonotonic(true)`, and a summary's sum reaches Prometheus as the
+> counter-typed `<name>_sum` — whose `StartTimestamp` only moves when the stream
+> is (re)admitted. Folding a decrease in would ship a drop on an unchanged start
+> stamp, which is a counter reset kubescrape never declared: `rate()` and
+> `increase()` read it as one and add the whole new value on top of everything
+> already counted, permanently inflating the rate. The value comes from a
+> `value`/`valueRegexp` over log content the workload writes, so this is a
+> misconfiguration a tenant can trigger at will; it is refused rather than
+> admitted, counted on
+> `kubescrape_log_metrics_dropped_negative_total`, and named by a
+> throttled WARN carrying the metric and the offending value. A signed quantity
+> belongs on `gauge` (with an `add`/`sub` action, or a `min`/`max`/`avg`/`sum`
+> window) or on a `histogram` whose `buckets` cover it — neither is monotonic,
+> and both take negatives unchanged. A non-finite value (`NaN`, `Inf`) is
+> refused on every type, and counted separately on
+> `kubescrape_log_metrics_dropped_nan_total`.
+
 > **A histogram may not set a label named `le`, through `labels` OR
 > `resourceLabels`.** It is refused at startup, naming the rule AND which of the
 > two lists carried it. `le` is the bucket-bound label a Prometheus consumer
@@ -1768,15 +1877,15 @@ receiver never has. This listener does not register the OTLP trace service or
 | Flag | Default | Description |
 |---|---|---|
 | `-ingest-grpc-endpoint` | `:4317` | OTLP/gRPC listen address; empty disables |
-| `-ingest-http-endpoint` | `:4318` | OTLP/HTTP protobuf listen address (`/v1/logs`, `/v1/metrics`); gzip `Content-Encoding` accepted; empty disables |
+| `-ingest-http-endpoint` | `:4318` | OTLP/HTTP protobuf listen address (`/v1/logs`, `/v1/metrics`); gzip `Content-Encoding` accepted (the token is matched case-insensitively, and `x-gzip` is the same coding); empty disables |
 | `-ingest-metrics-mode` | `auto` | `resource` (ID on the resource), `datapoint` (ID per point → split into per-object resources), or `auto` |
 | (`-enrich`) | `true` | parse pushed log bodies with the same switch, filling only fields the sender left unset |
 | `-ingest-peer-ip-fallback` | `false` | attribute telemetry whose resource carries **no** container id / pod uid to the pod owning the connection's source address (`GET /v1/pod-ips/{ip}`, live non-hostNetwork pods only). Opt-in: a proxy, a mesh sidecar or any NAT hop rewrites that address, and hostNetwork senders share the node IP and never resolve. Counted as `kubescrape_ingest_resources_total{outcome="peer_ip"}`. Read by the trace tier too |
 | `-ingest-container-id-keys` | `container.id,k8s.container.id` | attribute keys inspected for a container ID |
 | `-ingest-pod-uid-keys` | `k8s.pod.uid` | attribute keys inspected for a pod UID |
 | `-ingest-metadata-wait` | `0` | how long a lookup may block for a not-yet-known object. A push's attribution lookups may block at most 4× this in TOTAL (the remainder proceed without waiting), so a payload naming many distinct unknown IDs cannot stack waits into a long in-flight-slot hold |
-| `-ingest-max-in-flight` | `0` (= 32) | bound on pushes processed concurrently **across both transports**. Over it, senders are refused *retryably* rather than queued. It bounds PROCESSING only — the raw-byte and decoded-structure budgets below are what bound memory, and neither moves when this is raised |
-| `-ingest-grpc-max-recv-bytes` | `0` (= 4 MiB) | cap on **one decoded gRPC message** (the counterpart of a collector's `max_recv_msg_size`); an over-cap push is refused, not truncated. Applies to the trace tier's application ports too; the OTLP/HTTP body cap stays 16 MiB. Raising it is a per-push memory grant on an unauthenticated listener — BOTH byte budgets below scale with it (the raw one to 4x the new cap once that passes its 64 MiB floor, the decoded one to twice the raw) |
+| `-ingest-max-in-flight` | `0` (= 32) | bound on pushes processed concurrently **across both transports**. Over it, senders are refused *retryably* rather than queued. It bounds PROCESSING only — the raw-byte and decoded-structure budgets below are what bound memory, and neither moves when this is raised. `0` is the only spelling of "use the default": a **negative is refused at startup**, `-check-config` included, because it reads like the "negative disables" that `-otlp-max-send-bytes` documents and in fact ran at 32 in silence — there is no "no bound" here, since the bound is what keeps an unauthenticated listener from being an OOM |
+| `-ingest-grpc-max-recv-bytes` | `0` (= 4 MiB) | cap on **one decoded gRPC message** (the counterpart of a collector's `max_recv_msg_size`); an over-cap push is refused, not truncated. Applies to the trace tier's application ports too; the OTLP/HTTP body cap stays 16 MiB. Raising it is a per-push memory grant on an unauthenticated listener — BOTH byte budgets below scale with it (the raw one to 4x the new cap once that passes its 64 MiB floor, the decoded one to twice the raw). Like the flag above, `0` is the only spelling of "use the default" and a **negative is refused at startup**: unlike `-otlp-max-send-bytes`, it has no "unbounded" |
 
 A container ID resolves the exact container incarnation; a pod UID resolves
 the pod.
@@ -1823,7 +1932,40 @@ data itself always still forwarded. Duplicate resource keys (legal OTLP, a
 hostile-sender shape) are deduped last-wins before metric binding. Outcomes count into `kubescrape_ingest_resources_total{outcome}`
 (`enriched` / `unresolved` / `peer_ip` / `peer_ip_rejected`).
 
-Both listeners are unauthenticated and node-local, and every in-flight request
+### How an application addresses the local agent
+
+The listeners are node-local, and as shipped that means **reachable at the
+agent's pod IP and nothing else**: the DaemonSet sets no `hostNetwork` and the
+chart renders no Service for them, so there is no stable address to put in
+`OTEL_EXPORTER_OTLP_ENDPOINT`.
+
+A ClusterIP Service over the DaemonSet is the wrong answer, and quietly so: it
+round-robins a push to some *other* node's agent, which defeats
+`-ingest-peer-ip-fallback` (the connection's source address no longer names a
+pod that agent's node hosts) and invalidates the node-local reasoning behind
+`-ingest-max-in-flight`. (The trace tier is the opposite case, and does ship a
+Service — a span must leave the node for its trace to be assembled.)
+
+Set `agent.ingest.hostPort: true` (Helm; `hostPort:` beside the two
+`containerPort:` lines in `deploy/agent.yaml`) and address the node itself
+through the downward API:
+
+```yaml
+env:
+  - name: NODE_IP
+    valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: "http://$(NODE_IP):4318"
+```
+
+It is **off by default** for two reasons worth weighing: a `hostPort` claims
+that port on every node, so 4317/4318 collide with a collector DaemonSet or
+anything else already holding the OTLP defaults and the pods go unschedulable;
+and it widens the listeners from the pod network to the node's own addresses,
+which `agent.ingest.allowFrom` does *not* cover — a NetworkPolicy does not
+filter traffic arriving on a hostPort.
+
+Both listeners are unauthenticated, and every in-flight request
 holds its body plus the inflated pdata — on the same process that tails the
 node's logs — so the count is bounded. A push arriving over the bound is not
 queued (that would turn back-pressure into latency the sender cannot see) and
@@ -1850,7 +1992,16 @@ so one legal message always fits — which covers exactly that window: an HTTP b
 steps — a declared `Content-Length` is never credited up front, since the
 declaration is the sender's claim, not a fact — and a gRPC push reserves
 `MaxRecvMsgSize` from the moment its headers arrive until its message is
-decoded.
+decoded. That gRPC reservation is bounded by a **decode window** — 10 s at the
+default 4 MiB message cap, scaled in proportion when
+`-ingest-grpc-max-recv-bytes` raises it (5 minutes is the ceiling), so a
+raised cap buys the time to deliver the bigger message it just authorised
+rather than becoming a silent per-byte deadline. A peer that opens a stream and
+then sends nothing is reaped when the window elapses: the bytes come back, the
+stream is cancelled (the sender sees `Canceled`, which OTLP lists as
+retryable), and it counts `kubescrape_ingest_reserve_expired_total` — kept
+apart from `kubescrape_ingest_rejected_total` because nothing was refused and
+the budget had room.
 
 The third is a **DECODED-structure budget of twice that** (128 MiB), because a
 count cannot bound a size and raw bytes do not bound what they inflate INTO. A
@@ -2440,7 +2591,12 @@ tier's enricher stamps). The quarter leaves room for the pairing store, the span
 metrics, the exporter and Go's heap slack.
 
 **It is checked at startup**, against the container's cgroup memory limit (or the
-host's RAM when the pod is uncapped):
+host's RAM when the pod is uncapped). The limit is resolved by the same reader
+the Go soft memory limit uses — this container's own cgroup, named by
+`/proc/self/cgroup`, so it is found under both cgroup layouts including
+`cgroupns=host` — and the file it came from is printed as `limitSource` on the
+sizing line, which is the thing to check if the sizing ever looks like it was
+done against the node rather than the pod:
 
 * an unset `maxSpans` is **lowered** to what the limit affords, with a warning
   naming the arithmetic;
@@ -2600,7 +2756,7 @@ resource".
 
 | Flag | Default | Description |
 |---|---|---|
-| `-kubelet-endpoint` | — | kubelet base URL, typically `https://$(NODE_IP):10250` with `NODE_IP` from the downward API. On an IPv6 node that expands to a BARE IPv6 literal (`https://fd00:10::5:10250`), which `net/url` refuses since Go 1.26's strict-colon host parsing — the agent re-forms the authority with `net.JoinHostPort` (`https://[fd00:10::5]:10250`), so the one default serves both families; do NOT pre-bracket it in the manifest, which renders `[10.0.0.5]` on IPv4 and is rejected as an invalid IP-literal. `-check-config` parses the value and refuses one no request can be built from. Empty disables all THREE kubelet scrapes (cadvisor, node-metrics, stats-summary) |
+| `-kubelet-endpoint` | — | kubelet base URL, typically `https://$(NODE_IP):10250` with `NODE_IP` from the downward API. On an IPv6 node that expands to a BARE IPv6 literal (`https://fd00:10::5:10250`), which `net/url` refuses since Go 1.26's strict-colon host parsing — the agent re-forms the authority with `net.JoinHostPort` (`https://[fd00:10::5]:10250`), so the one default serves both families; do NOT pre-bracket it in the manifest, which renders `[10.0.0.5]` on IPv4 and is rejected as an invalid IP-literal. A bare IPv6 authority is read **host:port first**, because both readings succeed on `https://fd00::1:8443` — a 1-4 digit port is also a legal hextet — so a kubelet on a non-default port below 10000 works too; if you really mean an address whose last group is decimal, bracket it (`https://[fd00::1:8443]`). `-check-config` parses the value and refuses one no request can be built from. Empty disables all THREE kubelet scrapes (cadvisor, node-metrics, stats-summary) |
 | `-kubelet-token-file` | ServiceAccount token | bearer token towards the kubelet (needs `nodes/metrics get` RBAC) |
 | `-kubelet-insecure-tls` | `true` | kubelet serving certificates are typically self-signed |
 | `-cadvisor-rollups` | `true` | `false` drops the hierarchy aggregates (`/`, `/kubepods`, QoS/system slices) and pod-level rows of container-scoped families, keeping container-level series, `container_network_*` and `machine_*` |
@@ -3030,8 +3186,8 @@ naming the failing script position as `script=targets.star:3:9`), never to
 data loss:
 
 ```yaml
-ingest: |                  # per pushed RESOURCE, before enrichment
-  def admit(resource):     # False removes it (counted in
+ingest: |                  # per pushed RESOURCE, after the identity strip and
+  def admit(resource):     # before enrichment. False removes it (counted in
       return resource["team"] != "banned"   # kubescrape_ingest_admission_rejected_total)
 targets: |                 # per fetched scrape target, once per cycle
   def target(t):           # t.url/.path/.namespace/.pod/.labels/.source/.monitor
@@ -3051,7 +3207,18 @@ parse: |                   # per line of plain sources flagged parseScript
 
 The admission hook is the operator's **per-sender policy** on listeners
 nothing authenticates — the honest mitigation for a sender minting resources
-to latch a cardinality cap, which built-in bounds can only slow. The target
+to latch a cardinality cap, which built-in bounds can only slow. **What the
+resource holds when the hook runs** is worth stating, because it is neither
+the whole of what the sender wrote nor the whole of what the collector will
+see. The receipt-time strip has already run, so the sender's own Kubernetes
+identity claim — `k8s.namespace.name` and the `k8s.pod.*`/`k8s.node.name`/
+`container.*` siblings — is **gone**: a policy cannot be steered by a value
+any pod may write, which is the point, since routing keys tenancy on the
+first of those. Enrichment has **not** run, so the resolved identity is not
+there either. A hook keyed on a namespace therefore matches nothing at all,
+on purpose; key it on the lookup attribute the sender was going to be
+attributed by (`container.id`, `k8s.pod.uid`), on its OTLP service triple, or
+on its own descriptive attributes, as the `team` example above does. The target
 hook is full relabel-power (drop, rewrite `path`) without growing the
 declarative config. A dropped target has no other symptom — it is never
 fetched, so no `up` series falls to 0 — which is why the drop is counted. The sample policy plugs into the `tailSampling` policy
@@ -3554,6 +3721,27 @@ does not say so is worse than a big one:
   (`annotationsOmitted`, `ownersOmitted`) — without them it would answer "why is
   this pod not scraped?" with `podAnnotated: false` for a pod whose annotation
   was refused at the source.
+
+Every ceiling above bounds what ONE endpoint costs. The **endpoint list** is
+what multiplies them, and it is capped at **128** entries per ServiceMonitor or
+PodMonitor at the parse door. It was the last unbounded dimension of a monitor,
+and the response could not report it: 100,000 minimal endpoints in one 1.3 MB CR
+(inside etcd's object limit, writable by any tenant with edit rights in one
+namespace and the default `-monitor-namespaces`) parsed into ~38 MB retained in
+the singleton for the life of the CR, multiplied into one memo entry per
+(monitor, matched Service, endpoint) — 1,000,000 entries and 66 ms per rebuild
+at a tenth of that scale, rebuilt on any Service or monitor change — and were
+walked per pod per Service on every node-targets derivation, measured at 1.69 s
+for ONE 110-pod node. The served document stays small throughout, so the only
+symptoms are the singleton's RSS and every agent's targets poll timing out. Like
+the rule-count and chain-byte ceilings, this one keeps the **prefix** and
+refuses the tail — rejecting the CR would take every target its earlier
+endpoints contribute with it — and reports the refusal through
+`Endpoint.Ignored`, hence `kubescrape_monitor_fields_ignored_total` and the
+per-upsert warning, naming the CRD's own field (`endpoints(capped)` /
+`podMetricsEndpoints(capped)`). 128 is far above anything legitimate:
+kube-prometheus-stack's largest monitors carry single digits, and one pod cannot
+hold more than 16 targets however many endpoints resolve to it.
 
 **What is still not bounded, said plainly: labels.** They are selection input —
 Service and PodMonitor selectors match on them — so no filter can know which

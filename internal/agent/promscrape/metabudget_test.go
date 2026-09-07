@@ -243,7 +243,7 @@ func TestMetaLookupStopsIssuingOnceTheAllowanceIsSpent(t *testing.T) {
 	ctx, cancel := s.scrapeContext(context.Background(), 200*time.Millisecond, pipelineSummary)
 	defer cancel()
 
-	lctx, spent, may := s.metaLookup(ctx)
+	lctx, spent, may := s.metaLookup(ctx, nil)
 	if !may {
 		t.Fatal("the first lookup of a scrape was refused")
 	}
@@ -258,7 +258,7 @@ func TestMetaLookupStopsIssuingOnceTheAllowanceIsSpent(t *testing.T) {
 	<-lctx.Done()
 	spent()
 
-	if _, _, may := s.metaLookup(ctx); may {
+	if _, _, may := s.metaLookup(ctx, nil); may {
 		t.Error("a lookup was issued after the allowance was spent")
 	}
 	// The scrape's own context is untouched: that is the whole point — what is
@@ -275,7 +275,7 @@ func TestMetaLookupClampsToTheRemainingAllowance(t *testing.T) {
 	ctx, cancel := s.scrapeContext(context.Background(), time.Second, pipelineSummary)
 	defer cancel()
 
-	first, spent, may := s.metaLookup(ctx)
+	first, spent, may := s.metaLookup(ctx, nil)
 	if !may {
 		t.Fatal("the first lookup of a scrape was refused")
 	}
@@ -283,7 +283,7 @@ func TestMetaLookupClampsToTheRemainingAllowance(t *testing.T) {
 	spent()
 	_ = first
 
-	second, spent2, may := s.metaLookup(ctx)
+	second, spent2, may := s.metaLookup(ctx, nil)
 	if !may {
 		t.Fatal("the second lookup was refused while the allowance still had time in it")
 	}
@@ -301,7 +301,7 @@ func TestMetaLookupClampsToTheRemainingAllowance(t *testing.T) {
 func TestMetaLookupIsUnboundedWithoutAnAllowance(t *testing.T) {
 	s := New(Config{Node: "node1", Targets: staticTargets{}, Exporter: &captureExporter{}})
 	ctx := context.Background()
-	lctx, spent, may := s.metaLookup(ctx)
+	lctx, spent, may := s.metaLookup(ctx, nil)
 	defer spent()
 	if !may {
 		t.Fatal("a lookup outside a scrape was refused")
@@ -326,7 +326,7 @@ func TestASpentAllowanceIsNotNegativeCached(t *testing.T) {
 	ctx, cancel := s.scrapeContext(context.Background(), 200*time.Millisecond, pipelineSummary)
 	defer cancel()
 
-	if p, answered := s.podMeta(ctx, "ns1", "pod1"); p != nil || answered {
+	if p, answered := s.podMeta(ctx, "ns1", "pod1", nil); p != nil || answered {
 		t.Fatalf("a hung lookup reported (%v, answered=%v), want (nil, false)", p, answered)
 	}
 	if _, ok := s.cacheGet("n\x00ns1/pod1"); ok {
@@ -334,7 +334,7 @@ func TestASpentAllowanceIsNotNegativeCached(t *testing.T) {
 	}
 	// The allowance is now spent, so the next call must not even ask.
 	before := meta.calls.Load()
-	if p, answered := s.podMeta(ctx, "ns2", "pod2"); p != nil || answered {
+	if p, answered := s.podMeta(ctx, "ns2", "pod2", nil); p != nil || answered {
 		t.Errorf("a lookup past the allowance reported (%v, answered=%v), want (nil, false)", p, answered)
 	}
 	if got := meta.calls.Load(); got != before {
@@ -356,14 +356,14 @@ func TestASpentAllowanceIsWarnedAbout(t *testing.T) {
 	})
 	ctx, cancel := s.scrapeContext(context.Background(), 20*time.Millisecond, pipelineSummary)
 
-	_, spent, may := s.metaLookup(ctx)
+	_, spent, may := s.metaLookup(ctx, nil)
 	if !may {
 		t.Fatal("the first lookup of a scrape was refused")
 	}
 	time.Sleep(15 * time.Millisecond)
 	spent()
 	for range 3 {
-		if _, _, may := s.metaLookup(ctx); may {
+		if _, _, may := s.metaLookup(ctx, nil); may {
 			t.Fatal("a lookup was issued after the allowance was spent")
 		}
 	}
@@ -390,7 +390,7 @@ func TestAnUnspentAllowanceIsSilent(t *testing.T) {
 		Logger: slog.New(slog.NewTextHandler(&buf, nil)),
 	})
 	ctx, cancel := s.scrapeContext(context.Background(), time.Second, pipelineCadvisor)
-	_, spent, may := s.metaLookup(ctx)
+	_, spent, may := s.metaLookup(ctx, nil)
 	if !may {
 		t.Fatal("the first lookup of a scrape was refused")
 	}
@@ -410,7 +410,7 @@ func TestMetaLookupNeverOutlivesTheScrape(t *testing.T) {
 	defer cancel()
 	scrapeDeadline, _ := ctx.Deadline()
 
-	lctx, spent, may := s.metaLookup(ctx)
+	lctx, spent, may := s.metaLookup(ctx, nil)
 	defer spent()
 	if !may {
 		t.Fatal("the first lookup of a scrape was refused")

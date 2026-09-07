@@ -724,6 +724,8 @@ func run() error {
 	// Set when the disk buffer is enabled: the shutdown pass that empties the
 	// spools after every producer has stopped (Buffered.Run exits on cancel).
 	var finalDrain func(context.Context)
+	// Buffered.Run, held until the stop-and-drain defer below is registered.
+	var startBuffered func(context.Context)
 	if *bufferDir != "" {
 		logBuf, err := otlpexport.OpenBuffer(filepath.Join(*bufferDir, "logs"), int64(*bufferMax))
 		if err != nil {
@@ -761,11 +763,14 @@ func run() error {
 			}()
 		}
 		buffered := otlpexport.NewBuffered(exporter, logBuf, metricBuf, traceBuf, *otlpBackoff, log)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			buffered.Run(ctx)
-		}()
+		// STARTED below, past the stop-and-drain defer, not here. Nothing
+		// exports between the two points — the route clients and the transform
+		// program are only being BUILT — and starting the drain above that
+		// defer is what made the invariant it asserts false: an early return
+		// from either of those closed the spools and the exporter under a live
+		// drain goroutine, with `defer stop()` (registered far higher up)
+		// cancelling its context only afterwards.
+		startBuffered = buffered.Run
 		out = buffered
 		finalDrain = buffered.FinalDrain
 		// Make a filling buffer visible BEFORE it starts refusing writes: every
@@ -846,17 +851,23 @@ func run() error {
 		traceNext, _ := out.(transform.TracesExporter)
 		transforms = transform.Wrap(out, traceNext, prog)
 		out = transforms
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			transform.Reload(ctx, transforms, *transformsFile, 0, log)
-		}()
+		// The watcher is started below the stop-and-drain defer too, for the
+		// reason given at the buffer's Run.
 		log.Info("transforms enabled", "path", *transformsFile, "hash", prog.Hash)
 	}
 
 	// Registered AFTER the exporter/spool Close defers (LIFO): an early `return
 	// err` below must stop and drain every started goroutine BEFORE their
 	// exporter and spools are closed under them.
+	//
+	// NOTHING IS STARTED ABOVE THIS POINT — that is what makes the sentence
+	// above true rather than aspirational. The disk buffer's drain and the
+	// transform watcher used to be spawned where they are built, which is above
+	// the route-client and transform-compile early returns, so those returns
+	// ran the Close defers under two live goroutines and cancelled their context
+	// only afterwards (`defer stop()` is registered far higher, so LIFO runs it
+	// last). Both are started a few lines below instead; neither exports
+	// anything in between.
 	//
 	// BOUNDED, and on the normal shutdown path CLAMPED TO THE SHARED DEADLINE
 	// (shutdownBy, anchored once ctx is cancelled below). This is NOT a no-op on
@@ -886,13 +897,34 @@ func run() error {
 		stop()
 		budget := shutdownDrain
 		if !shutdownBy.IsZero() {
-			budget = min(shutdownDrain, time.Until(shutdownBy))
+			// CLAMPED at zero like the step budget: a shutdown that spent the
+			// shared deadline has nothing left to give, and a negative budget
+			// is not a wait, it is a number in a log line that reads as one.
+			budget = max(0, min(shutdownDrain, time.Until(shutdownBy)))
 		}
 		if !waitFor(&wg, budget) {
 			log.Warn("producers did not stop within the shutdown budget; closing anyway",
 				"budget", budget)
 		}
 	}()
+
+	// The two goroutines the sections above deliberately did not start. Below
+	// the drain defer, so every started goroutine is joined before the exporter
+	// and the spools it uses are closed.
+	if startBuffered != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			startBuffered(ctx)
+		}()
+	}
+	if transforms != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			transform.Reload(ctx, transforms, *transformsFile, 0, log)
+		}()
+	}
 
 	// The sink for the metrics the agent generates ABOUT ITSELF: this pod's own
 	// Kubernetes attributes filled in where the agent's identity left a key
@@ -1781,10 +1813,28 @@ func startNodeInfo(ctx context.Context, meta *metaclient.Client, nodeName string
 // terminationGracePeriodSeconds, which the manifests set explicitly.
 const shutdownDrain = 15 * time.Second
 
+// waitForProbe is the floor under waitFor's budget. It is a SCHEDULING grace,
+// not a wait: it exists only so that a spent budget still gets an honest answer.
+const waitForProbe = 10 * time.Millisecond
+
 // waitFor waits for wg with a deadline, reporting whether it finished in time.
+//
+// A NON-POSITIVE budget is answered, never assumed. time.After(<=0) is ready
+// before the goroutine that observes the WaitGroup has been scheduled at all, so
+// an ALREADY-DRAINED group reported a timeout that had not happened — measured
+// 1999 times in 2000 at budget=0, and 2000 in 2000 at a negative one. That is
+// reached on exactly the shutdown whose log an operator reads to find out what
+// went wrong: one that has spent its shared deadline, where the truthful
+// "shutdown deadline exceeded" line was joined by a "producers did not stop"
+// line accusing a tailer, journald or events producer that had in fact stopped.
+// The floor costs a blown-deadline shutdown ten milliseconds and cannot delay
+// one that has budget left.
 func waitFor(wg *sync.WaitGroup, budget time.Duration) bool {
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
+	if budget < waitForProbe {
+		budget = waitForProbe
+	}
 	select {
 	case <-done:
 		return true

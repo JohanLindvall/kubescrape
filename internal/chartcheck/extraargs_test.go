@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"sigs.k8s.io/yaml"
+
+	"github.com/JohanLindvall/kubescrape/internal/manifestcheck"
 )
 
 // TestFlowSequenceExtraArgsExamplesDoNotSplitAtAComma pins the one thing a
@@ -35,17 +37,15 @@ import (
 // scan looks only for `extraArgs:` followed by `[`.
 func TestFlowSequenceExtraArgsExamplesDoNotSplitAtAComma(t *testing.T) {
 	t.Parallel()
-	var files []string
-	for _, glob := range []string{
-		filepath.Join("..", "..", "charts", "kubescrape", "*.yaml"),
-		filepath.Join("..", "..", "charts", "kubescrape", "templates", "*.yaml"),
-		filepath.Join("..", "..", "deploy", "*.yaml"),
-	} {
-		found, err := filepath.Glob(glob)
-		if err != nil {
-			t.Fatalf("globbing %s: %v", glob, err)
-		}
-		files = append(files, found...)
+	// manifestcheck.ManifestFiles, not a glob: it WALKS and takes .yml too, so
+	// a template grouped into a subdirectory (which helm renders exactly like a
+	// flat one) or renamed cannot drop out of the scan silently.
+	files, err := manifestcheck.ManifestFiles(
+		filepath.Join("..", "..", "charts", "kubescrape"),
+		filepath.Join("..", "..", "deploy"),
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if len(files) == 0 {
 		t.Fatal("no chart or manifest files found to scan")

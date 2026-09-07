@@ -463,7 +463,7 @@ func TestSubOneRateBurstIsFlooredToGrantable(t *testing.T) {
 			t.Fatalf("RateLimit=%v: RateBurst=%v cannot hold one token, so no line is ever granted",
 				cfg.RateLimit, tl.cfg.RateBurst)
 		}
-		if !tl.allowLine(&file{}) {
+		if !tl.allowLine(&file{}, time.Now()) {
 			t.Fatalf("RateLimit=%v RateBurst=%v: first line refused", cfg.RateLimit, tl.cfg.RateBurst)
 		}
 	}

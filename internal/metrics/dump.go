@@ -254,6 +254,39 @@ func (r *Registry) noteLabelParseError(metric, labels string, err error) {
 			"mislabelled, not missing. Further reports are suppressed for "+dumpLabelWarnEvery.String())
 }
 
+// NoteSkippedPoint counts a data point a CONSUMER of Dump could not render,
+// and names it at most once per window — the same counter, and the same
+// throttle, Dump's own label-parse skips use.
+//
+// It is exported because the Prometheus bridge sits one layer UP, in
+// internal/obs (which imports this package, so it cannot declare the counter
+// there): Dump hands out points, and the const-metric construction that turns
+// them into an exposition can refuse one for reasons this package cannot see —
+// an invalid metric or label NAME, a label-count mismatch. That refusal used
+// to be discarded with no counter and no log, which is the identical invisible
+// shrinkage of the operator's own telemetry that noteLabelParseError exists to
+// close one layer down.
+//
+// ONE counter and not two, deliberately: both layers drop a point from the
+// SAME response — the /metrics exposition that is the only delivery path for
+// kubescrape_* metrics when -self-metrics-interval=0 — so the operator's
+// question ("is my self-telemetry complete?") and the alert answering it are
+// the same either way, and the WARN beside the counter is what says which
+// layer refused. A sibling metric would split one signal in two, and one half
+// would be a series nothing in this repo can currently move.
+func (r *Registry) NoteSkippedPoint(metric string, err error) {
+	r.dumpLabelErrors.Add(1)
+	if !r.dumpWarn.Allow(dumpLabelWarnEvery) {
+		return
+	}
+	slog.Default().Warn("a self-metric data point was skipped: the Prometheus exposition could not be built for it, "+
+		"so it is missing from the /metrics response this process serves for itself",
+		"metric", metric, "error", err, "skipped", r.dumpLabelErrors.Load(),
+		"note", "every self-metric name and label NAME comes from code in kubescrape, so this is a bug here and not "+
+			"anything a caller supplied. The OTLP push path renders the same point without this step, so the pushed "+
+			"copy of this series is unaffected. Further reports are suppressed for "+dumpLabelWarnEvery.String())
+}
+
 // truncLabelString bounds what a log line carries from a corrupt label string.
 func truncLabelString(s string) string {
 	const maxLoggedLabelBytes = 256

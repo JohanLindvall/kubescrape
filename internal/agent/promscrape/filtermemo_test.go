@@ -12,7 +12,7 @@ import (
 // broken charge would agree with itself.
 func retainedMemoBytes(s *filterSession) int {
 	n := 0
-	for k := range s.masks {
+	for k := range s.offsets {
 		n += len(k)
 	}
 	for k := range s.lblMatch {
@@ -58,8 +58,8 @@ func TestFilterSessionMemoIsBoundedByBytes(t *testing.T) {
 			"(%d names + %d label values of %d bytes; the entry caps bound the COUNT, which is not a memory bound)",
 			retained, maxMemoBytes, names, names, nameLen)
 	}
-	if len(s.masks) < 10 {
-		t.Fatalf("only %d names memoized: the byte bound must stop the memo GROWING, not disable it", len(s.masks))
+	if len(s.offsets) < 10 {
+		t.Fatalf("only %d names memoized: the byte bound must stop the memo GROWING, not disable it", len(s.offsets))
 	}
 
 	// Verdicts, after the budget is spent: identical to the unmemoized filter's.
@@ -79,6 +79,51 @@ func TestFilterSessionMemoIsBoundedByBytes(t *testing.T) {
 		if got := filter.Keep(tc.name, tc.labels); got != tc.want {
 			t.Fatalf("unmemoized Keep(%.10s..., %v) = %v, want %v", tc.name, tc.labels, got, tc.want)
 		}
+	}
+}
+
+// The memo must survive ANY rule count. It used to be a uint64 mask, so past 64
+// rules session() returned a memo-less view and BOTH memos vanished with it —
+// MetricFilters concatenates the shared `all` list with the pipeline's own, so
+// 40 plus 25 crosses the width with neither list looking large, and a
+// 100k-series target then re-ran ~65 anchored regexes per SAMPLE on the scrape
+// goroutine cycle() waits for. It was cost only (the verdicts never changed),
+// announced nowhere, and reached by adding one rule.
+func TestFilterSessionMemoSurvivesPastOneBitsetWord(t *testing.T) {
+	const rules = 200 // > 64, and not a multiple of it
+	many := make([]FilterRule, rules)
+	for i := range many {
+		many[i] = FilterRule{Action: "drop", Metrics: "rule" + pad8Scrape(i) + "_.+"}
+	}
+	// A final catch-all keep, so a series matching no drop rule still exercises
+	// a mask with a bit set in the LAST word.
+	many = append(many, FilterRule{Action: "keep", Metrics: "kept_.+"})
+	filter, err := newMetricFilter(many)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := filter.session()
+	if s.offsets == nil {
+		t.Fatal("no name memo past 64 rules: the cliff is back")
+	}
+	if want := (len(many) + 63) / 64; s.words != want {
+		t.Fatalf("bitset is %d words, want %d for %d rules", s.words, want, len(many))
+	}
+
+	// Every rule must still decide, including those past the first word, and
+	// the memoized verdict must equal the unmemoized one — twice, so the second
+	// call is served from the memo.
+	for _, name := range []string{"rule" + pad8Scrape(0) + "_x", "rule" + pad8Scrape(63) + "_x",
+		"rule" + pad8Scrape(64) + "_x", "rule" + pad8Scrape(rules-1) + "_x", "kept_x", "unmatched_x"} {
+		want := filter.Keep(name, nil)
+		for pass := range 2 {
+			if got := s.Keep(name, nil); got != want {
+				t.Fatalf("pass %d: memoized Keep(%q) = %v, unmemoized = %v", pass, name, got, want)
+			}
+		}
+	}
+	if len(s.offsets) != 6 {
+		t.Fatalf("memoized %d names, want 6 — the second pass must be served from the memo", len(s.offsets))
 	}
 }
 

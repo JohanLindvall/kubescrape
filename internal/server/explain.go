@@ -433,15 +433,35 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 			refused[t.Port] = v
 		}
 	}
-	// Unreachable today — podPorts pre-caps at MaxPortsPerPod and this door
-	// adds first, at d.base, so it can never be the one refused. Wired anyway:
-	// a door whose refusals are silent is precisely this finding, and the cost
-	// of the guard is a map that stays empty.
+	// The COUNT ceiling cannot bind here — podPorts pre-caps at MaxPortsPerPod
+	// and this door adds first, at d.base — but the BYTE one can, from this
+	// pod's SECOND target onwards: only the FIRST is unconditional (see
+	// targetDedup.add), so a pod carrying a large document and a multi-entry
+	// port annotation has entries 2..N refused at this very door.
+	// podbytesbomb_test.go's TestFatPodAnnotationCannotMultiplyIntoTheNode
+	// TargetsDocument is the case that reaches it, and without these notes it
+	// would answer "why is my 16th port not scraped?" with `ports: [n]` and no
+	// note at all — the "it is" inversion the ceiling notes exist to prevent.
 	noteCapped(doc.PortEntries, refused, d.podBytes)
+	// And the pod-level exclusion, which no port mirror can see: for a pod
+	// that is not scrapeable the derivation produced nothing at all, so
+	// `refused` is empty and every entry would otherwise be listed as
+	// resolving — the head saying "not scrapeable" and the entries saying the
+	// annotation works.
+	if !doc.Scrapeable {
+		noteNotScrapeable(doc.PortEntries)
+	}
 	// Clipped AFTER the verdicts are written, never before: the ceiling's
 	// refusals land on the TAIL of the list, so clipping first would hide
 	// exactly the entries the notes exist for.
 	doc.PortEntries, doc.PortEntriesNotShown = clipList(&portBudget, doc.PortEntries)
+	// Whether ANY matched Service opts this pod in, accumulated as the
+	// derivation runs. The hint below must not read this back off doc.Services:
+	// that list is clipped to svcBudget, so a pod whose only annotated Service
+	// sorts 17th would be told, flatly, that nothing opts it into scraping —
+	// the false negative the ...NotShown counters exist to prevent, in the one
+	// field an operator reads first.
+	svcOptIn := false
 	for _, svc := range matched {
 		// Whether this Service is LISTED. The derivation below runs either
 		// way — a Service that opts the pod in still contributes its targets,
@@ -451,6 +471,9 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 		es := explainService{
 			Name:      svc.Name,
 			Annotated: svc.Annotations[scrape.AnnotationScrape] == "true",
+		}
+		if es.Annotated || len(monitored[svc.UID]) > 0 {
+			svcOptIn = true
 		}
 		if show {
 			es.PortEntries, es.PortAnnotated = scrape.ExplainServicePorts(pod, svc)
@@ -462,6 +485,9 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 			}
 		}
 		noteCapped(es.PortEntries, refused, d.podBytes)
+		if !doc.Scrapeable {
+			noteNotScrapeable(es.PortEntries)
+		}
 		es.PortEntries, es.PortEntriesNotShown = clipList(&portBudget, es.PortEntries)
 		for _, sme := range monitored[svc.UID] {
 			// Same rule: the endpoint is offered, merged and counted whatever
@@ -504,7 +530,7 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 			} else {
 				// The wording (and the SIZE-refusal case it also covers) is
 				// scrape's: see scrape.MonitorEndpointNote.
-				em.Note = scrape.PodMonitorEndpointNote(*ep)
+				em.Note = scrape.PodMonitorEndpointNote(pod, *ep)
 			}
 			if monBudget.room(len(doc.PodMonitors)) {
 				doc.PodMonitors = append(doc.PodMonitors, em)
@@ -545,21 +571,17 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 	doc.NotShown = portBudget.hidden + declaredBudget.hidden + svcBudget.hidden + monBudget.hidden
 
 	if len(doc.Targets) == 0 && doc.Hint == "" {
-		// doc.Services lists EVERY selector-matching Service; only one that is
-		// scrape-annotated or selected by a ServiceMonitor is an opt-in, so a
-		// pod whose sole matches are unannotated Services still gets the
-		// "nothing opts this pod in" hint rather than a phantom opt-in.
-		svcOptIn := false
-		for _, es := range doc.Services {
-			if es.Annotated || len(es.Monitors) > 0 {
-				svcOptIn = true
-				break
-			}
-		}
+		// svcOptIn was accumulated over EVERY selector-matching Service (see
+		// its declaration) and podMonitors is the unclipped match set, for the
+		// same reason: only a Service that is scrape-annotated or selected by a
+		// ServiceMonitor is an opt-in, so a pod whose sole matches are
+		// unannotated Services still gets the "nothing opts this pod in" hint
+		// rather than a phantom opt-in — and a pod whose opt-in was clipped out
+		// of the document must not get that hint at all.
 		switch {
 		case !doc.Scrapeable:
 			doc.Hint = "pod is not scrapeable; see notScrapeableWhy"
-		case !doc.PodAnnotated && !svcOptIn && len(doc.PodMonitors) == 0:
+		case !doc.PodAnnotated && !svcOptIn && len(podMonitors) == 0:
 			doc.Hint = "nothing opts this pod into scraping: no prometheus.io/scrape=\"true\" pod annotation, no scrape-annotated or monitor-selected Service selecting it, and no PodMonitor matching it"
 		default:
 			doc.Hint = "an opt-in exists but no port resolved; see portEntries / services[].portEntries for the entry-by-entry verdicts"
@@ -626,6 +648,32 @@ func noteCapped(verdicts []scrape.PortVerdict, refused map[int32]targetVerdict, 
 	}
 }
 
+// noteNotScrapeable rewrites the verdicts of one door's port entries when the
+// POD is excluded from scraping. It is noteCapped's sibling and it corrects the
+// same class of statement: the mirrors in internal/scrape resolve ports and
+// cannot see Scrapeable, which the DERIVATION checks before it resolves
+// anything, so on a terminating pod every entry read as resolving while the
+// document's own head said the pod yields no targets.
+//
+// An entry that already resolves to nothing keeps its own note: that note is
+// still true and is the sharper answer of the two. A resolving entry loses its
+// `ports`, exactly as a ceiling-refused one does — listing them is what reads
+// as "this port is scraped".
+func noteNotScrapeable(verdicts []scrape.PortVerdict) {
+	for i := range verdicts {
+		v := &verdicts[i]
+		if len(v.Ports) == 0 {
+			continue
+		}
+		ports := make([]string, 0, len(v.Ports))
+		for _, p := range v.Ports {
+			ports = append(ports, strconv.Itoa(int(p)))
+		}
+		v.Ports = nil // omitempty: an empty array reads as "resolves, to nothing"
+		v.Note = scrape.NotScrapeableNote("port " + strings.Join(ports, ", "))
+	}
+}
+
 // explainMonitorEndpoint runs one ServiceMonitor endpoint through the same
 // resolve-then-offer-then-dedup the targets path takes, recording the verdict.
 // Every step here is nodeTargets' step, in nodeTargets' order — the counters
@@ -635,7 +683,7 @@ func (s *Server) explainMonitorEndpoint(d *targetDedup, offers *monitorOffers, c
 	em := explainMonitor{Monitor: sme.monitor}
 	url, ok := scrape.MonitorTargetURL(pod, svc, *sme.endpoint)
 	if !ok {
-		em.Note = scrape.MonitorEndpointNote(*sme.endpoint)
+		em.Note = scrape.MonitorEndpointNote(pod, *sme.endpoint)
 		return em
 	}
 	em.Resolved, em.URL = true, url

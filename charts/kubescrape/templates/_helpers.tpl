@@ -2,6 +2,37 @@
 {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
 {{- end -}}
 
+{{/*
+kubescrape.imagePullPolicy renders imagePullPolicy for all four workloads.
+
+An explicit `image.pullPolicy` wins. With none set it follows KUBERNETES' OWN
+rule, which the chart used to override: a FLOATING tag (`latest`, or an unset
+tag with the chart's `appVersion: latest`) gets `Always`, a pinned one gets
+`IfNotPresent`.
+
+That override is what made a republished image invisible. `helm upgrade` against
+a re-pushed `:latest` renders byte-identical Deployment/DaemonSet specs — the
+image string is unchanged and the only rollout-forcing annotation hashes the
+CONFIG — so nothing rolls at all; and a manual `kubectl rollout restart` then
+starts pods that, under IfNotPresent, reuse the `latest` layer every node
+already cached. The operator sees a successful upgrade with the old binary
+running, and the only evidence anywhere is the `version=` field on the startup
+log line.
+
+`Always` is not a fix for a floating tag, it is the mitigation: PIN
+`image.tag` to a released version or a digest, at which point this helper
+returns IfNotPresent by itself and the pull cost goes away with it.
+*/}}
+{{- define "kubescrape.imagePullPolicy" -}}
+{{- if .Values.image.pullPolicy -}}
+{{- .Values.image.pullPolicy -}}
+{{- else if eq (.Values.image.tag | default .Chart.AppVersion) "latest" -}}
+Always
+{{- else -}}
+IfNotPresent
+{{- end -}}
+{{- end -}}
+
 {{- define "kubescrape.labels" -}}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 app.kubernetes.io/instance: {{ .Release.Name }}

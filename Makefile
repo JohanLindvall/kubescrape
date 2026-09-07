@@ -118,8 +118,10 @@ $(GOLANGCI_LINT):
 # not merely re-add a dependency) and that the agent WITHOUT azure really has
 # dropped franz-go. Cheap enough for CI.
 #
-# The THIRD command is not about linking at all — it is the only step of `make
-# check` that TYPE-CHECKS the stubs. `-tags azure` compiles journald_disabled.go
+# The LAST command — the tag-less `go build ./cmd/kubescrape-agent` at the foot
+# of the recipe — is not about linking at all: it is the only step of `make
+# check` that TYPE-CHECKS the stubs. (It was the third until the client-go guard
+# was inserted above it; count from the bottom, not the top.) `-tags azure` compiles journald_disabled.go
 # (its `!journald` constraint holds), but the franz-go half is a `go list -deps`,
 # which resolves imports WITHOUT type-checking, so azure_disabled.go — the repo's
 # only `//go:build !azure` file — was compiled by no step of `make check` at all:

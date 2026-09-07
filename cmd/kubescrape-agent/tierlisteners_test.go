@@ -88,3 +88,70 @@ func TestSameListenAddr(t *testing.T) {
 		}
 	}
 }
+
+// The collision is not a TIER property, and checking only the tier's four
+// listeners (and only under -service-graph) left two shapes an operator can
+// type and -check-config signed off on:
+//
+//   - -ingest beside -service-graph. The node agent's logs-and-metrics receiver
+//     and the tier's trace receiver DEFAULT to the same :4317/:4318, so one
+//     process asked for both binds each twice; the loser gets `address already
+//     in use`, and which server that is varies per restart.
+//   - -pprof-listen typed onto -metrics-listen's :9090, which needs no feature
+//     flag at all.
+func TestValidateConfigRefusesAnyTwoListenersOnOneAddress(t *testing.T) {
+	defer restoreServiceGraphFlags(t)()
+	ingest, igrpc, ihttp := *ingestOn, *ingestGRPC, *ingestHTTP
+	lst, mtr, pprof := *listen, *metricsListen, *pprofListen
+	defer func() {
+		*ingestOn, *ingestGRPC, *ingestHTTP = ingest, igrpc, ihttp
+		*listen, *metricsListen, *pprofListen = lst, mtr, pprof
+	}()
+
+	// The shipped defaults on a plain DaemonSet agent must stay accepted.
+	*ingestOn, *serviceGraphOn = false, false
+	*listen, *metricsListen, *pprofListen = ":8081", ":9090", ""
+	if err := validateConfig(agentConfig{}, ""); err != nil {
+		t.Fatalf("the default listener layout was refused: %v", err)
+	}
+
+	// -ingest with its default ports, on a plain agent: still fine.
+	*ingestOn, *ingestGRPC, *ingestHTTP = true, ":4317", ":4318"
+	if err := validateConfig(agentConfig{}, ""); err != nil {
+		t.Fatalf("-ingest on its own default ports was refused: %v", err)
+	}
+
+	// ...and the same flags with the tier turned on, which is where they
+	// collide.
+	*serviceGraphOn = true
+	*serviceGraphToken = "/etc/kubescrape/service-graph/token"
+	*serviceGraphEndpoint, *serviceGraphShards = "", 0
+	*serviceGraphListen, *serviceGraphHTTPListen = ":4319", ""
+	*serviceGraphIngest = true
+	*serviceGraphIngestGRPC, *serviceGraphIngestHTTP = ":4317", ":4318"
+	err := validateConfig(agentConfig{}, "")
+	if err == nil {
+		t.Fatal("-check-config accepted -ingest beside -service-graph on one set of ports: both bind :4317 and the loser CrashLoops")
+	}
+	if !strings.Contains(err.Error(), "-ingest-grpc-endpoint") || !strings.Contains(err.Error(), "-service-graph-ingest-grpc") {
+		t.Fatalf("error %q does not name both flags", err)
+	}
+
+	// -pprof-listen onto -metrics-listen, with no feature flag involved.
+	*ingestOn, *serviceGraphOn = false, false
+	*pprofListen = ":9090"
+	err = validateConfig(agentConfig{}, "")
+	if err == nil {
+		t.Fatal("-check-config accepted -pprof-listen on -metrics-listen's address")
+	}
+	if !strings.Contains(err.Error(), "-pprof-listen") || !strings.Contains(err.Error(), "-metrics-listen") {
+		t.Fatalf("error %q does not name both flags", err)
+	}
+
+	// An empty listener is disabled and collides with nothing, however many of
+	// them there are.
+	*listen, *metricsListen, *pprofListen = "", "", ""
+	if err := validateConfig(agentConfig{}, ""); err != nil {
+		t.Fatalf("three disabled listeners were read as a collision: %v", err)
+	}
+}

@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"go.starlark.net/syntax"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 // logsScript wraps a transform() body as the transforms file's logs: section.
@@ -700,4 +702,115 @@ func TestCompileTimePrintIsAlsoRouted(t *testing.T) {
 	if !strings.Contains(logged.String(), "at-module-level") {
 		t.Fatalf("a module-level print did not reach the script log: %q", logged.String())
 	}
+}
+
+// --- the bound has to bind BEFORE the allocation ---
+
+// allocatedBy runs f and reports how many bytes it allocated, and whether that
+// figure means anything. The gap these cases are about is three orders of
+// magnitude wide (a few MiB against gigabytes), so a coarse ceiling is a stable
+// assertion rather than a machine-dependent one — but under -race the
+// detector's own bookkeeping swamps it (the findall case measured 1,592 MiB
+// against a 128 MiB ceiling), so there the REFUSAL is still asserted and only
+// the size claim is skipped.
+func allocatedBy(f func()) (uint64, bool) {
+	if testrace.Enabled {
+		f()
+		return 0, false
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	f()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc, true
+}
+
+// str() and repr() RENDER their input, so the element-COUNT check the other
+// materialisers rely on is not a bound on their result: `str([body] * 200)` is
+// a legal 200-element sequence built from two individually legal values, and
+// it renders to 200 copies of the body. The after-the-fact charge could only
+// refuse it once the string existed — measured at 1.57 GiB allocated before
+// the refusal fired, which is exactly the OOM this layer exists to prevent.
+func TestRenderingMaterialisersRefuseBeforeTheyAllocate(t *testing.T) {
+	for _, name := range []string{"str", "repr"} {
+		t.Run(name, func(t *testing.T) {
+			var err error
+			grew, measured := allocatedBy(func() {
+				err = runBody(t, fmt.Sprintf("s = \"x\" * (1<<20)\nl = [s] * 200\n_x = %s(l)\n", name))
+			})
+			mustContain(t, err, "limit for one value")
+			// The operands themselves are ~1 MiB; anything near the ~200 MiB
+			// result means the refusal came after the render.
+			if measured && grew > 64<<20 {
+				t.Fatalf("refused only after allocating %d MiB — the bound must be predictive, not a charge", grew>>20)
+			}
+		})
+	}
+}
+
+// The projection walks nested containers, so wrapping the same operands one
+// level deeper is not a way past it.
+func TestNestedRenderIsBoundedToo(t *testing.T) {
+	mustContain(t, runBody(t, "s = \"x\" * (1<<20)\ninner = [s] * 32\nouter = [inner] * 32\n_x = str(outer)\n"), "limit for one value")
+}
+
+// A cyclic value has no size at all; the projection must terminate on it
+// rather than recurse, and the render itself still works (starlark prints the
+// cycle as [...]).
+func TestRenderProjectionTerminatesOnACycle(t *testing.T) {
+	if got := evalToAttr(t, "a = []\na.append(a)\nfor r in batch:\n    r.attributes[\"out\"] = str(a)\n"); got != "[[...]]" {
+		t.Fatalf("str(cyclic list) = %q, want \"[[...]]\"", got)
+	}
+}
+
+// ...and the bound must not refuse the renders a real script does.
+func TestOrdinaryRendersAreNotRefused(t *testing.T) {
+	for _, tc := range []struct{ expr, want string }{
+		{`str([1, 2, 3])`, "[1, 2, 3]"},
+		{`str({"a": 1})`, `{"a": 1}`},
+		{`repr("hi")`, `"hi"`},
+		{`str(["x" * 1024] * 64)[:5]`, `["xxx`},
+	} {
+		if got := evalToAttr(t, "for r in batch:\n    r.attributes[\"out\"] = "+tc.expr+"\n"); got != tc.want {
+			t.Errorf("%s = %q, want %q", tc.expr, got, tc.want)
+		}
+	}
+}
+
+// --- the wall clock is EVERY builtin's, not most of them ---
+
+// limits.go promises the wall clock is "checked between interpreter steps via
+// OnMaxSteps and on entry to every builtin this package defines, because a
+// script can spend minutes inside a handful of O(n) steps". Three verbs broke
+// it by discarding the *starlark.Thread in their signature, which also put
+// them out of reach of the allocation budget — and the next verb written
+// beside them would have inherited the omission by copying the shape.
+func TestEveryBuiltinChecksTheWallClockOnEntry(t *testing.T) {
+	withWallClock(t, 25*time.Millisecond)
+	for _, tc := range []struct{ name, body string }{
+		{"route", "for r in batch:\n    r.route(\"tenant-a\")\n"},
+		{"emit_metric", "for r in batch:\n    r.emit_metric(\"m\", 1)\n"},
+		{"log", "log(\"hello\")\n"},
+		// The already-covered ones, so a regression in the shared helper is
+		// caught by the same test as a regression in one verb.
+		{"re", "for r in batch:\n    r.attributes[\"m\"] = str(re.match(\"x\", r.body))\n"},
+		{"range", "for _i in range(1):\n    pass\n"},
+		{"str", "_x = str(1)\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withFakeClock(t, time.Second)
+			mustContain(t, runBody(t, tc.body), "over the 25ms budget")
+		})
+	}
+}
+
+// emit_metric's labels are the one script-built value that reached a Go
+// allocation with no bound at all: the dict is built by uncharged setitem, and
+// a non-string value is RENDERED, which is str()'s amplifier under another
+// name.
+func TestEmitMetricLabelsAreCharged(t *testing.T) {
+	mustContain(t, runBody(t,
+		"s = \"x\" * (1<<20)\nl = [s] * 200\nfor r in batch:\n    r.emit_metric(\"m\", 1, {\"k\": l})\n"),
+		"limit for one value")
 }

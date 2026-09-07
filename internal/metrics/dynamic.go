@@ -354,6 +354,18 @@ func (s *DynamicMetricSet) DroppedCappedByMetric() map[string]float64 {
 // was not finite (NaN or +/-Inf).
 func (s *DynamicMetricSet) DroppedNaN() uint64 { return s.drops.NaN() }
 
+// DroppedNegative counts observations this set rejected because the extracted
+// value was negative on a metric whose exported form is MONOTONIC — a
+// `counter` (an OTLP Sum with IsMonotonic(true)) or a `summary` (whose sum
+// reaches Prometheus as the counter-typed <name>_sum).
+//
+// It is a SEPARATE series from DroppedNaN because the remedy is separate: a
+// non-finite value means the extraction is producing garbage, while a negative
+// one is usually a well-formed signed quantity on the wrong metric type — the
+// fix is `gauge` (with an add/sub action or a min/max/avg/sum window) or a
+// `histogram` whose bounds cover it, neither of which is monotonic.
+func (s *DynamicMetricSet) DroppedNegative() uint64 { return s.drops.Negative() }
+
 // addContext is the per-line scratch state pooled across Add calls. labelFn
 // and valueFn are bound once at construction (closing over the context) so a
 // line's evaluation allocates no closures; the per-line inputs live in the

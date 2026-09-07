@@ -148,7 +148,7 @@ type Scraper struct {
 	// tlsClients caches per-target transports keyed by their resolved TLS
 	// material (see clientFor); targets sharing a CA share a connection pool.
 	tlsMu      sync.Mutex
-	tlsClients map[string]*http.Client
+	tlsClients map[string]tlsClientEntry
 
 	dueMu           sync.Mutex
 	due             map[string]time.Time
@@ -265,7 +265,7 @@ func New(cfg Config) *Scraper {
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
-		tlsClients:  map[string]*http.Client{},
+		tlsClients:  map[string]tlsClientEntry{},
 		log:         log,
 		kubeletHTTP: newKubeletHTTPClient(cfg.Kubelet, cfg.Timeout),
 		podCache:    make(map[string]podCacheEntry),
@@ -285,6 +285,9 @@ func (s *Scraper) scrapeProto(ctx context.Context, body io.Reader, cb chunker, r
 	ss := s.newScrapeSession(ctx, cb, pipelineTargets, what, warnKey, relabel, true)
 	defer ss.reportDropped()
 	malformed, err := s.parseProtoAndExport(ss, body)
+	// Before the abort check, like the text front's: a body that tripped the
+	// sample limit still carried whatever exemplars were converted before it.
+	ss.reportBadExemplars(ss.badExemplars)
 	ss.reportMalformed("scrape had malformed proto families", malformed, nil)
 	if err != nil {
 		return ss.samples, err
@@ -300,7 +303,8 @@ func (s *Scraper) scrapeProto(ctx context.Context, body io.Reader, cb chunker, r
 // hammer the service).
 func (s *Scraper) authToken(ctx context.Context, ref string) (string, error) {
 	s.authMu.Lock()
-	if e, ok := s.authCache[ref]; ok && time.Since(e.fetched) < time.Minute {
+	s.sweepAuthCacheLocked(time.Now())
+	if e, ok := s.authCache[ref]; ok {
 		s.authMu.Unlock()
 		return e.token, nil
 	}
@@ -314,19 +318,56 @@ func (s *Scraper) authToken(ctx context.Context, ref string) (string, error) {
 	}
 	s.authMu.Lock()
 	now := time.Now()
-	// Drop what has aged out. These entries hold bearer tokens, CA bundles and
-	// client private keys; keeping them resident for the process lifetime past
-	// their 1-minute usefulness is secret material sitting in heap for nothing
-	// (the service side evicts, and the sibling TLS-client cache in this
-	// package is bounded).
+	s.sweepAuthCacheLocked(now)
+	// The cap is the second bound, because expiry alone bounds nothing under
+	// churn: a monitor edited in a loop mints a fresh ref each time, and every
+	// entry inside one TTL window survives the sweep. An arbitrary victim costs
+	// the next scrape of that ref one metadata request.
+	for k := range s.authCache {
+		if len(s.authCache) < maxAuthCacheEntries {
+			break
+		}
+		delete(s.authCache, k)
+	}
+	s.authCache[ref] = authCacheEntry{token: token, fetched: now}
+	s.authMu.Unlock()
+	return token, nil
+}
+
+// maxAuthCacheEntries bounds the resolved-secret cache. One monitor endpoint
+// can name up to six refs (bearer, basicAuth user and password, authorization
+// credentials, CA, cert, key), so this is a few dozen monitored targets' worth
+// on one node — far above any real node, and a hard bound against ref churn.
+const maxAuthCacheEntries = 256
+
+// sweepAuthCacheLocked drops entries past their 1-minute usefulness. Caller
+// holds authMu.
+//
+// It is called on EVERY path into the cache — the hit, the insert, and the
+// scrape cycle — because these entries hold bearer tokens, CA bundles, client
+// certificates and client PRIVATE KEYS, and a sweep that ran only inside a
+// cache-miss insert (as this one did) never reaches the entry that matters: a
+// ref that stops being fetched is exactly the one whose monitor was deleted or
+// whose pod moved off this node, and if EVERY ref goes away the sweep stops
+// running at all, leaving the whole map resident for the process lifetime —
+// the opposite of what the comment here promised. Nothing was ever SERVED
+// stale (the hit path re-checked the age), so this is hygiene rather than
+// correctness: the material simply must not outlive its use.
+func (s *Scraper) sweepAuthCacheLocked(now time.Time) {
 	for k, e := range s.authCache {
 		if now.Sub(e.fetched) >= time.Minute {
 			delete(s.authCache, k)
 		}
 	}
-	s.authCache[ref] = authCacheEntry{token: token, fetched: now}
+}
+
+// sweepAuthCache releases aged-out secret material even when nothing asks for
+// a token any more — the cycle always runs, an authToken call may never come
+// again.
+func (s *Scraper) sweepAuthCache() {
+	s.authMu.Lock()
+	s.sweepAuthCacheLocked(time.Now())
 	s.authMu.Unlock()
-	return token, nil
 }
 
 // Run scrapes until ctx is done; the first cycle starts immediately.
@@ -470,6 +511,15 @@ const maxWarnKeys = 1024
 // uncompilable regex — for the life of the agent. Identity (warnTarget, the
 // kubelet endpoint, a pipeline name) is bounded by the cluster's own objects;
 // content is not. Content still RIDES on the line, through clipForLog.
+//
+// Bounded by the cluster's objects means bounded PER INSTANT, and this table
+// lives for the process, so warnTarget additionally avoids naming anything that
+// churns faster than the agent restarts — see its bare-pod arm. The residual,
+// stated rather than papered over: an owner object that is itself per-run (an
+// Argo Workflow, which the owner resolver cannot follow and appends bare) is
+// still named, because the operator's fix IS on that object and nothing stable
+// stands behind it. It takes maxWarnKeys distinct such workloads, each also
+// serving a malformed exposition or an unusable scrapeTimeout, to saturate.
 func (s *Scraper) warnOnce(key, msg string, args ...any) {
 	s.dueMu.Lock()
 	if s.warned == nil {
@@ -520,15 +570,28 @@ func warnTarget(t kubemeta.ScrapeTarget) string {
 	}
 	// Pod annotations. The chain is direct-owner-first, so the LAST owner is
 	// the workload root: a Deployment rather than its per-revision ReplicaSet,
-	// so a rollout does not mint a new key. A bare pod falls back to its name.
+	// so a rollout does not mint a new key.
 	if n := len(t.Pod.Owners); n > 0 {
 		o := t.Pod.Owners[n-1]
 		return t.Source + ":" + t.Pod.Namespace + "/" + o.Kind + "/" + o.Name
 	}
-	return t.Source + ":" + t.Pod.Namespace + "/" + t.Pod.Name
+	// A BARE pod is keyed by its namespace alone, deliberately without its
+	// name. It is the one arm with no object outliving the pod behind it, so
+	// the name is the churn the table cannot survive: a cluster that keeps
+	// creating owner-less annotated pods (kubectl run, debug pods carrying
+	// prometheus.io/scrape=true) mints one permanent key per incarnation, and
+	// the window is zero, so past maxWarnKeys the table refuses every NEW key
+	// for the life of the agent — including the kubelet's RBAC refusal, which
+	// is the warning an operator can least afford to lose. The cost is
+	// granularity among owner-less pods of one namespace, which is small: the
+	// line still names the target, and the counters are the ongoing signal.
+	return t.Source + ":" + t.Pod.Namespace
 }
 
 func (s *Scraper) cycle(ctx context.Context) {
+	// Release aged-out secret material on a cadence that does not depend on a
+	// target still asking for it (see sweepAuthCacheLocked).
+	s.sweepAuthCache()
 	var targets []kubemeta.ScrapeTarget
 	targetsOK := s.cfg.DisableTargets // nothing to schedule when targets are off
 	if !s.cfg.DisableTargets {
@@ -610,7 +673,10 @@ func (s *Scraper) cycle(ctx context.Context) {
 		return true
 	}
 	now := time.Now()
-	due := make(map[string]time.Time, len(targets)+2)
+	// +len(kubeletDueKeys), never a literal: the count is derived from the
+	// authoritative list, as s.due's own sizing already is. The literal was a
+	// second copy of it and went stale when /stats/summary added a third key.
+	due := make(map[string]time.Time, len(targets)+len(kubeletDueKeys))
 	intervals := make(map[string]time.Duration, len(targets))
 	// dueNow reports whether a scheduled key is due, and records its next time.
 	// The kubelet scrapes go through it too: they are the most expensive on the
@@ -891,8 +957,11 @@ func targetInstance(rawURL string) string {
 // that could go differently.
 func (s *Scraper) resolveContext(ctx context.Context, containerID, namespace, pod, uid, container string, res pcommon.Resource) (attrs.Context, bool, bool) {
 	var actx attrs.Context
+	// ONE object, however many lookups it takes: the metadata allowance's shed
+	// count is per object (see objectShed).
+	var obj objectShed
 	if containerID != "" {
-		md, answered := s.containerMeta(ctx, containerID)
+		md, answered := s.containerMeta(ctx, containerID, &obj)
 		if md != nil {
 			actx.Pod, actx.Container = &md.Pod, &md.Container
 			return actx, true, true
@@ -914,14 +983,14 @@ func (s *Scraper) resolveContext(ctx context.Context, containerID, namespace, po
 		// this container id is unknown, and whether the pod lookup beside it
 		// also reached the service says nothing about that verdict.
 		if pod != "" {
-			if meta, _ := s.podMeta(ctx, namespace, pod); meta != nil && podAnswersFor(meta, uid) {
+			if meta, _ := s.podMeta(ctx, namespace, pod, &obj); meta != nil && podAnswersFor(meta, uid) {
 				actx.Pod = meta
 			}
 		}
 		return actx, false, answered
 	}
 	if pod != "" {
-		meta, answered := s.podMeta(ctx, namespace, pod)
+		meta, answered := s.podMeta(ctx, namespace, pod, &obj)
 		if meta != nil && podAnswersFor(meta, uid) {
 			actx.Pod = meta
 			if container != "" {

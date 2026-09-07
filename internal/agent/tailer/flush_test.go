@@ -790,3 +790,87 @@ func TestCandidateInANewerSegmentThanTheWatermarkIsWithheld(t *testing.T) {
 			f.exportedHighs, end3)
 	}
 }
+
+// A REWIND must drop the file's withheld commit highs. `exportedHighs` names
+// entries that were DELIVERED but whose commit the watermark clamp held back,
+// and a later flush re-offers them once nothing is buffered — which is right
+// for as long as those bytes are still the bytes the file holds. A rewind is
+// the one restart path that reuses the TAIL ID (the file is unchanged, so no
+// newTail is issued, unlike every replacement path), and it puts readPos back
+// to `committed`; from there nothing detects an in-place truncate-and-rewrite
+// (logrotate copytruncate, or an app reopening with O_TRUNC): the pre-read
+// fingerprint re-verify is skipped at readPos 0 and neither truncation arm of
+// handleRotation can fire on a from-zero read. So a surviving high commits the
+// REPLACEMENT's checkpoint past bytes it never exported — measured at
+// committed=587 for a 112-byte replacement, 9 of 11 lines never exported and
+// the restart resuming mid-line into a torn body, with every loss counter flat.
+func TestARewoundFilesWithheldHighsCannotCommitReplacementBytes(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	f := &file{
+		path:        filepath.Join(dir, logName),
+		source:      &compiledSource{name: "containers", containerd: true},
+		containerID: "0123456789abcdef",
+		resolved:    true,
+		resource:    pcommon.NewResource(),
+	}
+	tl.newPipeline(f)
+	tl.files[f.path] = f
+
+	// One stream holds an open CRI P run at offset 0, so the watermark pins
+	// every commit at 0 while the OTHER stream's entries are delivered.
+	hold := timeNowCRI() + " stdout P frag"
+	off := int64(len(hold) + 1)
+	tl.feedLine(ctx, f, hold, 0, off, time.Now())
+	for i := range 10 {
+		l := fmt.Sprintf("%s stderr F line-%d", timeNowCRI(), i)
+		end := off + int64(len(l)+1)
+		tl.feedLine(ctx, f, l, off, end, time.Now())
+		off = end
+	}
+	tl.flush(ctx)
+	if f.committed != 0 {
+		t.Fatalf("precondition: committed = %d, want 0 (the open P run should clamp every commit)", f.committed)
+	}
+	high := f.exportedHighs[f.tail]
+	if high != off {
+		t.Fatalf("precondition: exportedHighs = %v, want the withheld high %d", f.exportedHighs, off)
+	}
+	tailBefore := f.tail
+
+	// A collector blip: the next batch fails all three attempts, so failBatch
+	// rewinds the file to its committed offset (0) and purges the pipeline.
+	exp.fail = 3
+	blip := timeNowCRI() + " stderr F blip"
+	tl.feedLine(ctx, f, blip, off, off+int64(len(blip)+1), time.Now())
+	tl.flush(ctx)
+	if f.tail != tailBefore {
+		t.Fatalf("a rewind issued a fresh tail id (%d -> %d); this test's premise is that it does NOT, "+
+			"which is what leaves a stale high live against the reused id", tailBefore, f.tail)
+	}
+	if len(f.exportedHighs) != 0 {
+		t.Fatalf("exportedHighs = %v after a rewind, want empty: every one of those positions lies above "+
+			"`committed`, so the re-read re-proposes them — keeping them buys nothing and lets a replacement's "+
+			"checkpoint jump to %d", f.exportedHighs, high)
+	}
+
+	// The writer truncates the file in place and rewrites it far shorter. The
+	// rewind left readPos at 0, so nothing detected the swap: the replacement
+	// is read from zero and its one line is all that was ever exported.
+	repl := timeNowCRI() + " stderr F replacement"
+	replEnd := int64(len(repl) + 1)
+	tl.feedLine(ctx, f, repl, 0, replEnd, time.Now())
+	tl.flush(ctx)
+
+	if f.committed > replEnd {
+		t.Fatalf("committed = %d for a %d-byte replacement whose only exported line ends at %d: the withheld "+
+			"high %d survived the rewind and committed bytes nothing ever exported. A restart resumes past "+
+			"them — mid-line, so the next record is torn — and every loss counter stays flat",
+			f.committed, replEnd, replEnd, high)
+	}
+	if f.committed != replEnd {
+		t.Fatalf("committed = %d, want %d: the replacement's own delivered line did not commit", f.committed, replEnd)
+	}
+}

@@ -71,3 +71,66 @@ func TestEveryCloseIsRegisteredBeforeTheProducerDrain(t *testing.T) {
 		}
 	}
 }
+
+// The other half of the same invariant, and the half the comment above the
+// drain defer asserted while the code broke it: nothing may be STARTED above
+// that defer either.
+//
+// The disk buffer's Run and the transform watcher used to be spawned where they
+// are built, which is above the route-client and transform-compile early
+// returns. Those returns then ran the exporter and spool Close defers under two
+// live goroutines and cancelled their context only afterwards (`defer stop()`
+// is registered far higher, so LIFO runs it last) — a startup that failed on an
+// unreadable route CA file narrated a collector outage instead.
+//
+// Source order is the property, so the test reads the source.
+func TestNoGoroutineIsStartedBeforeTheProducerDrainIsRegistered(t *testing.T) {
+	const file = "main.go"
+	src, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, file, src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var run *ast.FuncDecl
+	for _, d := range parsed.Decls {
+		if fn, ok := d.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name.Name == "run" {
+			run = fn
+		}
+	}
+	if run == nil {
+		t.Fatalf("no run() in %s", file)
+	}
+
+	text := func(n ast.Node) string {
+		return string(src[fset.Position(n.Pos()).Offset:fset.Position(n.End()).Offset])
+	}
+	var drain ast.Node
+	var starts []ast.Node
+	ast.Inspect(run.Body, func(n ast.Node) bool {
+		switch s := n.(type) {
+		case *ast.DeferStmt:
+			if strings.Contains(text(s), "waitFor(&wg") {
+				drain = s
+			}
+		case *ast.GoStmt:
+			starts = append(starts, s)
+		}
+		return true
+	})
+	if drain == nil {
+		t.Fatal("no producer-drain defer (waitFor(&wg, ...)) in run()")
+	}
+	if len(starts) == 0 {
+		t.Fatal("no `go` statements found in run(); the check would pass vacuously")
+	}
+	for _, g := range starts {
+		if g.Pos() < drain.Pos() {
+			t.Errorf("%s: started before the producer drain is registered, so an early `return err` below closes its exporter and spools under it:\n%s",
+				fset.Position(g.Pos()), text(g))
+		}
+	}
+}

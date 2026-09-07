@@ -263,8 +263,8 @@ func TestGetPodByIPIgnoresFinishedPods(t *testing.T) {
 
 // runningPod builds a Running pod. created varies across the pods so the
 // tests can model an IP being released by one pod and handed to another; the
-// claim itself is last-write-wins with terminating pods yielding (creation
-// time deliberately does NOT order it).
+// claim itself is ordered by acquisition, the later one winning (creation
+// time deliberately does NOT order it, and neither does the terminating bit).
 func runningPod(uid, name, rv, podIP string, created time.Time) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -315,9 +315,9 @@ func TestDeleteOfStaleIPClaimantKeepsLiveMapping(t *testing.T) {
 // unrelated update (any status/condition change bumps ResourceVersion —
 // routine while a pod terminates) after the new pod claimed the IP. UpsertPod
 // used to unconditionally re-stamp byPodIP[ip] for a Running-phase pod, so
-// the terminating pod stole the mapping back from the live owner and its
-// later deletion removed the entry entirely. The fix: a terminating pod
-// (DeletionTimestamp set) yields its IP claim to a live incumbent.
+// the stale pod stole the mapping back from the live owner and its later
+// deletion removed the entry entirely. The fix: the LATER acquirer holds the
+// address, so a re-assert by the earlier one decides nothing.
 func TestStaleUpdateCannotReclaimRecycledIP(t *testing.T) {
 	s := New(time.Minute)
 	s.UpsertPod(runningPod("a-uid", "old", "1", "10.0.0.5", tOld))

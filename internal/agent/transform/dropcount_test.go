@@ -188,3 +188,63 @@ func TestTransformNoDropsNoCount(t *testing.T) {
 		t.Fatalf("counter moved by %v with nothing dropped", got)
 	}
 }
+
+// A FAILED export is where the two producer classes part company, and the
+// failure branch used to apply the copy path's reasoning to both.
+//
+// A copy-path producer re-offers the same object and the retry re-runs the
+// script over a fresh copy, so counting on failure would multiply one batch's
+// drops by the length of an outage. A HANDED-OFF producer never re-offers it:
+// handoff.go's contract is that it rebuilds from source, and for promscrape
+// (a take()n chunk behind its exportFailed latch) and cgroupstats (windows
+// that snapshot() reset as it read them) the source is destroyed by the
+// attempt. Their drops were counted nowhere at all — precisely during the
+// collector outage in which an operator reads this counter to tell an
+// intentional script drop from a delivery failure.
+func TestFailedExportCountsDropsOnlyForProducersThatWillNotRetryTheScript(t *testing.T) {
+	prog, err := compileStarlark("logs", "def transform(batch):\n    for r in batch:\n        if r.body != \"keep\":\n            r.drop()\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	program := &Program{logs: prog}
+	payload := func() plog.Logs {
+		ld := plog.NewLogs()
+		sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+		for _, body := range []string{"drop", "keep", "drop", "drop"} {
+			sl.LogRecords().AppendEmpty().Body().SetStr(body)
+		}
+		return ld
+	}
+
+	t.Run("handed off: counted, because the script never sees them again", func(t *testing.T) {
+		next := &failN{fail: 1}
+		w := Wrap(next, next, program)
+		before := obs.TransformDropped.WithLabelValues("logs").Value()
+		if err := w.ExportLogs(Handoff(context.Background()), payload()); err == nil {
+			t.Fatal("want the export error")
+		}
+		if got := obs.TransformDropped.WithLabelValues("logs").Value() - before; got != 3 {
+			t.Fatalf("counted %v drops, want 3", got)
+		}
+	})
+
+	t.Run("copy path: not counted, because the retry re-runs the script", func(t *testing.T) {
+		next := &failN{fail: 1}
+		w := Wrap(next, next, program)
+		before := obs.TransformDropped.WithLabelValues("logs").Value()
+		ld := payload()
+		if err := w.ExportLogs(context.Background(), ld); err == nil {
+			t.Fatal("want the export error")
+		}
+		if got := obs.TransformDropped.WithLabelValues("logs").Value() - before; got != 0 {
+			t.Fatalf("counted %v drops on the failed attempt, want 0: the retry re-runs the script", got)
+		}
+		// The retry delivers, and THAT is where the batch's drops land — once.
+		if err := w.ExportLogs(context.Background(), ld); err != nil {
+			t.Fatal(err)
+		}
+		if got := obs.TransformDropped.WithLabelValues("logs").Value() - before; got != 3 {
+			t.Fatalf("counted %v drops over the failure and the retry, want 3", got)
+		}
+	})
+}

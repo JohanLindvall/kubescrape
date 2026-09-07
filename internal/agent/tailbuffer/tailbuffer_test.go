@@ -3,8 +3,10 @@ package tailbuffer
 import (
 	"context"
 	"errors"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -907,5 +909,92 @@ func TestRunDecidesOnItsTicker(t *testing.T) {
 	}
 	if got := cap.count(); got != 1 {
 		t.Fatalf("exported %d spans, want 1", got)
+	}
+}
+
+// One sweep must not hold the buffer mutex across its whole decision batch.
+//
+// Deciding happens under the mutex by design — the evaluator reads the shared
+// scratch, and removing a trace edits the map and the FIFO — but a decision is
+// not cheap: a `type: script` policy is a Starlark decide(trace) per trace, and
+// the receive path takes the SAME mutex for every push. Holding it for a
+// backlog's worth of decisions once per tick stalls every sender on the shard
+// and holds their -ingest-max-in-flight slots for the duration; the drain is
+// therefore chunked, exactly as internal/agent/servicegraph and
+// internal/agent/spanmetrics chunk their renders (TestRenderDoesNotStallRecord,
+// TestRenderDoesNotStallConsume).
+func TestSweepDoesNotStallReceive(t *testing.T) {
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("needs a second core: the measurement is a concurrent push against a running sweep")
+	}
+	const due = 8192 // 16 chunks
+	// Stand in for a Starlark policy body: a decision that costs real time.
+	slow := func(tailsample.Trace) (bool, bool) {
+		t0 := time.Now()
+		for time.Since(t0) < 20*time.Microsecond {
+		}
+		return true, false
+	}
+	cfg := Config{
+		Config: tailsample.Config{
+			Policies: []tailsample.PolicyConfig{{Name: "slow", Type: tailsample.TypeScript}},
+			Script:   slow,
+		},
+		DecisionWait: "1m",
+	}
+	cap := &capture{}
+	b, clk := newTestBuffer(t, cfg, cap)
+	ctx := context.Background()
+
+	for i := uint64(1); i <= due; i++ {
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: i, span: 1, end: 5})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clk.advance(2 * time.Minute) // every buffered trace is now due
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var maxStall atomic.Int64
+	var pushes atomic.Int64
+	go func() {
+		defer close(done)
+		// Distinct trace ids, far from the due set: each push buffers a trace
+		// that is NOT due, so the pusher measures the lock and nothing else.
+		for id := uint64(1_000_000); ; id++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			t0 := time.Now()
+			if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: id, span: 1, end: 5})); err != nil {
+				return
+			}
+			if d := int64(time.Since(t0)); d > maxStall.Load() {
+				maxStall.Store(d)
+			}
+			pushes.Add(1)
+		}
+	}()
+	for pushes.Load() < 100 { // let the pusher get going
+		time.Sleep(time.Millisecond)
+	}
+
+	start := time.Now()
+	b.Sweep(ctx)
+	sweep := time.Since(start)
+	close(stop)
+	<-done
+
+	if got := cap.count(); got != due {
+		t.Fatalf("the sweep exported %d spans, want %d: the measurement below is vacuous", got, due)
+	}
+	stall := time.Duration(maxStall.Load())
+	t.Logf("a sweep of %d due traces took %v; the worst concurrent push took %v", due, sweep, stall)
+	// Relative, so a slow machine moves both numbers together; the absolute
+	// floor keeps an unlucky scheduler blip from failing a fast sweep.
+	if stall > sweep/2 && stall > 2*time.Millisecond {
+		t.Errorf("a concurrent push blocked for %v during a %v sweep: the drain is holding the buffer mutex across its whole decision batch", stall, sweep)
 	}
 }

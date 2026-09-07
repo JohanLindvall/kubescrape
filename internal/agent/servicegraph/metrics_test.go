@@ -145,7 +145,7 @@ func firstHist(t *testing.T, got map[string]pmetric.Metric, name string) pmetric
 // name that happens to end in it) and unit "s" on the histograms, whose
 // `seconds` token the unit rule then finds and leaves alone.
 func TestMetricNamesAndLabelsAreTempoVerbatim(t *testing.T) {
-	r := NewRegistry(Config{})
+	r := NewRegistry(Config{}, nil)
 	r.Record(edge("frontend", "checkout"))
 
 	exp := &capExporter{}
@@ -221,7 +221,7 @@ func TestMetricNamesAndLabelsAreTempoVerbatim(t *testing.T) {
 func TestConnectionTypeValuesAreVerbatim(t *testing.T) {
 	for _, ct := range []ConnectionType{ConnectionUnknown, ConnectionMessagingSystem, ConnectionDatabase, ConnectionVirtualNode} {
 		t.Run(fmt.Sprintf("%q", string(ct)), func(t *testing.T) {
-			r := NewRegistry(Config{})
+			r := NewRegistry(Config{}, nil)
 			e := edge("frontend", "checkout")
 			e.Connection = ct
 			r.Record(e)
@@ -249,7 +249,7 @@ func TestConnectionTypeValuesAreVerbatim(t *testing.T) {
 // the virtual-node marker rides as its own `virtual_node` label, and only when
 // a side really was synthesized.
 func TestDimensionAndVirtualNodeLabels(t *testing.T) {
-	r := NewRegistry(Config{})
+	r := NewRegistry(Config{}, nil)
 	e := edge("frontend", "orders-db")
 	e.Connection = ConnectionDatabase
 	e.HaveServer = false // an uninstrumented database has no server half
@@ -307,7 +307,7 @@ func TestDimensionAndVirtualNodeLabels(t *testing.T) {
 // sequence would key the second call differently and render a byte-identical
 // label set twice in one payload.
 func TestArrivalOrderDoesNotSplitSeries(t *testing.T) {
-	r := NewRegistry(Config{})
+	r := NewRegistry(Config{}, nil)
 	p := NewProcessor(Config{Dimensions: []string{"http.method", "http.route"}}, nil)
 	p.SetSink(r)
 	attrs := map[string]string{"http.method": "GET", "http.route": "/orders"}
@@ -342,7 +342,7 @@ func TestArrivalOrderDoesNotSplitSeries(t *testing.T) {
 // rendered: the attributes share one map, so it would overwrite the real client
 // or server and two distinct series would render one identical label set.
 func TestCollidingDimensionIsDropped(t *testing.T) {
-	r := NewRegistry(Config{})
+	r := NewRegistry(Config{}, nil)
 	e := edge("frontend", "checkout")
 	e.Dimensions = []EdgeDimension{{"client", "impostor"}, {"connection_type", "nonsense"}, {"keep", "yes"}}
 	r.Record(e)
@@ -360,7 +360,7 @@ func TestCollidingDimensionIsDropped(t *testing.T) {
 // and each side's latency lands in its own histogram — the two are measured by
 // different processes and are never mixed.
 func TestHistogramBucketsAndPerSideValues(t *testing.T) {
-	r := NewRegistry(Config{})
+	r := NewRegistry(Config{}, nil)
 	e := edge("frontend", "checkout")
 	e.ClientSeconds = 0.15 // bucket (0.1, 0.2]
 	e.ServerSeconds = 0.05 // bucket (-inf, 0.1]
@@ -395,7 +395,7 @@ func TestHistogramBucketsAndPerSideValues(t *testing.T) {
 // it) plus that half's own span id. A single id on both would explain only one
 // half of what it was attached to.
 func TestDurationHistogramExemplars(t *testing.T) {
-	r := NewRegistry(Config{})
+	r := NewRegistry(Config{}, nil)
 	now := t0
 	fixedClock(r, &now)
 	r.Record(edge("frontend", "checkout"))
@@ -420,7 +420,7 @@ func TestDurationHistogramExemplars(t *testing.T) {
 // One per BUCKET, latest wins: a busy edge must not accumulate an exemplar per
 // request, and the newest is the one an operator watching a live graph wants.
 func TestExemplarsAreOnePerBucketLatestWins(t *testing.T) {
-	r := NewRegistry(Config{})
+	r := NewRegistry(Config{}, nil)
 	now := t0
 	fixedClock(r, &now)
 	for _, secs := range []float64{0.15, 0.19, 0.5} { // two in (0.1,0.2], one in (0.4,0.8]
@@ -447,7 +447,7 @@ func TestExemplarsAreOnePerBucketLatestWins(t *testing.T) {
 // Exemplars are cleared by DELIVERY, never by rendering: a failed send keeps
 // them for the retry rather than wiping evidence no collector ever saw.
 func TestExemplarsResetOnlyAfterDelivery(t *testing.T) {
-	r := NewRegistry(Config{})
+	r := NewRegistry(Config{}, nil)
 	now := t0
 	fixedClock(r, &now)
 	r.Record(edge("frontend", "checkout"))
@@ -472,7 +472,7 @@ func TestExemplarsResetOnlyAfterDelivery(t *testing.T) {
 // than no link. (The processor refuses to key such spans at all, so this is the
 // belt to that braces.)
 func TestExemplarsSkippedWithoutTraceID(t *testing.T) {
-	r := NewRegistry(Config{})
+	r := NewRegistry(Config{}, nil)
 	e := edge("frontend", "checkout")
 	e.TraceID = pcommon.TraceID{}
 	r.Record(e)
@@ -488,7 +488,7 @@ func TestExemplarsSkippedWithoutTraceID(t *testing.T) {
 // otherwise unchanged (counts and buckets still land).
 func TestExemplarsCanBeDisabled(t *testing.T) {
 	off := false
-	r := NewRegistry(Config{Exemplars: &off})
+	r := NewRegistry(Config{Exemplars: &off}, nil)
 	r.Record(edge("frontend", "checkout"))
 
 	exp := &capExporter{}
@@ -506,7 +506,7 @@ func TestExemplarsCanBeDisabled(t *testing.T) {
 // child series on the first failure, which leaves failed/total undefined for
 // exactly the edges that are working; a present zero makes the ratio total.
 func TestFailedCounterPresentAtZeroAndCountsFailures(t *testing.T) {
-	r := NewRegistry(Config{})
+	r := NewRegistry(Config{}, nil)
 	r.Record(edge("frontend", "checkout"))
 
 	exp := &capExporter{}
@@ -533,7 +533,7 @@ func TestFailedCounterPresentAtZeroAndCountsFailures(t *testing.T) {
 // cumulative counters, and freezing them would look downstream like the traffic
 // stopped rather than like a bound binding.
 func TestCardinalityCapDropsOnlyNewSeries(t *testing.T) {
-	r := NewRegistry(Config{MaxCardinality: 2})
+	r := NewRegistry(Config{MaxCardinality: 2}, nil)
 	r.Record(edge("a", "b"))
 	r.Record(edge("c", "d"))
 
@@ -568,7 +568,7 @@ func TestCardinalityCapDropsOnlyNewSeries(t *testing.T) {
 // observations nobody has seen.
 func TestStaleEvictionOnlyAfterDelivery(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	r := NewRegistry(Config{StaleAfter: "15m"})
+	r := NewRegistry(Config{StaleAfter: "15m"}, nil)
 	fixedClock(r, &now)
 	r.Record(edge("frontend", "checkout"))
 
@@ -612,7 +612,7 @@ func TestStaleEvictionOnlyAfterDelivery(t *testing.T) {
 // backwards.
 func TestReCreatedSeriesGetsFreshStartTimestamp(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	r := NewRegistry(Config{StaleAfter: "1m"})
+	r := NewRegistry(Config{StaleAfter: "1m"}, nil)
 	fixedClock(r, &now)
 
 	r.Record(edge("frontend", "checkout"))
@@ -654,7 +654,7 @@ func TestReCreatedSeriesGetsFreshStartTimestamp(t *testing.T) {
 // clamped to ts (cumagg.ClampStart), and the TRUE start renders from the next
 // export on.
 func TestStartClampedWhenSeriesAdmittedDuringExport(t *testing.T) {
-	r := NewRegistry(Config{})
+	r := NewRegistry(Config{}, nil)
 	admitted := t0.Add(time.Second) // the receive goroutine's later clock read
 	fixedClock(r, &admitted)
 	r.Record(edge("frontend", "checkout"))
@@ -712,7 +712,7 @@ func assertPointStamps(t *testing.T, md pmetric.Metrics, wantStart, wantTS pcomm
 // always makes a final export so the last window's edges are not lost at
 // shutdown.
 func TestExportEmptyAndRunFinalExport(t *testing.T) {
-	r := NewRegistry(Config{})
+	r := NewRegistry(Config{}, nil)
 	exp := &capExporter{}
 	export(t, r, exp)
 	if exp.count() != 0 {
@@ -739,7 +739,7 @@ func TestExportEmptyAndRunFinalExport(t *testing.T) {
 // up with map[string(key)], and the dimension names are sorted in place in a
 // second stack scratch.
 func BenchmarkRecord(b *testing.B) {
-	r := NewRegistry(Config{})
+	r := NewRegistry(Config{}, nil)
 	e := edge("frontend", "checkout")
 	e.Connection = ConnectionDatabase
 	e.Dimensions = []EdgeDimension{{"client_http.method", "GET"}, {"server_db.system", "postgresql"}}
@@ -759,7 +759,7 @@ func TestRecordIsAllocationFree(t *testing.T) {
 	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
-	r := NewRegistry(Config{})
+	r := NewRegistry(Config{}, nil)
 	e := edge("frontend", "checkout")
 	e.Dimensions = []EdgeDimension{{"client_http.method", "GET"}, {"server_db.system", "postgresql"}}
 	r.Record(e) // admit the series: only the warm path is budgeted
@@ -771,7 +771,7 @@ func TestRecordIsAllocationFree(t *testing.T) {
 // Record is called from the pairing store on the ingest goroutines while the
 // export loop renders; -race is the point of this test.
 func TestRecordConcurrent(t *testing.T) {
-	r := NewRegistry(Config{})
+	r := NewRegistry(Config{}, nil)
 	var wg sync.WaitGroup
 	for w := 0; w < 8; w++ {
 		wg.Add(1)
@@ -858,7 +858,7 @@ func TestTruncatedLabelsDoNotRetainTheSenderStrings(t *testing.T) {
 	dim := strings.Repeat("z", huge)
 
 	p := NewProcessor(Config{Dimensions: []string{"http.route"}}, nil)
-	reg := NewRegistry(Config{})
+	reg := NewRegistry(Config{}, nil)
 	p.SetSink(reg)
 	p.Consume(sgTraces(name, sgSpan{
 		name: "GET /orders", kind: ptrace.SpanKindClient, dur: 0.1,
@@ -905,7 +905,7 @@ func TestTruncatedLabelsDoNotRetainTheSenderStrings(t *testing.T) {
 // once per export interval. The lock is now held only for the value snapshot.
 func TestRenderDoesNotStallRecord(t *testing.T) {
 	const series = 20000
-	r := NewRegistry(Config{MaxCardinality: series + 1})
+	r := NewRegistry(Config{MaxCardinality: series + 1}, nil)
 	for i := 0; i < series; i++ {
 		e := edge(fmt.Sprintf("client-%05d", i), "checkout")
 		e.Dimensions = []EdgeDimension{{"client_http.route", "/api/v1/orders"}}
@@ -968,7 +968,7 @@ func TestRenderDoesNotStallRecord(t *testing.T) {
 func TestRenderScratchDoesNotPinTheLabelsOfEvictedSeries(t *testing.T) {
 	const peak = 64
 	now := time.Unix(1_700_000_000, 0)
-	r := NewRegistry(Config{MaxCardinality: peak + 8, StaleAfter: "1m"})
+	r := NewRegistry(Config{MaxCardinality: peak + 8, StaleAfter: "1m"}, nil)
 	fixedClock(r, &now)
 	exp := &capExporter{}
 
@@ -1005,7 +1005,7 @@ func TestRenderScratchDoesNotPinTheLabelsOfEvictedSeries(t *testing.T) {
 func TestRenderScratchShrinksBackAfterACardinalityBurst(t *testing.T) {
 	const peak = 2000
 	now := time.Unix(1_700_000_000, 0)
-	r := NewRegistry(Config{MaxCardinality: peak + 8, StaleAfter: "1m"})
+	r := NewRegistry(Config{MaxCardinality: peak + 8, StaleAfter: "1m"}, nil)
 	fixedClock(r, &now)
 	exp := &capExporter{}
 

@@ -51,6 +51,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/JohanLindvall/kubescrape/internal/cli"
 )
 
 // spanCostBytes is the memory one buffered span is budgeted at. See the file
@@ -65,48 +67,50 @@ const bufferBudgetShare = 0.25
 // package var so tests can supply one instead of the machine's.
 var memLimit = detectMemoryLimit
 
+// cgroupLimit resolves THIS CONTAINER'S OWN cgroup memory limit, and memInfo
+// names the file the host-RAM fallback reads. Package vars so a test can drive
+// the fallback order without a cgroup.
+var (
+	cgroupLimit = cli.CgroupMemoryLimit
+	memInfo     = "/proc/meminfo"
+)
+
 // detectMemoryLimit reads the container's memory limit, falling back to the
 // machine's RAM when the workload is not capped. Both are "something real"; the
 // source is named in every message, because a warning sized against 64 GiB of
 // host RAM means something different from one sized against a 1 GiB limit.
 //
+// The cgroup half is internal/cli's cgroupMemoryLimit, not a second reader
+// here, and that is the whole point of the delegation: the limit this file
+// sizes maxSpans against and the limit SetMemoryLimit hands the Go runtime
+// MUST be the same number, and they were not. This file read the mount ROOT
+// (/sys/fs/cgroup/memory.max) only, which is the container's own file only
+// INSIDE a cgroup namespace; with cgroupns=host — still a supported kubelet
+// configuration — /sys/fs/cgroup is the host's v2 root, which carries no
+// controller files at all, so a capped pod read nothing here, fell through to
+// the node's MemTotal, sized the span buffer against a node-scale number and
+// logged "this workload has no memory limit" for a pod that had one. That
+// disables the OOM guard on precisely the layer whose loss mode IS the OOM.
+// cli resolves the container's own cgroup from /proc/self/cgroup and keeps the
+// mount root only as the fallback that cgroup v1's bind-mounted controller
+// needs.
+//
+// The MemTotal fallback stays here and is deliberately absent from cli: an
+// UNCAPPED workload has no heap goal worth deriving, but it does have a real
+// ceiling to size a span buffer against, and saying so is better than sizing
+// against nothing.
+//
 // Returns 0 when neither can be read, in which case nothing is derived or
 // refused and only the estimate is logged — a sizing rule an operator cannot
 // see the inputs of must not become a startup failure.
 func detectMemoryLimit() (int64, string) {
-	// cgroup v2: the container's own limit, "max" when uncapped.
-	if v, ok := readMemFile("/sys/fs/cgroup/memory.max"); ok {
-		return v, "cgroup v2 memory.max"
+	if v, path, ok := cgroupLimit(); ok {
+		return v, "cgroup " + path
 	}
-	// cgroup v1.
-	if v, ok := readMemFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); ok {
-		return v, "cgroup v1 memory.limit_in_bytes"
-	}
-	if v, ok := readMemTotal("/proc/meminfo"); ok {
+	if v, ok := readMemTotal(memInfo); ok {
 		return v, "host MemTotal (this workload has no memory limit)"
 	}
 	return 0, ""
-}
-
-// readMemFile reads one cgroup limit file. "max" and the sentinel values the
-// kernel uses for "unlimited" report not-ok.
-func readMemFile(path string) (int64, bool) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false
-	}
-	s := strings.TrimSpace(string(b))
-	if s == "max" {
-		return 0, false
-	}
-	v, err := strconv.ParseInt(s, 10, 64)
-	if err != nil || v <= 0 || v >= 1<<62 {
-		// cgroup v1 spells "unlimited" as a number near the int64 maximum
-		// (PAGE_COUNTER_MAX scaled), which is not a limit anyone can plan
-		// against.
-		return 0, false
-	}
-	return v, true
 }
 
 // readMemTotal reads MemTotal (in kB) out of /proc/meminfo.

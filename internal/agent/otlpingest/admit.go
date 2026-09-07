@@ -217,10 +217,16 @@ func decodedTracesSize(td ptrace.Traces) int64 {
 // One gRPC push reserves Server.grpcMaxRecv before grpc-go reads it. The size
 // of the message is not knowable at that point — the tap runs on the HEADERS
 // frame — so the reservation is the worst case the transport will accept
-// (MaxRecvMsgSize). It is released again as soon as the message is decoded and
-// the interceptor takes over, so this bounds concurrent DECODES, not
-// concurrent pushes: the reservation is held for microseconds of unmarshal,
-// not for the seconds a slow collector holds a processing slot.
+// (MaxRecvMsgSize). It is released as soon as the message is decoded and the
+// interceptor takes over, so this bounds concurrent RECEIVES rather than
+// concurrent pushes: it does NOT span the seconds a slow collector holds a
+// processing slot, which is the count bound's job.
+//
+// What it DOES span is the upload, and that correction matters: this used to
+// say "microseconds of unmarshal", which is true only of the decode at the end
+// of it. grpc-go runs the unary interceptor once the whole message has been
+// received, so the reservation covers every DATA frame — which is why the
+// window that bounds it has to scale with the message cap (reserveWindowFor).
 
 // grpcReserveWindow bounds how long ONE reservation may live, and it is the
 // difference between a bound and a gift.
@@ -244,16 +250,70 @@ func decodedTracesSize(td ptrace.Traces) int64 {
 // sender sees codes.Canceled, which the OTLP spec lists as retryable, so an
 // honest-but-slow sender re-pushes rather than losing data.
 //
-// 10s to deliver at most MaxRecvMsgSize is 3.4 Mbit/s from a pod on this node
-// (or, on the trace tier, from a pod in this cluster) — two orders of magnitude
-// of slack — and it is the same clock, on the same question, as the HTTP arm's
-// ReadHeaderTimeout: the peer has connected and shown no intent.
+// 10s to deliver at most maxIngestGRPCMessage is 3.4 Mbit/s from a pod on this
+// node (or, on the trace tier, from a pod in this cluster) — two orders of
+// magnitude of slack — and it is the same clock, on the same question, as the
+// HTTP arm's ReadHeaderTimeout: the peer has connected and shown no intent.
 //
 // It does not make the budget unspendable by a hostile peer: nothing can, on a
 // listener with no credentials. It removes the asymmetry, which is the part
 // that mattered — spending it now costs a stream open per 4 MiB per 10s, and
 // the budget recovers on its own.
+//
+// It is the window for the DEFAULT message cap. reserveWindowFor scales it,
+// because the sentence above is a BIT RATE and the numerator is a flag.
 const grpcReserveWindow = 10 * time.Second
+
+// maxReserveWindow caps what reserveWindowFor will scale to. The window's whole
+// job is to reclaim a pin a peer would otherwise hold for the process' life, so
+// it has to stay finite however large the configured message is — a reservation
+// is grpcMaxRecv bytes of a budget only four of them fit in, and the peer that
+// takes them needs no credentials.
+//
+// Five minutes is where the scaling stops being a rate and starts being a gift:
+// at the default's 3.4 Mbit/s it is a 128 MiB message, an order of magnitude
+// past anything a batching SDK emits and well past what -ingest-grpc-max-recv-bytes
+// is documented for. Above that the flag buys bytes, not time.
+const maxReserveWindow = 5 * time.Minute
+
+// reserveWindowFor sizes the pre-decode window against the message it has to
+// carry, which is what grpcReserveWindow's own justification assumes and what a
+// constant cannot do.
+//
+// The window is armed on the HEADERS frame and disarmed in the unary
+// interceptor, which grpc-go runs only once the whole message has been received
+// and decoded — so it spans the ENTIRE upload, not the "microseconds of
+// unmarshal" the paragraph above reservation once claimed. The reservation SIZE
+// already scales with -ingest-grpc-max-recv-bytes (tapAdmit reserves
+// grpcMaxRecv, and NewServer grows the budget with it); leaving the window fixed
+// turned that flag into a silent per-byte deadline. A tier told to accept 64 MiB
+// messages gave a sender 10s to deliver one — 54 Mbit/s per stream — and reaped
+// every push that could not, under a counter and a Warn that both say the peer
+// "delivered no message", which is the opposite of what happened.
+//
+// So the rate is held constant instead of the time: the window is
+// grpcReserveWindow scaled by MaxRecvBytes/maxIngestGRPCMessage, never shorter
+// than grpcReserveWindow (a receiver configured for SMALLER messages keeps the
+// full grace — the flag exists to raise the cap, and shrinking the window would
+// make a lowered cap reap honest senders for a bound they never asked to
+// tighten) and never longer than maxReserveWindow.
+//
+// The rate is derived by dividing FIRST and the ceiling is applied BEFORE the
+// multiply, so no value of the flag — an operator may pass math.MaxInt, and the
+// trace tier passes math.MaxInt32 for an uncapped hop — can overflow the
+// arithmetic into a short window, which would be the failure this function
+// exists to remove wearing a different hat. Truncating the per-byte rate costs
+// well under a millisecond of a ten-second base.
+func reserveWindowFor(recv int) time.Duration {
+	if recv <= maxIngestGRPCMessage {
+		return grpcReserveWindow
+	}
+	const perByte = int64(grpcReserveWindow) / int64(maxIngestGRPCMessage) // ns per byte
+	if int64(recv) > int64(maxReserveWindow)/perByte {
+		return maxReserveWindow
+	}
+	return time.Duration(perByte * int64(recv))
+}
 
 // errBufferBudget is the refusal: retryable, and mapped to 429 + Retry-After by
 // bodyErrorStatus / writeBodyError.
@@ -364,6 +424,29 @@ func readAllCapped(r io.Reader, hint, limit int64) ([]byte, error) {
 	buf := make([]byte, 0, start+1)
 	for {
 		if len(buf) == cap(buf) {
+			// Already past the cap: the caller rejects this body (413), so
+			// every further byte is bought and thrown away. Stop here rather
+			// than doubling into it.
+			//
+			// The growth loop cannot see that on its own. The trim below lands
+			// the last step exactly on a declared length, so an identity-encoded
+			// body declaring the cap fills a buffer of exactly limit+1 — the
+			// LimitReader's one byte of over-cap evidence — and the next
+			// iteration found len==cap with the hint no longer ahead of it and
+			// doubled to ~2x the cap, copying the ~16 MiB predecessor into it
+			// while both were live. That is ~3x the body's byte-budget charge
+			// for a request that is refused two lines later, and maxBufferBytes
+			// admits four of them at once (measured: cap 33,554,435 for a
+			// 16 MiB limit).
+			//
+			// Returning a nil error is right: the buffer already carries the
+			// over-cap evidence (limit+1 bytes), and BodyReader.Read tests
+			// len(buf) > max unconditionally, so the answer is the same 413 by
+			// the same route — the compressed-cap arm above it is reached only
+			// on an error, and it would have answered 413 as well.
+			if int64(len(buf)) > limit {
+				return buf, nil
+			}
 			// Double, except for the step that would overshoot a declared
 			// length still ahead of us — that one lands exactly on it.
 			next := int64(cap(buf)) * 2

@@ -1432,6 +1432,54 @@ func TestTheDescriptorCapBindsOnPromotion(t *testing.T) {
 	}
 }
 
+// And a GONE container does not hold a descriptor slot either — the same rule
+// as the pending set, one map further in.
+//
+// markGone releases the three descriptors immediately and keeps the entry only
+// until the next export carries its final window, which is up to a whole
+// -scrape-interval away. Charging those entries against a DESCRIPTOR cap meant
+// that on a dense node a batch of exits refused newly resolved live containers
+// for a budget nobody was spending: the container is counted capped, latched
+// into the one-shot warning, and simply not measured.
+func TestAGoneContainerDoesNotHoldADescriptorSlot(t *testing.T) {
+	h := newHarness(t)
+	h.maxTracked = 2
+	first := systemdContainerDir(h.root, 1, hexID(1))
+	makeContainer(t, first, 0, 100<<20, 0)
+	makeContainer(t, systemdContainerDir(h.root, 1, hexID(2)), 0, 200<<20, 0)
+	h.discover()
+	if got := h.Containers(); got != 2 {
+		t.Fatalf("Containers() = %d, want the cap of 2 filled", got)
+	}
+
+	// One of them exits, and a replacement is started in the same window. The
+	// dead one's descriptors are already closed; only its window is left (two
+	// readings, which is the least that is a distribution — see measured).
+	h.advance(time.Second)
+	h.advance(time.Second)
+	if err := os.RemoveAll(first); err != nil {
+		t.Fatal(err)
+	}
+	makeContainer(t, systemdContainerDir(h.root, 1, hexID(3)), 0, 300<<20, 0)
+	before := obs.CgroupContainersCapped.WithLabelValues("tracked").Value()
+	h.discover()
+
+	if c := h.tracked[hexID(1)]; c == nil || !c.gone {
+		t.Fatalf("the exited container is %v, want a gone entry still awaiting its final flush", c)
+	}
+	if c := h.tracked[hexID(3)]; c == nil || !c.open {
+		t.Fatalf("the replacement container was not promoted (%v); it was refused a descriptor budget the gone entry had already released", c)
+	}
+	if got := obs.CgroupContainersCapped.WithLabelValues("tracked").Value(); got != before {
+		t.Errorf("capped{tracked} moved to %v from %v: nothing was over the cap — one of the two entries holds no descriptors", got, before)
+	}
+
+	// And the gone entry still does the one job it was kept for.
+	if _, ok := h.exportOnce(t)[hexID(1)]; !ok {
+		t.Error("the exited container's final window was lost")
+	}
+}
+
 // A container REFUSED by the descriptor cap has still had a lookup spent on it,
 // and the queue ordering has to know that.
 //

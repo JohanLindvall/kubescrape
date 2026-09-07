@@ -961,7 +961,22 @@ func (r *Reader) handle(ctx context.Context, ev watch.Event) error {
 			r.pendingRV = o.ResourceVersion
 			r.noteSeen(o.ResourceVersion)
 			if len(r.batch) == 0 {
-				r.committed.ResourceVersion = o.ResourceVersion
+				// The two guards settle's pending-bookmark arm applies, for
+				// the same reasons — one arm, one rule. The position may only
+				// move FORWARD (applying an older revision walks it backwards,
+				// and a restart or leader handover then redelivers everything
+				// in between), and the pending copy is SPENT here: leaving it
+				// set hands the next emptying flush a bookmark this arm has
+				// already applied, which reaches secureReplay a second time.
+				// Neither is load-bearing on the shape running today — the API
+				// server's bookmarks are monotone within one stream, and only
+				// expire() can empty the committed revision a stale pendingRV
+				// would have to misfire against — so this is the sibling's
+				// discipline held rather than a defect repaired.
+				if newerRV(o.ResourceVersion, r.committed.ResourceVersion) {
+					r.committed.ResourceVersion = o.ResourceVersion
+				}
+				r.pendingRV = ""
 				r.relist = false // a bookmark covers everything before it
 				r.secureReplay()
 			}

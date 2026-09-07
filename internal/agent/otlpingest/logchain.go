@@ -496,11 +496,18 @@ func dedupeResourceKeys(m pcommon.Map) {
 
 // admitLogs/admitMetrics/admitTraces apply the operator's ingest admission
 // hook (ServerConfig.Admit — the transforms file's ingest: section) per
-// pushed RESOURCE, before enrichment: a rejected resource is removed and
-// counted, the push is still acked, and an emptied payload acks without a
-// send. Before enrichment deliberately — a rejected sender must not spend a
-// metadata lookup per resource on its way out (the same argument as
-// RejectTraces).
+// pushed RESOURCE, AFTER the reserved strip and BEFORE enrichment: a rejected
+// resource is removed and counted, the push is still acked, and an emptied
+// payload acks without a send.
+//
+// Before enrichment deliberately — a rejected sender must not spend a metadata
+// lookup per resource on its way out (the same argument as RejectTraces). AFTER
+// the strip equally deliberately, and it is the half that was wrong: the hook
+// was reading the sender's unverified identity claim one line before the
+// receiver deleted it, so an operator policy keyed on k8s.namespace.name gated
+// nothing at all. The strip costs no lookup, so putting it first preserves the
+// pre-enrichment argument intact. See ServerConfig.Admit for what the hook can
+// therefore key on.
 func (s *Server) admitLogs(ld plog.Logs) {
 	if s.cfg.Admit == nil {
 		return

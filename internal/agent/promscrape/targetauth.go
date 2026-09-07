@@ -121,9 +121,11 @@ func (s *Scraper) clientFor(ctx context.Context, t kubemeta.ScrapeTarget, timeou
 		lp(strconv.FormatBool(t.InsecureSkipVerify)) + lp(timeout.String())
 
 	s.tlsMu.Lock()
-	if c, ok := s.tlsClients[key]; ok {
+	if e, ok := s.tlsClients[key]; ok {
+		e.used = time.Now()
+		s.tlsClients[key] = e
 		s.tlsMu.Unlock()
-		return c, nil
+		return e.client, nil
 	}
 	s.tlsMu.Unlock()
 
@@ -148,42 +150,65 @@ func (s *Scraper) clientFor(ctx context.Context, t kubemeta.ScrapeTarget, timeou
 	// using, and whose pooled connections nothing would ever close. The loser
 	// built here adopts the cached client instead; it has served no request,
 	// so there is nothing of its own to close.
-	if c, ok := s.tlsClients[key]; ok {
+	if e, ok := s.tlsClients[key]; ok {
+		e.used = time.Now()
+		s.tlsClients[key] = e
 		s.tlsMu.Unlock()
-		return c, nil
+		return e.client, nil
+	}
+	now := time.Now()
+	// Retire what nothing has used for a while, BEFORE the cap is consulted.
+	// The size cap was the only removal path, so a superseded entry — the key
+	// includes the resolved PEM, so every cert-manager rotation minted a new one
+	// and left the old untouched — held the PREVIOUS client PRIVATE KEY in the
+	// agent's heap until 64 distinct materials had been seen, i.e. for the
+	// process lifetime on any node with a handful of TLS targets. Retired by
+	// LAST USE and not by age: a client scraped every cycle must not be rebuilt
+	// on a timer, while one nothing selects any more is exactly the rotated-away
+	// credential to release.
+	var retired []*http.Client
+	for k, e := range s.tlsClients {
+		if now.Sub(e.used) >= tlsClientIdleTTL {
+			retired = append(retired, e.client)
+			delete(s.tlsClients, k)
+		}
 	}
 	// Bound the cache: the key includes the secret bytes, so a rotating
-	// credential would otherwise accumulate a transport per rotation. Evict ONE
-	// entry (and close its idle connections) rather than clearing the map: a
-	// steady population above the cap would otherwise rebuild every transport
-	// each cycle, paying a fresh TCP+TLS handshake per target while the orphans
-	// held their pooled connections open for the full idle timeout.
-	var evicted *http.Client
+	// credential would otherwise accumulate a transport per rotation faster than
+	// the TTL retires them. Evict ONE entry (and close its idle connections)
+	// rather than clearing the map: a steady population above the cap would
+	// otherwise rebuild every transport each cycle, paying a fresh TCP+TLS
+	// handshake per target while the orphans held their pooled connections open
+	// for the full idle timeout.
+	capped := false
 	if len(s.tlsClients) >= maxTLSClients {
 		for k, victim := range s.tlsClients {
-			evicted = victim
+			retired = append(retired, victim.client)
 			delete(s.tlsClients, k)
+			capped = true
 			break
 		}
 	}
-	s.tlsClients[key] = client
+	s.tlsClients[key] = tlsClientEntry{client: client, used: now}
 	s.tlsMu.Unlock()
-	if evicted != nil {
-		// Both of these are done with the lock DROPPED: closing idle
-		// connections walks the victim's whole connection pool and the warn
-		// renders and writes a slog record, and every scrape goroutine on the
-		// node contends for tlsMu. The victim is unreachable from the map by
-		// now, so nothing can adopt it while we work on it — a scrape already
-		// holding it keeps its live connections either way (CloseIdleConnections
-		// closes only idle ones).
-		if tr, ok := evicted.Transport.(*http.Transport); ok {
+	// Done with the lock DROPPED: closing idle connections walks a victim's
+	// whole connection pool and the warn renders and writes a slog record, and
+	// every scrape goroutine on the node contends for tlsMu. A victim is
+	// unreachable from the map by now, so nothing can adopt it while we work on
+	// it — a scrape already holding it keeps its live connections either way
+	// (CloseIdleConnections closes only idle ones).
+	for _, victim := range retired {
+		if tr, ok := victim.Transport.(*http.Transport); ok {
 			tr.CloseIdleConnections()
 		}
+	}
+	if capped {
 		// The eviction is correct and the scrape still works, so this is a Warn
 		// about COST rather than about loss: past the cap every cycle pays a
 		// fresh TCP+TLS handshake for the targets that keep missing. The key
 		// includes the resolved secret bytes, so the realistic cause is
-		// credentials rotating faster than the cache holds them.
+		// credentials rotating faster than the cache holds them. The TTL sweep
+		// above is ordinary hygiene and deliberately says nothing.
 		s.warnCacheEviction(&s.tlsEvictWarn, "per-target TLS clients", maxTLSClients,
 			"more than the cache holds are in use: targets are rotating their CA or client certificate, or too many distinct tlsConfigs are in play")
 	}
@@ -192,6 +217,22 @@ func (s *Scraper) clientFor(ctx context.Context, t kubemeta.ScrapeTarget, timeou
 
 // maxTLSClients bounds the per-target transport cache.
 const maxTLSClients = 64
+
+// tlsClientEntry is a cached per-target client and when a scrape last selected
+// it. The stamp is what lets a SUPERSEDED entry — whose *http.Client holds the
+// previous client certificate's private key — be released without waiting for
+// the size cap.
+type tlsClientEntry struct {
+	client *http.Client
+	used   time.Time
+}
+
+// tlsClientIdleTTL is how long an unselected client is kept. Comfortably above
+// the transport's own 90s IdleConnTimeout, past which the cached client's
+// pooled connections are gone anyway and all it still buys is the tls.X509KeyPair
+// parse — so retiring it costs a rarely-scraped target one handshake it was
+// going to pay regardless, and buys the release of retired key material.
+const tlsClientIdleTTL = 5 * time.Minute
 
 // tlsConfigFromPEM builds a target's TLS config from its resolved secret
 // material; caRef is the CA's "ns/name/key" reference (empty = none asked

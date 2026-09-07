@@ -3,14 +3,55 @@ package docscheck
 import (
 	"flag"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
-// Docs are the hand-written files whose table rows inventory flags.
-var docs = []string{
-	"../../docs/CONFIGURATION.md",
-	"../../docs/FLAGS.md",
-	"../../README.md",
+// docFiles are the files whose table rows inventory flags: EVERY markdown doc,
+// found by glob, plus the README.
+//
+// It was a hardcoded three (CONFIGURATION.md, FLAGS.md, README.md), which meant
+// the package doc's claim to cover "the hand-written docs" was false one file
+// over: the `-buffer-dir` row in docs/FIRST-RUN.md — the operator-facing
+// first-ten-minutes guide — was read by no guard in either direction, so
+// renaming or deleting that flag would have left the row standing. That is the
+// exact `-runtime-metrics` drift this package was written to stop. A glob also
+// covers a doc that does not exist yet, which a list by construction cannot;
+// the row pattern ignores prose, so a doc with no flag table costs nothing.
+func docFiles(t *testing.T) []string {
+	t.Helper()
+	paths, err := filepath.Glob("../../docs/*.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no docs/*.md matched — the glob is broken and every doc is unscanned")
+	}
+	return append(paths, "../../README.md")
+}
+
+// And the glob really is one: a doc added under docs/ is scanned without anyone
+// remembering to list it.
+func TestEveryMarkdownDocIsScannedForFlagRows(t *testing.T) {
+	scanned := map[string]bool{}
+	for _, p := range docFiles(t) {
+		scanned[filepath.Base(p)] = true
+	}
+	entries, err := os.ReadDir("../../docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".md" {
+			continue
+		}
+		if !scanned[e.Name()] {
+			t.Errorf("docs/%s is not scanned for flag table rows; a flag it documents can be renamed or deleted with nothing to notice", e.Name())
+		}
+	}
+	if !scanned["README.md"] {
+		t.Error("README.md is not scanned; it is where -runtime-metrics survived its own deletion")
+	}
 }
 
 // Every flag a doc table documents must be registered by one of the binaries.
@@ -19,7 +60,7 @@ var docs = []string{
 // nothing else to notice — README documented `-runtime-metrics` long after
 // the flag was gone, and only the manifests' copy of that drift had a guard.
 func TestDocumentedFlagsAreRegistered(t *testing.T) {
-	documented, err := TableFlags(docs...)
+	documented, err := TableFlags(docFiles(t)...)
 	if err != nil {
 		t.Fatal(err)
 	}

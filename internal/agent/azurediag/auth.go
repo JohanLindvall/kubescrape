@@ -35,6 +35,7 @@ import (
 	ljson "github.com/JohanLindvall/lightning/pkg/json"
 
 	"github.com/JohanLindvall/kubescrape/internal/clip"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -45,6 +46,19 @@ const (
 	// refreshMargin is how long before expiry a cached token is renewed;
 	// Entra tokens live ~1h, so refreshes are rare and never on the deadline.
 	refreshMargin = 5 * time.Minute
+	// tokenRetryBackoff is how long a FAILED fetch suppresses the next one.
+	// get is called per SASL session and Event Hubs closes idle connections
+	// aggressively, so without a negative cache a token endpoint that is
+	// merely unreachable puts a fresh 10s round trip (the fetch client's
+	// timeout) in front of every new Kafka connection, one after another
+	// because the fetch is single-flighted under t.mu. The window is
+	// deliberately short — recovery is at most this late — and retryAt shortens
+	// it further so it can never reach past a cached token's expiry.
+	tokenRetryBackoff = 30 * time.Second
+	// tokenWarnEvery re-warns while the token endpoint keeps failing. The
+	// condition persists for the length of the outage while the noticing code
+	// runs per SASL session, which is logdedupe's whole subject.
+	tokenWarnEvery = time.Minute
 )
 
 // connectionStringMechanism authenticates with the Event Hubs connection
@@ -131,8 +145,35 @@ type tokenSource struct {
 
 	token  string
 	expiry time.Time
+	// nextRetry and lastErr are the negative cache: a failed fetch is answered
+	// from what we already hold until nextRetry passes (see tokenRetryBackoff).
+	// lastErr is what a caller with no usable token is told in the meantime —
+	// the real cause, not a synthetic "backing off", because it is the thing to
+	// act on and it is what kgo's SASL failure line will carry.
+	nextRetry time.Time
+	lastErr   error
+	// failing latches that a failure has been reported, so the fix landing gets
+	// a line of its own: both failure lines are throttled and both say the
+	// pipeline is about to stop working, and a recovery that says nothing is
+	// indistinguishable from an outage nobody has noticed yet.
+	failing bool
+
+	// staleWarn and failWarn throttle the two failure lines. SEPARATE
+	// throttles, because they are two conditions that co-occur — a token
+	// expiring mid-outage moves from one to the other — and one gate would let
+	// whichever fired first silence the other (the tailer's lesson, verbatim).
+	staleWarn logdedupe.Throttle
+	failWarn  logdedupe.Throttle
 }
 
+// get serves the cached token, refreshing it ahead of expiry.
+//
+// The fetch runs UNDER the mutex on purpose: it single-flights the round trip,
+// so a burst of new SASL sessions (Event Hubs closes idle connections
+// aggressively, so there are many) asks the token endpoint once rather than
+// once each. What that costs — one hold of up to the fetch client's 10s
+// timeout — is bounded by the negative cache below: the sessions that queue
+// behind a FAILING fetch return from it without a round trip of their own.
 func (t *tokenSource) get(ctx context.Context) (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -143,36 +184,86 @@ func (t *tokenSource) get(ctx context.Context) (string, error) {
 	if t.token != "" && now.Before(t.expiry.Add(-refreshMargin)) {
 		return t.token, nil
 	}
+	if t.lastErr != nil && now.Before(t.nextRetry) {
+		// A recent fetch failed and the back-off has not passed: answer from
+		// what is already held rather than spend another round trip per SASL
+		// session. The two answers are exactly the failure arm's below.
+		if t.token != "" && now.Before(t.expiry) {
+			return t.token, nil
+		}
+		return "", t.lastErr
+	}
 	tok, ttl, err := t.fetch(ctx)
 	if err != nil {
 		obs.AzureTokenRefreshes.WithLabelValues("error").Inc()
+		t.lastErr, t.nextRetry, t.failing = err, t.retryAt(now), true
 		if t.token != "" && now.Before(t.expiry) {
 			// Inside the refresh margin but not yet expired: the stale token
 			// still works; a transient token-endpoint blip must not fail
 			// every new Kafka connection. The FALLBACK is the thing to say —
 			// the pipeline is fine right now and will stop being fine at the
 			// expiry printed here if the endpoint does not come back.
-			t.logger().Warn("refreshing the event hubs entra token failed; serving the last good token until it expires",
-				"error", err, "source", t.what, "expiry", t.expiry.UTC().Format(time.RFC3339))
+			if t.staleWarn.Allow(tokenWarnEvery) {
+				t.logger().Warn("refreshing the event hubs entra token failed; serving the last good token until it expires",
+					"error", err, "source", t.what, "expiry", t.expiry.UTC().Format(time.RFC3339))
+			}
 			return t.token, nil
 		}
 		// No usable token: every new Kafka connection now fails SASL, and kgo
 		// retries that internally — so without this line the consumer simply
 		// goes quiet (kgolog.go carries the same argument).
-		t.logger().Warn("acquiring an entra token for event hubs failed; the consumer cannot authenticate",
-			"error", err, "source", t.what)
+		if t.failWarn.Allow(tokenWarnEvery) {
+			t.logger().Warn("acquiring an entra token for event hubs failed; the consumer cannot authenticate",
+				"error", err, "source", t.what)
+		}
 		return "", err
 	}
 	obs.AzureTokenRefreshes.WithLabelValues("ok").Inc()
-	if t.token == "" {
+	switch {
+	case t.token == "":
 		// The FIRST token is a lifecycle event (it is what makes the pipeline
 		// able to run at all); every later refresh is routine and is Debug.
 		t.logger().Info("acquired an entra token for event hubs", "source", t.what, "ttl", ttl)
-	} else {
+	case t.failing:
+		t.logger().Info("refreshing the entra token for event hubs recovered", "source", t.what, "ttl", ttl)
+	default:
 		t.logger().Debug("refreshed the entra token for event hubs", "source", t.what, "ttl", ttl)
 	}
 	t.token, t.expiry = tok, now.Add(ttl)
+	t.lastErr, t.nextRetry, t.failing = nil, time.Time{}, false
 	return t.token, nil
+}
+
+// retryAt is when a failed fetch may be re-attempted: a short back-off, never
+// past the point where the cached token stops being usable. Past that there is
+// nothing left to serve, so continuing to hold the back-off would refuse SASL
+// sessions the endpoint might by then be able to answer.
+func (t *tokenSource) retryAt(now time.Time) time.Time {
+	next := now.Add(tokenRetryBackoff)
+	if t.token != "" && t.expiry.After(now) && t.expiry.Before(next) {
+		return t.expiry
+	}
+	return next
+}
+
+// invalidate drops the cached token — and the failed-fetch back-off with it —
+// so the next SASL session acquires a fresh one.
+//
+// It is what makes the consumer REBUILD honest. A rebuild happens for the one
+// class of fetch error no further fetch can clear (kafka.go's fatalFetchErr: a
+// cluster-wide authorization or SASL failure), and both that log line and
+// Run's promise credentials read afresh. The connection-string path delivers
+// that for free — plain.Plain re-reads its file per SASL session — while an
+// Entra token is cached for up to ~55 minutes, so without this the new client
+// re-presents the very credential the broker just rejected and an operator who
+// FIXES the role assignment sees no recovery until the token expires on its
+// own. The back-off is cleared too: the caller is asking BECAUSE the credential
+// was rejected, so making it wait one out would defeat the point.
+func (t *tokenSource) invalidate() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.token, t.expiry = "", time.Time{}
+	t.lastErr, t.nextRetry = nil, time.Time{}
 }
 
 // logger is the token source's logger, defaulted. NEVER log t.token or the

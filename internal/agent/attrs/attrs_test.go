@@ -117,6 +117,47 @@ func TestPodEmptyFieldsOmitted(t *testing.T) {
 	}
 }
 
+// The same rule as TestPodEmptyFieldsOmitted, for the two functions that
+// stamp on top of Pod's attributes. It is not symmetry for its own sake:
+// k8s.container.name is a RESERVED-IDENTITY key, so on the ingest path a
+// resolved lookup overwrites the sender's own value with whatever Container
+// stamps — an empty one would blank an honest name — and an empty
+// k8s.service.uid participates in series identity and log-metric label sets as
+// if it were a value.
+func TestContainerAndServiceEmptyFieldsOmitted(t *testing.T) {
+	res := pcommon.NewResource()
+	Container(res, kubemeta.Container{ID: "cid"})
+	got := res.Attributes().AsRaw()
+	if got["container.id"] != "cid" {
+		t.Errorf("container.id = %v, want cid", got["container.id"])
+	}
+	if v, ok := got["k8s.container.name"]; ok {
+		t.Errorf("k8s.container.name = %q set from an empty field; must be omitted", v)
+	}
+
+	res = pcommon.NewResource()
+	Container(res, kubemeta.Container{})
+	if n := res.Attributes().Len(); n != 0 {
+		t.Errorf("zero Container produced %d attributes: %v", n, res.Attributes().AsRaw())
+	}
+
+	res = pcommon.NewResource()
+	Service(res, &kubemeta.Service{Name: "checkout"})
+	got = res.Attributes().AsRaw()
+	if got["k8s.service.name"] != "checkout" {
+		t.Errorf("k8s.service.name = %v, want checkout", got["k8s.service.name"])
+	}
+	if v, ok := got["k8s.service.uid"]; ok {
+		t.Errorf("k8s.service.uid = %q set from an empty field; must be omitted", v)
+	}
+
+	res = pcommon.NewResource()
+	Service(res, &kubemeta.Service{})
+	if n := res.Attributes().Len(); n != 0 {
+		t.Errorf("zero Service produced %d attributes: %v", n, res.Attributes().AsRaw())
+	}
+}
+
 // ReservedIdentity is the boundary the tailer's pod-annotation filter (and any
 // other workload/line-supplied attribute path) consults; the exact key set is
 // load-bearing for those consumers, so pin it.

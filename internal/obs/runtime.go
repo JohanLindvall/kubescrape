@@ -73,11 +73,31 @@ func (registryCollector) Collect(ch chan<- prometheus.Metric) {
 				}
 				m, err = prometheus.NewConstHistogram(desc, p.Count, p.Sum, buckets, values...)
 			default:
+				// Dump only ever reports the three kinds above (metrics.kindType
+				// refuses the rest), so this is a new kind that reached the
+				// bridge without a case here — a point vanishing from the
+				// exposition for a reason nothing else records.
+				err = fmt.Errorf("no Prometheus mapping for series kind %q", s.Kind)
+			}
+			if err != nil {
+				// NOT silently dropped. This is the /metrics exposition, which
+				// with -self-metrics-interval=0 is the ONLY delivery path for
+				// every kubescrape_* metric, so a discarded point is a series
+				// simply absent from the response and every alert written over
+				// it matching nothing — the same invisible shrinkage
+				// metrics.Registry already counts one layer down, on the same
+				// counter (kubescrape_self_metrics_points_skipped_total).
+				//
+				// Nothing here can fail today: NewDesc refuses only an invalid
+				// metric or label NAME, and NewConstMetric/NewConstHistogram
+				// only a label-count mismatch, and every self-metric name and
+				// label name is code-defined kubescrape_* (only label VALUES
+				// are data-driven, and those cannot make these calls fail). The
+				// guard exists so that if one ever does, it says so.
+				Registry.NoteSkippedPoint(s.Name, err)
 				continue
 			}
-			if err == nil {
-				ch <- m
-			}
+			ch <- m
 		}
 	}
 }

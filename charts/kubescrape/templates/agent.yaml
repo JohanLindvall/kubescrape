@@ -127,7 +127,7 @@ spec:
       containers:
         - name: agent
           image: {{ include "kubescrape.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ include "kubescrape.imagePullPolicy" . }}
           command: ["/kubescrape-agent"]
           args:
             - -metadata-endpoint=http://{{ .Release.Name }}.{{ .Release.Namespace }}
@@ -393,13 +393,34 @@ spec:
               containerPort: {{ (split ":" .Values.metrics.listen)._1 | int }}
             {{- end }}
             {{- if .Values.agent.ingest.enabled }}
+            {{- /* hostPort, optional and off by default, is the ONLY address
+                   the shipped chart can give an application for "the local
+                   agent". Without it the listeners are reachable at the agent's
+                   POD IP and nothing else — no hostNetwork, no Service — and
+                   the obvious workaround, a ClusterIP Service over the
+                   DaemonSet, is the wrong one twice over: it round-robins a
+                   push to some OTHER node's agent, which defeats
+                   -ingest-peer-ip-fallback (the source address then names a
+                   sender the receiving agent's node does not host) and
+                   invalidates the node-local argument that sized
+                   -ingest-max-in-flight. With it on, an SDK reaches the agent
+                   on its own node via the downward API; see
+                   agent.ingest.hostPort in values.yaml for the recipe.
+                   Off by default because a hostPort occupies that port on
+                   EVERY node and collides with anything else claiming it. */}}
             {{- with .Values.agent.ingest.grpcEndpoint }}
             - name: otlp-grpc
               containerPort: {{ (split ":" .)._1 | int }}
+              {{- if $.Values.agent.ingest.hostPort }}
+              hostPort: {{ (split ":" .)._1 | int }}
+              {{- end }}
             {{- end }}
             {{- with .Values.agent.ingest.httpEndpoint }}
             - name: otlp-http
               containerPort: {{ (split ":" .)._1 | int }}
+              {{- if $.Values.agent.ingest.hostPort }}
+              hostPort: {{ (split ":" .)._1 | int }}
+              {{- end }}
             {{- end }}
             {{- end }}
           readinessProbe:
@@ -441,6 +462,19 @@ spec:
             # mount above.
             - name: runlogjournal
               mountPath: /run/log/journal
+              readOnly: true
+            {{- /* The node's machine id, and it is NOT optional for the
+                   persistent journal (the Debian/Ubuntu/RHEL default).
+                   go-systemd opens with SD_JOURNAL_LOCAL_ONLY, under which
+                   libsystemd reads /var/log/journal/<id> only when <id> is the
+                   CONTAINER's own machine id; the image has no /etc/machine-id,
+                   so without this the reader starts, blocks and exports zero
+                   records. /run/log/journal is exempt from the rule, which is
+                   why a volatile-journal node (and kind, and therefore the
+                   e2e) works without it. Promtail, Alloy and fluent-bit all
+                   carry the same mount. */}}
+            - name: machineid
+              mountPath: /etc/machine-id
               readOnly: true
             {{- end }}
             {{- if .Values.agent.cgroupStats.enabled }}
@@ -497,6 +531,15 @@ spec:
           hostPath:
             path: /run/log/journal
             type: DirectoryOrCreate
+        {{- /* `File`, not FileOrCreate: an empty /etc/machine-id is worse than
+               an absent one — sd_id128_get_machine() fails on it exactly as it
+               does on nothing, so the pod would start and read nothing, which
+               is the failure this mount exists to close. A node with no
+               /etc/machine-id cannot serve a persistent journal anyway. */}}
+        - name: machineid
+          hostPath:
+            path: /etc/machine-id
+            type: File
         {{- end }}
         {{- if .Values.agent.cgroupStats.enabled }}
         {{- /* `Directory`, not DirectoryOrCreate: an absent /sys/fs/cgroup is a

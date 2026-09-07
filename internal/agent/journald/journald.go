@@ -480,15 +480,20 @@ const utf8Replacement = "�"
 // the cut. Same lesson as logscrub's secretKVCandidate: the admission IS the
 // cost.
 //
-// Hand back a reslice of the original. clip.Runes ends in s[:n],
-// which pins the WHOLE journal message for the life of the batch while
+// Hand back a reslice of anything longer than the body. clip.Runes ends in
+// s[:n], which pins the WHOLE string it cut for the life of the batch while
 // batchBytes counts only the truncated length — so MaxBatchBytes, documented
 // as "a soft bound that keeps a batch from growing large in memory", bounded
 // nothing. Measured at MaxEntryBytes 1 KiB over 1024 x 64 KiB messages:
 // 1.00 MB accounted, 64.15 MB live. Defaults are nearly immune (both are
 // 1 MiB), so it bit exactly the operator who LOWERED the entry cap to bound
-// memory. The truncating branch clones; the whole-message branch cannot alias
-// anything the batch does not already own.
+// memory. BOTH truncating branches therefore clone, which is the half that
+// had to be said twice: the under-cap branch cuts the ToValidUTF8
+// INTERMEDIATE rather than the raw message, so its reslice pinned the
+// validated copy instead (2-3x the accounted bytes rather than 64x — a
+// message of many separate invalid runs grows by two bytes per run — and
+// flushRetry holds the batch in place for a whole collector outage). The
+// whole-message branch cannot alias anything the batch does not already own.
 func (r *Reader) sanitize(msg, unit string) (body string, origLen int) {
 	raw := len(msg)
 	if raw <= r.cfg.MaxEntryBytes {
@@ -501,8 +506,10 @@ func (r *Reader) sanitize(msg, unit string) (body string, origLen int) {
 			return msg, 0
 		}
 		// A replacement rune is wider than the byte it replaces, so a message
-		// that fit before validation need not fit after it.
-		return clip.Runes(msg, r.cfg.MaxEntryBytes), raw
+		// that fit before validation need not fit after it. Cloned for the
+		// reason above: msg is the validated copy, and the cut would otherwise
+		// pin all of it.
+		return strings.Clone(clip.Runes(msg, r.cfg.MaxEntryBytes)), raw
 	}
 	cut := clip.Runes(msg, r.cfg.MaxEntryBytes)
 	if !utf8.ValidString(cut) {

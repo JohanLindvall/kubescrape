@@ -213,3 +213,98 @@ func TestAnOrdinaryRelabelChainIsUntouched(t *testing.T) {
 		}
 	}
 }
+
+// …and it refuses it WHEREVER the rule sits, which is the whole reason the
+// per-rule ceiling is spelled as the whole chain budget: a rule over it fits no
+// chain in any order, so its POSITION must not decide the verdict.
+//
+// It did. Both aggregate ceilings stopped the walk, so an oversized rule placed
+// past one of them was never measured: `oversize` stayed false, the endpoint
+// kept its Port, and every target it resolved to was served with the prefix
+// applied and the allowlist silently absent — the fail-OPEN this ceiling exists
+// to prevent, reported through relabelCappedIgnored, i.e. as the fail-open the
+// AGGREGATE ceilings are documented to be, so neither
+// kubescrape_monitor_fields_ignored_total nor /v1/explain could tell the two
+// apart. Both doors are pinned because they were separately reachable.
+func TestAnOversizedRelabelRulePastTheCountCapStillRefusesTheEndpoint(t *testing.T) {
+	var rules []any
+	for i := range maxRelabelRules {
+		rules = append(rules, map[string]any{
+			"action": "drop", "sourceLabels": []any{"__name__"},
+			"regex": "small" + strconv.Itoa(i),
+		})
+	}
+	// The rule the count ceiling would have stopped the walk before reaching.
+	rules = append(rules, map[string]any{
+		"action": "keep", "sourceLabels": []any{"__name__"},
+		"regex": strings.Repeat("z", maxRelabelRuleBytes+1),
+	})
+	assertOversizeRefusal(t, monitorWithRelabelings(t, rules))
+}
+
+func TestAnOversizedRelabelRulePastTheChainByteCapStillRefusesTheEndpoint(t *testing.T) {
+	var rules []any
+	// Nine ~1 KiB rules: the chain budget binds partway through them, well
+	// inside the 64-rule count ceiling, so this is the OTHER door.
+	for i := range 9 {
+		rules = append(rules, map[string]any{
+			"action": "drop", "sourceLabels": []any{"__name__"},
+			"regex": strconv.Itoa(i) + strings.Repeat("y", 1<<10),
+		})
+	}
+	if len(rules) >= maxRelabelRules {
+		t.Fatalf("precondition: %d filler rules must stay under the count ceiling of %d", len(rules), maxRelabelRules)
+	}
+	rules = append(rules, map[string]any{
+		"action": "keep", "sourceLabels": []any{"__name__"},
+		"regex": strings.Repeat("z", maxRelabelRuleBytes+1),
+	})
+	assertOversizeRefusal(t, monitorWithRelabelings(t, rules))
+}
+
+// assertOversizeRefusal is TestAnOversizedRelabelRuleRefusesTheEndpoint's
+// verdict, applied to a monitor whose oversized rule sits past an aggregate
+// ceiling: the endpoint yields nothing and says why.
+func assertOversizeRefusal(t *testing.T, m *Monitor) {
+	t.Helper()
+	ep := m.Endpoints[0]
+	if ep.Refused == "" || !strings.Contains(ep.Refused, relabelRefusedField) {
+		t.Fatalf("Refused = %q, rules kept = %d, Ignored = %v: the oversized rule escaped the per-rule ceiling, "+
+			"so the endpoint is served with its allowlist silently missing",
+			ep.Refused, len(ep.MetricRelabelings), ep.Ignored)
+	}
+	if ep.Port != "" || ep.TargetPort != nil {
+		t.Errorf("a refused endpoint still names a port: %q/%v", ep.Port, ep.TargetPort)
+	}
+	if ep.MetricRelabelings != nil {
+		t.Errorf("a refused endpoint still carries %d rules", len(ep.MetricRelabelings))
+	}
+	if !slices.Contains(ep.Ignored, relabelOversizeIgnored) {
+		t.Errorf("the refusal is not reported as an oversize: Ignored = %v", ep.Ignored)
+	}
+}
+
+// The walk continuing past an aggregate ceiling must not make the REPORT grow
+// with the unread tail: a capped chain is one entry, not one per rule the
+// ceiling refused.
+func TestACappedChainReportsOnceHoweverLongTheTailIs(t *testing.T) {
+	var rules []any
+	for i := range maxRelabelRules + 500 {
+		rules = append(rules, map[string]any{
+			"action": "drop", "sourceLabels": []any{"__name__"},
+			"regex": "small" + strconv.Itoa(i),
+		})
+	}
+	// Unsupported actions in the tail, which the walk now reaches and must stay
+	// silent about: each would otherwise embed a DISTINCT tenant-chosen value.
+	for i := range 20 {
+		rules = append(rules, map[string]any{"action": "hashmod" + strconv.Itoa(i), "regex": "x"})
+	}
+	ep := monitorWithRelabelings(t, rules).Endpoints[0]
+	if len(ep.MetricRelabelings) != maxRelabelRules {
+		t.Errorf("kept %d rules, want the %d-rule prefix", len(ep.MetricRelabelings), maxRelabelRules)
+	}
+	if got := len(ep.Ignored); got != 1 || ep.Ignored[0] != relabelCappedIgnored {
+		t.Errorf("Ignored = %v (%d entries), want exactly one %q", ep.Ignored, got, relabelCappedIgnored)
+	}
+}

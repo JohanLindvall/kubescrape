@@ -54,6 +54,20 @@ type KafkaConfig struct {
 	Brokers   []string
 	TLSConfig *tls.Config
 	Mechanism sasl.Mechanism
+	// Invalidate drops a CACHED credential so the next SASL session acquires a
+	// fresh one; nil when the auth path holds nothing to drop. Resolve sets it
+	// on the managed-identity path only — the connection-string mechanism
+	// re-reads its file per session and is already fresh — and Reader.Run calls
+	// it before rebuilding the consumer, which is what makes the fatal-fetch
+	// line's "rebuilt with freshly read credentials" true on BOTH paths.
+	Invalidate func()
+}
+
+// invalidateCredentials drops a cached credential, if this auth path has one.
+func (k *KafkaConfig) invalidateCredentials() {
+	if k.Invalidate != nil {
+		k.Invalidate()
+	}
 }
 
 // Resolve derives Brokers/TLSConfig/Mechanism from the Azure-facing fields.
@@ -81,7 +95,8 @@ func (k *KafkaConfig) Resolve(log *slog.Logger) error {
 		if host == "" {
 			return errors.New("azure event hubs: set -azure-eventhub-namespace or -azure-eventhub-connection-string-file")
 		}
-		k.Mechanism = managedIdentitySource(strings.TrimSuffix(hostOnly(host), ":9093"), k.ClientID, k.TenantID, nil, log).mechanism()
+		ts := managedIdentitySource(strings.TrimSuffix(hostOnly(host), ":9093"), k.ClientID, k.TenantID, nil, log)
+		k.Mechanism, k.Invalidate = ts.mechanism(), ts.invalidate
 	}
 	if !strings.Contains(host, ":") {
 		host += ":9093"

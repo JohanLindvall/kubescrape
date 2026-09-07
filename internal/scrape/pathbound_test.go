@@ -58,7 +58,7 @@ func TestOversizeMonitorPathYieldsNoTarget(t *testing.T) {
 	}
 	// And /v1/explain says WHY, naming the field rather than the port (which
 	// the endpoint did name) and never the value.
-	note := MonitorEndpointNote(ep)
+	note := MonitorEndpointNote(basePod(), ep)
 	if !strings.Contains(note, "path") || !strings.Contains(note, "REFUSED") {
 		t.Errorf("explain does not name the refusal: %q", note)
 	}
@@ -77,7 +77,7 @@ func TestOversizePodMonitorPathYieldsNoTarget(t *testing.T) {
 	if _, ok := PodMonitorTargetURL(basePod(), ep); ok {
 		t.Errorf("the identity half still resolves the endpoint")
 	}
-	if note := PodMonitorEndpointNote(ep); !strings.Contains(note, "REFUSED") {
+	if note := PodMonitorEndpointNote(basePod(), ep); !strings.Contains(note, "REFUSED") {
 		t.Errorf("explain does not name the refusal: %q", note)
 	}
 }

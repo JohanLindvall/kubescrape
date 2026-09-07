@@ -446,11 +446,16 @@ const exportResolveBudget = 5 * time.Second
 // well past a full node; past it, a newly resolved container is not promoted
 // into the sampled set and is counted (obs.CgroupContainersCapped{cap=tracked}).
 //
-// Only entries that HOLD descriptors are counted against it. It used to be
+// Only entries that HOLD descriptors are counted against it (liveTrackedLocked,
+// not len(tracked)), and that rule has had to be applied twice. It used to be
 // tested against tracked+pending, which spent an fd budget on entries that own
 // no fd — and since every pod's sandbox cgroup is permanently pending, a large
 // node's sandboxes crowded out its real workload containers, which is precisely
-// backwards.
+// backwards. The same defect then survived inside the tracked map itself: a
+// GONE container has already released its three descriptors and lingers only
+// until the export that carries its final window, so on a dense node a batch of
+// exits refused newly resolved live containers for up to one whole export
+// window, on a budget nobody was spending.
 const maxContainers = 512
 
 // maxPending bounds the not-yet-attributed set. It is the MEMORY bound, a
@@ -736,6 +741,12 @@ type Sampler struct {
 	// the node's container count, which is exactly what logdedupe exists for.
 	readWarn logdedupe.Throttle
 	listWarn logdedupe.Throttle
+	// rootWarn is the ROOT-listing complaint, throttled apart from listWarn
+	// for the reason walk() already counts the two apart: an unreadable root
+	// is a missing mount and a silent pipeline, an unreadable subtree is one
+	// directory inside a working hierarchy. A mount that flaps between the two
+	// must not have whichever fired first suppress the other.
+	rootWarn logdedupe.Throttle
 	// retireWarn is its own throttle rather than readWarn's: a retirement is
 	// the CONCLUSION of a run of read failures, and sharing the throttle would
 	// let the failures suppress the line that says what was done about them.
@@ -1066,6 +1077,25 @@ func (s *Sampler) Unresolved() int { return int(s.nPending.Load()) }
 // Discovered reports every container cgroup found in the hierarchy, resolved or
 // not, for the startup log line.
 func (s *Sampler) Discovered() int { return int(s.nDiscover.Load()) }
+
+// liveTrackedLocked counts the tracked containers that still HOLD descriptors,
+// which is what the maxContainers cap bounds. Caller holds mu.
+//
+// It applies the same `if c.gone { continue }` rule publishCountsLocked does: a
+// gone container released its three descriptors in markGone and stays in the
+// map only until the export that carries its final window, so charging it
+// against a descriptor budget refuses a live container for descriptors nobody
+// holds.
+func (s *Sampler) liveTrackedLocked() int {
+	n := 0
+	for _, c := range s.tracked {
+		if c.gone {
+			continue
+		}
+		n++
+	}
+	return n
+}
 
 // publishCountsLocked refreshes the atomics the gauges read. Caller holds mu.
 //

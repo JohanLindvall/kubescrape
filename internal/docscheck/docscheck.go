@@ -39,7 +39,25 @@ var tableFlagPattern = regexp.MustCompile("(?m)^\\|\\s*\\(?`--?([A-Za-z0-9][A-Za
 // internal/cli's shared registrations (`fs.String(...)`). The name is always a
 // string literal in this repo (a computed name could not be matched — nothing
 // registers one, and the FLAGS.md generator would catch the omission anyway).
-var registerPattern = regexp.MustCompile(`(?:flag|fs)\.(?:String|Bool|Int64|Int|Uint64|Uint|Float64|Duration|Var|Func|TextVar)\(\s*(?:&[A-Za-z0-9_.]+,\s*)?"([A-Za-z0-9][A-Za-z0-9-]*)"`)
+//
+// The `Var` SUFFIX is part of the alternation rather than a separate
+// alternative, which it has to be: the alternation is followed immediately by
+// `(`, so an earlier spelling that listed `Duration` and `TextVar` side by side
+// matched neither `flag.DurationVar` nor `flag.TextVar` — every `flag.XxxVar`
+// form, which is the idiomatic package-level registration, was invisible. That
+// is a FAIL-LOUD miss rather than a silent one (docs/FLAGS.md is generated from
+// the live flag set and is one of the scanned docs, so the new row would be
+// accused of naming a flag nothing registers) and the obvious remedy for the
+// red build is to delete a true row. registerpattern_test.go pins every
+// spelling.
+//
+// Up to two leading arguments may precede the name literal: one for the
+// `flag.XxxVar(&v, "name", ...)` and `flag.Var(&v, "name", ...)` forms, two for
+// `flag.TextVar(&v, defaultValue, "name", ...)`. They are matched as "anything
+// that is not a string literal, a bracket or a comma", so a default value
+// spelled as a call — `net.ParseIP("::1")` — is out of reach; nothing in this
+// repo writes one, and a missed registration fails loudly rather than passing.
+var registerPattern = regexp.MustCompile(`(?:flag|fs)\.(?:BoolFunc|Func|Var|(?:String|Bool|Int64|Int|Uint64|Uint|Float64|Duration|Text)(?:Var)?)\(\s*(?:[^"(),]+,\s*){0,2}"([A-Za-z0-9][A-Za-z0-9-]*)"`)
 
 // TableFlags returns the flag names documented in markdown table rows of the
 // given files, deduplicated, with the file and line of the first occurrence.

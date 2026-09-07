@@ -125,9 +125,17 @@ func prefixedKey(c *genCache[string], prefix, key string) string {
 }
 
 // Container adds the container-level resource attributes on top of Pod's.
+// Empty fields are omitted, never stamped as "", for Pod's reason and one
+// sharper: k8s.container.name is a RESERVED-IDENTITY key (see
+// ReservedIdentity), so on the ingest path a resolved lookup OVERWRITES
+// whatever a sender declared with what this function stamps — an empty value
+// there would replace a conformant SDK's honest container name with nothing,
+// on every resource it resolves.
 func Container(res pcommon.Resource, c kubemeta.Container) {
 	a := res.Attributes()
-	a.PutStr("k8s.container.name", c.Name)
+	if c.Name != "" {
+		a.PutStr("k8s.container.name", c.Name)
+	}
 	if c.ID != "" {
 		a.PutStr("container.id", c.ID)
 	}
@@ -140,14 +148,20 @@ func Container(res pcommon.Resource, c kubemeta.Container) {
 }
 
 // Service adds attributes identifying the Service a scrape target was
-// discovered through.
+// discovered through. Empty fields are omitted for Pod's reason — a Service
+// resolved by name but not by UID must not put an empty k8s.service.uid into
+// the series identity, where it reads as a value rather than as an absence.
 func Service(res pcommon.Resource, svc *kubemeta.Service) {
 	if svc == nil {
 		return
 	}
 	a := res.Attributes()
-	a.PutStr("k8s.service.name", svc.Name)
-	a.PutStr("k8s.service.uid", svc.UID)
+	if svc.Name != "" {
+		a.PutStr("k8s.service.name", svc.Name)
+	}
+	if svc.UID != "" {
+		a.PutStr("k8s.service.uid", svc.UID)
+	}
 }
 
 // Identity sets service.namespace and service.instance.id so a Prometheus

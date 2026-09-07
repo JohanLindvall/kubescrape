@@ -143,9 +143,22 @@ func NewProcessor(cfg Config, log *slog.Logger) *Processor {
 	// write the same map key twice — harmless but pure waste on the hot path
 	// (spanmetrics learned a sharper version of this lesson: there a duplicate
 	// silently blanked a built-in label).
+	//
+	// Dropping is right; doing it SILENTLY is not, which is the other half of
+	// that lesson and the half this loop was missing. Config.Validate does not
+	// look at Dimensions at all, so nothing upstream reports it either: the
+	// operator asked for a label, got no error, and the only trace was the
+	// resolved COUNT on a Debug line — so a list quietly one entry shorter than
+	// it reads is undetectable at Info. One line per rejection, at startup, with
+	// the key that was dropped.
 	seen := make(map[string]bool, len(cfg.Dimensions))
 	for _, d := range cfg.Dimensions {
-		if d == "" || seen[d] {
+		if d == "" {
+			log.Warn("ignoring an empty serviceGraph dimension: there is no attribute to resolve, and it would mint a client_/server_ label pair with no name")
+			continue
+		}
+		if seen[d] {
+			log.Warn("ignoring a repeated serviceGraph dimension", "key", d)
 			continue
 		}
 		seen[d] = true
@@ -241,9 +254,23 @@ func (p *Processor) Consume(td ptrace.Traces) {
 			// at entry and derives service.name for every attributable
 			// sender, so a sustained rate here means senders the tier cannot
 			// attribute, whose requests are on no edge at all.
+			// Only the spans PAIRING would have used. The named arm below
+			// calls observe, which returns without counting anything for an
+			// INTERNAL or UNSPECIFIED span — those are not a call between two
+			// services — so counting every span here measured a different
+			// thing on each side of the same question: an ordinary batch is
+			// mostly internal spans, and the incompleteness ratio an operator
+			// computes against kubescrape_service_graph_completed_total came
+			// out inflated several-fold by a fraction that was never going to
+			// be an edge. ONE classifier for both arms, so they cannot drift.
 			n := 0
 			for j := 0; j < sss.Len(); j++ {
-				n += sss.At(j).Spans().Len()
+				spans := sss.At(j).Spans()
+				for k := 0; k < spans.Len(); k++ {
+					if _, _, ok := spanSide(spans.At(k).Kind()); ok {
+						n++
+					}
+				}
 			}
 			if n > 0 {
 				obs.ServiceGraphUnnamed.Add(float64(n))
@@ -356,24 +383,36 @@ func (p *Processor) sweepDue(now time.Time) {
 	}
 }
 
-func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, now time.Time) {
-	var side edgeSide
-	conn := ConnectionUnknown
-	switch span.Kind() {
+// spanSide classifies a span kind into the half of an edge it can be, and
+// whether the kind ALONE already settles the connection type. ok is false for
+// the kinds that are not a call between two services at all.
+//
+// It is a function rather than a switch inside observe because the unnamed-
+// resource arm of Consume has to answer the same question — "would pairing have
+// used this span?" — and answering it differently there made the counter and
+// the graph measure different populations.
+func spanSide(k ptrace.SpanKind) (side edgeSide, conn ConnectionType, ok bool) {
+	switch k {
 	case ptrace.SpanKindClient:
-		side = sideClient
+		return sideClient, ConnectionUnknown, true
 	case ptrace.SpanKindProducer:
 		// A producer is the client half of an asynchronous hop, and the pair
 		// being a messaging one is known from the KIND alone — the consumer
 		// says the same thing, so whichever arrives first classifies the edge.
-		side, conn = sideClient, ConnectionMessagingSystem
+		return sideClient, ConnectionMessagingSystem, true
 	case ptrace.SpanKindServer:
-		side = sideServer
+		return sideServer, ConnectionUnknown, true
 	case ptrace.SpanKindConsumer:
-		side, conn = sideServer, ConnectionMessagingSystem
-	default:
-		// INTERNAL and UNSPECIFIED spans are not a call between two services;
-		// pairing them would invent edges inside a single process.
+		return sideServer, ConnectionMessagingSystem, true
+	}
+	// INTERNAL and UNSPECIFIED spans are not a call between two services;
+	// pairing them would invent edges inside a single process.
+	return 0, ConnectionUnknown, false
+}
+
+func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, now time.Time) {
+	side, conn, ok := spanSide(span.Kind())
+	if !ok {
 		return
 	}
 

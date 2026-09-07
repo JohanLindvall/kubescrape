@@ -11,6 +11,8 @@ import (
 	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 func capturedLog() (*slog.Logger, func() string) {
@@ -170,5 +172,117 @@ func TestClipForLogLeavesShortValuesAlone(t *testing.T) {
 		if len(strings.TrimSuffix(got, "…")) > maxLoggedValueBytes {
 			t.Errorf("clipForLog returned %d bytes, over the %d-byte bound", len(got), maxLoggedValueBytes)
 		}
+	}
+}
+
+// The unnamed counter and the graph itself have to answer the same question in
+// the same unit. observe skips INTERNAL and UNSPECIFIED spans without counting
+// anything, so counting every span of an unnamed resource measured a different
+// population: an ordinary batch is mostly internal spans, and the
+// incompleteness ratio an operator computes against
+// kubescrape_service_graph_completed_total came out inflated several-fold by a
+// fraction that could never have been an edge.
+func TestUnnamedSpansCountsOnlyTheKindsPairingWouldHaveUsed(t *testing.T) {
+	p := NewProcessor(Config{}, discardLog())
+
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty() // deliberately no service.name
+	spans := rs.ScopeSpans().AppendEmpty().Spans()
+	kinds := []ptrace.SpanKind{
+		ptrace.SpanKindInternal, ptrace.SpanKindInternal, ptrace.SpanKindInternal,
+		ptrace.SpanKindUnspecified,
+		ptrace.SpanKindClient, ptrace.SpanKindServer,
+		ptrace.SpanKindProducer, ptrace.SpanKindConsumer,
+	}
+	for i, k := range kinds {
+		sp := spans.AppendEmpty()
+		sp.SetTraceID(traceID(1))
+		sp.SetSpanID(spanID(byte(i + 1)))
+		sp.SetKind(k)
+	}
+
+	before := obs.ServiceGraphUnnamed.Value()
+	p.Consume(td)
+	if got := obs.ServiceGraphUnnamed.Value() - before; got != 4 {
+		t.Errorf("counted %v unnamed spans, want 4 (the client/server/producer/consumer ones): the counter's unit must be the spans pairing would have used, not every span on the resource", got)
+	}
+}
+
+// A resource carrying only spans pairing would have skipped anyway loses the
+// graph nothing, so it moves no counter and writes no line.
+func TestUnnamedResourceWithNoEdgeCapableSpansIsSilent(t *testing.T) {
+	log, dump := capturedLog()
+	p := NewProcessor(Config{}, log)
+	base := len(dump())
+
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("k8s.pod.name", "legacy-7d9")
+	sp := rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	sp.SetTraceID(traceID(1))
+	sp.SetSpanID(spanID(1))
+	sp.SetKind(ptrace.SpanKindInternal)
+
+	before := obs.ServiceGraphUnnamed.Value()
+	p.Consume(td)
+	if got := obs.ServiceGraphUnnamed.Value() - before; got != 0 {
+		t.Errorf("counted %v unnamed spans for a resource whose spans could never pair", got)
+	}
+	if out := dump()[base:]; out != "" {
+		t.Errorf("warned about a resource that costs the graph nothing:\n%s", out)
+	}
+}
+
+// Dropping a dimension is right; doing it silently is not. Config.Validate does
+// not look at Dimensions at all, so without this line the only trace of a list
+// one entry shorter than it reads is the resolved COUNT on a Debug line.
+func TestDroppedDimensionsAreWarnedWithTheKey(t *testing.T) {
+	log, dump := capturedLog()
+	p := NewProcessor(Config{Dimensions: []string{"http.method", "http.method", "", "http.route"}}, log)
+	out := dump()
+
+	if n := strings.Count(out, "repeated serviceGraph dimension"); n != 1 {
+		t.Errorf("want one repeat warning, got %d:\n%s", n, out)
+	}
+	if !strings.Contains(out, "key=http.method") {
+		t.Errorf("the warning does not name the dropped key:\n%s", out)
+	}
+	if n := strings.Count(out, "empty serviceGraph dimension"); n != 1 {
+		t.Errorf("want one empty-entry warning, got %d:\n%s", n, out)
+	}
+	if len(p.dims) != 2 {
+		t.Errorf("resolved %d dimensions, want 2", len(p.dims))
+	}
+}
+
+// A clean dimension list says nothing.
+func TestCleanDimensionsAreSilent(t *testing.T) {
+	log, dump := capturedLog()
+	NewProcessor(Config{Dimensions: []string{"http.method", "http.route"}}, log)
+	if out := dump(); strings.Contains(out, "level=WARN") {
+		t.Errorf("a clean dimension list warned:\n%s", out)
+	}
+}
+
+// New never refuses to aggregate over a bad staleAfter (Config.Validate is what
+// reports it, and -check-config runs that) — but a start that has somehow got
+// past Validate must not then apply a DIFFERENT eviction policy in silence:
+// with eviction disabled the cardinality cap is the one-way latch
+// cumagg.ParseStaleAfter exists to prevent. The sibling aggregator already said
+// so; this one fell back with nothing to grep for.
+func TestUnparseableStaleAfterIsWarned(t *testing.T) {
+	log, dump := capturedLog()
+	r := NewRegistry(Config{StaleAfter: "nonsense"}, log)
+	out := dump()
+	if !strings.Contains(out, "staleAfter is unparseable") {
+		t.Errorf("the fallback to the default eviction age was silent:\n%s", out)
+	}
+	if got := r.store.StaleAfter(); got != DefaultStaleAfter {
+		t.Errorf("staleAfter = %v, want the default %v", got, DefaultStaleAfter)
+	}
+	log2, dump2 := capturedLog()
+	NewRegistry(Config{StaleAfter: "5m"}, log2)
+	if out := dump2(); out != "" {
+		t.Errorf("a parseable staleAfter warned:\n%s", out)
 	}
 }

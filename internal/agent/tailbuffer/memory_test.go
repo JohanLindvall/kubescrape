@@ -155,31 +155,76 @@ func TestNewLowersTheDefaultCeiling(t *testing.T) {
 	}
 }
 
-// The cgroup readers, against files rather than the machine's own.
-func TestReadMemFile(t *testing.T) {
+// The host-RAM fallback's reader, against a file rather than the machine's own.
+// The cgroup reader is internal/cli's (see detectMemoryLimit) and is pinned by
+// its own fixture tests there, including the cgroupns=host layout this file
+// used to be blind to.
+func TestReadMemTotal(t *testing.T) {
 	dir := t.TempDir()
-	write := func(name, content string) string {
-		p := filepath.Join(dir, name)
-		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return p
+	meminfo := filepath.Join(dir, "meminfo")
+	if err := os.WriteFile(meminfo, []byte("MemFree:  123 kB\nMemTotal:       2097152 kB\nBuffers: 1 kB\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if v, ok := readMemFile(write("limit", "1073741824\n")); !ok || v != gib {
-		t.Fatalf("readMemFile: got %d %v, want 1 GiB", v, ok)
-	}
-	if _, ok := readMemFile(write("max", "max\n")); ok {
-		t.Fatal("cgroup v2 \"max\" must read as no limit")
-	}
-	if _, ok := readMemFile(write("v1max", "9223372036854771712\n")); ok {
-		t.Fatal("cgroup v1's unlimited sentinel must read as no limit")
-	}
-	if _, ok := readMemFile(filepath.Join(dir, "absent")); ok {
-		t.Fatal("a missing file must read as no limit")
-	}
-
-	meminfo := write("meminfo", "MemFree:  123 kB\nMemTotal:       2097152 kB\nBuffers: 1 kB\n")
 	if v, ok := readMemTotal(meminfo); !ok || v != 2*gib {
 		t.Fatalf("readMemTotal: got %d %v, want 2 GiB", v, ok)
+	}
+	if _, ok := readMemTotal(filepath.Join(dir, "absent")); ok {
+		t.Fatal("a missing file must read as no limit")
+	}
+}
+
+// The CONTAINER'S OWN cgroup limit wins, and the host's RAM is only ever the
+// fallback for a workload that has no limit.
+//
+// This is the shape of the bug it pins: the reader here looked at the cgroup
+// MOUNT ROOT only, which is the container's own file just inside a cgroup
+// namespace. Under cgroupns=host on a cgroup-v2 node the root carries no
+// controller files at all, so a capped pod read nothing, sized maxSpans
+// against the NODE's RAM — disabling the guard entirely, since a quarter of
+// 64 GiB affords millions of spans — and said "this workload has no memory
+// limit" about a pod that had one. The resolution now belongs to
+// internal/cli.CgroupMemoryLimit, which walks /proc/self/cgroup, so the number
+// this file sizes against and the number SetMemoryLimit hands the Go runtime
+// are one number.
+func TestMemoryLimitPrefersTheContainersOwnCgroup(t *testing.T) {
+	dir := t.TempDir()
+	meminfo := filepath.Join(dir, "meminfo")
+	if err := os.WriteFile(meminfo, []byte("MemTotal:       67108864 kB\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldCg, oldMI := cgroupLimit, memInfo
+	t.Cleanup(func() { cgroupLimit, memInfo = oldCg, oldMI })
+	memInfo = meminfo
+
+	// A capped container: its own cgroup answers, and the host's 64 GiB is
+	// never consulted.
+	cgroupLimit = func() (int64, string, bool) {
+		return gib, "/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/pod-uid/container/memory.max", true
+	}
+	v, source := detectMemoryLimit()
+	if v != gib {
+		t.Errorf("limit = %d, want the container's own %d", v, gib)
+	}
+	if strings.Contains(source, "MemTotal") || strings.Contains(source, "no memory limit") {
+		t.Errorf("limitSource = %q: a capped pod was described as uncapped", source)
+	}
+	if !strings.Contains(source, "memory.max") {
+		t.Errorf("limitSource = %q: it must name the file the number came from", source)
+	}
+
+	// An uncapped one: the host's RAM, and it says so.
+	cgroupLimit = func() (int64, string, bool) { return 0, "", false }
+	v, source = detectMemoryLimit()
+	if v != 64*gib {
+		t.Errorf("limit = %d, want the host's %d", v, 64*gib)
+	}
+	if !strings.Contains(source, "no memory limit") {
+		t.Errorf("limitSource = %q, want the uncapped wording", source)
+	}
+
+	// Neither readable: nothing is derived and nothing is refused.
+	memInfo = filepath.Join(dir, "absent")
+	if v, source := detectMemoryLimit(); v != 0 || source != "" {
+		t.Errorf("detectMemoryLimit() = %d, %q; want 0, \"\" when nothing can be read", v, source)
 	}
 }

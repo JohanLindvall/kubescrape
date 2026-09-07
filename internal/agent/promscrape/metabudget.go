@@ -83,6 +83,11 @@ type metaBudget struct {
 	// pipeline labels the exhaustion counter; it is the scrape's own pipeline
 	// id so an operator can tell which scrape is shedding attribution.
 	pipeline string
+	// budget is the scrape budget this allowance was carved out of — the
+	// MINIMUM of -scrape-timeout and whatever intervals clamp it, never the
+	// configured flag. Kept so the warning can name the number the allowance
+	// actually relates to (see reportMetaBudget).
+	budget time.Duration
 	// exhausted latches so the counter moves once per SCRAPE rather than once
 	// per shed object.
 	exhausted atomic.Bool
@@ -111,7 +116,9 @@ func withMetaBudget(ctx context.Context, scrapeBudget time.Duration, pipeline st
 	if scrapeBudget <= 0 {
 		return ctx
 	}
-	return context.WithValue(ctx, metaBudgetKey{}, &metaBudget{limit: scrapeBudget / metaBudgetDivisor, pipeline: pipeline})
+	return context.WithValue(ctx, metaBudgetKey{}, &metaBudget{
+		budget: scrapeBudget, limit: scrapeBudget / metaBudgetDivisor, pipeline: pipeline,
+	})
 }
 
 func metaBudgetFrom(ctx context.Context) *metaBudget {
@@ -158,7 +165,7 @@ func (s *Scraper) scrapeContext(ctx context.Context, budget time.Duration, pipel
 // near the bound. Nothing here reaches the metadata client's own cache, because
 // the Scraper's podCache (a minute, against the client's ten seconds) is read
 // first and is the longer of the two.
-func (s *Scraper) metaLookup(ctx context.Context) (context.Context, func(), bool) {
+func (s *Scraper) metaLookup(ctx context.Context, obj *objectShed) (context.Context, func(), bool) {
 	b := metaBudgetFrom(ctx)
 	if b == nil {
 		return ctx, func() {}, true
@@ -175,7 +182,19 @@ func (s *Scraper) metaLookup(ctx context.Context) (context.Context, func(), bool
 		// the shed count is final; here there is only ever one object's worth
 		// of it, and a warn per shed object would take the throttle's atomic on
 		// a path a 200-pod node walks 200 times.
-		b.shed.Add(1)
+		//
+		// shed is per OBJECT, which is why obj exists: one cadvisor container
+		// row issues TWO lookups (the container id, then its pod), so charging
+		// per LOOKUP reported `unattributed=400` for the 200 objects a 200-pod
+		// node actually shed — and the inflation factor is between 1x and 2x
+		// and not derivable from the line, since rows without a vouched
+		// container id and every summary object charge once.
+		if obj == nil || !obj.charged {
+			b.shed.Add(1)
+		}
+		if obj != nil {
+			obj.charged = true
+		}
 		return ctx, func() {}, false
 	}
 	// WithTimeout takes the earlier of the two deadlines, so a scrape already
@@ -195,9 +214,17 @@ func (s *Scraper) metaLookup(ctx context.Context) (context.Context, func(), bool
 // The counters are the ongoing signal — kubescrape_scrape_metadata_budget_
 // exhausted_total counts the scrapes, and on the summary pipeline the objects
 // also land in kubescrape_summary_unresolved_total — so what this adds is WHICH
-// pipeline is shedding, HOW MANY objects it shed, and the allowance and timeout
-// it was cut from, which together are what an operator needs to decide whether
-// to raise the scrape timeout or go and fix the metadata service.
+// pipeline is shedding, HOW MANY objects it shed, and the BUDGET the allowance
+// was cut from, which together are what an operator needs to decide whether to
+// raise the scrape timeout or go and fix the metadata service.
+//
+// `scrapeBudget` and not the configured -scrape-timeout: the budget is the
+// MINIMUM of the timeout and the intervals that clamp it (kubeletTimeout, and
+// targetTimeout's min of the target's own interval too), so printing the
+// unclamped flag put two numbers on one line that do not relate — with
+// -scrape-timeout=60s and -scrape-interval=30s it read `allowance=15s
+// scrapeTimeout=60s`, and an operator following this line's own advice raised
+// the timeout to 120s and moved the allowance not at all.
 func (s *Scraper) reportMetaBudget(ctx context.Context) {
 	b := metaBudgetFrom(ctx)
 	if b == nil || !b.exhausted.Load() || !s.metaBudgetWarn.Allow(metaBudgetWarnEvery) {
@@ -205,5 +232,12 @@ func (s *Scraper) reportMetaBudget(ctx context.Context) {
 	}
 	s.log.Warn("a scrape spent its whole metadata allowance; the objects it had left are exported with their label identity, and the scrape itself still ships",
 		"pipeline", b.pipeline, "unattributed", b.shed.Load(),
-		"allowance", b.limit, "scrapeTimeout", s.cfg.Timeout, "scrapeInterval", s.cfg.Interval)
+		"allowance", b.limit, "scrapeBudget", b.budget,
+		"scrapeTimeout", s.cfg.Timeout, "scrapeInterval", s.cfg.Interval)
 }
+
+// objectShed makes the shed count per OBJECT rather than per LOOKUP: one
+// resolution may issue two (the container id, then the pod), and both are the
+// same object going out unjoinable. Declared on the caller's stack, so this
+// costs no allocation on the enriched path.
+type objectShed struct{ charged bool }

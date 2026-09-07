@@ -51,9 +51,9 @@ const (
 )
 
 // attrFilter is one resource-attribute condition: a resource matches when ANY
-// of its attributes has a key matching Key and a value (rendered as string)
-// matching Value — both path.Match globs, with '/' an ordinary character (see
-// globMatch). A subscriber's filters are ANDed.
+// of its attributes has a key matching Key and a SCALAR value (rendered as
+// string) matching Value — both path.Match globs, with '/' an ordinary
+// character (see globMatch). A subscriber's filters are ANDed.
 type attrFilter struct {
 	Key   string
 	Value string
@@ -63,7 +63,8 @@ func (f attrFilter) matches(attrs pcommon.Map) bool {
 	found := false
 	attrs.Range(func(k string, v pcommon.Value) bool {
 		if globMatch(f.Key, k) {
-			if globMatch(f.Value, v.AsString()) {
+			s, ok := filterValue(v)
+			if ok && globMatch(f.Value, s) {
 				found = true
 				return false
 			}
@@ -71,6 +72,39 @@ func (f attrFilter) matches(attrs pcommon.Map) bool {
 		return true
 	})
 	return found
+}
+
+// filterValue renders an attribute value for the VALUE half of a filter, and
+// refuses the kinds whose rendering is unbounded — the size half of the
+// ceiling maxAttrFilters and maxAttrFilterBytes bound on the PATTERN side, and
+// which they cannot express because it is the payload, not the query, that
+// chooses it.
+//
+// pcommon.Value.AsString JSON-marshals a Map or Slice value in full (building
+// a map[string]any first) and base64-encodes a Bytes one, allocating
+// proportionally to the value — once per key-matching filter, per resource,
+// per export, on the EXPORTING goroutine, which for logs is the tailer's
+// single sweep goroutine serving every log file on the node. A resource
+// attribute of those kinds cannot come from this agent (everything attrs.Build
+// stamps is a scalar); it can only arrive from a push on the unauthenticated
+// -ingest or trace-tier listeners, bounded only by the 16 MiB message cap. So
+// a wide-key filter over a hostile payload is the same multiplier
+// maxAttrFilters exists to refuse, reached through the value side.
+//
+// They are therefore treated as NON-MATCHING rather than truncated: a
+// truncated render would match a glob the whole value does not, which is the
+// one thing worse than not matching on a debugging stream. What is lost is the
+// ability to filter on a pushed structured attribute; what is kept is a bound
+// on what one export pays.
+func filterValue(v pcommon.Value) (string, bool) {
+	switch v.Type() {
+	case pcommon.ValueTypeStr:
+		return v.Str(), true
+	case pcommon.ValueTypeEmpty, pcommon.ValueTypeBool, pcommon.ValueTypeInt, pcommon.ValueTypeDouble:
+		return v.AsString(), true
+	default: // Map, Slice, Bytes — rendered size is the sender's choice
+		return "", false
+	}
 }
 
 // globMatch is path.Match with the SEPARATOR NEUTRALIZED: neither half of an

@@ -193,15 +193,26 @@ func (f *MetricFilter) Keep(name string, labels []Label) bool {
 }
 
 // session returns a per-scrape memoizing view of the filter: the set of rules
-// whose NAME regex matches is cached per series name (a bitmask), so a family
+// whose NAME regex matches is cached per series name (a bitset), so a family
 // of thousands of series pays the regex walk once. Safe on a nil receiver;
 // the returned session is single-goroutine (one per scrape), keeping the
 // shared MetricFilter immutable.
+//
+// The bitset is a WORD SLICE and not a uint64, so there is no rule count at
+// which the memo silently disappears. It used to: past 64 rules — the width of
+// the mask, reached by 40 shared `all` rules plus 25 pipeline ones with neither
+// list looking large, since MetricFilters concatenates them — session() returned
+// a memo-less view and BOTH memos vanished with it (the label memo is created
+// only beside the mask one), so every sample of a 100k-series target re-ran the
+// whole anchored-regex chain on the scrape goroutine cycle() waits for. Nothing
+// warned, no metric told the two modes apart, and the operator saw only a node
+// whose cycles got slower after one added rule.
 func (f *MetricFilter) session() *filterSession {
-	if f == nil || len(f.rules) > 64 {
-		return &filterSession{f: f} // no memo; fall back to direct Keep
+	if f == nil {
+		return &filterSession{} // nothing to memoize; Keep answers true
 	}
-	s := &filterSession{f: f, masks: make(map[string]uint64, 64)}
+	words := (len(f.rules) + 63) / 64
+	s := &filterSession{f: f, words: words, offsets: make(map[string]int, 64), scratch: make([]uint64, words)}
 	for _, r := range f.rules {
 		if len(r.labels) > 0 {
 			s.lblMatch = make(map[lblMatchKey]bool, 64)
@@ -224,12 +235,24 @@ func (f *MetricFilter) session() *filterSession {
 const maxMemoBytes = 1 << 20
 
 type filterSession struct {
-	f        *MetricFilter
-	masks    map[string]uint64 // name -> bitmask of name-matching rules
+	f *MetricFilter
+	// words is the bitset width in uint64s — one per 64 rules, so every rule
+	// count is memoizable. offsets maps a series name to the start of its
+	// words-long run in maskWords; ONE flat backing slice rather than a slice
+	// per name keeps a memo hit a plain reslice (no allocation, which
+	// TestFilterSessionAllocationBudget pins) and a miss an amortized append.
+	words     int
+	offsets   map[string]int
+	maskWords []uint64
+	// scratch holds the mask of a name the budget refused to memoize, so the
+	// over-budget path still costs no allocation.
+	scratch  []uint64
 	lblMatch map[lblMatchKey]bool
-	// memoBytes is the key text both memos hold; see maxMemoBytes. One budget
-	// for the session, because it is the session's retained heap that matters
-	// and either memo alone can spend it.
+	// memoBytes is what both memos hold; see maxMemoBytes. One budget for the
+	// session, because it is the session's retained heap that matters and
+	// either memo alone can spend it. A name's mask words are charged with its
+	// key text: at 1000 rules a bitset is 128 bytes, so a count cap alone
+	// would not bound them.
 	memoBytes int
 }
 
@@ -245,29 +268,46 @@ func (s *filterSession) Keep(name string, labels []Label) bool {
 	if s.f == nil {
 		return true
 	}
-	if s.masks == nil {
-		return s.f.Keep(name, labels)
-	}
-	mask, ok := s.masks[name]
-	if !ok {
-		for i, r := range s.f.rules {
-			if r.name == nil || r.name.MatchString(name) {
-				mask |= 1 << i
+	mask := s.mask(name)
+	for w, word := range mask {
+		for word != 0 {
+			i := w*64 + bits.TrailingZeros64(word)
+			word &= word - 1
+			if r := &s.f.rules[i]; s.labelsMatch(r, labels) {
+				return !r.drop
 			}
-		}
-		if len(s.masks) < maxTrackedFamilies && s.memoBytes+len(name) <= maxMemoBytes { // bound the per-scrape memo
-			s.masks[name] = mask
-			s.memoBytes += len(name)
-		}
-	}
-	for mask != 0 {
-		i := bits.TrailingZeros64(mask)
-		mask &^= 1 << i
-		if r := &s.f.rules[i]; s.labelsMatch(r, labels) {
-			return !r.drop
 		}
 	}
 	return true
+}
+
+// mask returns the bitset of rules whose NAME regex matches, memoized per name.
+// The returned slice aliases session-owned memory and is valid until the next
+// call — every reader consumes it before it returns.
+func (s *filterSession) mask(name string) []uint64 {
+	if off, ok := s.offsets[name]; ok {
+		return s.maskWords[off : off+s.words]
+	}
+	dst := s.scratch
+	charge := len(name) + s.words*8
+	memo := len(s.offsets) < maxTrackedFamilies && s.memoBytes+charge <= maxMemoBytes // bound the per-scrape memo
+	if memo {
+		off := len(s.maskWords)
+		for range s.words {
+			s.maskWords = append(s.maskWords, 0)
+		}
+		dst = s.maskWords[off : off+s.words]
+		s.offsets[name] = off
+		s.memoBytes += charge
+	} else {
+		clear(dst)
+	}
+	for i, r := range s.f.rules {
+		if r.name == nil || r.name.MatchString(name) {
+			dst[i/64] |= 1 << (i % 64)
+		}
+	}
+	return dst
 }
 
 // labelsMatch is compiledRule.labelsMatch with the session's memo in front of

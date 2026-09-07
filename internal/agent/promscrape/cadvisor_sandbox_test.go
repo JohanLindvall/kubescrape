@@ -764,3 +764,51 @@ func TestCadvisorImpostorRowsCannotDuplicateARealResource(t *testing.T) {
 		}
 	}
 }
+
+// The pod-LEVEL resource must be named by a row that CARRIES the pod's
+// identity, whatever order cadvisor emits its rows in. An unattributable child
+// of a pod slice — kata's kata_<sandbox-id>, whose name yields no container id
+// — parses to (uid, "") exactly as the pod's own cgroup row does, and the key
+// omitted namespace and pod, so the two shared one resource and whichever
+// arrived FIRST filled it. With the helper first, container_network_* and every
+// pod-cgroup rollup row went out carrying only k8s.pod.uid: no
+// k8s.namespace.name, no k8s.pod.name, hence no service.name and no Prometheus
+// job — and it flapped between scrapes with cadvisor's row order.
+func TestUnattributableCgroupCannotNameThePodResource(t *testing.T) {
+	podSlice := systemdPodSlice(uid1)
+	helper := cadvisorRow("container_cpu_usage_seconds_total", []Label{
+		{Name: "id", Value: podSlice + "/kata_" + pauseCID},
+		{Name: "name", Value: "kata_" + pauseCID},
+	}, 7)
+
+	const head = "# TYPE container_cpu_usage_seconds_total counter\n"
+	rest := strings.TrimPrefix(containerdCadvisorBody(podSlice), head)
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"helper first", head + helper + rest},
+		{"helper last", head + rest + helper},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var podRes []string
+			for _, batch := range cadvisorShapes(t, tc.body, false) {
+				for _, sh := range batch {
+					if strings.Contains(sh.attrs, "k8s.pod.uid:"+uid1) && !strings.Contains(sh.attrs, "k8s.container.name:") {
+						podRes = append(podRes, sh.attrs)
+					}
+				}
+			}
+			var named int
+			for _, a := range podRes {
+				if strings.Contains(a, "k8s.pod.name:pod1") && strings.Contains(a, "k8s.namespace.name:ns1") {
+					named++
+				}
+			}
+			if named != 1 {
+				t.Fatalf("%d of %d pod-level resources carry the pod's identity, want exactly 1 — the unattributable row must not name (or share) the pod's resource:\n%v",
+					named, len(podRes), podRes)
+			}
+		})
+	}
+}

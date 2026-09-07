@@ -296,9 +296,11 @@ type record struct {
 	expireAt time.Time
 	// terminating is true once the pod has a deletionTimestamp (graceful
 	// teardown in progress; phase stays Running), mirroring
-	// pod.DeletionTimestamp. Such a pod's status still carries its
-	// now-recycled PodIP, so it must not steal the IP index from a live pod
-	// that legitimately holds it.
+	// pod.DeletionTimestamp. It does NOT order the IP index — a draining pod
+	// still holds its address until its sandbox is torn down, so ipSeq alone
+	// decides that (see claimOneIPLocked) — it marks the claims noteContested
+	// excludes, an address changing hands from a drainer being the ordinary
+	// release rather than a window in which a lookup was wrong.
 	terminating bool
 	// ipSeq is the store sequence at which this record last ACQUIRED an
 	// address it did not already hold (see Store.ipSeq).
@@ -516,10 +518,12 @@ func (s *Store) indexContainersLocked(rec *record, uid types.UID, containers map
 
 // claimPodIPLocked maintains the live-pod IP index for one upsert: hostNetwork
 // and finished pods never claim, a stale old mapping is dropped (identity-
-// checked), and a TERMINATING claimant yields to a live incumbent — pod IPs
-// recycle, and a drained pod's routine status updates still carry the IP the
-// CNI already handed to someone else. Every live pod claims (last-write-wins),
-// including a late-scheduled OLDER pod legitimately taking a freed IP.
+// checked), and among the rest the LATER ACQUIRER holds the address — pod IPs
+// recycle, and a stale pod's routine status updates still carry the IP the CNI
+// already handed to someone else. That covers a late-scheduled OLDER pod
+// legitimately taking a freed IP, and a drainer keeping its address until it is
+// actually released (claimOneIPLocked says why the terminating bit orders
+// nothing here).
 func (s *Store) claimPodIPLocked(rec *record, pod kubemeta.Pod, oldIPs []string) {
 	// EVERY address the pod reports. On a dual-stack cluster a connection can
 	// arrive from the family status.podIP does not carry, and indexing only
@@ -554,16 +558,34 @@ func (s *Store) claimPodIPLocked(rec *record, pod kubemeta.Pod, oldIPs []string)
 // would otherwise index the pod under a key no lookup can ever form, and both
 // of those paths would 404 for it — indistinguishable from any other miss. The
 // SERVED model keeps the verbatim strings; only the keys are normalised.
+//
+// The copy is made only when an address is NOT already canonical, which on
+// every cluster that spells its addresses the ordinary way is never. This runs
+// on the informer goroutine holding the store's EXCLUSIVE lock — twice per
+// upsert (the record's old addresses and the pod's new ones), again on every
+// delete, and once per claimant a promotion scans — so the allocation it used
+// to make unconditionally was paid by every reader waiting on that lock. The
+// returned slice may therefore ALIAS the pod's own PodIPs and is read-only to
+// callers; podAddresses honours that, and nothing else writes to it.
 func rawIPs(pod kubemeta.Pod) []string {
 	ips := pod.PodIPs
 	if len(ips) == 0 && pod.PodIP != "" {
 		ips = []string{pod.PodIP}
 	}
-	out := make([]string, len(ips))
 	for i, ip := range ips {
-		out[i] = peerip.Canonical(ip)
+		c := peerip.Canonical(ip)
+		if c == ip {
+			continue
+		}
+		out := make([]string, len(ips))
+		copy(out, ips[:i])
+		out[i] = c
+		for j := i + 1; j < len(ips); j++ {
+			out[j] = peerip.Canonical(ips[j])
+		}
+		return out
 	}
-	return out
+	return ips
 }
 
 // podAddresses returns the addresses a pod may legitimately be reached at, or
@@ -578,15 +600,26 @@ func podAddresses(pod kubemeta.Pod) []string {
 	// The host address in the same form the pod addresses are keyed in, or the
 	// comparison below misses whenever the two are spelled differently.
 	host := peerip.Canonical(pod.HostIP)
-	out := ips[:0:0]
-	for _, ip := range ips {
+	// Nothing to filter is the case every ordinary pod takes, and it returns
+	// rawIPs' slice rather than a copy of it (see rawIPs on why the store's
+	// write lock makes that worth the branch). The copy is built only from the
+	// first address that has to go.
+	for i, ip := range ips {
 		// A hostNetwork pod whose status.hostIP has not been populated yet
 		// would otherwise claim the node address.
 		if ip != "" && ip != host {
-			out = append(out, ip)
+			continue
 		}
+		out := make([]string, 0, len(ips)-1)
+		out = append(out, ips[:i]...)
+		for _, ip := range ips[i+1:] {
+			if ip != "" && ip != host {
+				out = append(out, ip)
+			}
+		}
+		return out
 	}
-	return out
+	return ips
 }
 
 // recordAddresses returns every address a record ever claimed, including for a
@@ -618,10 +651,33 @@ func (s *Store) releaseIPLocked(rec *record, ip string) {
 
 // claimOneIPLocked applies the claim rules for ONE of a pod's addresses.
 //
+// ACQUISITION ORDER IS THE WHOLE RULE, and the terminating bit deliberately
+// decides nothing on its own. The rule that used to sit above it — "a draining
+// pod yields to a live incumbent" — is entirely SUBSUMED by ipSeq whenever its
+// own justification holds: a pod that keeps reporting an address "the CNI has
+// already handed to someone else" is by construction the EARLIER acquirer, so
+// it loses on ipSeq without any help. The only shapes in which the terminating
+// arms decided anything were the ones their justification does NOT describe,
+// and there they INVERTED the ordering: a live pod that merely re-asserted an
+// address it acquired FIRST took it back from the pod that acquired it later
+// and is now draining — which is not a recycle at all, since an address is not
+// released until the sandbox is torn down. Any status churn on the stale pod
+// (a node-lifecycle condition on a NotReady node, a resurrect after DeletePod)
+// fired it, /v1/pod-ips, /v1/self and every agent peer-IP fallback then carried
+// the stale pod's identity for the drainer's remaining traffic, and the flip
+// did not heal when the drainer was finally deleted (releaseIPLocked promotes
+// only when the leaver still HELD the address) — it stood until some new pod
+// genuinely acquired the address. It was also silent: noteContested excludes
+// every claim in which either side is terminating.
+//
+// The ordinary hand-off still happens, one event later and on real evidence:
+// the drainer's deletion (or its transition to a finished phase) releases the
+// address and promoteIPClaimantLocked hands it to the best surviving claimant.
+//
 // It deliberately takes no kubemeta.Pod: eligibility and precedence come from
-// RECORD state the caller has already established (rec.terminating, rec.ipSeq),
-// not from the pod value. Passing the pod invited a later edit to re-derive
-// them here and bypass the ipSeq ordering.
+// RECORD state the caller has already established (rec.ipSeq), not from the pod
+// value. Passing the pod invited a later edit to re-derive it here and bypass
+// the ipSeq ordering.
 func (s *Store) claimOneIPLocked(rec *record, ip string, oldIPs []string) {
 	s.addClaimantLocked(ip, rec)
 	if !containsStr(oldIPs, ip) {
@@ -634,13 +690,12 @@ func (s *Store) claimOneIPLocked(rec *record, ip string, oldIPs []string) {
 	switch {
 	case cur == nil || cur == rec:
 		s.byPodIP[ip] = rec
-	case rec.terminating && !cur.terminating:
-		// A draining pod keeps reporting its now-recycled IP; it yields.
-	case !rec.terminating && cur.terminating:
-		s.byPodIP[ip] = rec
 	case rec.ipSeq > cur.ipSeq:
 		// Last acquisition wins — including a late-scheduled older pod
-		// legitimately taking a freed address.
+		// legitimately taking a freed address, and a live pod taking over from
+		// a drainer that acquired the address before it. noteContested skips
+		// the latter: a hand-off from a terminating holder is the ordinary way
+		// an address changes hands, not a window in which a lookup was wrong.
 		s.noteContested(rec, cur)
 		s.byPodIP[ip] = rec
 	default:
@@ -648,7 +703,7 @@ func (s *Store) claimOneIPLocked(rec *record, ip string, oldIPs []string) {
 		// later pod legitimately took it. Plain last-write-wins let any
 		// unrelated update to a stale pod (a node-lifecycle condition on a
 		// NotReady node, a resurrect after DeletePod, a transient podIP
-		// blip) steal the mapping from the live owner and mis-attribute
+		// blip) steal the mapping from the later acquirer and mis-attribute
 		// every peer-IP lookup until that pod finally went away.
 		s.noteContested(rec, cur)
 	}
@@ -658,9 +713,10 @@ func (s *Store) claimOneIPLocked(rec *record, ip string, oldIPs []string) {
 // after the current claimant released or lost the IP. Eligibility mirrors
 // claimPodIPLocked, through the same podAddresses helper: live (not
 // tombstoned), running-phase, non-hostNetwork, and holding ip among
-// status.podIPs — the SECONDARY address of a dual-stack pod included. A non-terminating claimant is preferred over a
-// terminating one (same precedence the claim path applies); among equals the
-// pick is arbitrary — exactly like concurrent last-write-wins claims.
+// status.podIPs — the SECONDARY address of a dual-stack pod included. The LATER
+// acquirer wins (same precedence the claim path applies, and for the same
+// reason: a drainer has not released its address until its sandbox is torn
+// down, which is the event that brings the promotion round again).
 //
 // skip is the record that just gave the IP up and must never win it back. It is
 // this function's OWN precondition, not a patch for its caller: the scan is over
@@ -708,15 +764,13 @@ func (s *Store) promoteIPClaimantLocked(ip string, skip *record) {
 }
 
 // beatsClaimant reports whether candidate should displace cur for an address.
-// It is the claim path's precedence (claimPodIPLocked): a live pod beats a
-// terminating one, then the LATER acquisition wins. Promotion used only the
-// terminating half, so between two live claimants the winner was map-iteration
-// random — reintroducing, on this one path, the stale-pod-wins outcome ipSeq
-// exists to prevent.
+// It is the claim path's precedence (claimOneIPLocked) and must stay identical
+// to it: the LATER acquisition wins, and the terminating bit decides nothing —
+// preferring a live claimant here would promote a pod whose claim the claim
+// path had already ruled stale, i.e. reintroduce on this one path the outcome
+// ipSeq exists to prevent. Promotion once had no ipSeq comparison at all, and
+// the winner between two claimants was map-iteration random.
 func beatsClaimant(cur, candidate *record) bool {
-	if cur.terminating != candidate.terminating {
-		return cur.terminating
-	}
 	return candidate.ipSeq > cur.ipSeq
 }
 

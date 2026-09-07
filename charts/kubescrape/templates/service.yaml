@@ -5,6 +5,22 @@
   an existing Secret the user manages > an explicit value > a generated
   random token, which is read back from the live Secret on upgrade so
   rolling the chart does not invalidate every agent's token.
+
+  THE READ-BACK NEEDS A LIVE CLUSTER, and that is the trap this block exists
+  to name. `lookup` returns nothing whenever there is no API connection —
+  every `helm template` and every `--dry-run`, which is exactly how
+  template-rendering GitOps (Argo CD, Flux's HelmRelease with
+  `postRenderers`/`helm template`) produces its manifests. On that path the
+  fallback below mints a FRESH token on every render: the application is
+  permanently OutOfSync, auto-sync rewrites the Secret every cycle, and once
+  the sync cadence outruns the kubelet's Secret projection refresh the agents
+  present a token two rotations old — 401 on /v1/scrape-auth and up=0 on every
+  secret-backed monitor, with the chart looking correctly configured.
+
+  So under that kind of GitOps, set `service.scrapeAuthToken.value` (from a
+  sealed/external Secret) or `existingSecret`. `autoGenerate: false` turns the
+  silent rotation into a render-time failure, which is the setting to use when
+  nobody is going to remember this paragraph.
 */}}
 {{- $scrapeAuthKey := .Values.service.scrapeAuthToken.key | default "token" }}
 {{- $scrapeAuthSecret := .Values.service.scrapeAuthToken.existingSecret }}
@@ -15,8 +31,10 @@
 {{- $existing := (lookup "v1" "Secret" .Release.Namespace $scrapeAuthSecret) }}
 {{- if and $existing (index $existing.data $scrapeAuthKey) }}
 {{- $scrapeAuthToken = index $existing.data $scrapeAuthKey | b64dec }}
-{{- else }}
+{{- else if .Values.service.scrapeAuthToken.autoGenerate }}
 {{- $scrapeAuthToken = randAlphaNum 48 }}
+{{- else }}
+{{- fail (printf "service.scrapeAuthSecrets is enabled and service.scrapeAuthToken.autoGenerate is false, but no token was supplied and none could be read back from the live Secret %s/%s: set service.scrapeAuthToken.value or service.scrapeAuthToken.existingSecret. (autoGenerate is off, so this render refuses rather than minting a token that would differ on the next one.)" .Release.Namespace $scrapeAuthSecret) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -139,7 +157,7 @@ spec:
       containers:
         - name: kubescrape
           image: {{ include "kubescrape.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ include "kubescrape.imagePullPolicy" . }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

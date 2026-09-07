@@ -317,6 +317,12 @@ type splitBatcher struct {
 	lastM       pmetric.Metric
 	lastMOK     bool
 
+	// resolvedAttrs are the attribute keys resolveContext wrote onto the
+	// resource being built, so fillSplitResource's render loop can yield to the
+	// looked-up identity WITHOUT yielding to its own earlier writes (see the
+	// loop). Reused across resources; normally 0 or 1 entries.
+	resolvedAttrs []string
+
 	// Per-scrape regex memos (pure mappings, so they survive reset()): the
 	// first-matching-rule per family name — ruleFor walks every rule's metrics
 	// regex, and a family's series arrive as a run of samples — and the
@@ -526,11 +532,18 @@ func (b *splitBatcher) fillSplitResource(res pcommon.Resource, rule *compiledSpl
 
 	var ctx attrs.Context
 	resolved := false
+	b.resolvedAttrs = b.resolvedAttrs[:0]
 	if rule.enrich {
 		// The failure classification is the cgroup sampler's alone (it decides a
 		// retry cadence); a split row is emitted with its label identity either
 		// way.
 		ctx, resolved, _ = b.s.resolveContext(b.ctx, containerID, namespace, pod, uid, container, res)
+		// What the resolve WROTE, recorded while res still holds nothing else:
+		// the render loop below must yield to those and to nothing else. Reused
+		// across calls, and normally length 0 or 1.
+		for k := range res.Attributes().All() {
+			b.resolvedAttrs = append(b.resolvedAttrs, k)
+		}
 	}
 	// The groupBy labels move onto the resource under their mapped attribute
 	// names — ALWAYS, not only when enrichment failed. putSplitLabels strips
@@ -543,7 +556,20 @@ func (b *splitBatcher) fillSplitResource(res pcommon.Resource, rule *compiledSpl
 	// It also made a series' resource shape change during a metadata outage.
 	//
 	// When enrichment DID resolve, the looked-up identity is authoritative, so
-	// the label-derived value only fills what the resolve left unset.
+	// the label-derived value only fills what THE RESOLVE left unset — which is
+	// what b.resolvedAttrs names, and why the check is not an `exists` probe on
+	// the resource. res is empty when fillSplitResource is entered, so every
+	// key present after resolveContext returns is the resolve's (today exactly
+	// one, k8s.container.name); an `exists` probe could not tell those from a
+	// key THIS LOOP had just written one iteration earlier, so a coalescing
+	// groupBy — two labels mapped onto one attribute, the case groupMapping.slot
+	// exists for — rendered FIRST-non-empty-wins while the route key (route)
+	// and the identity extraction above are both LAST-non-empty-wins. Two rows
+	// differing only in the later label then keyed as two resources and
+	// rendered byte-identical ones: the duplicate-resource class the slot
+	// vector was introduced to prevent, in one payload. It also flipped shape
+	// with the metadata service's health, since the !resolved arm never took
+	// the probe.
 	for _, g := range rule.groupBy {
 		value := labelValue(labels, g.label)
 		if g.attr == "container.id" {
@@ -552,10 +578,8 @@ func (b *splitBatcher) fillSplitResource(res pcommon.Resource, rule *compiledSpl
 		if value == "" {
 			continue
 		}
-		if resolved {
-			if _, exists := res.Attributes().Get(g.attr); exists {
-				continue
-			}
+		if resolved && slices.Contains(b.resolvedAttrs, g.attr) {
+			continue
 		}
 		res.Attributes().PutStr(g.attr, value)
 	}

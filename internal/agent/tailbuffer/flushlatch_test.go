@@ -15,10 +15,13 @@ package tailbuffer
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -224,5 +227,85 @@ func TestPostFlushPushMixesLateSpansAndNewTraces(t *testing.T) {
 	}
 	if got := b.Stats(); got != (Stats{}) {
 		t.Fatalf("the buffer holds %+v", got)
+	}
+}
+
+// The shutdown Flush is ONE lock hold, where a sweep is chunked.
+//
+// The sweep's decision loop releases and re-takes the mutex every decideChunk
+// traces so a backlog of policy evaluations does not stall every sender on the
+// shard. The flush must NOT: its first act is to latch the buffer, and take()
+// answers that latch by deciding, itself, everything it finds — on the
+// assertion that a latched buffer holds only what THAT push just parked there
+// (the tests above depend on it). A gap mid-flush falsifies that: a straggler
+// landing in it sweeps up other senders' already-acked, still-undecided traces
+// and hands their spans out on ITS ack, where they are neither marked
+// otlpexport.Own (so a disk buffer never sees them) nor counted lost if the
+// push is NACKed. Shutdown is also the one moment contention does not matter.
+//
+// The observable is exactly that: no batch may mix the straggler's trace with
+// anybody else's.
+func TestFlushDoesNotHandOtherSendersSpansToAStraggler(t *testing.T) {
+	const traces = 4 * decideChunk // several chunks' worth
+	const straggler = uint64(999_999)
+
+	first := make(chan struct{})
+	var once sync.Once
+	slow := func(tailsample.Trace) (bool, bool) {
+		once.Do(func() { close(first) })
+		t0 := time.Now()
+		for time.Since(t0) < 20*time.Microsecond { // stand in for a Starlark policy
+		}
+		return true, false
+	}
+	cap := &capture{}
+	b, _ := newTestBuffer(t, Config{
+		Config: tailsample.Config{
+			Policies: []tailsample.PolicyConfig{{Name: "slow", Type: tailsample.TypeScript}},
+			Script:   slow,
+		},
+		DecisionWait: "1m",
+		MaxTraces:    traces + 2,
+	}, cap)
+	ctx := context.Background()
+
+	for i := uint64(1); i <= traces; i++ {
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: i, span: 1, end: 5})); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-first // the flush is deciding from here
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: straggler, span: 1, end: 5})); err != nil {
+			t.Error(err)
+		}
+	}()
+	b.Flush(ctx)
+	<-done
+
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	for _, td := range cap.batches {
+		mine, others := false, 0
+		rss := td.ResourceSpans()
+		for i := 0; i < rss.Len(); i++ {
+			sss := rss.At(i).ScopeSpans()
+			for j := 0; j < sss.Len(); j++ {
+				sp := sss.At(j).Spans()
+				for k := 0; k < sp.Len(); k++ {
+					if sp.At(k).TraceID() == traceID(straggler) {
+						mine = true
+					} else {
+						others++
+					}
+				}
+			}
+		}
+		if mine && others > 0 {
+			t.Fatalf("a straggler push landing mid-flush acked %d other senders' spans: the flush released the mutex between chunks, so take() decided traces that were never this push's", others)
+		}
 	}
 }

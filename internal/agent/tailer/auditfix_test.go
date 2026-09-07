@@ -15,6 +15,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/fsnotify/fsnotify"
 )
 
 // A PROHIBITION claims the file so no later catch-all source can resurrect it —
@@ -243,5 +244,56 @@ func TestReplayBudgetIsNotDefeatedByTheOverrunEscape(t *testing.T) {
 	}
 	if sg.fedTo >= rst.Size() {
 		t.Fatalf("the pass read the segment to EOF (%d bytes) in one sweep", sg.fedTo)
+	}
+}
+
+// watchTarget caches the RESOLVED target directory even when the watch itself
+// cannot be established. findRotated locates a rotated segment's file by name
+// in that directory, and by the time it runs the live symlink is frequently
+// gone (a GC'd container takes /var/log/containers/<name>.log while its rotated
+// files remain), so its EvalSymlinks fallback fails and an empty targetDir
+// declares still-on-disk lines unrecoverable — counted obs.LogPrefixLost,
+// warned, retired. The nil-watcher branch was fixed for exactly that; the
+// watcher.Add FAILURE path returned before the assignment and reinstated it for
+// as long as the failure lasts, which on a node that has exhausted
+// fs.inotify.max_user_watches is every newly opened file, indefinitely.
+func TestWatchTargetCachesTheTargetDirWhenTheWatchCannotBeAdded(t *testing.T) {
+	linkDir := t.TempDir()
+	targets := t.TempDir()
+
+	tl := driveTailer(linkDir, &fakeExporter{})
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Skipf("fsnotify unavailable: %v", err)
+	}
+	// A CLOSED watcher fails every Add — the stand-in for ENOSPC on a node out
+	// of inotify watches, which is the condition that makes this permanent.
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tl.watcher = w
+
+	target := filepath.Join(targets, "0.log")
+	writeLines(t, target, timeNowCRI()+" stdout F hello")
+	link := filepath.Join(linkDir, logName)
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	f := &file{path: link}
+
+	tl.watchTarget(f)
+
+	if f.targetDir != targets {
+		t.Fatalf("targetDir = %q, want %q: the watcher.Add failure skipped the cache, so findRotated has no "+
+			"directory to look in and a rotated segment still on disk is counted lost and retired",
+			f.targetDir, targets)
+	}
+	if f.watchedDir != "" {
+		t.Fatalf("watchedDir = %q, want empty: no watch was established, and claiming one makes the "+
+			"short-circuit skip the retry the next open exists to make", f.watchedDir)
+	}
+	// The retry must still happen: a cached directory is not a held watch.
+	if _, held := tl.watchRefs[targets]; held {
+		t.Fatalf("watchRefs holds a reference for a watch that was never added: %v", tl.watchRefs)
 	}
 }

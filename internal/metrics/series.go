@@ -31,6 +31,7 @@ const leLabel = "le"
 type drops struct {
 	capped   atomic.Uint64
 	nan      atomic.Uint64
+	negative atomic.Uint64
 	retained atomic.Uint64
 
 	mu       sync.Mutex
@@ -63,6 +64,11 @@ func (d *drops) CappedByMetric() map[string]float64 {
 // aggregation the series feeds.)
 func (d *drops) NaN() uint64 { return d.nan.Load() }
 
+// Negative counts observations rejected because the value was negative on a
+// series whose exported form is monotonic (counter, summary). See
+// series.refuseNegative for why those two and not the other kinds.
+func (d *drops) Negative() uint64 { return d.negative.Load() }
+
 // Retained counts undelivered export chunks dropped because the
 // re-offer buffer was full — a collector outage lasting longer than
 // maxRetainedResources can hold. These ARE lost observations, and they are the
@@ -92,6 +98,68 @@ const (
 	kindHistogram                   // bucketed distribution
 	kindSummary                     // running sum + count
 )
+
+// seriesRole names which of this package's two products owns a series. It
+// exists for the refusal LINES the two share, and for nothing else: series is
+// one storage type serving a Registry of self-telemetry and a
+// DynamicMetricSet of log-derived metrics (see the package doc), so a message
+// hard-coded to one product's vocabulary sends the other product's operator
+// looking for a rule, or a metric, that does not exist.
+//
+// The two differ on both halves of a refusal. The CAUSE differs: a log-derived
+// value is extracted by an operator-written `value`/`valueRegexp` from
+// tenant-authored text, so a refusal points at that rule; a self-metric value
+// comes from this repo's own code, so a refusal is a BUG here and there is no
+// configuration to correct. And the ACCOUNTING differs: the log-derived
+// store's drops are published (obs.RegisterLogMetricsDrops), while the
+// Registry's deliberately are not — a registry has no cardinality cap and its
+// label sets come from code — so naming a kubescrape_log_metrics_dropped_*
+// metric on a Registry refusal points the operator at a counter that can never
+// move for it.
+type seriesRole uint8
+
+const (
+	// roleLogMetric is the DynamicMetricSet's: log-derived, values extracted
+	// from tenant-authored log content, refusals published.
+	roleLogMetric seriesRole = iota
+	// roleSelfMetric is the Registry's: this process's own telemetry, values
+	// produced by code in this repo, refusals counted but not published.
+	roleSelfMetric
+)
+
+// what names the kind of observation this role refuses, for a log line.
+func (r seriesRole) what() string {
+	if r == roleSelfMetric {
+		return "self-metric"
+	}
+	return "log-metric"
+}
+
+// dropNote is the remedy a refused observation of this role carries, and the
+// half that used to be wrong: it says WHERE the running total is published, so
+// a Registry refusal does not send an operator grepping for a
+// kubescrape_log_metrics_* series that is flat by construction (and, since
+// obs.RegisterLogMetricsDrops registers only when a log-metrics SET exists,
+// often absent altogether).
+func (r seriesRole) dropNote() string {
+	if r == roleSelfMetric {
+		return "this is one of this process's OWN metrics, so the value came from code in kubescrape rather than from a logMetrics rule; " +
+			"the running total is process-local and deliberately unpublished (a registry has no cardinality cap and its label sets come from code)"
+	}
+	return "check the rule's value/valueRegexp against the lines it matches; the running total is kubescrape_log_metrics_dropped_nan_total"
+}
+
+// negativeNote is dropNote for the negative-value refusal: same split, and for
+// the log-derived half it also names the two kinds that legitimately take a
+// negative, since choosing one of them is the whole remedy.
+func (r seriesRole) negativeNote() string {
+	if r == roleSelfMetric {
+		return "this is one of this process's OWN metrics: a counter or summary here must never be given a negative value (see RegCounter.Add), so this is a bug in kubescrape and not a configuration error; " +
+			"the running total is process-local and deliberately unpublished"
+	}
+	return "a signed quantity belongs on type: gauge (action: add/sub, or a min/max/avg/sum window) or on type: histogram with bounds covering it; " +
+		"the running total is kubescrape_log_metrics_dropped_negative_total"
+}
 
 // gaugeAction selects how a gauge folds each observation. It is meaningless for
 // other kinds (which always accumulate).
@@ -230,6 +298,28 @@ type series struct {
 	name  string
 	desc  string
 	kind  seriesKind
+	// role selects the vocabulary the refusal lines use; see seriesRole.
+	role seriesRole
+	// refuseNegative is set for the kinds whose exported form is MONOTONIC, and
+	// it is the whole of the negative-value guard (see refuse).
+	//
+	// A counter renders as an OTLP Sum with IsMonotonic(true) and cumulative
+	// temporality, and a summary's sum reaches Prometheus as the counter-typed
+	// <name>_sum: on both, a decrease on an unchanged StartTimestamp is a
+	// counter RESET that this process never declared, which rate()/increase()
+	// reads as one and adds the whole new value on top of everything already
+	// counted. There is no reading of "count -500 requests" that recovers, so
+	// the observation is refused rather than folded in.
+	//
+	// NOT set for a gauge (negative is its ordinary range: actionSub, a min/max
+	// window over signed values) and NOT for a histogram (its bucket bounds are
+	// operator-configured and validated only as INCREASING, so a distribution
+	// over signed values is a configuration this package supports on purpose —
+	// refusing there would silently delete points from a histogram designed for
+	// them). A histogram's _sum inherits the same downstream caveat Prometheus
+	// documents for negative observations; that is the operator's declared
+	// choice of bounds, not an extraction accident.
+	refuseNegative bool
 
 	// drops is the OWNING store's refusal counters (never nil; newSeries fills
 	// it in). Per store, not per process: see the type's doc.
@@ -266,7 +356,12 @@ type series struct {
 	// time.Now directly: a throttle a test cannot step past would make these
 	// two lines the only untestable behaviour in the file.
 	lastNonFinite int64
-	log           *slog.Logger
+	// lastNegative is the epoch second of the last negative-value notice,
+	// throttled separately from lastNonFinite: the two conditions co-occur on a
+	// rule whose extraction is simply wrong, and one shared gate would let
+	// whichever fired first silence the other for the hour.
+	lastNegative int64
+	log          *slog.Logger
 
 	// buckets are the histogram boundaries with +Inf appended; nil for
 	// non-histograms.
@@ -278,6 +373,11 @@ type series struct {
 type seriesSpec struct {
 	name, desc string
 	kind       seriesKind
+	// role selects the refusal lines' vocabulary. Both doors state it
+	// explicitly — compile.go passes roleLogMetric and registry.go
+	// roleSelfMetric — so which product a series belongs to is never a
+	// zero-value coincidence one edit away from being wrong.
+	role       seriesRole
 	action     gaugeAction
 	maxSize    int
 	expiration time.Duration
@@ -312,16 +412,18 @@ func newSeries(spec seriesSpec) *series {
 		startEpochClock()
 	}
 	s := &series{
-		db:         make(map[uint64]*expiringSample),
-		drops:      dr,
-		now:        spec.now,
-		name:       spec.name,
-		desc:       spec.desc,
-		kind:       spec.kind,
-		action:     spec.action,
-		maxSize:    spec.maxSize,
-		expiration: expirationSeconds(spec.expiration),
-		log:        log,
+		db:             make(map[uint64]*expiringSample),
+		drops:          dr,
+		now:            spec.now,
+		name:           spec.name,
+		desc:           spec.desc,
+		kind:           spec.kind,
+		role:           spec.role,
+		refuseNegative: spec.kind == kindCounter || spec.kind == kindSummary,
+		action:         spec.action,
+		maxSize:        spec.maxSize,
+		expiration:     expirationSeconds(spec.expiration),
+		log:            log,
 	}
 	if spec.kind == kindHistogram {
 		s.initBuckets(spec.buckets)
@@ -364,6 +466,36 @@ func (s *series) initBuckets(buckets []float64) {
 // bounds are the histogram's finite bucket bounds — what sample.counts indexes.
 func (s *series) bounds() []float64 { return s.buckets[:len(s.buckets)-1] }
 
+// refuse reports whether value must not be admitted, counting and (at most
+// hourly) naming the reason. It is the ONE value guard, shared by both observe
+// doors so they cannot drift — the per-line path and the registry's
+// pre-hashed path used to spell the non-finite half separately.
+//
+// Order matters: -Inf is negative AND non-finite, and it is reported as
+// non-finite, which is the sharper diagnosis (the extraction produced a value
+// that is not a number at all, rather than one with the wrong sign).
+//
+// The warm path is two predictable branches over a float already in a register
+// and one bool field read; the counting and the log line live in the note*
+// helpers, off this path. The allocation budgets in bench_test.go observe
+// finite non-negative values and reach neither.
+func (s *series) refuse(value float64) bool {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		// Inf too, and for the same reason: ParseFloat accepts "inf"/"Infinity"
+		// from a log line, and Inf is ABSORBING under every accumulate path —
+		// one such observation pins a counter, summary or histogram sum at Inf
+		// for the whole maxAge (24h by default), which no later real value can
+		// undo. Counted, never admitted.
+		s.noteNonFinite(value)
+		return true
+	}
+	if value < 0 && s.refuseNegative {
+		s.noteNegative(value)
+		return true
+	}
+	return false
+}
+
 // observe records value for the given data-point label set, resource, and extra
 // resource labels. The series is keyed by all three together (their hashes
 // XOR-fold into the base accumulator), so per-resource series are distinct.
@@ -383,13 +515,7 @@ func (s *series) observe(lbls labels, value float64, resAccum xxh3.Uint128, res 
 // exceed — so every kind is a single hash and a single map probe per
 // observation.
 func (s *series) observeFold(lbls labels, value float64, res resourceFold, resLabels labels) {
-	if math.IsNaN(value) || math.IsInf(value, 0) {
-		// Inf too, and for the same reason: ParseFloat accepts "inf"/"Infinity"
-		// from a log line, and Inf is ABSORBING under every accumulate path —
-		// one such observation pins a counter, summary or histogram sum at Inf
-		// for the whole maxAge (24h by default), which no later real value can
-		// undo. Counted, never admitted.
-		s.noteNonFinite(value)
+	if s.refuse(value) {
 		return
 	}
 	now := s.epoch()
@@ -413,8 +539,7 @@ func (s *series) observeFold(lbls labels, value float64, res resourceFold, resLa
 // label sets, so the accumulators AND the finalized hash are precomputed at
 // construction; a bump pays neither the label rehash nor the avalanche.
 func (s *series) observePreHashed(lbls labels, hash xxh3.Uint128, value float64, res pcommon.Map) {
-	if math.IsNaN(value) || math.IsInf(value, 0) {
-		s.noteNonFinite(value)
+	if s.refuse(value) {
 		return
 	}
 	now := s.epoch()
@@ -623,8 +748,39 @@ func (s *series) noteNonFinite(value float64) {
 	// breakdown exists only for the cardinality cap (drops.byMetric), and
 	// adding a second per-metric map on a refusal path would be a map write per
 	// bad line for a number the line itself already localises.
-	s.log.Warn("dropping a non-finite log-metric observation; the value extraction produced NaN or Inf, which would poison every aggregate this metric feeds",
-		"metric", s.name, "value", strconv.FormatFloat(value, 'g', -1, 64), "dropped", s.drops.NaN())
+	s.log.Warn("dropping a non-finite "+s.role.what()+" observation; the value is NaN or Inf, which would poison every aggregate this metric feeds",
+		"metric", s.name, "value", strconv.FormatFloat(value, 'g', -1, 64),
+		"dropped", s.drops.NaN(), "note", s.role.dropNote())
+}
+
+// noteNegative counts a refused negative observation on a monotonic kind and
+// names the metric at most hourly.
+//
+// The counter says the rate; only the line can reach the rule. It is a WARN
+// and not a Debug because the alternative to refusing was a SILENT lie: the
+// value folded in, the exported cumulative sum went DOWN on an unchanged
+// StartTimestamp, and every rate() over it read an undeclared counter reset and
+// added the new total on top of the old one. Nothing downstream can detect
+// that, so the refusal is the only place it can ever be reported.
+//
+// Throttled and locked exactly like noteNonFinite, and for the same reason: a
+// workload logging a negative delta does it on every line, and one sweep
+// goroutine serves every log file on the node.
+func (s *series) noteNegative(value float64) {
+	s.drops.negative.Add(1)
+	now := s.epoch()
+	s.mu.Lock()
+	warn := now-s.lastNegative >= 3600
+	if warn {
+		s.lastNegative = now
+	}
+	s.mu.Unlock()
+	if !warn {
+		return
+	}
+	s.log.Warn("dropping a negative "+s.role.what()+" observation; this metric exports a MONOTONIC sum, and folding a decrease into it on an unchanged start timestamp is a counter reset that rate() would read as one and add on top of everything already counted",
+		"metric", s.name, "value", strconv.FormatFloat(value, 'g', -1, 64),
+		"dropped", s.drops.Negative(), "note", s.role.negativeNote())
 }
 
 // record folds one observation into a sample. Gauges apply their action;

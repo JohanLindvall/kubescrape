@@ -32,12 +32,15 @@ jobs:
       - run: make build
       - run: make vet
 
-      - name: gofmt
-        run: |
-          unformatted=$(gofmt -l . | grep -v '^hack/' || true)
-          if [ -n "$unformatted" ]; then
-            echo "not gofmt'd:"; echo "$unformatted"; exit 1
-          fi
+      # `make fmt-check`, not a bespoke gofmt step, so CI and `make check` gate on
+      # exactly the same set. This used to run its own `gofmt -l . | grep -v
+      # '^hack/'`, and that exclusion — presumably aimed at the tools
+      # hack/bin/ downloads, which hold no .go files — silently dropped
+      # hack/nhexporter/main.go, a real package in the MAIN module that
+      # `make vet`, `make lint` and `make fmt-check` all cover. So an
+      # unformatted commit there merged green and then failed the next
+      # developer's `make check` on a commit CI had certified.
+      - run: make fmt-check
 
       # internal/chartcheck renders the chart and diffs it against goldens, and
       # it SKIPS without a helm binary — so `make test` ran it as a no-op here

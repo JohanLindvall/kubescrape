@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -178,5 +179,110 @@ func TestOrdinaryEndpointStringsAreNotRefused(t *testing.T) {
 	}
 	if ep.Path != "/actuator/prometheus?full=true" || ep.TLSCA != "tenant/ca/ca.crt" {
 		t.Errorf("ordinary endpoint mangled: %+v", ep)
+	}
+}
+
+// The LIST is bounded too, and it is the dimension every other ceiling in this
+// package was measured underneath: each endpoint STRING is bounded, each
+// relabel chain is bounded, each report is bounded — and 100,000 minimal
+// endpoints in one 1.3 MB CR (inside etcd's object limit, writable by any
+// namespace-scoped tenant with the default -monitor-namespaces) still retained
+// ~38 MB in the singleton for the life of the CR, multiplied into one
+// monitor→services memo entry per (matched Service, endpoint), and were walked
+// per pod per Service on every node-targets derivation — 1.69 s for ONE 110-pod
+// node at a tenth of that scale. The response stays small, so nothing
+// downstream could report it: the symptoms are the singleton's RSS and every
+// agent's targets poll timing out.
+func TestAMonitorsEndpointListIsBoundedAtTheParseDoor(t *testing.T) {
+	eps := make([]any, 0, maxEndpointsPerMonitor+500)
+	for i := range maxEndpointsPerMonitor + 500 {
+		eps = append(eps, map[string]any{"port": "p" + strconv.Itoa(i)})
+	}
+	m, err := Parse(&unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "bomb", "namespace": "tenant"},
+		"spec": map[string]any{
+			"selector":          map[string]any{},
+			"namespaceSelector": map[string]any{"any": true},
+			"endpoints":         eps,
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Endpoints) != maxEndpointsPerMonitor {
+		t.Fatalf("kept %d endpoints, want the %d-endpoint ceiling", len(m.Endpoints), maxEndpointsPerMonitor)
+	}
+	// The PREFIX, in the operator's own order — like the aggregate relabel
+	// ceilings, and for the same reason: refusing the CR would take every
+	// target its earlier endpoints contribute with it.
+	if m.Endpoints[0].Port != "p0" || m.Endpoints[maxEndpointsPerMonitor-1].Port != "p"+strconv.Itoa(maxEndpointsPerMonitor-1) {
+		t.Errorf("the kept endpoints are not the head of the list: first=%q last=%q",
+			m.Endpoints[0].Port, m.Endpoints[maxEndpointsPerMonitor-1].Port)
+	}
+	// Reported, or the refusal is exactly the silent partial application the
+	// Ignored machinery exists to prevent: it must reach
+	// kubescrape_monitor_fields_ignored_total and the per-upsert warning.
+	ig := IgnoredFields(m.Endpoints)
+	if !slices.Contains(ig, "endpoints"+cappedSuffix) {
+		t.Errorf("the refusal is not reported: IgnoredFields = %v", ig)
+	}
+	// Once, however many endpoints carry it.
+	n := 0
+	for _, f := range ig {
+		if f == "endpoints"+cappedSuffix {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("the refusal is reported %d times in %v, want once", n, ig)
+	}
+}
+
+// The PodMonitor arm shares the skeleton, so it shares the bound — and reports
+// it under the CRD's own name for the list, which is not the ServiceMonitor's.
+func TestAPodMonitorsEndpointListIsBoundedToo(t *testing.T) {
+	eps := make([]any, 0, maxEndpointsPerMonitor+10)
+	for i := range maxEndpointsPerMonitor + 10 {
+		eps = append(eps, map[string]any{"port": "p" + strconv.Itoa(i)})
+	}
+	m, err := ParsePodMonitor(&unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "bomb", "namespace": "tenant"},
+		"spec": map[string]any{
+			"selector":            map[string]any{},
+			"namespaceSelector":   map[string]any{"any": true},
+			"podMetricsEndpoints": eps,
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Endpoints) != maxEndpointsPerMonitor {
+		t.Fatalf("kept %d endpoints, want the %d-endpoint ceiling", len(m.Endpoints), maxEndpointsPerMonitor)
+	}
+	if ig := IgnoredFields(m.Endpoints); !slices.Contains(ig, "podMetricsEndpoints"+cappedSuffix) {
+		t.Errorf("the refusal is not reported under the PodMonitor's own field name: %v", ig)
+	}
+}
+
+// A monitor of an ordinary size is untouched and reports nothing: the ceiling
+// is on the pathological, and a spurious "(capped)" entry would be a warning
+// per upsert about a monitor that is entirely honoured.
+func TestAnOrdinaryEndpointListIsNotCapped(t *testing.T) {
+	eps := make([]any, 0, 8)
+	for i := range 8 {
+		eps = append(eps, map[string]any{"port": "p" + strconv.Itoa(i)})
+	}
+	m, err := Parse(&unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "sm", "namespace": "tenant"},
+		"spec":     map[string]any{"selector": map[string]any{}, "endpoints": eps},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Endpoints) != 8 {
+		t.Fatalf("kept %d of 8 endpoints", len(m.Endpoints))
+	}
+	if ig := IgnoredFields(m.Endpoints); len(ig) != 0 {
+		t.Errorf("an ordinary monitor reports %v", ig)
 	}
 }

@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -127,5 +128,36 @@ func TestDumpSkipDoesNotDisturbTheExportPath(t *testing.T) {
 	}
 	if total != 1 {
 		t.Fatalf("value after Dump = %v, want 1", total)
+	}
+}
+
+// The Prometheus bridge that turns Dump's output into an exposition sits one
+// layer UP, in internal/obs, and used to discard a point whose const-metric
+// construction failed with no counter and no log — the identical invisible
+// shrinkage of the operator's own telemetry that the label-parse skip above
+// exists to close. It reports through the SAME counter, because both layers
+// drop a point from the same /metrics response and the remedy is the same.
+func TestASkippedPointIsCountedWhereverTheExpositionRefusesIt(t *testing.T) {
+	log, buf := capture()
+	prev := slog.Default()
+	slog.SetDefault(log)
+	defer slog.SetDefault(prev)
+
+	r := NewRegistry()
+	before := r.DumpLabelErrors()
+	for range 3 {
+		r.NoteSkippedPoint("kubescrape_test_bridge", errors.New("label count mismatch"))
+	}
+	if delta := r.DumpLabelErrors() - before; delta != 3 {
+		t.Fatalf("DumpLabelErrors moved by %d, want 3 (every skip counts)", delta)
+	}
+	out := buf.String()
+	if n := strings.Count(out, "a self-metric data point was skipped"); n != 1 {
+		t.Fatalf("logged %d times, want 1 (throttle window %v)", n, dumpLabelWarnEvery)
+	}
+	for _, want := range []string{"level=WARN", "metric=kubescrape_test_bridge", "label count mismatch"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("log %q is missing %q", out, want)
+		}
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"github.com/JohanLindvall/multiline"
 	"github.com/JohanLindvall/multiline/patterns"
@@ -871,5 +872,111 @@ func TestLastFedIsRestampedAfterAMidChunkFlush(t *testing.T) {
 			"consume did not re-stamp the chunk clock, so every line after a slow export "+
 			"carries a reading from before it and sweep reads a busy file as idle",
 			f.lastFed, exp.firstDone)
+	}
+}
+
+// A BLANK physical line is not a line: it produces no record, so it must not
+// spend a rate-limit token, must not defer the whole file's reading behind a
+// pause, and must not be counted into kubescrape_log_rate_limited_total
+// {action="drop"}, whose help says "lines discarded". The limiter used to be
+// consulted first, exactly the ordering the sibling oversize-discard tail was
+// deliberately moved ahead of it to avoid.
+func TestABlankLineSpendsNoRateLimitToken(t *testing.T) {
+	ctx := context.Background()
+	for _, drop := range []bool{false, true} {
+		mode := "pause"
+		if drop {
+			mode = "drop"
+		}
+		t.Run(mode, func(t *testing.T) {
+			tl, f := benchTailer(t, Config{
+				MaxEntryBytes: 1024,
+				RateLimit:     1, // 1/s: the bucket does not refill within the test
+				RateBurst:     1,
+				RateDrop:      drop,
+			})
+			dropped := obs.LogRateLimited.WithLabelValues("drop").Value()
+			paused := obs.LogRateLimited.WithLabelValues("pause").Value()
+
+			// ONE token, and a blank line ahead of a real one in the same chunk.
+			f.tokens, f.lastRefill = 1, time.Now()
+			tl.ingestChunk(ctx, f, []byte("\n"+timeNowCRI()+" stdout F survivor\n"), false)
+
+			if f.limited {
+				t.Fatal("a blank line paused the file: read.go stops reading it entirely, so every real line " +
+					"queued behind waits burst/rate seconds for a byte that can never become a record")
+			}
+			if !emitted(tl, "survivor") {
+				t.Fatalf("the blank line spent the only token and the real line behind it was refused: %v", bodies(tl))
+			}
+			if got := obs.LogRateLimited.WithLabelValues("drop").Value() - dropped; got != 0 {
+				t.Fatalf("kubescrape_log_rate_limited_total{action=\"drop\"} moved by %v for a blank line: "+
+					"the counter means lines DISCARDED, and a fleet padding its output with blank lines then "+
+					"reads as dropping far more log lines than it does", got)
+			}
+			if got := obs.LogRateLimited.WithLabelValues("pause").Value() - paused; got != 0 {
+				t.Fatalf("kubescrape_log_rate_limited_total{action=\"pause\"} moved by %v for a blank line", got)
+			}
+		})
+	}
+}
+
+// The rate bucket is refilled from the CALLER's clock reading — the one
+// time.Now() consume takes per 64 KiB chunk — not from one of allowLine's own
+// per physical line. consume hoisted that call out of its loop because it was a
+// mid-single-digit percent of BenchmarkIngestChunk's cumulative profile at 6000
+// lines/s/node; taking one inside allowLine put it straight back for every
+// deployment running -logs-rate-limit.
+func TestTheRateBucketIsMeteredByTheCallersChunkClock(t *testing.T) {
+	tl, f := benchTailer(t, Config{MaxEntryBytes: 1024, RateLimit: 1e6, RateBurst: 2})
+
+	// Deliberately not time.Now(): only a reading the caller supplied can end
+	// up on f.lastRefill.
+	now := time.Now().Add(-time.Hour)
+	f.tokens, f.lastRefill = 0, now.Add(-time.Second)
+
+	if !tl.allowLine(f, now) {
+		t.Fatal("the first line was refused although a full second of refill was owed")
+	}
+	if !f.lastRefill.Equal(now) {
+		t.Fatalf("lastRefill = %v, want the caller's chunk clock %v: allowLine is reading time.Now() per "+
+			"physical line again", f.lastRefill, now)
+	}
+	// Two more calls at the SAME reading: the second spends the burst's last
+	// token and the third finds an empty bucket, because no time has passed.
+	if !tl.allowLine(f, now) {
+		t.Fatal("the second line was refused although the burst held two tokens")
+	}
+	if tl.allowLine(f, now) {
+		t.Fatalf("a third line was granted at an unchanged clock with RateLimit=%v: the bucket refilled "+
+			"per line, i.e. from a clock allowLine read itself", tl.cfg.RateLimit)
+	}
+}
+
+// traceEmitFunc's n == 0 arm discards a fully assembled entry: nothing is
+// emitted, nothing is popped, and the bytes' lastEnd has already advanced so
+// the watermark stops holding them back. It is unreachable while multiline
+// keeps its sum(Lines) == lines-consumed contract (pinned upstream by
+// FuzzCappedConservation) — which is exactly why it is driven directly here:
+// it was the one give-up path in this package with no counter and no log line,
+// so a library regression would have been pure silent loss.
+func TestAnUnmappableEntryIsCountedRatherThanSilentlyDropped(t *testing.T) {
+	ctx := context.Background()
+	tl, f := benchTailer(t, Config{MaxEntryBytes: 1024, Multiline: true})
+
+	before := obs.LogEntriesUnmapped.Value()
+	batched := len(tl.batch)
+	if err := tl.traceEmitFunc(f)(ctx, multiline.Entry[time.Time]{
+		Key: f.keyStdout, Text: "assembled body nothing owes bytes for", Lines: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := obs.LogEntriesUnmapped.Value() - before; got != 1 {
+		t.Fatalf("kubescrape_log_entries_unmapped_total moved by %v, want 1: an assembled entry was dropped "+
+			"with no counter, no log line and no record", got)
+	}
+	if len(tl.batch) != batched {
+		t.Fatalf("the unmappable entry was batched anyway: %v", bodies(tl))
 	}
 }

@@ -2,7 +2,6 @@ package manifestcheck
 
 import (
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -139,26 +138,23 @@ func TestACommentedOfferIsNotReadAsAPassedFlag(t *testing.T) {
 func agentDaemonSetDocs(t *testing.T) map[string]string {
 	t.Helper()
 	out := map[string]string{}
-	for _, dir := range manifestDirs {
-		entries, err := os.ReadDir(dir)
+	// The SAME walk Flags uses: a subdirectory template or a .yml one is part
+	// of the shipped corpus, and a host-mount check that never opened it is a
+	// green tick over a file nobody read.
+	paths, err := ManifestFiles(manifestDirs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		b, err := os.ReadFile(path)
 		if err != nil {
-			t.Fatalf("reading %s: %v", dir, err)
+			t.Fatalf("reading %s: %v", path, err)
 		}
-		for _, e := range entries {
-			if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" {
+		for _, doc := range docSeparator.Split(string(b), -1) {
+			if !strings.Contains(doc, AgentCommand) || !isKind(doc, "DaemonSet") {
 				continue
 			}
-			path := filepath.Join(dir, e.Name())
-			b, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatalf("reading %s: %v", path, err)
-			}
-			for _, doc := range docSeparator.Split(string(b), -1) {
-				if !strings.Contains(doc, AgentCommand) || !isKind(doc, "DaemonSet") {
-					continue
-				}
-				out[path] = doc
-			}
+			out[path] = doc
 		}
 	}
 	return out

@@ -1050,6 +1050,22 @@ func (t *Tailer) rewind(f *file) {
 	// Bump BEFORE any state changes so a loop that flushed mid-pass can see
 	// that its own read position was purged under it (see replaySegment).
 	f.rewindGen++
+	// Drop the withheld highs. Every one of them names bytes ABOVE `committed`
+	// — that is what "withheld" means — so the rewind re-reads them and the
+	// next flush re-proposes them; keeping the map buys nothing and costs the
+	// one thing this package must never do. A rewind reuses the TAIL ID (no
+	// newTail, unlike every replacement path, because the file is unchanged),
+	// so a stale high stays live against it: if the writer then replaces the
+	// content in place (logrotate copytruncate, an app reopening with O_TRUNC)
+	// while readPos is back at `committed`, nothing detects it — the pre-read
+	// fingerprint re-verify is skipped at readPos 0, and neither truncation arm
+	// of handleRotation can fire on a from-zero read — and the stale high
+	// commits the REPLACEMENT past bytes it never exported. Measured: a 587-byte
+	// high applied to a 112-byte replacement, committed=587, 9 of 11 lines never
+	// exported and the restart resuming mid-line into a torn body, with every
+	// loss counter flat. read.go's `replaced` arm makes the same clear for the
+	// same reason; this is the path that reuses the id rather than retiring it.
+	f.exportedHighs = nil
 	if f.compressed {
 		// gzip is not seekable: drop the reader so openArchive re-decompresses
 		// from the committed offset next sweep. The fd is RETAINED (the archive

@@ -1238,3 +1238,66 @@ func TestSplitBatcherRoutingIsAllocationFree(t *testing.T) {
 		t.Fatalf("routing an already-known object allocates %v times, want 0: the resource or metric key is being materialized per row", allocs)
 	}
 }
+
+// A coalescing groupBy must render the SAME value the route key selected, and
+// the enriching arm is where the two used to part company: the render loop
+// skipped an attribute that already existed on the resource, which under
+// `resolved` could not tell an attribute resolveContext had written from one
+// this same loop had written an iteration earlier — so the render was
+// FIRST-non-empty-wins while the route key (and the identity extraction) are
+// LAST-non-empty-wins. Two rows differing only in the later-sorted label then
+// keyed as two resources and rendered byte-identical ones, with putSplitLabels
+// stripping every groupBy label off the points: the duplicate-resource class
+// groupMapping.slot exists to prevent, in one payload.
+func TestSplitterCoalescingRendersWhatTheRouteKeySelectedWhenEnriched(t *testing.T) {
+	// Sorted-label coalesce order is exported_resource, then resource, so
+	// "resource" is what both the key and the render must take.
+	body := "# TYPE kube_pod_container_resource_requests gauge\n" +
+		`kube_pod_container_resource_requests{namespace="ns1",pod="pod1",exported_resource="shadow",resource="cpu"} 1` + "\n" +
+		`kube_pod_container_resource_requests{namespace="ns1",pod="pod1",exported_resource="shadow",resource="memory"} 2` + "\n"
+	srv := serveBody(t, body)
+	target := testTarget(srv.URL)
+	target.Pod.Name = "ksm-abc"
+	target.Pod.Labels = map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}
+	sp, err := NewSplitters([]SplitterConfig{{
+		Match: SplitterMatch{PodLabels: map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}},
+		Rules: []SplitRule{{
+			Metrics: `kube_pod_.+`,
+			GroupBy: map[string]string{
+				"namespace":         "k8s.namespace.name",
+				"pod":               "k8s.pod.name",
+				"exported_resource": "k8s.hpa.resource",
+				"resource":          "k8s.hpa.resource",
+			},
+			Enrich: true,
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
+		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
+	})
+	if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
+		t.Fatal(err)
+	}
+
+	rms := exp.batches[0].ResourceMetrics()
+	if rms.Len() != 2 {
+		t.Fatalf("got %d resources, want 2 (one per resource dimension)", rms.Len())
+	}
+	// The resolve must have happened, or the branch under test never ran.
+	if got := attrStr(rms.At(0).Resource(), "k8s.pod.uid"); got != uid1 {
+		t.Fatalf("k8s.pod.uid = %q, want %s — enrichment did not resolve, so the resolved arm was never exercised", got, uid1)
+	}
+	seen := map[string]int{}
+	for i := 0; i < rms.Len(); i++ {
+		seen[attrStr(rms.At(i).Resource(), "k8s.hpa.resource")]++
+	}
+	if seen["cpu"] != 1 || seen["memory"] != 1 {
+		t.Fatalf("rendered k8s.hpa.resource = %v, want one cpu and one memory — the render must take the same last-non-empty value the route key did, not the earlier-sorted \"shadow\"", seen)
+	}
+}

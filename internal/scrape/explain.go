@@ -109,26 +109,55 @@ func refusedPath(annotations map[string]string) (int, bool) {
 
 // MonitorEndpointNote is the ONE wording for a ServiceMonitor endpoint that
 // resolves to no target on a pod, and it lives here rather than in the handler
-// for the reason the whole file exists: the two REASONS an endpoint resolves to
-// nothing are decided in this package (monitorEndpoint: the port, and
-// servicemonitors' size refusal it honours), and a note spelled over there
-// could name only the one the handler happened to know about — which it did,
-// reporting a size-refused endpoint as naming no port.
-func MonitorEndpointNote(ep servicemonitors.Endpoint) string {
+// for the reason the whole file exists: every REASON an endpoint resolves to
+// nothing is decided in this package, and a note spelled over there could name
+// only the ones the handler happened to know about — which it did, twice.
+//
+// The reasons are monitorEndpoint's own, in monitorEndpoint's order:
+// servicemonitors' size refusal it honours, then the POD being excluded, then
+// the port. The middle one was missing, so a terminating pod behind a perfectly
+// good ServiceMonitor was explained as "endpoint resolves to no pod port" —
+// sending an operator to fix a port name that is fine, while the head of the
+// same document said the pod is not scrapeable.
+func MonitorEndpointNote(pod kubemeta.Pod, ep servicemonitors.Endpoint) string {
 	if note := refusedEndpointNote(ep); note != "" {
 		return note
+	}
+	if !Scrapeable(pod) {
+		return NotScrapeableNote("this endpoint")
 	}
 	return "endpoint resolves to no pod port (port must name a Service port, targetPort a number or declared container-port name; an endpoint naming neither resolves to nothing)"
 }
 
-// PodMonitorEndpointNote is MonitorEndpointNote's PodMonitor half: same two
-// reasons, different port semantics (a PodMonitor's port names a CONTAINER
-// port).
-func PodMonitorEndpointNote(ep servicemonitors.Endpoint) string {
+// PodMonitorEndpointNote is MonitorEndpointNote's PodMonitor half: same
+// reasons in the same order (podMonitorEndpoint mirrors monitorEndpoint),
+// different port semantics (a PodMonitor's port names a CONTAINER port).
+func PodMonitorEndpointNote(pod kubemeta.Pod, ep servicemonitors.Endpoint) string {
 	if note := refusedEndpointNote(ep); note != "" {
 		return note
 	}
+	if !Scrapeable(pod) {
+		return NotScrapeableNote("this endpoint")
+	}
 	return "endpoint resolves to no pod port (port must name a declared container port; targetPort a number or declared name)"
+}
+
+// NotScrapeableNote is the ONE wording for an entry or endpoint that resolves
+// perfectly well and yields no target anyway, because the POD is excluded.
+//
+// Scrapeable is a short-circuit the diagnostic mirrors kept missing: it sits
+// inside monitorEndpoint and podMonitorEndpoint beside the port resolution, and
+// PodTargets/ServiceTargets never run at all for such a pod — while
+// ExplainPodPorts and ExplainServicePorts, which mirror only the port
+// arithmetic, went on reporting every entry as resolving. The head of the
+// document was right (scrapeable / notScrapeableWhy) and the per-entry verdicts
+// contradicted it, which is the shape an operator reads PAST the head to reach.
+//
+// It names notScrapeableWhy rather than repeating the reasons: those are
+// ScrapeableReasons' and they are already at the head, per pod, once.
+func NotScrapeableNote(subject string) string {
+	return fmt.Sprintf("%s resolves, but the pod itself is excluded from scraping, so it yields NO target; "+
+		"see notScrapeableWhy", subject)
 }
 
 // refusedEndpointNote explains a size-refused endpoint, naming the fields that

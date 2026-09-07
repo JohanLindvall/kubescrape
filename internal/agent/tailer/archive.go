@@ -264,6 +264,15 @@ func (t *Tailer) openArchive(f *file) error {
 				"path", f.path, "committed", f.committed)
 		}
 		f.committed = 0
+		// Withheld highs name decompressed positions in the stream that is
+		// gone. This arm reuses the tail id (there is nothing to record a
+		// segment for — the old stream's offsets mean nothing in the
+		// replacement), so a surviving high would commit the NEW archive past
+		// bytes it never exported, exactly as it did on the rewind path. The
+		// fd-release gate (committed >= fedEnd, nothing pending) means the map
+		// is empty by the time an archive can reach here at all; the clear is
+		// what keeps that an invariant rather than a coincidence.
+		f.exportedHighs = nil
 		// The old identity is spent with the reset. Kept, it re-fired this
 		// arm — and the count — on the NEXT replacement whenever this open
 		// fails below (the non-gzip quarantine returns before the new

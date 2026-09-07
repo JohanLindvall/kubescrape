@@ -318,12 +318,13 @@ func (s *Server) handlePodByIP(w http.ResponseWriter, r *http.Request) {
 // this route exists to supply.
 //
 // So the one hop that CAN be recognised is refused: a request carrying a
-// forwarding header (Forwarded, X-Forwarded-For, X-Real-Ip) says, in the hop's
-// own words, that the connection is not the caller's. The header is still never
-// READ for an address — it selects nothing and names nobody, so no caller can
-// use one to be told about somebody else; its mere PRESENCE is the whole
-// effect, and the refusal it produces is one a caller can only inflict on
-// itself.
+// forwarding header (Forwarded, Via, X-Forwarded-For, X-Real-Ip —
+// forwardedHeaders is the list, and Via is the one RFC 9110 REQUIRES a proxy to
+// add) says, in the hop's own words, that the connection is not the caller's.
+// The header is still never READ for an address — it selects nothing and names
+// nobody, so no caller can use one to be told about somebody else; its mere
+// PRESENCE is the whole effect, empty value included, and the refusal it
+// produces is one a caller can only inflict on itself.
 //
 // THAT COSTS SOMETHING, and it is paid by a deployment that works today: a
 // forwarding header is evidence of a HOP, not evidence of address REWRITING,
@@ -419,12 +420,29 @@ const selfWarnEvery = 15 * time.Minute
 // Any one of them present is the hop declaring itself, which is the only
 // evidence /v1/self can have that the address it is holding is not its
 // caller's.
-var forwardedHeaders = []string{"Forwarded", "X-Forwarded-For", "X-Real-Ip"}
+//
+// Via is in the list because it is the one a forwarding proxy is REQUIRED to
+// add (RFC 9110 §7.6.3), where the three X-/Forwarded headers are conventions.
+// A proxy that follows the spec and adds only Via — leaving the address it
+// rewrote unannounced — was answered 200 with its own pod's identity, which the
+// caller then stamped on every self-metric it exports: the silent permanent
+// outcome this refusal exists to prevent, reached through the header the
+// standard mandates.
+//
+// Names must be in net/http's canonical form, since forwardedVia indexes the
+// header map directly (TestForwardedHeaderNamesAreCanonical).
+var forwardedHeaders = []string{"Forwarded", "Via", "X-Forwarded-For", "X-Real-Ip"}
 
 // forwardedVia names the forwarding header the request carries, or "".
+//
+// PRESENCE, not value: Header.Get cannot tell an absent header from a
+// present-but-empty one, and the doc above says the presence is the whole
+// effect. An empty X-Forwarded-For is a hop that declared itself and wrote
+// nothing — no less evidence than a populated one, since the value is never
+// read for an address anyway.
 func forwardedVia(r *http.Request) string {
 	for _, h := range forwardedHeaders {
-		if r.Header.Get(h) != "" {
+		if _, ok := r.Header[h]; ok {
 			return h
 		}
 	}
@@ -1145,8 +1163,20 @@ func (d *targetDedup) add(t kubemeta.ScrapeTarget) targetVerdict {
 	// pod source wins over service source, and a monitor wins over both.
 	held := &(*d.out)[i]
 	if configuredTarget(&t) && !configuredTarget(held) {
+		before := scrape.TargetOwnBytes(held)
 		carryForward(&t, held)
 		*held = t
+		// The UPGRADE is a swap, and what it swaps in is exactly the expensive
+		// half: a monitor target carries a merged relabel chain (up to 16 KiB),
+		// a contributor list and auth references that the annotation target it
+		// displaces never had, and the pod door charged only the annotation
+		// one. Sixteen such upgrades on one pod put ~400 KiB into the response
+		// against a 256 KiB budget with d.capped at 0. Charging only — like the
+		// merge arm, and for the same reason: refusing here would drop the
+		// monitor's declaration rather than bound a response, and the URL is
+		// already being served either way. It only makes the pod's remaining
+		// budget honest, so the next NEW url is measured against the truth.
+		d.chargeSwap(before, scrape.TargetOwnBytes(held))
 		return targetAccepted
 	}
 	// The holder keeps the URL — and carries forward from the target it
@@ -1158,7 +1188,12 @@ func (d *targetDedup) add(t kubemeta.ScrapeTarget) targetVerdict {
 	// k8s.service.uid — the identical loss carryForward was written for on the
 	// replace path, on the arm nobody had looked at. Which Service donates is
 	// deterministic: matchingServices preserves the snapshot's name order.
+	before := scrape.TargetOwnBytes(held)
 	carryForward(held, &t)
+	// A Service view is up to kubemeta.MaxAnnotationBytes of annotations plus
+	// its labels, and it arrives on a target the pod door has already charged
+	// without one. Same charge-never-refuse rule as the arm above.
+	d.chargeSwap(before, scrape.TargetOwnBytes(held))
 	return targetAccepted
 }
 
@@ -1175,6 +1210,21 @@ func (d *targetDedup) add(t kubemeta.ScrapeTarget) targetVerdict {
 // makes the pod's remaining budget honest, so the next NEW url is measured
 // against what is really being served.
 func (d *targetDedup) charge(n int) { d.bytes += n }
+
+// chargeSwap spends what a target GREW by when the accumulator replaced it, or
+// enriched it in place, on a URL it already held: add's upgrade and
+// holder-keeps arms, which change what is served without appending anything.
+//
+// The delta is floored at zero rather than refunded. A swap that shrinks the
+// target is not a reason to hand budget back — the budget bounds the RESPONSE,
+// and a door that can lower it invites a shrink-then-grow sequence to spend
+// more than the ceiling admits — and the direction that matters is the other
+// one anyway: nothing here may leave the budget understating what is served.
+func (d *targetDedup) chargeSwap(before, after int) {
+	if after > before {
+		d.bytes += after - before
+	}
+}
 
 // refuse records one refusal by ceiling v and returns it. Both ceilings move
 // the SAME counter — a refused target is a refused target, and the rate an
@@ -1931,18 +1981,28 @@ func formatTag(h xxh3.Uint128) string {
 	return string(out[:])
 }
 
-// cacheControl renders the freshness lifetime a cached 200 advertises.
+// maxAgeSeconds is the whole TTL rendered in the seconds max-age is expressed
+// in.
 //
 // max-age has second granularity: a sub-second TTL truncates to 0, which tells
 // the client not to cache AT ALL — the opposite of a short cache, and silently
 // (the ETag is still computed on every response). Round up so any non-zero TTL
 // caches for at least a second; 0 disables caching before we get here.
+//
+// The node-targets memo grants through this too, and the two MUST agree. While
+// the memo floored where cacheControl rounded up, a sub-second TTL made the
+// memo unreachable by arithmetic: the 200 advertised max-age=1 and the memo
+// then refused every revalidation it seeded, so a conforming agent re-derived,
+// re-sorted, re-marshalled and re-hashed the whole node on every poll while
+// kubescrape_node_targets_builds_total reported "built" forever — the same
+// symptom as an unwired change token, with nothing to tell the two apart.
+func (s *Server) maxAgeSeconds() int {
+	return max(1, int(s.cacheTTL/time.Second))
+}
+
+// cacheControl renders the freshness lifetime a cached 200 advertises.
 func (s *Server) cacheControl(private bool) string {
-	maxAge := int(s.cacheTTL.Seconds())
-	if maxAge < 1 {
-		maxAge = 1
-	}
-	cc := "max-age=" + strconv.Itoa(maxAge)
+	cc := "max-age=" + strconv.Itoa(s.maxAgeSeconds())
 	if private {
 		cc = "private, " + cc
 	}
@@ -2082,10 +2142,10 @@ func (s *Server) nodeTargetsNotModified(w http.ResponseWriter, r *http.Request, 
 			return false
 		}
 		// Unchanged, so the copy is current as of NOW and the grant is the full
-		// window — the same one a 200 hands out, for the same reason. builtAt
-		// moves with it so the fallback below stays truthful if a source is
-		// later unwired.
-		maxAge = int(s.cacheTTL / time.Second)
+		// window — the same one a 200 hands out, through the same function and
+		// therefore with the same rounding. builtAt moves with it so the
+		// fallback below stays truthful if a source is later unwired.
+		maxAge = s.maxAgeSeconds()
 		now := s.now()
 		s.targetsMu.Lock()
 		if cached, still := s.targetsETags[node]; still && cached.etag == e.etag {
@@ -2099,7 +2159,18 @@ func (s *Server) nodeTargetsNotModified(w http.ResponseWriter, r *http.Request, 
 		// above). A remainder under a second grants nothing, so the memo counts
 		// as expired (which subsumes the age >= TTL check) and the store is
 		// consulted.
-		maxAge = int((s.cacheTTL - s.now().Sub(e.builtAt)) / time.Second)
+		//
+		// EXCEPT when the TTL is itself sub-second, where flooring can never
+		// grant anything and the memo would be dead by arithmetic. That bound
+		// is not expressible on this wire at all there — the 200 that seeded
+		// the memo already rounded its own window up to a second — so matching
+		// the 200 is both the honest reading and the only one under which this
+		// branch does anything.
+		remaining := s.cacheTTL - s.now().Sub(e.builtAt)
+		maxAge = int(remaining / time.Second)
+		if maxAge < 1 && remaining > 0 && s.cacheTTL < time.Second {
+			maxAge = s.maxAgeSeconds()
+		}
 	}
 	if maxAge < 1 {
 		return false

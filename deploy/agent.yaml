@@ -95,6 +95,19 @@ spec:
       containers:
         - name: agent
           image: ghcr.io/johanlindvall/kubescrape:latest
+          # `:latest` with IfNotPresent, and both halves are deliberate here
+          # while being a real hazard in production: re-pushing the tag leaves
+          # this manifest byte-identical, so `kubectl apply` rolls nothing, and
+          # a manual rollout restart then reuses the `latest` layer every node
+          # already cached — a successful-looking upgrade running the old
+          # binary, with the startup line's `version=` as the only evidence.
+          # It stays because hack/e2e.sh applies these files against an image
+          # `kind load`ed from the working tree, which exists in no registry:
+          # `Always` would either fail the pull or fetch a PUBLISHED :latest
+          # over the build under test. Pin the tag to a release or an
+          # `@sha256:` digest for a real deployment (the Helm chart's
+          # `image.tag`), and the pull policy stops mattering. See
+          # docs/CONFIGURATION.md, "Accepted security residuals".
           imagePullPolicy: IfNotPresent
           command: ["/kubescrape-agent"]
           args:
@@ -210,14 +223,22 @@ spec:
             # `make build TAGS=azure` binary refuses to start with this set,
             # naming the tag (docs/CONFIGURATION.md, "Build variants").
             #
-            # Uncomment the flag AND the runlogjournal volume + mount below
-            # TOGETHER. Persistent journals arrive through the /var/log mount,
-            # but a node whose journal is volatile keeps it only under
-            # /run/log/journal, which nothing else here mounts: the reader then
+            # Uncomment the flag AND the runlogjournal + machineid volumes
+            # and mounts below TOGETHER — BOTH of them, because the two cover
+            # the two journal layouts and a node has one or the other. A
+            # VOLATILE journal (systemd Storage=volatile, or auto with no
+            # /var/log/journal) lives only under /run/log/journal, which
+            # nothing else here mounts. A PERSISTENT one arrives through the
+            # /var/log mount, but libsystemd is opened with
+            # SD_JOURNAL_LOCAL_ONLY and under that rule reads
+            # /var/log/journal/<id> only when <id> is the CONTAINER's own
+            # machine id, which this image does not ship — so /etc/machine-id
+            # has to come from the node too. Either one missing and the reader
             # starts cleanly, blocks waiting for entries that cannot arrive and
             # exports zero records. The startup WARNING naming the empty
             # journal is the only signal — /readyz stays 200 and no counter
-            # moves, an untouched counter never being exported at all.
+            # moves, an untouched counter never being exported at all — and it
+            # says which of the two is missing.
             #- -journald
             # High-frequency cgroup sampling. The cadvisor scrape above reports
             # ONE average per -scrape-interval, so a container that spikes to 4
@@ -326,6 +347,21 @@ spec:
             #- name: runlogjournal
             #  mountPath: /run/log/journal
             #  readOnly: true
+            # The node's machine id. Uncomment it with -journald TOO, and read
+            # this before deciding it is optional: the PERSISTENT journal (the
+            # Debian/Ubuntu/RHEL default) is unreadable without it. libsystemd
+            # is opened with SD_JOURNAL_LOCAL_ONLY, under which it reads
+            # /var/log/journal/<id> only when <id> equals the CONTAINER's own
+            # machine id — and this image has no /etc/machine-id, so the reader
+            # starts, blocks on entries that cannot arrive and exports zero
+            # records. /run/log/journal is exempt from that rule, which is why
+            # a volatile-journal node works without this mount and a persistent
+            # one silently does not. The startup WARNING names which of the two
+            # is missing. Promtail, Alloy and fluent-bit all require the same
+            # mount. The chart adds it whenever agent.journald.enabled is set.
+            #- name: machineid
+            #  mountPath: /etc/machine-id
+            #  readOnly: true
             # The host's cgroup hierarchy, for -cgroup-stats. Read-only: the
             # sampler only ever reads three files per container. Uncomment with
             # the flag above; the chart mounts this whenever
@@ -377,6 +413,14 @@ spec:
         #  hostPath:
         #    path: /run/log/journal
         #    type: DirectoryOrCreate
+        # Uncomment with -journald and its mount above. `File`, not
+        # FileOrCreate: an EMPTY /etc/machine-id fails sd_id128_get_machine()
+        # exactly as an absent one does, so creating one would hand the agent a
+        # mount that looks right and reads nothing.
+        #- name: machineid
+        #  hostPath:
+        #    path: /etc/machine-id
+        #    type: File
         # Uncomment with -cgroup-stats and its mount above. `Directory`, not
         # DirectoryOrCreate: an absent /sys/fs/cgroup is a node this feature
         # cannot work on, and creating an empty directory over it would hand the

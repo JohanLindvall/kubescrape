@@ -111,7 +111,7 @@ func TestExportFailureTransitionsAndRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range 3 {
-		set.noteExport(errors.New("collector unavailable"))
+		set.noteExport(0, errors.New("collector unavailable"))
 	}
 	out := buf.String()
 	if n := strings.Count(out, "level=WARN"); n != 1 {
@@ -122,7 +122,7 @@ func TestExportFailureTransitionsAndRecovers(t *testing.T) {
 	}
 
 	buf.Reset()
-	set.noteExport(nil)
+	set.noteExport(0, nil)
 	out = buf.String()
 	if !strings.Contains(out, "level=INFO") || !strings.Contains(out, "succeeded again") {
 		t.Errorf("want a recovery line naming the outage:\n%s", out)

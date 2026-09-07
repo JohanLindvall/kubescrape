@@ -461,7 +461,7 @@ const (
 // suffix like noPortIgnored, because they report a REFUSAL of something
 // kubescrape does interpret rather than a field it ignores wholesale.
 const (
-	relabelCappedIgnored = "metricRelabelings(capped)"
+	relabelCappedIgnored = "metricRelabelings" + cappedSuffix
 	// relabelRefusedField is the Refused name for an endpoint carrying a rule
 	// too large to apply, and relabelOversizeIgnored is built FROM it so the
 	// two spellings — the one in Ignored and the one in Refused — cannot drift.
@@ -540,7 +540,9 @@ func relabelRuleBytes(regex string, sourceLabels []string) int {
 // OVERSIZED rule, which refuses the endpoint itself (see the ceilings above —
 // the aggregate ones keep a prefix, this one cannot). One walk, because a rule
 // reported as dropped and then applied (or the reverse) is precisely the silent
-// partial application the Ignored machinery exists to prevent.
+// partial application the Ignored machinery exists to prevent — and one walk
+// over the WHOLE list, because the oversize verdict is a property of the CR
+// rather than of where in it the rule sits (see `capped` in the body).
 func (ep endpointSpec) relabelChain() (rules []RelabelRule, ignored []string, oversize bool) {
 	chainBytes := 0
 	// report appends one report entry under maxRelabelIgnored, folding
@@ -557,9 +559,30 @@ func (ep endpointSpec) relabelChain() (rules []RelabelRule, ignored []string, ov
 			ignored = append(ignored, relabelReportCappedIgnored)
 		}
 	}
+	// capped is set once an AGGREGATE ceiling has bound. The chain is closed
+	// from then on, but the WALK CONTINUES, and that is the difference between
+	// the two ceilings being what they are documented to be and one of them
+	// silently becoming the other. The per-rule ceiling refuses the ENDPOINT
+	// precisely because a rule over it fits no chain IN ANY ORDER — so its
+	// position must not decide the verdict. It did: the aggregate ceilings
+	// stopped the walk, so an oversized `keep` allowlist placed past the 64th
+	// rule (or past the 8 KiB) was never measured, `oversize` stayed false, the
+	// endpoint kept its Port, and every target it resolved to was served with
+	// the prefix applied and the allowlist silently absent — export everything,
+	// the exact fail-OPEN the per-rule ceiling exists to prevent, reported as
+	// the fail-open the aggregate ceilings are DOCUMENTED to be so no counter
+	// or /v1/explain document could tell them apart.
+	//
+	// Continuing costs one relabelRuleBytes per remaining rule over a list the
+	// decode already materialised, once per monitor upsert. The two report arms
+	// below stay silent past the ceiling, so the report is unchanged: a capped
+	// chain is one entry, not one per unread rule.
+	capped := false
 	for _, r := range ep.MetricRelabelings {
 		if !isKeepDrop(r.Action) {
-			report("metricRelabelings.action=" + clipValue(r.Action))
+			if !capped {
+				report("metricRelabelings.action=" + clipValue(r.Action))
+			}
 			continue
 		}
 		// A custom separator is reported and the rule SKIPPED: the agent joins
@@ -567,18 +590,14 @@ func (ep endpointSpec) relabelChain() (rules []RelabelRule, ignored []string, ov
 		// user's regex against a string it was never written for — silently
 		// inverting a keep into a drop-everything.
 		if r.Separator != "" && r.Separator != ";" {
-			report("metricRelabelings.separator=" + clipValue(r.Separator))
+			if !capped {
+				report("metricRelabelings.separator=" + clipValue(r.Separator))
+			}
 			continue
 		}
-		// Over the bounds: the PREFIX of the chain is kept and the rest
-		// refused. A prefix rather than nothing because relabel rules are
-		// independent filters applied in order — keeping the ones written
-		// first is strictly closer to the CR than keeping none — and because a
-		// legitimate chain never reaches here at all.
-		if len(rules) >= maxRelabelRules {
-			report(relabelCappedIgnored)
-			break
-		}
+		// Measured BEFORE the aggregate ceilings and on EVERY rule, capped or
+		// not — see `capped` above for why the order and the continuation are
+		// both load-bearing.
 		n := relabelRuleBytes(r.Regex, r.SourceLabels)
 		if n > maxRelabelRuleBytes {
 			// One rule bigger than the WHOLE chain budget refuses the endpoint
@@ -586,15 +605,25 @@ func (ep endpointSpec) relabelChain() (rules []RelabelRule, ignored []string, ov
 			// applying its neighbours ships a filter the CR does not describe,
 			// and for the one shape that is legitimately this large — a `keep`
 			// allowlist — that means exporting everything it excluded. The walk
-			// stops here because the chain is discarded either way; the report
-			// entry is what reaches the counter and the warning.
+			// stops here because the chain is discarded either way (the refusal
+			// nils it in enforceFieldBounds), so the prefix is dropped rather
+			// than returned; the report entry is what reaches the counter and
+			// the warning.
 			report(relabelOversizeIgnored)
-			oversize = true
-			break
+			return nil, ignored, true
 		}
-		if chainBytes+n > maxRelabelChainBytes {
+		if capped {
+			continue
+		}
+		// Over the aggregate bounds: the PREFIX of the chain is kept and the
+		// rest refused. A prefix rather than nothing because relabel rules are
+		// independent filters applied in order — keeping the ones written
+		// first is strictly closer to the CR than keeping none — and because a
+		// legitimate chain never reaches here at all.
+		if len(rules) >= maxRelabelRules || chainBytes+n > maxRelabelChainBytes {
 			report(relabelCappedIgnored)
-			break
+			capped = true
+			continue
 		}
 		chainBytes += n
 		rules = append(rules, RelabelRule{
@@ -604,7 +633,7 @@ func (ep endpointSpec) relabelChain() (rules []RelabelRule, ignored []string, ov
 			Regex:        r.Regex,
 		})
 	}
-	return rules, ignored, oversize
+	return rules, ignored, false
 }
 
 // Ceilings on the tenant-supplied endpoint STRINGS that scrape copies onto
@@ -640,6 +669,13 @@ const (
 	maxEndpointDurationBytes   = 64
 	maxEndpointSecretRefBytes  = 768
 )
+
+// cappedSuffix marks a report entry for a LIST kubescrape does interpret but
+// has kept only a prefix of. It is the counterpart of oversizeSuffix, which
+// marks a refusal: a capped list still yields targets, an oversize field does
+// not. Spelled once so the two ceilings that use it — the relabel chain and the
+// endpoint list — cannot drift into two words for one outcome.
+const cappedSuffix = "(capped)"
 
 // oversizeSuffix marks a report entry for a field kubescrape DOES interpret but
 // REFUSED for its size, the spelling relabelOversizeIgnored already uses.
@@ -937,18 +973,24 @@ type smSpec struct {
 func (s *smSpec) labelSelector() *metav1.LabelSelector { return &s.Selector }
 func (s *smSpec) nsSelector() namespaceSelector        { return s.NamespaceSelector }
 func (s *smSpec) endpointSpecs() []endpointSpec        { return s.Endpoints }
+func (s *smSpec) endpointsField() string               { return "endpoints" }
 func (s *smSpec) monitorIgnored() []string             { return s.ignored() }
 
 // monitorSpec is what the shared parse skeleton needs from a kind's decoded
 // spec shape: its label selector, its namespace selector, its endpoint list
-// (the two kinds spell the JSON key differently) and its monitor-level
-// ignored-fields report. A new monitor arm implements these four accessors
-// and gets the WHOLE skeleton — including the per-endpoint security step in
-// parseMonitorSpec — for free.
+// (the two kinds spell the JSON key differently, hence endpointsField beside
+// it) and its monitor-level ignored-fields report. A new monitor arm
+// implements these five accessors and gets the WHOLE skeleton — including the
+// per-endpoint security step in parseMonitorSpec — for free.
 type monitorSpec interface {
 	labelSelector() *metav1.LabelSelector
 	nsSelector() namespaceSelector
 	endpointSpecs() []endpointSpec
+	// endpointsField is the CRD's OWN name for that list, used only to report
+	// the maxEndpointsPerMonitor refusal. The two kinds spell it differently
+	// and the report names a field an operator will go and edit, so it is the
+	// kind's word for it and not a shared approximation.
+	endpointsField() string
 	monitorIgnored() []string
 }
 
@@ -964,6 +1006,58 @@ type monitorBase struct {
 	// re-delivery that changes nothing from a real update (see upsertMonitor).
 	ResourceVersion string
 }
+
+// maxEndpointsPerMonitor bounds the ENDPOINT LIST itself — the last unbounded
+// dimension of a monitor, and the one every other ceiling in this file was
+// measured underneath. Each endpoint STRING is bounded (enforceFieldBounds),
+// each relabel chain is bounded (maxRelabelRules/maxRelabelChainBytes), each
+// per-endpoint and per-monitor report is bounded (maxRelabelIgnored,
+// maxIgnoredFields) and the merged target's contributor list is bounded one
+// layer up (scrape.MaxContributorsPerTarget) — and a bound on what ONE entry
+// costs is not a bound on the list, which is this file's own lesson ("a bound
+// on ENTRIES is not a bound on BYTES") read in the other direction.
+//
+// The cost is paid in three places, none of them the served document — which is
+// why nothing downstream noticed. Measured through the real code (go1.26, 13th
+// Gen i7-1360P) with a tenant-authored `selector: {}` + `namespaceSelector.any:
+// true` monitor, the shape the default -monitor-namespaces honours:
+//
+//   - RETAINED, for the life of the CR: 100,000 endpoints of `{"port":"a"}`
+//     marshal to 1,300,015 bytes — inside etcd's object limit — and parse into
+//     37.9 MB of Endpoint records held by the index, in a singleton the chart
+//     requests 128Mi for with no limit.
+//   - MULTIPLIED, in the server's monitor→services memo, which holds one entry
+//     per (monitor, matched Service, endpoint): 10,000 endpoints over 100
+//     matched Services measured 1,000,000 entries / 26.1 MB / 65.96 ms per
+//     rebuild, under the memo's lock, triggered by ANY Service or monitor
+//     change and with the old and new map both alive across it.
+//   - WALKED, per pod per matched Service on every node-targets derivation:
+//     ONE 110-pod node with 10,000 endpoints over 10 Services took 1.69 s, per
+//     node per poll whenever that node's change-token memo lapses — which any
+//     pod upsert cluster-wide does. The RESPONSE stays small (the merge,
+//     contributor and byte ceilings bound it), so the only symptoms are the
+//     singleton's RSS and every agent's targets poll timing out: a cluster-wide
+//     loss of scrape-target discovery from an input any namespace-scoped tenant
+//     can write.
+//
+// The PREFIX is kept and the tail refused, like the aggregate relabel ceilings
+// and for the same reason: rejecting the CR would take every target its earlier
+// endpoints contribute with it, which is a bigger outage than the tail is a
+// risk. The refusal rides the monitor-level Ignored list, so it counts into
+// kubescrape_monitor_fields_ignored_total and names itself in the per-upsert
+// warning rather than being silent.
+//
+// 128 is far above anything legitimate — kube-prometheus-stack's largest
+// monitors carry single digits, and one pod cannot hold more than
+// scrape.MaxPortsPerPod (16) targets however many endpoints resolve to it — and
+// far below where any of the three costs above bites.
+//
+// What this does NOT bound, stated so it is not mistaken for closed: the
+// TRANSIENT decode. The informer caches the whole unstructured CR either way,
+// and FromUnstructured materialises the full endpoint list before this cap can
+// see it; the cap is what keeps that from being retained, multiplied and
+// re-walked forever after.
+const maxEndpointsPerMonitor = 128
 
 // parseMonitorSpec is the ONE parse skeleton of both monitor kinds: the
 // no-spec error, the unstructured decode into the kind's spec shape, the
@@ -1001,7 +1095,15 @@ func parseMonitorSpec(u *unstructured.Unstructured, kind string, spec monitorSpe
 		ResourceVersion: u.GetResourceVersion(),
 	}
 	specIgnored := spec.monitorIgnored()
-	for _, ep := range spec.endpointSpecs() {
+	eps := spec.endpointSpecs()
+	if len(eps) > maxEndpointsPerMonitor {
+		// The prefix is kept and the tail refused; see maxEndpointsPerMonitor.
+		// Reported at the MONITOR level, so it rides every kept endpoint and
+		// IgnoredFields dedupes it to one entry however many that is.
+		eps = eps[:maxEndpointsPerMonitor]
+		specIgnored = append(specIgnored, spec.endpointsField()+cappedSuffix)
+	}
+	for _, ep := range eps {
 		e := ep.toEndpoint()
 		// Monitor-level ignored fields ride on every endpoint; IgnoredFields
 		// dedupes across endpoints, so they are reported exactly once.
@@ -1368,13 +1470,16 @@ func (ix *Index) buildAuthSecretRefs() AuthRefs {
 
 // maxIgnoredFields bounds the report ONE monitor produces, which is the third
 // door of the same shape as maxRelabelIgnored and is here because bounding the
-// second one alone would only have moved the growth up a level: the per-
-// endpoint report is bounded, but a monitor's ENDPOINT LIST is not, every
-// endpoint may contribute report entries carrying a DISTINCT tenant-chosen
-// value (`action=`, `separator=`), and this function's whole output is joined
-// into ONE log record by warnIgnored. A ~1.5 MiB CR of minimal endpoints each
-// carrying a handful of distinct unsupported actions is tens of thousands of
-// distinct entries, re-emitted on every edit of the CR.
+// second one alone would only have moved the growth up a level: every endpoint
+// may contribute report entries carrying a DISTINCT tenant-chosen value
+// (`action=`, `separator=`), and this function's whole output is joined into
+// ONE log record by warnIgnored. When it was written the ENDPOINT LIST was
+// unbounded, so a ~1.5 MiB CR of minimal endpoints each carrying a handful of
+// distinct unsupported actions was tens of thousands of distinct entries,
+// re-emitted on every edit of the CR. maxEndpointsPerMonitor now bounds that
+// list, but at 128 — chosen against retained bytes and derivation CPU, not
+// against what a person will read — so this ceiling still binds first and still
+// earns its keep.
 //
 // A monitor whose report needs more than this many DISTINCT field names is not
 // one an operator is going to read to the end anyway.

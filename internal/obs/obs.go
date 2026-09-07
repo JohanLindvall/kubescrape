@@ -315,7 +315,8 @@ var (
 		"GET /v1/self requests answered 4xx instead of an identity, by reason. no_pod = the connection's source "+
 			"address owns no live pod, which is EXPECTED and permanent for a hostNetwork agent (it shares the node "+
 			"address) and for one behind SNAT — those fall back to a lookup by name and are fine; forwarded = the "+
-			"request carried Forwarded/X-Forwarded-For/X-Real-Ip, so kubescrape refuses to attribute a connection "+
+			"request carried Forwarded/Via/X-Forwarded-For/X-Real-Ip (presence alone), so kubescrape refuses to "+
+			"attribute a connection "+
 			"a hop declared is not its caller's (a service mesh adding the header in the caller's own network "+
 			"namespace lands here too, at the cost of one extra by-name lookup per -self-attributes-refresh); "+
 			"unparseable_peer = the connection had no readable address, which should not happen and is warned. A "+
@@ -483,6 +484,19 @@ var (
 		"Unterminated lines discarded for exceeding the per-entry size bound (no newline within MaxEntryBytes+4096).")
 	LogTornFinalLines = Registry.Counter("kubescrape_log_torn_final_lines_total",
 		"Unterminated final lines of RENAMED-away files (the fragment can never complete and is dropped). In-place truncation destroys its unread tail unmeasurably — there is nothing left to count — so truncation losses do not appear here or anywhere.")
+	// LogEntriesUnmapped is the tailer's LAST unsignalled give-up path. The
+	// multiline stage emits a fully assembled entry and the tailer maps it back
+	// onto the byte ranges its per-stream offset FIFO owes; if that FIFO is
+	// empty the entry cannot be positioned, so it is discarded — and it used to
+	// be discarded in total silence, the one drop in the package with neither a
+	// counter nor a line while every sibling (torn final lines, oversized
+	// lines, lost prefixes, permanent rejections) carries both.
+	LogEntriesUnmapped = Registry.Counter("kubescrape_log_entries_unmapped_total",
+		"Assembled multi-line log entries discarded because the file's per-stream offset FIFO held no byte "+
+			"range to map them onto, so the entry could not be positioned or committed. This is UNREACHABLE "+
+			"while the multiline library keeps its sum(Lines) == lines-consumed contract (pinned upstream by "+
+			"FuzzCappedConservation): any nonzero value means that contract broke and joined records are being "+
+			"dropped un-exported while their bytes' commit frontier moves past them — silent loss, and a bug.")
 	LogScrubbed = Registry.CounterVec("kubescrape_log_scrubbed_total",
 		"Log bodies redacted by a scrub pattern (one bump per pattern per record, not per match).", "pattern")
 	LogArchiveErrors = Registry.Counter("kubescrape_log_archive_errors_total",
@@ -673,8 +687,11 @@ var (
 	// permanent export failure with no hint of where the size came from.
 	ExportSplitParts = Registry.CounterVec("kubescrape_export_split_parts_total",
 		"Extra parts an over-cap OTLP payload was split into before sending (a payload sent whole adds "+
-			"nothing). A sustained rate means a producer is batching past -otlp-max-send-bytes: lower its "+
-			"batch size, or raise the cap if the collector's receive limit allows it.", "signal")
+			"nothing). Counted per export ATTEMPT, like kubescrape_export_requests_total: the split is "+
+			"re-derived on every try, so a retried payload adds its parts again — read this against the "+
+			"attempt counter, not as a payload count. A sustained rate means a producer is batching past "+
+			"-otlp-max-send-bytes: lower its batch size, or raise the cap if the collector's receive limit "+
+			"allows it.", "signal")
 	// The other half of the split's story: what it could NOT rescue. Both
 	// reasons ship a part the collector is expected to reject wholesale, which
 	// on its own surfaces only as a permanent export failure naming no size —
@@ -682,7 +699,10 @@ var (
 	// of its own the loss it trades for would be invisible.
 	ExportOversizeParts = Registry.CounterVec("kubescrape_export_oversize_parts_total",
 		"OTLP parts sent knowingly larger than -otlp-max-send-bytes, by signal and reason — the collector "+
-			"rejects each one, so any rate here is telemetry being lost. item: a SINGLE log record, span or "+
+			"rejects each one, so any rate here is telemetry being lost. Counted per export ATTEMPT, like "+
+			"kubescrape_export_requests_total: one oversized record is re-counted on every retry of its "+
+			"payload (with -buffer-dir, up to eight wire attempts), so this sizes the RATE of the condition "+
+			"and never the number of records lost. item: a SINGLE log record, span or "+
 			"metric data point is itself over the cap and nothing can shrink it, so it ships alone (find the "+
 			"producer of that record — a multi-megabyte log line, a histogram with an enormous label set — or "+
 			"raise the cap if the collector's receive limit allows). framing: the split was ABANDONED because "+
@@ -1143,9 +1163,9 @@ var (
 	// stream with no error logged and every other metric green. That has
 	// already happened once (see transform/hostobj.go).
 	TransformDropped = Registry.CounterVec("kubescrape_transform_dropped_total",
-		"Records a transform script called drop() on, by signal: logs (log records), metrics (data points — a dropped metric counts all of its points), traces (spans) and targets (whole scrape targets the targets: hook dropped, which stop being scraped from that cycle on; there is no other signal for one, since a target that is never fetched has no up series to go to 0). Counted when the batch's export is ACKED (a delivered forward, or a payload transformed to nothing and acked without a send), so a producer's transient retries never re-count. The one exception is the tailer's in-place seam, which counts at transform time: a rewound re-read after a failed export re-runs the (possibly hot-reloaded) script and re-counts.", "signal")
+		"Records a transform script called drop() on, by signal: logs (log records), metrics (data points — a dropped metric counts all of its points), traces (spans) and targets (whole scrape targets the targets: hook dropped, which stop being scraped from that cycle on; there is no other signal for one, since a target that is never fetched has no up series to go to 0). Counted when the batch's export is ACKED (a delivered forward, or a payload transformed to nothing and acked without a send), so a COPY-PATH producer's transient retries never re-count — and also on a FAILED forward of a HANDED-OFF payload, whose producer rebuilds from source rather than re-offering the object, so the script never runs over those records again (for promscrape's take()n chunk and cgroupstats' reset windows the source is destroyed by the attempt, and skipping them there counted their drops nowhere at all — under-reporting drop volume during exactly the collector outage this counter is read in). The other exception is the tailer's in-place seam, which counts at transform time: a rewound re-read after a failed export re-runs the (possibly hot-reloaded) script and re-counts.", "signal")
 	TransformReloads = Registry.CounterVec("kubescrape_transform_reloads_total",
-		"Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program).", "outcome")
+		"Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). BOTH outcomes are deduped by the file's content hash, so a persistently broken file counts once rather than once per poll tick: the rate reads as distinct broken edits, not as the reload cadence, and a nonzero failed rate with a flat applied rate means the file on disk is still the broken one.", "outcome")
 
 	// Trace tier (the -service-graph shard's sampler and span metrics).
 	TraceSpansDropped = Registry.CounterVec("kubescrape_trace_spans_dropped_total",
@@ -1185,8 +1205,16 @@ var (
 	// pairing its spans anyway minted one anonymous ""-labeled vertex that
 	// every unattributable sender in the cluster shared, accreting edges to
 	// real services (Tempo skips such resources too).
+	//
+	// It counts only the spans PAIRING WOULD HAVE USED — client, server,
+	// producer, consumer — because the named arm counts nothing at all for an
+	// INTERNAL or UNSPECIFIED span, and an ordinary batch is mostly those. The
+	// two arms of one question have to be in one unit or the ratio against
+	// _completed_total is inflated by a fraction that could never be an edge.
+	// Two such spans make one request, so the ratio is still against half the
+	// spans a completed edge takes.
 	ServiceGraphUnnamed = Registry.Counter("kubescrape_service_graph_unnamed_spans_total",
-		"Spans skipped by the service-graph processor because their resource carries no service.name — nothing to name a graph node with. The shipped tier enriches at entry and derives service.name for every attributable sender, so a sustained rate means unattributable senders whose spans can mint no edge (they still forward to the collector; only the graph skips them).")
+		"Edge-capable spans (client/server/producer/consumer) skipped by the service-graph processor because their resource carries no service.name — nothing to name a graph node with. INTERNAL and UNSPECIFIED spans are not counted: pairing would have skipped them too. The shipped tier enriches at entry and derives service.name for every attributable sender, so a sustained rate means unattributable senders whose spans can mint no edge (they still forward to the collector; only the graph skips them); two counted spans are one lost request.")
 )
 
 // RegisterServiceGraphStats publishes the pairing store's own numbers on the
@@ -1443,17 +1471,21 @@ func init() {
 	// metrics render after the stored series), which costs a scrape and never a
 	// count.
 	Registry.CounterFunc("kubescrape_self_metrics_points_skipped_total",
-		"Data points of this process's OWN metrics that could not be rendered because their stored label set "+
-			"failed to parse back, and were therefore left out. This should never move: the label sets of these "+
-			"series come from code, not from data. It matters because of WHERE the loss lands — the Prometheus "+
-			"/metrics exposition this process serves for itself, which is the delivery path when "+
-			"-self-metrics-interval=0 and the signal an operator uses to diagnose everything else. A skipped "+
-			"point is simply ABSENT from the response, so without this counter the operator's own telemetry "+
-			"shrinks invisibly. It counts the SCRAPE path only: the OTLP push reads the same stored string but "+
-			"degrades differently (it emits the point with whatever labels parsed, rather than dropping it), so "+
-			"a nonzero value here means the pushed copy of that series is mislabelled rather than missing. Any "+
-			"nonzero value means memory corruption or a bug in the label round-trip; the throttled WARN beside "+
-			"it names the metric.",
+		"Data points of this process's OWN metrics that were left out of the Prometheus /metrics response — either "+
+			"because their stored label set failed to parse back (metrics.Registry.Dump) or because the "+
+			"const-metric construction that turns a dumped point into an exposition refused it (obs's "+
+			"registryCollector: an invalid metric or label NAME, a label-count mismatch, a series kind the bridge "+
+			"has no mapping for). ONE counter for both layers because both drop a point from the SAME response and "+
+			"the remedy is the same; the throttled WARN beside it names the metric and says which layer refused. "+
+			"This should never move: the names and label sets of these series come from code, not from data. It "+
+			"matters because of WHERE the loss lands — the Prometheus /metrics exposition this process serves for "+
+			"itself, which is the delivery path when -self-metrics-interval=0 and the signal an operator uses to "+
+			"diagnose everything else. A skipped point is simply ABSENT from the response, so without this counter "+
+			"the operator's own telemetry shrinks invisibly. It counts the SCRAPE path only: the OTLP push does "+
+			"not run either step (it renders a mislabelled point rather than dropping it, and never builds a "+
+			"const metric at all), so the pushed copy of the series is mislabelled or unaffected rather than "+
+			"missing. Any nonzero value is a bug in kubescrape — memory corruption in the label round-trip, or a "+
+			"name the exposition cannot carry.",
 		func() float64 { return float64(Registry.DumpLabelErrors()) })
 }
 
@@ -1504,6 +1536,15 @@ func RegisterLogMetricsDrops(set *metrics.DynamicMetricSet) {
 	Registry.CounterFunc("kubescrape_log_metrics_dropped_nan_total",
 		"Log-metric observations dropped since start because the extracted value was NaN or +/-Inf (neither is representable as a sample).",
 		func() float64 { return float64(set.DroppedNaN()) })
+	Registry.CounterFunc("kubescrape_log_metrics_dropped_negative_total",
+		"Log-metric observations dropped since start because the extracted value was NEGATIVE on a metric whose exported form is monotonic "+
+			"(a counter, which renders as an OTLP Sum with IsMonotonic(true), or a summary, whose sum reaches Prometheus as the counter-typed "+
+			"<name>_sum). Folding a decrease into either on an unchanged start timestamp is a counter reset this process never declared, which "+
+			"rate()/increase() reads as one and adds the whole new value on top of everything already counted -- so it is refused instead. A "+
+			"SEPARATE series from the NaN one because the remedy is separate: a signed quantity belongs on type: gauge or on a histogram whose "+
+			"bounds cover it. Nonzero means a logMetrics rule's value/valueRegexp is extracting a signed quantity onto the wrong metric type; "+
+			"the Warn it raises names the rule.",
+		func() float64 { return float64(set.DroppedNegative()) })
 	Registry.CounterFunc("kubescrape_log_metrics_dropped_undelivered_total",
 		"Undelivered log-metric resources dropped because the re-offer buffer filled or the collector rejected them "+
 			"PERMANENTLY. Taking a snapshot is DESTRUCTIVE (it seals aggregation windows, zeroes idled samples and "+

@@ -212,11 +212,16 @@ func (p *starlarkProgram) run(batch starlark.Value) error {
 
 // run* return the pruned-record count WITHOUT counting it: the caller counts
 // via countDropped only once the batch's journey ends in an ack (a delivered
-// forward, or an emptied payload acked without a send). Counting at prune
-// time inflated kubescrape_transform_dropped_total by one full batch per
-// transient retry for the copy-path producers, which re-offer the same object
-// and re-run the script on a fresh copy every attempt — an operator alerting
-// on the rate saw drop volume proportional to outage length, not intent.
+// forward, or an emptied payload acked without a send) — or, on a FAILED
+// forward, once it is clear the script will never run over those records
+// again (transform.countFailed). Counting at prune time inflated
+// kubescrape_transform_dropped_total by one full batch per transient retry for
+// the copy-path producers, which re-offer the same object and re-run the
+// script on a fresh copy every attempt — an operator alerting on the rate saw
+// drop volume proportional to outage length, not intent. Skipping the failed
+// forward for a HANDED-OFF payload was the mirror-image error: that producer
+// rebuilds from source, and for promscrape and cgroupstats the source is
+// destroyed by the attempt, so those drops were counted nowhere at all.
 func (p *starlarkProgram) runLogs(ld plog.Logs, em MetricEmitter) (int, error) {
 	if err := p.run(&logBatch{ld: ld, em: em}); err != nil {
 		return 0, err

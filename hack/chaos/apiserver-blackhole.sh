@@ -10,9 +10,15 @@
 #   * /readyz keeps answering 200 — readiness LATCHES on purpose, because an
 #     unready service loses its endpoints and would cut every agent off a cache
 #     that is still serving useful data,
-#   * kubescrape_apiserver_probe_failures_total moves and the service logs a
-#     transition WARN then a recovery INFO,
+#   * kubescrape_apiserver_probe_failures_total MOVES — the compensating signal,
+#     asserted from the collector's own capture rather than printed, because it
+#     is the only thing that fires for a hanging outage,
 #   * nothing restarts.
+#
+# The transition WARN and recovery INFO the service logs are PRINTED and not
+# asserted, deliberately: they are a rendering of the same state the counter
+# already proves, and `kubectl logs` is the one input here that a busy node's
+# log rotation can take away.
 #
 # kubectl is unusable while paused, so a prober pod records /readyz to a
 # hostPath and we read it back with `"$CRI" exec` afterwards.
@@ -68,6 +74,15 @@ EOF
 "${KCTL[@]}" -n default wait --for=condition=Ready pod/chaos-readyz-prober --timeout=120s >/dev/null
 sleep 15
 
+# The BASELINE for the compensating signal. It has to be taken while the API
+# server is still up, because the collector is unreadable through `kubectl exec`
+# once it is paused. A cluster that has already run this scenario carries a
+# non-zero total, so "moved" is the assertion, never "is non-zero".
+PROBE_METRIC=kubescrape_apiserver_probe_failures_total
+FAILS_BEFORE=$(counter_total "$PROBE_METRIC") || \
+  fail "could not read the collector's metrics capture before the outage — without a baseline the watchdog assertion below would be vacuous"
+info "$PROBE_METRIC before the outage: $FAILS_BEFORE"
+
 # The pause MUST be checked. This script has no `set -e`, so a failed pause
 # (a CLUSTER_NAME override, a podman cluster, a multi-control-plane node named
 # ...-control-plane2, an already-stopped container) previously let it sleep with
@@ -79,7 +94,6 @@ say "PAUSING $CP (kubectl is unusable until it is unpaused)"
 "$CRI" pause "$CP" >/dev/null || fail "could not pause $CP — no outage was created, so this run would prove nothing"
 paused=$("$CRI" inspect -f '{{.State.Paused}}' "$CP" 2>/dev/null)
 [ "$paused" = "true" ] || fail "$CP did not enter the paused state (got ${paused:-unknown}) — no outage was created"
-"$CRI" pause "$CP" >/dev/null
 sleep "$OUTAGE"
 "$CRI" unpause "$CP" >/dev/null
 say "UNPAUSED; letting the cluster settle"
@@ -96,14 +110,23 @@ OKS=$("$CRI" exec "$SVCNODE" sh -c \
   "awk '/OK/{n++} END{print n+0}' /var/log/kubescrape-chaos/readyz.log" 2>/dev/null | tr -d '[:space:]')
 
 say "the compensating signal"
-counters apiserver
+counters apiserver || fail "could not read the collector's metrics capture after the outage"
 info "service log transitions:"
 "${KCTL[@]}" -n "$NS" logs -l app=kubescrape --tail=-1 --since=10m 2>/dev/null \
   | grep -iE 'API server (unreachable|reachable)' | tail -4 | sed 's/^/    /'
 
+# The reachability probe is the ONLY signal for a HANGING outage: client-go's
+# watch-error counter stays flat because the reflector never returns, and the
+# store gauges DECAY (the sweeper keeps expiring tombstones) rather than
+# freezing. So this counter moving is the invariant, not a printout — a
+# regression that disabled the probe used to leave `counters apiserver` empty
+# and still print CHAOS PASS.
+FAILS_AFTER=$(counter_total "$PROBE_METRIC") || \
+  fail "could not read the collector's metrics capture after the outage"
+info "$PROBE_METRIC after the outage: $FAILS_AFTER (was $FAILS_BEFORE)"
+
 say "restarts (must be zero)"
-"${KCTL[@]}" -n "$NS" get pods -l app=kubescrape \
-  -o jsonpath='{range .items[*]}{"    "}{.metadata.name}{" restarts="}{.status.containerStatuses[0].restartCount}{"\n"}{end}'
+assert_no_restarts app=kubescrape
 
 say "verdict"
 # OKS>0 only proves the prober ran ONCE. It samples every 2s across
@@ -113,8 +136,7 @@ say "verdict"
 minSamples=$((OUTAGE / 2))
 [ "${OKS:-0}" -ge "$minSamples" ] || \
   fail "the prober recorded only ${OKS:-0} samples, fewer than the $minSamples the ${OUTAGE}s outage should have produced — it did not span the outage, so a latched /readyz is not demonstrated"
-if [ "${BAD:-1}" = "0" ]; then
-  echo "CHAOS PASS: /readyz answered 200 $OKS/$OKS times across a ${OUTAGE}s API-server blackhole (readiness latched)"
-else
-  fail "/readyz returned non-200 $BAD times — readiness did not latch"
-fi
+[ "${BAD:-1}" = "0" ] || fail "/readyz returned non-200 $BAD times — readiness did not latch"
+[ "$FAILS_AFTER" -gt "$FAILS_BEFORE" ] || \
+  fail "$PROBE_METRIC did not move across a ${OUTAGE}s blackhole ($FAILS_BEFORE -> $FAILS_AFTER) — a latched /readyz is only HALF the design, and this counter is the other half: it is the one signal that says the cache may have stopped advancing, because client-go's watch-error counter is silent for a hanging outage"
+echo "CHAOS PASS: /readyz answered 200 $OKS/$OKS times across a ${OUTAGE}s API-server blackhole (readiness latched), the reachability probe reported the outage ($FAILS_BEFORE -> $FAILS_AFTER) and nothing restarted"

@@ -31,7 +31,7 @@ func openJournal(cfg Config, afterCursor string) (source, error) {
 	// (journalfiles.go). It sits here rather than in New because this is the
 	// function that decides which directories are read — and because tests
 	// inject their own source and must not probe the host's journal.
-	warnIfJournalEmpty(cfg)
+	warnIfJournalUnreadable(cfg)
 	var (
 		j   *sdjournal.Journal
 		err error

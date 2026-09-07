@@ -101,7 +101,11 @@ func typedFlags(t *testing.T, names ...string) {
 func restoreFlagValues(t *testing.T) {
 	t.Helper()
 	timeout, limit, burst := *scrapeTimeout, *logsRateLimit, *logsRateBurst
-	t.Cleanup(func() { *scrapeTimeout, *logsRateLimit, *logsRateBurst = timeout, limit, burst })
+	inFlight, recv := *ingestMaxInFlight, *ingestGRPCMaxRecv
+	t.Cleanup(func() {
+		*scrapeTimeout, *logsRateLimit, *logsRateBurst = timeout, limit, burst
+		*ingestMaxInFlight, *ingestGRPCMaxRecv = inFlight, recv
+	})
 }
 
 // A flag value that can only ever be a mistake is REFUSED, not normalised. The
@@ -138,6 +142,23 @@ func TestValidateConfigRefusesTypedFlagNonsense(t *testing.T) {
 			"negative burst", "logs-rate-burst",
 			func() { *logsRateLimit, *logsRateBurst = 100, -1 },
 			[]string{"-logs-rate-burst=-1", "burst of 1 or more"},
+		},
+		{
+			// The neighbouring -otlp-max-send-bytes documents "negative
+			// disables", so a negative here reads as "no bound" and is in fact
+			// normalised to the built-in 32 — while the effective-limits line
+			// prints the value that is NOT in force.
+			"negative ingest in-flight bound", "ingest-max-in-flight",
+			func() { *ingestMaxInFlight = -1 },
+			[]string{"-ingest-max-in-flight=-1", "0 for the default", "-otlp-max-send-bytes"},
+		},
+		{
+			// Same trap, the other flag: a negative silently runs at the 4 MiB
+			// default and every larger push is refused with ResourceExhausted
+			// while the cap looks disabled.
+			"negative ingest recv cap", "ingest-grpc-max-recv-bytes",
+			func() { *ingestGRPCMaxRecv = -1 },
+			[]string{"-ingest-grpc-max-recv-bytes=-1", "0 for the default"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -198,6 +219,23 @@ func TestValidateConfigAcceptsUsableTypedFlags(t *testing.T) {
 	}
 	if got := warnText(agentConfig{}); !strings.Contains(got, "bucket of 0.4") {
 		t.Fatalf("the derived bucket normalises silently: %q", got)
+	}
+}
+
+// The two ingest bounds' documented spelling of "use the built-in default" is 0,
+// and it must keep passing — the chart and the manifests render it — as must a
+// positive bound. Only the negative is refused.
+func TestValidateConfigAcceptsTheIngestBoundDefaults(t *testing.T) {
+	restoreFlagValues(t)
+	typedFlags(t, "ingest-max-in-flight", "ingest-grpc-max-recv-bytes")
+
+	for _, tc := range []struct{ inFlight, recv int }{
+		{0, 0}, {64, 8 << 20}, {1, 1},
+	} {
+		*ingestMaxInFlight, *ingestGRPCMaxRecv = tc.inFlight, tc.recv
+		if err := validateConfig(agentConfig{}, ""); err != nil {
+			t.Fatalf("refused -ingest-max-in-flight=%d -ingest-grpc-max-recv-bytes=%d: %v", tc.inFlight, tc.recv, err)
+		}
 	}
 }
 

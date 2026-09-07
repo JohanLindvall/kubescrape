@@ -407,13 +407,19 @@ metadata:
     helm.sh/chart: kubescrape-0.1.0
 rules:
   # The only cluster-wide grant: reading events. It lands on THIS
-  # ServiceAccount, never on the DaemonSet's.
+  # ServiceAccount, never on the DaemonSet's — and it is exactly what the
+  # reader uses and nothing beside it. The reader is core/v1 only
+  # (`CoreV1().Events(...)`), and it only ever List+Watches: the initial LIST
+  # (which the relist path re-runs, paginated) plus one WATCH. There is no
+  # single-object Get anywhere in internal/agent/events, and no EventsV1()
+  # call, so `get` and the `events.k8s.io` mirror were grants nothing
+  # exercises. They read the same underlying objects, so removing them changes
+  # no behaviour — but an operator hand-managing RBAC should be told the truth
+  # about which representation the code reads, and a least-privilege review
+  # should be able to see it from here.
   - apiGroups: [""]
     resources: ["events"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["events.k8s.io"]
-    resources: ["events"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["list", "watch"]
 ---
 # Source: kubescrape/templates/service.yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -699,7 +705,7 @@ spec:
       containers:
         - name: agent
           image: ghcr.io/johanlindvall/kubescrape:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command: ["/kubescrape-agent"]
           args:
             - -metadata-endpoint=http://kubescrape.monitoring
@@ -835,6 +841,9 @@ spec:
             - name: runlogjournal
               mountPath: /run/log/journal
               readOnly: true
+            - name: machineid
+              mountPath: /etc/machine-id
+              readOnly: true
             # The host's cgroup hierarchy. Read-only: the sampler reads three
             # files per container and writes nothing.
             - name: cgroup
@@ -867,6 +876,10 @@ spec:
           hostPath:
             path: /run/log/journal
             type: DirectoryOrCreate
+        - name: machineid
+          hostPath:
+            path: /etc/machine-id
+            type: File
         - name: cgroup
           hostPath:
             path: /sys/fs/cgroup
@@ -917,7 +930,7 @@ spec:
       containers:
         - name: events
           image: ghcr.io/johanlindvall/kubescrape:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command: ["/kubescrape-agent"]
           args:
             # Every per-node pipeline off: this replica only runs the
@@ -1055,7 +1068,7 @@ spec:
       containers:
         - name: kubescrape
           image: ghcr.io/johanlindvall/kubescrape:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -1158,7 +1171,7 @@ spec:
       containers:
         - name: servicegraph
           image: ghcr.io/johanlindvall/kubescrape:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command: ["/kubescrape-agent"]
           args:
             # Every per-node pipeline off: this tier does traces and nothing

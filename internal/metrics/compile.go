@@ -167,6 +167,7 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 			log:        cfg.log,
 			drops:      cfg.drops,
 			now:        cfg.now,
+			role:       roleLogMetric,
 		})
 		shared[name] = rule.series
 	}

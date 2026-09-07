@@ -147,6 +147,14 @@ func (r *Reader) Run(ctx context.Context) {
 			return
 		}
 		bo.ResetIfHealthy(started)
+		// The consumer is rebuilt for exactly one class of error — one no
+		// further fetch can clear, which fatalFetchErr admits as a cluster-wide
+		// authorization or SASL failure — and both that line and this one say
+		// the rebuild reads credentials afresh. Make it so: the connection
+		// string is re-read by the SASL session itself, while a cached Entra
+		// token would otherwise be re-presented for up to ~55 minutes, so an
+		// operator who FIXES the role assignment would see no recovery.
+		r.cfg.Kafka.invalidateCredentials()
 		r.log.Warn("event hubs consumer stopped; reopening", "error", err, "backoff", bo.Delay())
 		bo.Sleep(ctx)
 	}

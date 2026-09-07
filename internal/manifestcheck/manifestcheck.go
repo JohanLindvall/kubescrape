@@ -17,9 +17,11 @@ package manifestcheck
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -45,41 +47,91 @@ var docSeparator = regexp.MustCompile(`(?m)^---[ \t]*$`)
 // with. Manifests without it run the metadata service.
 const AgentCommand = "/kubescrape-agent"
 
-// Flags returns the flag names each manifest under dirs passes to a binary,
-// keyed by manifest path. When agent is true only the manifests running the
-// agent are considered, otherwise only those running the metadata service.
-func Flags(dirs []string, agent bool) (map[string][]string, error) {
-	out := map[string][]string{}
+// IsManifest reports whether a file name is one of the shipped manifests.
+//
+// BOTH YAML extensions, because helm and kubectl both accept both: a template
+// renamed .yml would otherwise have every flag it passes silently excluded from
+// the assertion, and the vacuity guard in each binary's test is whole-corpus
+// (it only asks whether ANY manifest was found), so it cannot see one file drop
+// out.
+func IsManifest(name string) bool {
+	switch filepath.Ext(name) {
+	case ".yaml", ".yml":
+		return true
+	}
+	return false
+}
+
+// ManifestFiles walks dirs and returns every manifest under them, in a stable
+// order. It is the ONE listing every guard over the shipped manifests uses —
+// this package's flag check, its host-mount check, and internal/chartcheck's
+// scans — because a guard that reads a SUBSET of the corpus reports "pass" for
+// a file it never opened, which is worse than no guard.
+//
+// WALKED rather than listed, because helm renders a template in a subdirectory
+// of templates/ exactly like a flat one (verified against the pinned helm:
+// `helm template` on templates/sub/deep.yaml emits it). A flat os.ReadDir meant
+// that grouping templates into templates/rbac/ dropped them all out of the
+// check silently.
+func ManifestFiles(dirs ...string) ([]string, error) {
+	var out []string
 	for _, dir := range dirs {
-		entries, err := os.ReadDir(dir)
+		err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() && IsManifest(d.Name()) {
+				out = append(out, path)
+			}
+			return nil
+		})
 		if err != nil {
 			return nil, fmt.Errorf("reading %s: %w", dir, err)
 		}
-		for _, e := range entries {
-			if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" {
+	}
+	// WalkDir is lexical per directory; sorting the whole result makes the
+	// order independent of how the dirs were split up.
+	sort.Strings(out)
+	return out, nil
+}
+
+// Flags returns the flag names each manifest under dirs passes to a binary,
+// keyed by manifest path. When agent is true only the manifests running the
+// agent are considered, otherwise only those running the metadata service.
+//
+// The tree is WALKED, not listed. helm renders a template in a SUBDIRECTORY of
+// templates/ exactly like a flat one (verified against the pinned helm), so a
+// flat os.ReadDir meant that moving one template into templates/rbac/ — or
+// adding a chart of nested templates — dropped every flag in it out of the
+// check with nothing to say so, on the one artefact this package exists to
+// guard: a flag the binary no longer defines is a fleet-wide CrashLoopBackOff
+// with one line of container log.
+func Flags(dirs []string, agent bool) (map[string][]string, error) {
+	paths, err := ManifestFiles(dirs...)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string][]string{}
+	for _, path := range paths {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("reading %s: %w", path, err)
+		}
+		var names []string
+		for _, doc := range docSeparator.Split(string(b), -1) {
+			// Only container specs carry flags; skip RBAC, Services, CRDs.
+			if !strings.Contains(doc, "args:") && !strings.Contains(doc, "command:") {
 				continue
 			}
-			path := filepath.Join(dir, e.Name())
-			b, err := os.ReadFile(path)
-			if err != nil {
-				return nil, fmt.Errorf("reading %s: %w", path, err)
+			if strings.Contains(doc, AgentCommand) != agent {
+				continue
 			}
-			var names []string
-			for _, doc := range docSeparator.Split(string(b), -1) {
-				// Only container specs carry flags; skip RBAC, Services, CRDs.
-				if !strings.Contains(doc, "args:") && !strings.Contains(doc, "command:") {
-					continue
-				}
-				if strings.Contains(doc, AgentCommand) != agent {
-					continue
-				}
-				for _, m := range argPattern.FindAllStringSubmatch(doc, -1) {
-					names = append(names, m[1])
-				}
+			for _, m := range argPattern.FindAllStringSubmatch(doc, -1) {
+				names = append(names, m[1])
 			}
-			if len(names) > 0 {
-				out[path] = names
-			}
+		}
+		if len(names) > 0 {
+			out[path] = names
 		}
 	}
 	return out, nil

@@ -24,6 +24,8 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 	"go.opentelemetry.io/collector/pdata/pcommon"
+
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 // recordingLogger captures rendered lines so a test can assert both HOW MANY
@@ -179,4 +181,48 @@ func firstLines(s string, n int) string {
 		lines = lines[:n]
 	}
 	return strings.Join(lines, "\n")
+}
+
+// The third door, and the one the key rule's own argument missed: "bounded by
+// the cluster's own objects" is bounded PER INSTANT, while this table lives for
+// the PROCESS. A cluster that keeps creating owner-less annotated pods (kubectl
+// run, debug pods carrying prometheus.io/scrape=true) minted one permanent key
+// per incarnation, so past maxWarnKeys the agent could never again warn about a
+// kubelet 403 or a monitor it cannot compile. No target content is involved —
+// the churn is Kubernetes' own — which is why it is keyed by namespace alone.
+func TestOwnerlessPodsDoNotChurnWarnKeys(t *testing.T) {
+	keys := map[string]bool{}
+	for i := range 4096 {
+		// A fresh owner-less pod every time.
+		keys[warnTarget(podTargetIn("debug", fmt.Sprintf("shell-%d", i), nil))] = true
+	}
+	if len(keys) != 1 {
+		t.Fatalf("%d owner-less pod incarnations minted %d warn keys, want 1 — %d of them wedge the table shut for the process",
+			4096, len(keys), maxWarnKeys)
+	}
+
+	// The distinctions that still MATTER are kept: namespace, source, and the
+	// workload root of an owned pod.
+	distinct := map[string]bool{}
+	for _, tgt := range []kubemeta.ScrapeTarget{
+		podTargetIn("debug", "shell-1", nil),
+		podTargetIn("other", "shell-1", nil),
+		podTargetIn("debug", "web-1", []kubemeta.Owner{{Kind: "Deployment", Name: "web"}}),
+		podTargetIn("debug", "api-1", []kubemeta.Owner{{Kind: "Deployment", Name: "api"}}),
+	} {
+		distinct[warnTarget(tgt)] = true
+	}
+	if len(distinct) != 4 {
+		t.Fatalf("namespace/owner distinctions collapsed into %d keys, want 4", len(distinct))
+	}
+}
+
+// podTargetIn is an annotation-discovered POD target: no Service and no
+// Monitor, so warnTarget reaches its pod arms.
+func podTargetIn(namespace, name string, owners []kubemeta.Owner) kubemeta.ScrapeTarget {
+	return kubemeta.ScrapeTarget{
+		URL:    "http://10.4.0.1:9090/metrics",
+		Source: "pod",
+		Pod:    kubemeta.Pod{Namespace: namespace, Name: name, Owners: owners},
+	}
 }

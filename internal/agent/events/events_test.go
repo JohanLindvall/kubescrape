@@ -688,6 +688,41 @@ func TestBookmarkNeverWalksThePositionBackwards(t *testing.T) {
 	}
 }
 
+// The same two guards on the OTHER bookmark arm — the one handle() takes when
+// nothing is buffered, which applies the bookmark itself instead of leaving it
+// to settle. One decision, two places, so they must answer alike: never
+// backwards, and the pending copy spent rather than left for the next
+// emptying flush to apply a second time.
+func TestIdleBookmarkAppliesTheSameGuardsAsAFlush(t *testing.T) {
+	r, _, _ := newReader(t, Config{})
+	ctx := context.Background()
+	r.committed.ResourceVersion = "9900400"
+
+	stale := &corev1.Event{ObjectMeta: metav1.ObjectMeta{ResourceVersion: "9900150"}}
+	if err := r.handle(ctx, watch.Event{Type: watch.Bookmark, Object: stale}); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.committed.ResourceVersion; got != "9900400" {
+		t.Errorf("committed %q; a bookmark older than the committed position must not roll it back — a restart then redelivers everything after it", got)
+	}
+	if got := r.pendingRV; got != "" {
+		t.Errorf("pendingRV = %q; a bookmark this arm consumed must not be left for the next flush to apply again", got)
+	}
+
+	// A NEWER one still applies immediately: that is what keeps an idle
+	// cluster's position inside the API server's watch window.
+	fresh := &corev1.Event{ObjectMeta: metav1.ObjectMeta{ResourceVersion: "9900500"}}
+	if err := r.handle(ctx, watch.Event{Type: watch.Bookmark, Object: fresh}); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.committed.ResourceVersion; got != "9900500" {
+		t.Errorf("committed %q; an idle bookmark newer than the position must apply", got)
+	}
+	if got := r.pendingRV; got != "" {
+		t.Errorf("pendingRV = %q after an applied bookmark", got)
+	}
+}
+
 // The same guard on the batch itself: a relist delivers the TTL backlog in
 // store order, so a later flush can carry entries OLDER than what an earlier
 // one already committed. settle must keep the maximum.

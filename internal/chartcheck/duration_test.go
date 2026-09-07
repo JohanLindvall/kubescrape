@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/JohanLindvall/kubescrape/internal/manifestcheck"
 )
 
 // durationValues is every chart value the templates render into a
@@ -525,7 +527,10 @@ var (
 // than no guard: the green check is read as coverage).
 func chartValuePaths(t *testing.T) map[string][]string {
 	t.Helper()
-	files, err := filepath.Glob(filepath.Join("..", "..", "charts", "kubescrape", "templates", "*.yaml"))
+	// Walked, not globbed — see manifestcheck.ManifestFiles: helm renders a
+	// template in a subdirectory like a flat one, and a value path this guard
+	// never reads is a value path nothing checks.
+	files, err := manifestcheck.ManifestFiles(filepath.Join("..", "..", "charts", "kubescrape", "templates"))
 	if err != nil || len(files) == 0 {
 		t.Fatalf("no chart templates found (err=%v)", err)
 	}

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -206,6 +207,169 @@ func TestExportConfigValidateRefusesSignalsInOrder(t *testing.T) {
 		err := cfg.Validate()
 		if err == nil || !strings.Contains(err.Error(), "export.logs.protocol") {
 			t.Fatalf("Validate = %v, want the logs override refused first", err)
+		}
+	}
+}
+
+// A per-signal override naming its OWN endpoint names a DIFFERENT host, so it
+// must not inherit the flag base's collector credentials — the bearer token,
+// the CA bundle and the skip-verify trust decision that -otlp-* configure for
+// the deployment's own collector. Copying the base wholesale presented all
+// three to whatever backend the override named (a third-party SaaS host in the
+// documented collectorless shape), with no per-signal field to opt out with.
+//
+// The section's OWN base additions still apply, and so does plaintext-ness:
+// both are argued at signalConfig.
+func TestOwnEndpointSignalDoesNotInheritBaseCredentials(t *testing.T) {
+	base := Config{
+		Endpoint:           "otel-collector.monitoring:4317",
+		Protocol:           "grpc",
+		Insecure:           true,
+		InsecureSkipVerify: true,
+		CAFile:             "/etc/certs/collector-ca.crt",
+		BearerTokenFile:    "/var/run/secrets/collector-token",
+		Headers:            map[string]string{"X-Flag-Header": "collector"},
+		Timeout:            9 * time.Second,
+		RetryAttempts:      4,
+		MaxSendBytes:       123456,
+	}
+	cfg := &ExportConfig{
+		Headers:        map[string]string{"X-Scope-OrgID": "platform"},
+		ClientCertFile: "/etc/certs/client.crt",
+		ClientKeyFile:  "/etc/certs/client.key",
+		Traces:         &ExportOverride{Endpoint: "https://tempo-prod-04.grafana.net/otlp", Protocol: "http"},
+	}
+	got := cfg.signalConfig(cfg.Traces, base)
+
+	if got.Endpoint != "https://tempo-prod-04.grafana.net/otlp" {
+		t.Fatalf("endpoint = %q, want the override's", got.Endpoint)
+	}
+	for _, tc := range []struct{ what, got string }{
+		{"bearerTokenFile", got.BearerTokenFile},
+		{"caFile", got.CAFile},
+	} {
+		if tc.got != "" {
+			t.Errorf("%s = %q crossed to the override's own endpoint; the flag base's credential is the COLLECTOR's", tc.what, tc.got)
+		}
+	}
+	if got.InsecureSkipVerify {
+		t.Error("insecureSkipVerify crossed to the override's own endpoint: the third party's certificate would not be verified")
+	}
+	if _, ok := got.Headers["X-Flag-Header"]; ok {
+		t.Error("a flag-base header crossed to the override's own endpoint")
+	}
+
+	// The section's own additions are declared beside the endpoint, at
+	// every-signal scope, and still apply — the documented collectorless
+	// example depends on it.
+	if got.Headers["X-Scope-OrgID"] != "platform" {
+		t.Errorf("export.headers = %v, want the section's tenancy header applied", got.Headers)
+	}
+	if got.ClientCertFile != cfg.ClientCertFile || got.ClientKeyFile != cfg.ClientKeyFile {
+		t.Errorf("client cert = %q/%q, want the section's mTLS identity", got.ClientCertFile, got.ClientKeyFile)
+	}
+	// Plaintext-ness is transport to the named host, not a credential.
+	if !got.Insecure {
+		t.Error("insecure was not carried; an own-endpoint signal written against a plaintext collector would flip to TLS on upgrade")
+	}
+	// Transport tuning is the inheritable half, by definition.
+	if got.Timeout != base.Timeout || got.RetryAttempts != base.RetryAttempts || got.MaxSendBytes != base.MaxSendBytes {
+		t.Errorf("transport tuning not inherited: %+v", got)
+	}
+
+	// The override's own credentials are still honoured — dropping the base's
+	// is not a refusal to authenticate, it is a refusal to REUSE.
+	cfg.Traces.BearerTokenFile = "/var/run/secrets/tempo-token"
+	cfg.Traces.CAFile = "/etc/certs/tempo-ca.crt"
+	yes := true
+	cfg.Traces.InsecureSkipVerify = &yes
+	got = cfg.signalConfig(cfg.Traces, base)
+	if got.BearerTokenFile != "/var/run/secrets/tempo-token" || got.CAFile != "/etc/certs/tempo-ca.crt" || !got.InsecureSkipVerify {
+		t.Errorf("the override's own credentials were not applied: %+v", got)
+	}
+}
+
+// The reflective half of the rule above: with a bare section, NOTHING
+// destination-scoped may reach an own-endpoint signal except the endpoint
+// itself and the plaintext decision. A new credential field on Config fails
+// this test until signalConfig is taught about it — the same job
+// TestConfigFieldsAreClassified does for TransportOnly.
+func TestNoDestinationFieldCrossesToAnOwnEndpointSignal(t *testing.T) {
+	base := fillConfig(t)
+	base.Endpoint = "otel-collector.monitoring:4317"
+	cfg := &ExportConfig{Logs: &ExportOverride{Endpoint: "https://loki.example.com/otlp"}}
+	got := reflect.ValueOf(cfg.signalConfig(cfg.Logs, base))
+	typ := got.Type()
+	// Endpoint is the override's; Insecure is transport to the named host.
+	carried := map[string]bool{"Endpoint": true, "Insecure": true}
+	for i := 0; i < typ.NumField(); i++ {
+		name := typ.Field(i).Name
+		if !destinationFields[name] || carried[name] {
+			continue
+		}
+		if !got.Field(i).IsZero() {
+			t.Errorf("Config.%s = %v reached a signal naming its own endpoint; a destination-scoped field must come from the override or stay unset",
+				name, got.Field(i).Interface())
+		}
+	}
+}
+
+// A signal whose override has no endpoint of its own — or repeats the flag
+// base's — is still aimed at the base destination, so the base's credentials
+// still belong to it. Dropping them there would break every deployment that
+// overrides only headers or a protocol.
+func TestSignalWithoutItsOwnEndpointStillInheritsTheBase(t *testing.T) {
+	base := Config{
+		Endpoint:        "otel-collector.monitoring:4317",
+		BearerTokenFile: "/var/run/secrets/collector-token",
+		CAFile:          "/etc/certs/collector-ca.crt",
+	}
+	cfg := &ExportConfig{
+		Logs:    &ExportOverride{Headers: map[string]string{"X-Scope-OrgID": "logs"}},
+		Metrics: &ExportOverride{Endpoint: base.Endpoint, Compression: "none"},
+	}
+	for _, tc := range []struct {
+		name string
+		o    *ExportOverride
+	}{{"logs", cfg.Logs}, {"metrics", cfg.Metrics}} {
+		got := cfg.signalConfig(tc.o, base)
+		if got.Endpoint != base.Endpoint {
+			t.Errorf("%s endpoint = %q, want the base's", tc.name, got.Endpoint)
+		}
+		if got.BearerTokenFile != base.BearerTokenFile || got.CAFile != base.CAFile {
+			t.Errorf("%s lost the base credentials for a destination that IS the base: %+v", tc.name, got)
+		}
+	}
+}
+
+// The warning behind the rule fires only where behaviour actually differs from
+// a naive merge: a credential the base does not carry, one the override
+// replaces, or a destination that IS the base has nothing to report, and a
+// warning on those would train an operator to ignore the one that matters.
+func TestDroppedBaseCredentialsNamesOnlyWhatActuallyStopped(t *testing.T) {
+	base := Config{Endpoint: "collector:4317", BearerTokenFile: "/tok", CAFile: "/ca", InsecureSkipVerify: true}
+	own := "https://tempo.example.com/otlp"
+
+	got := droppedBaseCredentials(&ExportOverride{Endpoint: own}, base)
+	want := []string{"-otlp-bearer-token-file", "-otlp-tls-ca-file", "-otlp-tls-insecure-skip-verify"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("dropped = %v, want %v (in flag order, so two runs name them the same way)", got, want)
+	}
+
+	no := false
+	for _, tc := range []struct {
+		name string
+		o    *ExportOverride
+		base Config
+	}{
+		{"no endpoint of its own", &ExportOverride{}, base},
+		{"the base's own endpoint", &ExportOverride{Endpoint: base.Endpoint}, base},
+		{"its own credentials throughout", &ExportOverride{
+			Endpoint: own, BearerTokenFile: "/t2", CAFile: "/ca2", InsecureSkipVerify: &no}, base},
+		{"a base carrying no credential", &ExportOverride{Endpoint: own}, Config{Endpoint: base.Endpoint}},
+	} {
+		if got := droppedBaseCredentials(tc.o, tc.base); got != nil {
+			t.Errorf("%s: dropped = %v, want nothing to warn about", tc.name, got)
 		}
 	}
 }

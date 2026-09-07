@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 )
 
 func capturedLog() (*slog.Logger, func() string) {
@@ -170,5 +172,98 @@ func TestQuietSweepsDoNotSpendTheThrottleSlot(t *testing.T) {
 	b.Sweep(ctx)
 	if !strings.Contains(dump(), "byMaxTraces=1") {
 		t.Errorf("the first binding drain was suppressed by an earlier quiet one:\n%s", dump())
+	}
+}
+
+// A graceful stop's early decisions RIDE the line once a real bound has forced
+// one out.
+//
+// any() deliberately leaves reasonShutdown out of the decision to WRITE the
+// line (every rolling update decides its whole buffer early, by design, and a
+// scary line about it would be noise). It says, and the operator needs, that
+// the count still appears when a real bound also bound — which is exactly the
+// window in which "how much of this burst was the stop?" is the question being
+// asked. The field was populated and zeroed and never rendered.
+func TestEarlyReportNamesShutdownDecisions(t *testing.T) {
+	b, _, dump := newLoggingBuffer(t, Config{Config: alwaysCfg(), DecisionWait: "1m", MaxTraces: 1})
+	ctx := context.Background()
+
+	// maxTraces forces trace 1 out early; trace 2 stays buffered.
+	for i := uint64(1); i <= 2; i++ {
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: i, span: 1, end: 5})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The graceful stop then decides trace 2 early too, in the same window.
+	b.Flush(ctx)
+
+	out := dump()
+	if n := strings.Count(out, "decided before their decisionWait"); n != 1 {
+		t.Fatalf("want one aggregate line, got %d:\n%s", n, out)
+	}
+	if !strings.Contains(out, "byMaxTraces=1") {
+		t.Errorf("the bound that forced the line is not on it:\n%s", out)
+	}
+	if !strings.Contains(out, "byShutdown=1") {
+		t.Errorf("the shutdown tally is collected and then never rendered; the line cannot separate the stop from the bound:\n%s", out)
+	}
+}
+
+// The two failed-export lines hold SEPARATE throttles.
+//
+// They describe one downstream condition and therefore co-occur, but only one
+// of them reports LOSS: ExportTraces' line says a push was NACKed, which costs
+// nothing (the sender still holds every span and retransmits), while the
+// drain's says spans whose senders were acked at buffering time have been
+// destroyed. The NACK line is emitted from every concurrent receive goroutine
+// and is thus far the more frequent, so with one shared gate it claimed the
+// slot and suppressed the only line that names spans actually lost — leaving a
+// log that reads as if the senders had it covered. Same rule as the tailer's
+// unresolved-file / metadata-budget pair.
+func TestLossReportIsNotStarvedByTheNackReport(t *testing.T) {
+	cap := &capture{}
+	log, dump := capturedLog()
+	b, err := New(Config{Config: alwaysCfg(), DecisionWait: "1s"}, cap, log)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	clk := newClock()
+	b.now = clk.now
+	ctx := context.Background()
+
+	// Decide trace 1 while the collector is healthy, so its keep is cached and
+	// later spans for it are LATE spans: those ride out on the receive path.
+	if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 1, span: 1, end: 5})); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(2 * time.Second)
+	b.Sweep(ctx)
+
+	// A permanent rejection: sendRetry does not sleep on one, so the drain
+	// below fails on its first attempt.
+	cap.fail(&otlpexport.HTTPStatusError{Code: 400, Body: "bad batch"})
+
+	// Three NACKed late-span pushes. Nothing is lost — the senders keep them —
+	// and the line is throttled to one, which is the whole point: it holds the
+	// window.
+	for i := uint64(2); i <= 4; i++ {
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 1, span: i, end: 5})); err == nil {
+			t.Fatal("a failing collector must fail the push")
+		}
+	}
+	if n := strings.Count(dump(), "the push is NACKed"); n != 1 {
+		t.Fatalf("the NACK line is not throttled (%d lines):\n%s", n, dump())
+	}
+
+	// Now spans that really are lost: buffered (their senders acked), decided
+	// by the sweep, and refused by the collector on the final attempt.
+	if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 2, span: 1, end: 5})); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(2 * time.Second)
+	b.Sweep(ctx)
+
+	if !strings.Contains(dump(), "their senders were acked at buffering time") {
+		t.Errorf("the data-loss line was starved by the harmless NACK line — an operator reads a log saying the senders have it covered while buffered spans are destroyed:\n%s", dump())
 	}
 }

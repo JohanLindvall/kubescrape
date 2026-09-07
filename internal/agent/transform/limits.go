@@ -29,7 +29,11 @@ package transform
 //     is the only layer that can bound a ONE-INSTRUCTION allocation, which is
 //     why the `*` and `+` operators are rewritten into calls to it (rewrite.go)
 //     — an operator has no hook, and a watchdog that can only interrupt
-//     BETWEEN steps never sees the 17 GB happen.
+//     BETWEEN steps never sees the 17 GB happen. Every guard here is
+//     PREDICTIVE for the same reason: a charge taken after the value exists
+//     can report the pathology but cannot prevent it, which is why str()/repr()
+//     project their render (renderSize) and re.replace/re.findall project their
+//     result (builtins.go) instead of charging what they just built.
 //   - PER INVOCATION (budget.alloc): every guarded allocation is charged, so
 //     accumulating bounded values in a loop is bounded too.
 //   - WALL CLOCK (budget.start): checked between interpreter steps via
@@ -114,6 +118,21 @@ const (
 	// bytesPerValue is what one element of a materialised sequence costs
 	// before its payload: a starlark.Value is a 16-byte interface word pair.
 	bytesPerValue = 16
+
+	// maxRenderDepth bounds how deep renderSize resolves a nested container
+	// before it falls back to charging its elements a minimum. It is what
+	// makes the projection terminate on a self-referential value (`l = []`
+	// then `l.append(l)`) and what bounds the projection's own cost; 4 is
+	// deeper than any structure a transform has business rendering.
+	maxRenderDepth = 4
+
+	// The floor renderSize charges each part of a render, so that a walk it
+	// cannot resolve exactly is still an over-estimate of nothing: a scalar
+	// renders as at least one character, a container adds its two brackets,
+	// and each element adds its ", " separator.
+	minRenderBytes = 1
+	bracketBytes   = 2
+	sepBytes       = 2
 )
 
 // wallClock bounds one invocation's elapsed time. Generous — a no-op pass over
@@ -167,8 +186,36 @@ func (b *budget) spend(n int64) error {
 	if b == nil {
 		return nil
 	}
-	b.alloc += n
-	if b.alloc > maxAllocBytes {
+	b.alloc = satAdd(b.alloc, n)
+	return b.overBudget(b.alloc)
+}
+
+// project reports whether building an n-byte value WOULD blow the invocation
+// budget, without charging it. It is what the predictive guards ask before
+// allocating; spend charges the value once it exists, so the two never
+// double-count.
+func (b *budget) project(n int64) error {
+	if b == nil {
+		return nil
+	}
+	return b.overBudget(satAdd(b.alloc, n))
+}
+
+// remaining is what this invocation may still build. It is the ceiling the
+// predictive guards short-circuit against, so a probe never costs more than
+// the value it is deciding about.
+func (b *budget) remaining() int64 {
+	if b == nil {
+		return maxAllocBytes
+	}
+	if b.alloc >= maxAllocBytes {
+		return 0
+	}
+	return maxAllocBytes - b.alloc
+}
+
+func (b *budget) overBudget(total int64) error {
+	if total > maxAllocBytes {
 		return fmt.Errorf("script allocated more than %d bytes in one invocation (strings, sequences and materialising builtins are charged; the batch itself is not) — build less per batch",
 			int64(maxAllocBytes))
 	}
@@ -251,6 +298,16 @@ func intBits(v starlark.Value) (int64, bool) {
 		return 64, false
 	}
 	return int64(i.BigInt().BitLen()), true
+}
+
+// satAdd is a + b saturated at MaxInt64, for the same reason as satMul: a
+// projection sums terms that are themselves saturated, and a wrapped negative
+// would read as "small". Both operands are non-negative sizes.
+func satAdd(a, b int64) int64 {
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
 }
 
 // satMul is a * b saturated at MaxInt64: the product of a repeat count and an
@@ -576,6 +633,69 @@ func boundedInt() *starlark.Builtin {
 	})
 }
 
+// renderSize projects how many bytes str()/repr() will build for v WITHOUT
+// building anything — the missing half of the materialiser bound, and the
+// reason it is needed: the element-COUNT check below bounds the number of
+// references a materialiser copies, which is the whole cost of list()/tuple()/
+// sorted() and friends, but str() and repr() render each element's CONTENTS,
+// so a legal small sequence of large strings (`str([body] * 1024)`) renders to
+// a multiple of the batch with every count and per-value bound respected.
+//
+// It is a LOWER bound on the real render (escapes, type names, float digits
+// and dict punctuation only add), which is what a refusal needs: a value whose
+// projection fits is never refused, and one whose projection is over the
+// ceiling really is over it. It stops descending at maxRenderDepth and stops
+// accumulating once it passes limit, so a cyclic value terminates and a value
+// already over the ceiling is refused after a handful of elements instead of a
+// full walk.
+func renderSize(v starlark.Value, depth int, limit int64) int64 {
+	if n, ok := textLen(v); ok {
+		return n
+	}
+	switch c := v.(type) {
+	case *starlark.Dict:
+		if depth >= maxRenderDepth {
+			return satAdd(bracketBytes, satMul(int64(c.Len()), minRenderBytes+sepBytes))
+		}
+		total := int64(bracketBytes)
+		iter := c.Iterate()
+		defer iter.Done()
+		var k starlark.Value
+		for iter.Next(&k) && total <= limit {
+			total = satAdd(total, 2*sepBytes) // ": " between, ", " after
+			total = satAdd(total, renderSize(k, depth+1, limit))
+			if val, found, err := c.Get(k); found && err == nil {
+				total = satAdd(total, renderSize(val, depth+1, limit))
+			}
+		}
+		return total
+	case starlark.Indexable: // list, tuple — read by position, no iterator
+		if depth >= maxRenderDepth {
+			return satAdd(bracketBytes, satMul(int64(c.Len()), minRenderBytes+sepBytes))
+		}
+		total := int64(bracketBytes)
+		for i, n := 0, c.Len(); i < n && total <= limit; i++ {
+			total = satAdd(total, sepBytes)
+			total = satAdd(total, renderSize(c.Index(i), depth+1, limit))
+		}
+		return total
+	case starlark.Sequence: // set, and anything else iterable with a length
+		if depth >= maxRenderDepth {
+			return satAdd(bracketBytes, satMul(int64(c.Len()), minRenderBytes+sepBytes))
+		}
+		total := int64(bracketBytes)
+		iter := c.Iterate()
+		defer iter.Done()
+		var e starlark.Value
+		for iter.Next(&e) && total <= limit {
+			total = satAdd(total, sepBytes)
+			total = satAdd(total, renderSize(e, depth+1, limit))
+		}
+		return total
+	}
+	return minRenderBytes
+}
+
 // materialisers are the universe builtins whose result grows with their input:
 // each is shadowed by a wrapper that charges what it built. Name resolution
 // consults predeclared BEFORE the universe (resolve.useToplevel), so these
@@ -583,11 +703,19 @@ func boundedInt() *starlark.Builtin {
 // TestBoundedBuiltinsShadowTheUniverse proves it.
 var materialisers = []string{"bytes", "dict", "enumerate", "list", "repr", "reversed", "set", "sorted", "str", "tuple", "zip"}
 
+// renderers are the materialisers whose output is a STRING built from its
+// input's contents rather than a sequence of references to it, i.e. the ones
+// whose result is not bounded by the element-count check. bytes() is not one:
+// its result is either its string argument or one byte per element, both
+// already inside maxStringBytes/maxSeqElems.
+var renderers = map[string]bool{"repr": true, "str": true}
+
 func boundedMaterialiser(name string) *starlark.Builtin {
 	inner, ok := starlark.Universe[name].(*starlark.Builtin)
 	if !ok {
 		panic("transform: no universe builtin named " + name) // a starlark-go upgrade removed it
 	}
+	renders := renderers[name] // resolved once per program, not per call
 	return starlark.NewBuiltin(name, func(th *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 		bud := budgetOf(th)
 		if err := bud.overtime(); err != nil {
@@ -602,6 +730,24 @@ func boundedMaterialiser(name string) *starlark.Builtin {
 				return nil, positioned(th, fmt.Errorf("%s() of %d elements is over the %d-element limit", name, s.Len(), int64(maxSeqElems)))
 			}
 		}
+		// A RENDER is bounded by what it will build, not by what it is given:
+		// the count check above bounds a copy of references, which is the
+		// whole cost of the other materialisers, but str()/repr() write out
+		// every element's contents.
+		if renders && len(args) == 1 {
+			limit := int64(maxStringBytes)
+			if r := bud.remaining(); r < limit {
+				limit = r
+			}
+			sz := renderSize(args[0], 0, limit)
+			if sz > maxStringBytes {
+				return nil, positioned(th, fmt.Errorf("%s() would build a string of at least %d bytes, over the %d-byte limit for one value — render less per call",
+					name, sz, int64(maxStringBytes)))
+			}
+			if err := bud.project(sz); err != nil {
+				return nil, positioned(th, err)
+			}
+		}
 		v, err := inner.CallInternal(th, args, kwargs)
 		if err != nil {
 			return nil, err
@@ -613,9 +759,16 @@ func boundedMaterialiser(name string) *starlark.Builtin {
 	})
 }
 
-// valueBytes is what a materialised value costs, charged AFTER the fact: these
-// builtins cannot exceed a per-value limit without an over-limit input (which
-// is refused above), so the accounting exists to bound REPETITION, not one call.
+// valueBytes is what a materialised value costs, charged AFTER it is built.
+//
+// This used to claim these builtins "cannot exceed a per-value limit without
+// an over-limit input (which is refused above)", and that was false for the
+// two whose result is a RENDER: `str([body] * 1024)` passes the element-count
+// check on a 1024-element sequence and builds a thousand copies of the body,
+// so the charge arrived after ~1.5 GiB had already been allocated. What the
+// input check bounds is the number of references a materialiser COPIES;
+// renderSize bounds what a render WRITES, before the call. The charge here
+// still exists to bound REPETITION — a loop of individually legal calls.
 func valueBytes(v starlark.Value) int64 {
 	switch v := v.(type) {
 	case starlark.String:

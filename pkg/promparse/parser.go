@@ -734,25 +734,49 @@ func (p *Parser) setMeta(family string, help, unit string) {
 	if help == "" && unit == "" {
 		return
 	}
-	// Bounded like the TYPE table, and by BYTES as well: these values are free
-	// text, which a count cap alone would not bound. The charge is monotonic —
-	// a family redeclaring its HELP pays twice — which only ever makes the
-	// bound conservative.
-	if len(p.metas) >= MaxTrackedFamilies || p.metaBytes >= maxMetaBytes {
+	m, seen := p.metas[family]
+	// The empty string leaves the other field alone, so what this call RETAINS
+	// is the merged pair.
+	if help == "" {
+		help = m.help
+	}
+	if unit == "" {
+		unit = m.unit
+	}
+	if seen && help == m.help && unit == m.unit {
+		// A redeclaration of the same text retains nothing new and changes
+		// nothing, so it must neither charge the budget nor invalidate the
+		// per-name memo (an unconditional invalidation restored classifyCached's
+		// map probe and suffix walks for every sample of a family whose exporter
+		// repeats its HELP).
 		return
 	}
-	p.metaBytes += len(family) + len(help) + len(unit)
+	// Bounded like the TYPE table, and by BYTES as well: these values are free
+	// text, which a count cap alone would not bound. The charge is what this
+	// call newly RETAINS — the key on first insert (a map assignment to an
+	// existing key keeps the ORIGINAL key string) plus the growth of the text —
+	// and never one charge per DECLARATION: exporters that repeat a family's
+	// HELP before every one of its samples exist, the same ones that repeat its
+	// TYPE, and charging them again each time spent the 1 MiB budget on one
+	// legitimate family after ~10k lines and left every family declared later in
+	// the exposition with no OTLP Description and no Unit — silently, with
+	// nothing counted, and with the missing unit changing what the downstream
+	// OTLP→Prometheus rewrite names those series.
+	add := len(help) + len(unit) - len(m.help) - len(m.unit)
+	if !seen {
+		if len(p.metas) >= MaxTrackedFamilies {
+			return // over the table bound: a deliberate cap, not malformed
+		}
+		add += len(family)
+	}
+	if add > 0 && p.metaBytes+add > maxMetaBytes {
+		return
+	}
+	p.metaBytes += add
 	if p.metas == nil {
 		p.metas = make(map[string]familyMeta, 16)
 	}
-	m := p.metas[family]
-	if help != "" {
-		m.help = help
-	}
-	if unit != "" {
-		m.unit = unit
-	}
-	p.metas[family] = m
+	p.metas[family] = familyMeta{help: help, unit: unit}
 	p.lastClassOK = false // the memo may hold the family just redeclared
 }
 
@@ -904,7 +928,7 @@ func (p *Parser) parseSample(line []byte) (Sample, bool) {
 	p.labels = p.labels[:0]
 	if len(rest) > 0 && rest[0] == '{' {
 		var ok bool
-		rest, ok = p.parseLabels(rest[1:], &p.labels, &p.lastKV)
+		rest, ok = p.parseLabels(rest[1:], &p.labels, &p.lastKV, &p.detail)
 		if !ok {
 			return s, false
 		}
@@ -954,7 +978,7 @@ func (p *Parser) parseQuotedNameSample(line []byte) (Sample, bool) {
 		rem = rem[1:]
 	}
 	p.labels = p.labels[:0]
-	rem, ok = p.parseLabels(rem, &p.labels, &p.lastKV)
+	rem, ok = p.parseLabels(rem, &p.labels, &p.lastKV, &p.detail)
 	if !ok {
 		return s, false
 	}
@@ -1022,7 +1046,7 @@ func (p *Parser) parseExemplar(rest []byte) (*Exemplar, bool) {
 		return nil, false
 	}
 	p.exLabels = p.exLabels[:0]
-	rest, ok := p.parseLabels(rest[1:], &p.exLabels, &p.exLastKV)
+	rest, ok := p.parseLabels(rest[1:], &p.exLabels, &p.exLastKV, nil)
 	if !ok {
 		return nil, false
 	}
@@ -1116,7 +1140,15 @@ func (p *Parser) parseTimestampToken(rest []byte) (int64, []byte, bool) {
 // remainder after the closing '}'. cache is the positional last-seen table
 // for this label block kind (sample labels vs exemplar labels — separate, so
 // exemplars do not evict the sample-label fast path).
-func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV) ([]byte, bool) {
+//
+// detail is where a refusal is ATTRIBUTED, and it is nil for the EXEMPLAR
+// block. MalformedDetail describes sample LINES DROPPED, and a broken exemplar
+// drops nothing — finishSample still emits its sample, and the fault is already
+// counted on badExemplars / kubescrape_scrape_exemplars_malformed_total. Bumping
+// the shared struct from here made the sum of MalformedDetail's fields exceed
+// the malformed total it is documented never to exceed, and made the operator's
+// line read `malformed=1 duplicateLabels=5000` for a scrape that lost one line.
+func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV, detail *MalformedDetail) ([]byte, bool) {
 	for {
 		rest = skipSpaceTab(rest)
 		if len(rest) == 0 {
@@ -1193,12 +1225,16 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV) ([]byte
 		// is uninterruptible by the scrape timeout; drop the line as malformed
 		// past the ceiling (see maxLabelsPerSample) before the scan runs again.
 		if len(*dst) >= maxLabelsPerSample {
-			p.detail.TooManyLabels++
+			if detail != nil {
+				detail.TooManyLabels++
+			}
 			return nil, false
 		}
 		for i := range *dst {
 			if (*dst)[i].Name == name {
-				p.detail.DuplicateLabels++
+				if detail != nil {
+					detail.DuplicateLabels++
+				}
 				return nil, false
 			}
 		}

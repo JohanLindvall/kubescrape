@@ -39,6 +39,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -309,14 +310,29 @@ func (br *BodyReader) Read(r *http.Request) ([]byte, int64, error) {
 		// Parameterized types ("application/x-protobuf; charset=...") are fine;
 		// only the media type itself must match.
 		if mt, _, err := mime.ParseMediaType(ct); err != nil || mt != "application/x-protobuf" {
-			return fail(fmt.Errorf("%w %q (want application/x-protobuf)", ErrUnsupportedType, ct))
+			// The value is CLIPPED into the error, not just onto the log line
+			// that carries it: this listener is unauthenticated and net/http
+			// admits a header block up to Server.MaxHeaderBytes (1 MiB by
+			// default), so an unclipped value renders at full size in the log's
+			// error= field and in the 415 body — which is the exact bound
+			// maxLoggedValueBytes exists to hold, walked around by the one
+			// attribute nobody thought to clip.
+			return fail(fmt.Errorf("%w %q (want application/x-protobuf)", ErrUnsupportedType, clipForLog(ct)))
 		}
 	}
 	var src io.Reader = body
 	var capped *cappedReader
-	switch enc := r.Header.Get("Content-Encoding"); enc {
+	// Content-coding tokens are case-INSENSITIVE (RFC 9110 8.4.1), so the token
+	// is folded before it is matched. An exact switch answered a proxy or SDK
+	// that title-cases its headers a PERMANENT 400 for `Gzip`, losing every
+	// batch it ever sent, while the Content-Type check one line up folds case
+	// for free inside mime.ParseMediaType — one door strict, its neighbour not.
+	// `x-gzip` is the same coding under its pre-RFC-2616 name and is admitted
+	// with it. Surrounding whitespace is not part of the token; net/http already
+	// trims it, and trimming again costs nothing and does not depend on that.
+	switch enc := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding"))); enc {
 	case "", "identity":
-	case "gzip": // OTel SDKs commonly gzip OTLP/HTTP
+	case "gzip", "x-gzip": // OTel SDKs commonly gzip OTLP/HTTP
 		// Allow one byte over the cap so an exactly-at-cap compressed body is
 		// not misreported as oversized; the decompressed cap below still holds.
 		capped = &cappedReader{r: body, remain: br.max + 1}
@@ -331,7 +347,9 @@ func (br *BodyReader) Read(r *http.Request) ([]byte, int64, error) {
 		defer func() { _ = zr.Close() }()
 		src = zr
 	default:
-		return fail(fmt.Errorf("%w %q (want gzip or identity)", errUnsupportedEncoding, enc))
+		// Clipped for the reason given at the media-type check above: the
+		// rendered error is a second, unbounded copy of a sender-chosen header.
+		return fail(fmt.Errorf("%w %q (want gzip or identity)", errUnsupportedEncoding, clipForLog(enc)))
 	}
 	// The cap applies to the decompressed size too (zip-bomb guard). Read one
 	// byte beyond it to distinguish at-cap from over-cap and reject the latter.

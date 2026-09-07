@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -294,6 +295,101 @@ func TestTrackedContainerIsNotRepointedAtASupervisorScope(t *testing.T) {
 	h.discover()
 	if got := h.tracked[cid]; got != nil && got.dir != own {
 		t.Errorf("re-pointed to %q after the container's own scope went away; the supervisor would be measured as the workload", got.dir)
+	}
+}
+
+// A GONE container is never re-pointed. It holds no descriptors and one thing
+// only: the window markGone preserved, which is the OOM-killed container's last
+// seconds. repointLocked would spend three descriptors on it and reset exactly
+// that window, so the next export would emit nothing for it and — for a
+// container no export has described yet — charge the too_short counter that is
+// supposed to be evidence about short-lived containers.
+func TestAGoneContainerIsNotRepointedAndKeepsItsFinalWindow(t *testing.T) {
+	h := newHarness(t)
+	cid := hexID(4)
+	pod := filepath.Join(h.root, "kubepods.slice", "kubepods-burstable.slice",
+		"kubepods-burstable-pod"+systemdUID(5)+".slice")
+	conmon := filepath.Join(pod, "crio-conmon-"+cid+".scope")
+	own := filepath.Join(pod, "crio-"+cid+".scope")
+
+	// Tracked at the only path there was, and measured.
+	makeContainer(t, conmon, 0, 4<<20, 0)
+	h.discover()
+	if got := h.tracked[cid]; got == nil || got.dir != conmon {
+		t.Fatalf("the first pass tracked %v, want the supervisor scope", got)
+	}
+	h.advance(time.Second)
+	setUsage(t, conmon, 4_000_000)
+	h.advance(time.Second) // 4 cores
+	setUsage(t, conmon, 4_100_000)
+	h.advance(time.Second) // 0.1 cores — two readings make a distribution
+
+	// It vanishes from a COMPLETE listing: descriptors released, window kept.
+	if err := os.RemoveAll(conmon); err != nil {
+		t.Fatal(err)
+	}
+	h.discover()
+	c := h.tracked[cid]
+	if c == nil || !c.gone {
+		t.Fatalf("tracked[%s] = %v, want a gone entry awaiting its final flush", cid, c)
+	}
+
+	// The id is listed again under a STRICTLY SHORTER basename before that
+	// flush happens — the shape the re-point arm matches on.
+	makeContainer(t, own, 9_000_000, 512<<20, 0)
+	beforeShort := obs.CgroupWindowsDropped.WithLabelValues("too_short").Value()
+	h.discover()
+
+	if c := h.tracked[cid]; c == nil || c.dir != conmon || c.open {
+		t.Fatalf("the gone container was re-pointed to %v (open=%v); its descriptors are respent and its final window is reset", c.dir, c.open)
+	}
+
+	g := h.exportOnce(t)[cid]
+	if g == nil {
+		t.Fatal("the gone container's final window was discarded by the re-point; that burst is what this package exists to keep")
+	}
+	if math.Abs(g[nameCPUMax]-4) > 1e-9 {
+		t.Errorf("%s = %v, want the 4 cores measured before it went away", nameCPUMax, g[nameCPUMax])
+	}
+	if got := obs.CgroupWindowsDropped.WithLabelValues("too_short").Value(); got != beforeShort {
+		t.Errorf("windows_dropped{too_short} moved to %v from %v: a container that WAS measured must not be reported as too short-lived to describe", got, beforeShort)
+	}
+}
+
+// A root that becomes unlistable after startup is a persisting STATE — the
+// bind mount lost, remounted or relabelled — so its complaint is throttled like
+// every other complaint in this package. Unthrottled it is one identical line
+// per discovery pass, four a minute per node at the default cadence and sixty
+// at the floor, multiplied by the fleet, for information that fits on one line.
+func TestAnUnlistableRootWarnsOnceNotEveryPass(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read a 0000 directory")
+	}
+	h := newHarness(t)
+	makeContainer(t, systemdContainerDir(h.root, 1, hexID(1)), 0, 100<<20, 0)
+	h.discover()
+	if h.Containers() != 1 {
+		t.Fatalf("Containers() = %d, want 1 before the mount goes away", h.Containers())
+	}
+
+	// The mount is pulled out from under a running sampler; New's checkCgroup2
+	// already passed, so the process keeps going.
+	if err := os.Chmod(h.root, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(h.root, 0o700) })
+
+	h.log.Reset()
+	before := obs.CgroupDiscoveryErrors.WithLabelValues("root").Value()
+	for range 5 {
+		h.t = h.t.Add(DefaultDiscoverInterval)
+		h.discover()
+	}
+	if got := strings.Count(h.log.String(), "cgroup discovery failed"); got != 1 {
+		t.Errorf("the unlistable root logged %d lines over five passes, want 1: an unchanging state is throttled through logdedupe, and the counter carries the rate\n%s", got, h.log.String())
+	}
+	if got := obs.CgroupDiscoveryErrors.WithLabelValues("root").Value(); got != before+5 {
+		t.Errorf("discovery_errors{root} = %v, want %v: the throttle is on the LINE, never on the counter", got, before+5)
 	}
 }
 

@@ -136,34 +136,32 @@ func TestUnknownNodeIsNotMemoised(t *testing.T) {
 	}
 }
 
-// THE MEMO'S REACH, pinned as a limit rather than left to be rediscovered.
+// THE MEMO'S REACH, which is the whole point of the change token.
 //
 // TestNodeTargetsRevalidationDoesNotRebuild above holds the server's clock
-// still, which is the only way a single conforming client's revalidation can
-// land inside the memo's window — and that is not an artefact of the test, it
-// is the design. The memo lives for cacheTTL from the build, and cacheTTL is
-// also the max-age the response advertises, so a client that honours its own
-// cache does not ask again until its copy expires, which is the instant the
-// memo does. The two windows are the same window.
+// still, and under the WALL CLOCK that was the only way a single conforming
+// client's revalidation could land inside the memo's window — not an artefact
+// of the test but the design: the memo lived for cacheTTL from the build, and
+// cacheTTL is also the max-age the response advertises, so a client honouring
+// its own cache asked again exactly when its copy expired, which is the instant
+// the memo did. The two windows were the same window, and at the shipped
+// defaults (-metadata-cache-ttl 10s under a 30s -scrape-interval, one DaemonSet
+// agent per node) EVERY steady-state poll re-derived, re-marshalled and
+// re-hashed the node's whole target list and then discarded the body to write
+// an empty 304. BenchmarkNodeTargetsRevalidation's agent_cadence arm reports
+// what that cost.
 //
-// The consequence at the shipped defaults (-metadata-cache-ttl 10s under a 30s
-// -scrape-interval, one DaemonSet agent per node): EVERY steady-state poll
-// re-derives, re-marshals and re-hashes the node's whole target list and then
-// discards the body to write an empty 304. BenchmarkNodeTargetsRevalidation's
-// agent_cadence arm reports what that costs.
-//
-// What the memo does still cover is a caller asking FASTER than the max-age it
-// was handed — a second agent during a rolling update, an operator's curl loop,
-// a client whose cache was evicted — which is the two-client case below.
-//
-// Making it cover the DaemonSet needs a validity signal that is not a wall
-// clock: a change token spanning the pod store, the owner/namespace metadata
-// caches, the Services index and the monitor index, so an unchanged node can be
-// answered 304 without re-deriving AND without claiming freshness it has not
-// checked. Two of those four already publish one (services.Index.Generation,
-// servicemonitors.Index.Generation); the store and internal/owners do not. Until
-// they do, this test is what says the memo is not doing the job its own doc
-// comment describes — and it fails, deliberately, the moment someone makes it.
+// The change token is what fixed it: a validity signal that is not a wall clock,
+// spanning the pod store, the owner/namespace metadata caches, the Services
+// index and the monitor index, so an unchanged node is answered 304 without
+// re-deriving AND without claiming freshness it has not checked. This test is
+// therefore the one that says the memo IS doing the job its doc comment
+// describes — for the caller it exists for, at that caller's real cadence — and
+// it fails the moment a source stops publishing, or starts over-publishing, its
+// token. The wall-clock fallback is still what an incompletely wired deployment
+// gets, and it still only covers a caller asking FASTER than the max-age it was
+// handed (a second agent during a rolling update, an operator's curl loop, a
+// client whose cache was evicted) — the two-client case below.
 func TestNodeTargetsMemoServesAConformingClient(t *testing.T) {
 	const ttl, poll = 10 * time.Second, 30 * time.Second
 	f := targetsFixture{pods: 20, services: 5, cacheTTL: ttl}
@@ -489,5 +487,79 @@ func TestOneMonitorViaTwoServicesIsNotReportedAsShadowed(t *testing.T) {
 	}
 	if got := obs.MonitorTargetShadowed.WithLabelValues("servicemonitor").Value() - before; got != 0 {
 		t.Errorf("shadowed counted %v times for one monitor reached twice", got)
+	}
+}
+
+// A sub-second -metadata-cache-ttl must still reach the memo, on BOTH of
+// nodeTargetsNotModified's branches.
+//
+// max-age has second granularity, so cacheControl rounds a sub-second TTL up:
+// the 200 says max-age=1 and a conforming client revalidates a second later.
+// The memo floored instead — the token branch to int(500ms/1s) = 0, the
+// wall-clock branch to a remaining window that can never reach a second — and
+// then refused every revalidation it had itself seeded, so every poll re-derived,
+// re-sorted, re-marshalled and re-hashed the whole node before writing an empty
+// 304. kubescrape_node_targets_builds_total reports "built" throughout, which is
+// indistinguishable from the memo being unwired: nothing else says a legal flag
+// value has switched the mechanism off.
+func TestSubSecondCacheTTLStillReachesTheNodeTargetsMemo(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		noOwnerGen bool
+		// advance is how long after the 200 the revalidation arrives. The two
+		// branches serve different callers and neither choice is arbitrary: a
+		// change token makes the copy provably current, so it answers the
+		// conforming client that waited out the advertised max-age of 1s,
+		// while the wall clock can only ever answer a caller asking FASTER
+		// than its grant (the memo's lifetime IS the TTL, which a rounded-up
+		// max-age necessarily outlives) — a second agent during a rolling
+		// update, an operator's curl loop, a client whose cache was evicted.
+		advance time.Duration
+	}{
+		{"change token", false, time.Second},
+		// A deployment that has not wired every source.
+		{"wall-clock fallback", true, 200 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const ttl = 500 * time.Millisecond
+			f := targetsFixture{pods: 20, services: 5, cacheTTL: ttl, noOwnerGen: tc.noOwnerGen}
+			s := f.build(t)
+			now := time.Now()
+			s.now = func() time.Time { return now }
+			srv := httptest.NewServer(s.Handler())
+			t.Cleanup(srv.Close)
+			url := srv.URL + "/v1/nodes/node1/targets"
+
+			resp, err := http.Get(url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			etag := resp.Header.Get("ETag")
+			cc := resp.Header.Get("Cache-Control")
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status %d, want 200", resp.StatusCode)
+			}
+			if etag == "" {
+				t.Fatal("no ETag on the first response")
+			}
+			if cc != "max-age=1" {
+				t.Fatalf("Cache-Control = %q, want max-age=1: a sub-second TTL rounds up, "+
+					"or the client is told not to cache at all", cc)
+			}
+
+			// The revalidation, at whichever cadence this branch can serve.
+			builds := s.targetBuilds.Load()
+			now = now.Add(tc.advance)
+			status, tag := conditionalGet(t, url, etag)
+			if status != http.StatusNotModified || tag != etag {
+				t.Fatalf("revalidation answered %d with tag %s, want 304 with %s", status, tag, etag)
+			}
+			if got := s.targetBuilds.Load() - builds; got != 0 {
+				t.Errorf("derivations for a revalidation under a %s TTL = %d, want 0: the memo "+
+					"floored its grant to 0 where the 200 rounded up to 1, so the client it "+
+					"handed max-age=1 to can never reach it", ttl, got)
+			}
+		})
 	}
 }

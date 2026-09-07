@@ -2,6 +2,8 @@ package transform
 
 import (
 	"context"
+	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -344,4 +346,107 @@ func (c *capMetrics) ExportMetrics(_ context.Context, md pmetric.Metrics) error 
 	md.CopyTo(cp)
 	c.md = append(c.md, cp)
 	return nil
+}
+
+// --- the re module's own amplifiers ---
+
+// re.replace's output is (matches x expanded replacement) bytes, and an empty
+// pattern matches at every position: a 1 MiB replacement over a 128-byte
+// subject is a 129 MiB string built inside ONE interpreter step, where neither
+// the step checkpoint nor the wall-clock check on entry can interrupt it. The
+// charge that used to follow the call measured 805 MiB allocated before it
+// refused, so the bound has to be predictive.
+func TestRegexReplaceRefusesBeforeItAllocates(t *testing.T) {
+	var err error
+	grew, measured := allocatedBy(func() {
+		err = runBody(t, "repl = \"x\" * (1<<20)\n_x = re.replace(\"\", repl, \"y\" * 128)\n")
+	})
+	mustContain(t, err, "limit for one value")
+	if measured && grew > 64<<20 {
+		t.Fatalf("refused only after allocating %d MiB — the bound must be predictive, not a charge", grew>>20)
+	}
+}
+
+// $1 references mean len(repl) is not the size of a replacement: a short repl
+// full of them expands to a multiple of the subject.
+func TestRegexReplaceBoundsGroupExpansion(t *testing.T) {
+	mustContain(t, runBody(t, "s = \"y\" * (1<<20)\n_x = re.replace(\"(y+)\", \"$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1$1\", s)\n"), "limit for one value")
+}
+
+// ...and the cheap worst case alone would refuse honest scripts, which is why
+// the guard counts the matches when it has to: one long replacement at a
+// handful of places is a legal redaction, not an amplifier.
+func TestRegexReplaceKeepsSparseMatchesLegal(t *testing.T) {
+	got := evalToAttr(t, "s = \"a\" * (1<<20) + \"SECRET\"\nout = re.replace(\"SECRET\", \"z\" * (1<<16), s)\nfor r in batch:\n    r.attributes[\"out\"] = str(len(out))\n")
+	if want := fmt.Sprint(1<<20 + 1<<16); got != want {
+		t.Fatalf("len = %s, want %s: a sparse match with a long replacement must not be refused", got, want)
+	}
+	// The everyday shape stays untouched too.
+	if got := evalToAttr(t, "for r in batch:\n    r.attributes[\"out\"] = re.replace(\"y\", \"[REDACTED]\", \"xyz\")\n"); got != "x[REDACTED]z" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// re.findall's match count grows with the SUBJECT, and the match limit is the
+// only size argument FindAllString has — so the limit is the bound, and it has
+// to come from the caps rather than from -1.
+func TestRegexFindallBoundsItsMatchCountBeforeBuildingTheList(t *testing.T) {
+	var err error
+	grew, measured := allocatedBy(func() {
+		err = runBody(t, "_x = re.findall(\"\", \"y\" * (8<<20))\n")
+	})
+	mustContain(t, err, "matches")
+	// 8Mi+1 matches, unbounded, is ~400 MiB of headers and boxed values; the
+	// bound stops at the per-value element cap.
+	if measured && grew > 128<<20 {
+		t.Fatalf("refused only after allocating %d MiB — the match limit must come from the caps", grew>>20)
+	}
+	// An ordinary findall is unaffected.
+	if got := evalToAttr(t, "for r in batch:\n    r.attributes[\"out\"] = \",\".join(re.findall(\"\\\\d+\", \"a1 b22 c333\"))\n"); got != "1,22,333" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// The compiled-pattern cache is keyed by the pattern STRING, and a script may
+// build one from data (`re.match(r.attributes["p"], r.body)`), so a bound on
+// the number of entries is not a bound on memory: the cache would sit at its
+// cap holding whatever sizes happened to land there, for the life of the
+// process, with no counter and no recovery short of a restart.
+func TestPatternCacheIsBoundedInBytesNotJustEntries(t *testing.T) {
+	t.Run("an over-long pattern is refused rather than cached", func(t *testing.T) {
+		err := runBody(t, "p = \"a\" * (1<<20)\n_x = re.match(p, \"a\")\n")
+		mustContain(t, err, "over the 8192-byte limit")
+	})
+	t.Run("the retained pattern bytes stay bounded", func(t *testing.T) {
+		reMu.Lock()
+		reCache, reCacheLen = map[string]*regexp.Regexp{}, 0
+		reMu.Unlock()
+		// Every distinct pattern is a fresh entry; the cache must evict on
+		// bytes as well as on count.
+		big := strings.Repeat("b", maxPatternBytes-8)
+		for i := range 512 {
+			if _, err := compiledPattern(fmt.Sprintf("%s%04d", big, i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		reMu.Lock()
+		bytes, entries := reCacheLen, len(reCache)
+		reMu.Unlock()
+		if bytes > maxCachedPatternBytes {
+			t.Fatalf("cache retains %d pattern bytes, over the %d-byte bound (%d entries)", bytes, maxCachedPatternBytes, entries)
+		}
+		if entries > maxCachedPatterns {
+			t.Fatalf("cache holds %d entries, over the %d bound", entries, maxCachedPatterns)
+		}
+		// The accounting must track the map, or the bound drifts.
+		sum := 0
+		reMu.Lock()
+		for k := range reCache {
+			sum += len(k)
+		}
+		reMu.Unlock()
+		if sum != bytes {
+			t.Fatalf("reCacheLen = %d but the map holds %d bytes of keys", bytes, sum)
+		}
+	})
 }

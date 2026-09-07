@@ -220,3 +220,36 @@ func TestWarmGzipWriterRetainedSize(t *testing.T) {
 			"(the gzipWriterCache doc's one-slot argument is sized on it)", per/1024)
 	}
 }
+
+// pooledGzipWriter.Close is idempotent, for the reason the reader half's
+// releaseLocked is: the cache is a warm slot backed by a sync.Pool, so a
+// second put would hand ONE writer to two concurrent Compress calls, which
+// would Reset it onto two different sinks and interleave one deflate stream
+// into two gRPC message buffers — two corrupt bodies, rejected as permanent.
+func TestPooledGzipWriterCloseIsIdempotent(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("sync.Pool deliberately drops one Put in four under the race detector, so pool identity says nothing")
+	}
+	c := &gzipCodec{}
+	var buf bytes.Buffer
+	w, err := c.Compress(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v, want a no-op", err)
+	}
+	first := c.writers.get()
+	if first == nil {
+		t.Fatal("the first Close did not pool the writer at all")
+	}
+	if second := c.writers.get(); second != nil {
+		t.Fatalf("a second Close pooled the writer AGAIN (%p vs %p): two concurrent compressions would share one deflate stream", first, second)
+	}
+}

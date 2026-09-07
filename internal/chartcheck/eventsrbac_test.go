@@ -48,6 +48,7 @@ var scopedEventsResources = []struct {
 
 // rbacRule is the subset of a PolicyRule this test judges.
 type rbacRule struct {
+	APIGroups     []string `json:"apiGroups"`
 	Resources     []string `json:"resources"`
 	Verbs         []string `json:"verbs"`
 	ResourceNames []string `json:"resourceNames"`
@@ -121,6 +122,71 @@ func assertEventsRBACIsScoped(t *testing.T, where, manifest string) {
 	}
 }
 
+// assertEventsClusterRoleReadsOnlyWhatTheReaderReads is the other half of the
+// same argument, applied to the ONE cluster-wide grant this workload gets.
+//
+// internal/agent/events is core/v1 only and does exactly two things with
+// events: the initial LIST (which the relist path re-runs, paginated) and one
+// WATCH — `CoreV1().Events(ns).List` and `.Watch`. There is no single-object
+// Get in the package and no `EventsV1()` call anywhere, so `get` and an
+// `events.k8s.io` mirror rule grant reads nothing exercises. Neither is a
+// runtime hazard (both representations are read-only views of the same
+// objects); what they cost is that an operator hand-managing RBAC — the
+// audience deploy/events.yaml's comments are written for — is told to grant
+// more than the code uses, and a least-privilege review cannot tell from the
+// manifest which representation the reader actually takes. The goldens pin the
+// bytes but cannot say which shape is CORRECT, so the intent is pinned here.
+func assertEventsClusterRoleReadsOnlyWhatTheReaderReads(t *testing.T, where, manifest string) {
+	t.Helper()
+	seen := 0
+	for _, doc := range docSep.Split(manifest, -1) {
+		var d rbacDoc
+		if err := yaml.Unmarshal([]byte(doc), &d); err != nil {
+			continue
+		}
+		if d.Kind != "ClusterRole" {
+			continue
+		}
+		for _, rule := range d.Rules {
+			if !contains(rule.Resources, "events") {
+				continue
+			}
+			seen++
+			if !contains(rule.APIGroups, "") || len(rule.APIGroups) != 1 {
+				t.Errorf("%s: ClusterRole rule on events has apiGroups %v, want exactly [\"\"] — "+
+					"the reader uses CoreV1() and never EventsV1(), so an events.k8s.io grant is "+
+					"unexercised and misdescribes which representation is read",
+					where, rule.APIGroups)
+			}
+			if !equalSets(rule.Verbs, []string{"list", "watch"}) {
+				t.Errorf("%s: ClusterRole rule on events has verbs %v, want exactly [list watch] — "+
+					"the reader does one LIST (paginated on a relist) plus one WATCH and no "+
+					"single-object Get; `get` here is a grant nothing exercises",
+					where, rule.Verbs)
+			}
+		}
+	}
+	// Exactly one rule, or the scan is describing a shape that has moved.
+	if seen != 1 {
+		t.Errorf("%s: found %d ClusterRole rules granting `events`, want 1; the events singleton's "+
+			"one cluster-wide grant has changed shape and this guard no longer sees it", where, seen)
+	}
+}
+
+// equalSets reports whether two verb lists hold the same members, order and
+// duplicates aside.
+func equalSets(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for _, w := range want {
+		if !contains(got, w) {
+			return false
+		}
+	}
+	return true
+}
+
 func contains(hay []string, needle string) bool {
 	for _, s := range hay {
 		if s == needle {
@@ -145,6 +211,7 @@ func TestEventsRoleScopesWritesToTheObjectsTheFlagsName(t *testing.T) {
 		t.Fatalf("helm template failed: %v\n%s", err, out)
 	}
 	assertEventsRBACIsScoped(t, "rendered chart (events.enabled)", string(out))
+	assertEventsClusterRoleReadsOnlyWhatTheReaderReads(t, "rendered chart (events.enabled)", string(out))
 }
 
 // TestDeployEventsRoleScopesWritesLikeTheChart covers the OTHER install path.
@@ -159,6 +226,7 @@ func TestDeployEventsRoleScopesWritesLikeTheChart(t *testing.T) {
 		t.Fatalf("reading %s: %v", path, err)
 	}
 	assertEventsRBACIsScoped(t, path, string(b))
+	assertEventsClusterRoleReadsOnlyWhatTheReaderReads(t, path, string(b))
 	// The two install paths must agree on the names as well as the shape: the
 	// chart's values and the binary's flag defaults are separate copies of the
 	// same two strings, and deploy/ silently relies on them being equal.

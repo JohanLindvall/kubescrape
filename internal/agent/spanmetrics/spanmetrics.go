@@ -468,12 +468,12 @@ func (g *Generator) renderRED(sm pmetric.ScopeMetrics, now time.Time) {
 // them rendered, and returns them for a lock-free build. It is the ONLY part of
 // a render that holds the store lock. See renderRED for why the build must not.
 func (g *Generator) snapshot(now time.Time) []spanSnapshot {
-	// Hold 1: evict, then take the series POINTERS in one cheap pass (one
-	// pointer write each) so the expensive value copy can be chunked — a slice
-	// can be walked across lock releases, a map cannot.
+	// Hold 1: evict and take the series POINTERS in ONE cheap walk (one pointer
+	// write each; the two used to be two passes inside this hold) so the
+	// expensive value copy can be chunked — a slice can be walked across lock
+	// releases, a map cannot.
 	g.store.Lock()
-	g.store.EvictLocked(now)
-	ptrs := g.store.PointersLocked(g.snapPtrs[:0])
+	ptrs := g.store.LivePointersLocked(g.snapPtrs[:0], now)
 	g.snapPtrs = ptrs
 	g.store.Unlock()
 

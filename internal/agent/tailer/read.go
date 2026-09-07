@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
@@ -562,7 +563,16 @@ func (t *Tailer) ensureOpen(f *file) error {
 	if replaced {
 		start = 0
 	}
-	if start > st.Size() {
+	// The file was TRUNCATED IN PLACE below our committed offset while we held
+	// no fd: the same physical event as handleRotation's truncated arm, reached
+	// through the other door (that one needs an fd and a read; this one is what
+	// a restart before the first open, an -logs-idle-close release, or a rewind
+	// whose Seek failed and dropped the handle sees). It restarts the file at
+	// zero, so it is a NEW INCARNATION and takes the canonical reset below —
+	// this arm used to do neither, reusing the tail id and keeping the withheld
+	// highs live against it.
+	truncated := !replaced && start > st.Size()
+	if truncated {
 		start = 0
 	}
 	if _, err := fh.Seek(start, 0); err != nil {
@@ -613,6 +623,20 @@ func (t *Tailer) ensureOpen(f *file) error {
 				f.hopUnsaved, t.hopsUnsaved = true, true
 			}
 		}
+	}
+	if truncated {
+		// Counted and named like every other rotation. This arm discarded a
+		// whole committed prefix in SILENCE — kubescrape_log_rotations_total,
+		// kubescrape_log_prefix_lost_total and every log line flat — leaving an
+		// operator watching a file restart from zero with nothing anywhere that
+		// says why. Nothing is LOST (the discarded prefix [size, committed) had
+		// already exported), so no loss counter moves, exactly as in
+		// handleRotation's truncated arm.
+		obs.LogRotations.Inc()
+		t.log.Debug("log file rotated", "path", f.path, "reason", "truncated",
+			"inode", inode, "bytes", st.Size(), "committed", oldCommitted)
+	}
+	if replaced || truncated {
 		// A new incarnation, so take the canonical path rather than resetting
 		// byte positions inline. Keeping the OLD tail id attributed the new
 		// inode's bytes to the previous incarnation's segment, and a withheld

@@ -138,7 +138,7 @@ func (r *Registry) add(name, desc string, kind seriesKind, buckets []float64, fu
 		return s
 	}
 	s := newSeries(seriesSpec{
-		name: name, desc: desc, kind: kind, action: actionSet,
+		name: name, desc: desc, kind: kind, action: actionSet, role: roleSelfMetric,
 		expiration: registryExpiration, buckets: buckets, drops: &r.drops,
 	})
 	if r.byName == nil {
@@ -293,7 +293,17 @@ type RegCounter struct{ bound }
 // Inc adds one.
 func (c *RegCounter) Inc() { c.observe(1) }
 
-// Add adds v (must be >= 0).
+// Add adds v, which must be >= 0.
+//
+// That is ENFORCED, not merely documented: a negative reaches the same guard a
+// log-derived counter's does (series.refuse) and is refused and counted rather
+// than folded into a stream this package renders as a monotonic cumulative
+// Sum. No caller in this repo passes one — every registration counts, measures
+// a length or stamps a time, and counterDelta already floors a func-backed
+// counter's push at the fresh total after a reset — so the guard exists to keep
+// the documented invariant true rather than to fix a live defect. The refusal
+// is counted on the Registry's own (deliberately unpublished) drops and warned
+// at most hourly, naming this metric.
 func (c *RegCounter) Add(v float64) { c.observe(v) }
 
 // RegGauge is a set-latest gauge.

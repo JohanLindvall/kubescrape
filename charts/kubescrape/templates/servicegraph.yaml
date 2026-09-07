@@ -199,7 +199,7 @@ spec:
       containers:
         - name: servicegraph
           image: {{ include "kubescrape.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ include "kubescrape.imagePullPolicy" . }}
           command: ["/kubescrape-agent"]
           args:
             # Every per-node pipeline off: this tier does traces and nothing

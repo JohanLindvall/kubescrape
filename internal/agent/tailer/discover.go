@@ -90,20 +90,29 @@ func (t *Tailer) watchTarget(f *file) {
 		return // next open retries; any existing watch stays
 	}
 	dir := filepath.Dir(target)
+	// Cache the RESOLVED DIRECTORY unconditionally, before anything that can
+	// fail or return: findRotated locates a rotated segment's file by name in
+	// it, and by the time that runs the live path is frequently gone (a
+	// container GC'd after a CrashLoop restart takes the /var/log/containers
+	// symlink while its rotated files remain), so its EvalSymlinks fallback
+	// fails. Leaving targetDir empty for the file's whole life declared
+	// still-on-disk segments unrecoverable — counted obs.LogPrefixLost and
+	// retired. The nil-watcher branch was fixed for exactly that, and the
+	// watcher.Add FAILURE below reinstated the same state for as long as the
+	// failure lasts: a node that has exhausted fs.inotify.max_user_watches
+	// fails every Add, so EVERY newly opened file kept targetDir empty.
+	//
+	// Hence the cache is separate from f.watchedDir, which names the directory
+	// this file holds a watch REFERENCE on. They are usually equal; when the
+	// Add fails they are not, and conflating them would make the short-circuit
+	// below skip the retry the next open exists to make.
+	f.targetDir = dir
 	if t.watcher == nil {
-		// No watcher (-logs-watch=false, or a failed fsnotify init) — but the
-		// RESOLVED DIRECTORY is still needed: findRotated locates a rotated
-		// segment's file by name in it, and by the time that runs the live path
-		// is frequently gone (a container GC'd after a CrashLoop restart takes
-		// the /var/log/containers symlink while its rotated files remain), so
-		// its EvalSymlinks fallback fails. Leaving targetDir empty for the
-		// file's whole life declared still-on-disk segments unrecoverable —
-		// counted obs.LogPrefixLost and retired. releaseDir/unwatchTarget are
-		// refcount no-ops without a watcher, so the cache costs nothing else.
-		f.targetDir = dir
+		// releaseDir/unwatchTarget are refcount no-ops without a watcher, so
+		// the cache costs nothing else.
 		return
 	}
-	if dir == f.targetDir {
+	if dir == f.watchedDir {
 		return // unchanged (the common case for every reopen)
 	}
 	// Acquire the new directory's watch BEFORE releasing the old one: a
@@ -112,6 +121,8 @@ func (t *Tailer) watchTarget(f *file) {
 	// and its segment is lost.
 	if t.watchRefs[dir] == 0 {
 		if err := t.watcher.Add(dir); err != nil {
+			// The file keeps whatever watch it already held (if any) and
+			// degrades to the poll cadence for this one; the next open retries.
 			t.log.Debug("watching log target directory", "dir", dir, "error", err)
 			return
 		}
@@ -126,14 +137,15 @@ func (t *Tailer) watchTarget(f *file) {
 		t.byTargetDir[dir] = set
 	}
 	set[f] = struct{}{}
-	old := f.targetDir
-	f.targetDir = dir
+	old := f.watchedDir
+	f.watchedDir = dir
 	t.releaseDir(f, old) // release the previous dir (refcounted; "" is a no-op)
 }
 
 // unwatchTarget releases the file's directory watch.
 func (t *Tailer) unwatchTarget(f *file) {
-	t.releaseDir(f, f.targetDir)
+	t.releaseDir(f, f.watchedDir)
+	f.watchedDir = ""
 	f.targetDir = ""
 }
 

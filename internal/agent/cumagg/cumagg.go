@@ -159,6 +159,10 @@ type Store[S Series] struct {
 
 	mu     sync.Mutex
 	series map[string]S
+	// markPtrs is afterDelivered's reused pointer scratch. Export holds the
+	// exportGate for render, send and mark together, so nothing else can be
+	// walking it.
+	markPtrs []S
 	// capRefused counts cardinality-cap refusals since the last time the export
 	// loop reported them. The COUNTER (Options.Dropped) carries the rate; this
 	// is what lets the loop emit ONE throttled line per interval instead of one
@@ -251,27 +255,53 @@ func (st *Store[S]) ObservedLocked(s S, now time.Time) {
 // series that reaches Delivered from here may ever be evicted.
 func (st *Store[S]) MarkRenderedLocked(s S) { s.meta().State = Rendered }
 
-// EvictLocked drops series that a delivered export carried and that have not
-// been observed within StaleAfter. Without it the map only ever grows: dead
-// series render into every export forever and — worse — the cardinality cap
-// becomes a ONE-WAY LATCH, so one burst of short-lived label values permanently
-// blinds the aggregate for everything that starts afterwards. A cumulative
-// series that stops being reported is the standard staleness signal downstream.
-func (st *Store[S]) EvictLocked(now time.Time) {
-	if st.opt.StaleAfter <= 0 { // eviction disabled
-		return
-	}
+// LivePointersLocked evicts the stale series and appends every survivor to dst,
+// in ONE walk of the map.
+//
+// Eviction drops series that a delivered export carried and that have not been
+// observed within StaleAfter. Without it the map only ever grows: dead series
+// render into every export forever and — worse — the cardinality cap becomes a
+// ONE-WAY LATCH, so one burst of short-lived label values permanently blinds the
+// aggregate for everything that starts afterwards. A cumulative series that
+// stops being reported is the standard staleness signal downstream.
+//
+// The two steps are ONE pass because the WALK is the cost, and this walk is the
+// only whole-map pass a render cannot get rid of: a map cannot be iterated
+// across lock releases, so it is the one hold that scales with MaxCardinality
+// while everything downstream of it is chunked. Evicting in a pass of its own
+// doubled it for nothing — both callers ran EvictLocked and PointersLocked
+// back to back inside one hold, so the series were visited twice and the stall
+// on the receive path (Record/observe take this same mutex, the pairing store
+// from inside its own) was twice what it had to be.
+//
+// dst is the caller's reused scratch; the survivors come back in map order.
+func (st *Store[S]) LivePointersLocked(dst []S, now time.Time) []S {
+	evict := st.opt.StaleAfter > 0
 	for k, s := range st.series {
 		// Only a series whose CURRENT values a delivered export carried may go:
 		// an export interval longer than StaleAfter — or a failed export — must
 		// not destroy observations unseen.
-		if m := s.meta(); m.State == Delivered && now.Sub(m.LastSeen) > st.opt.StaleAfter {
+		if m := s.meta(); evict && m.State == Delivered && now.Sub(m.LastSeen) > st.opt.StaleAfter {
 			delete(st.series, k)
 			if st.opt.Evicted != nil {
 				st.opt.Evicted.Inc()
 			}
+			continue
 		}
+		dst = append(dst, s)
 	}
+	return dst
+}
+
+// pointersLocked appends every live series to dst. One pointer write each, which
+// is the cheapest whole-map pass there is — and the only kind worth holding the
+// mutex for uninterrupted, since a map cannot be walked across lock releases and
+// a slice can.
+func (st *Store[S]) pointersLocked(dst []S) []S {
+	for _, s := range st.series {
+		dst = append(dst, s)
+	}
+	return dst
 }
 
 // CountLocked is the number of live series.
@@ -284,17 +314,6 @@ func (st *Store[S]) EachLocked(f func(S)) {
 	for _, s := range st.series {
 		f(s)
 	}
-}
-
-// PointersLocked appends every live series to dst and returns it. It is the
-// cheapest pass that can exist over the map — one pointer write each — and it
-// is what lets an expensive render walk the series across lock RELEASES: a
-// slice can be walked in chunks, a map cannot.
-func (st *Store[S]) PointersLocked(dst []S) []S {
-	for _, s := range st.series {
-		dst = append(dst, s)
-	}
-	return dst
 }
 
 // Len is CountLocked for a caller that holds nothing.
@@ -410,23 +429,53 @@ func (st *Store[S]) Export(ctx context.Context, exp Exporter, res pcommon.Resour
 	return nil
 }
 
+// markChunk is how many series one lock-hold of the delivery mark touches. Both
+// callers chunk their snapshot at the same width and for the same reason; the
+// constant is theirs to tune independently, which is why it is spelled twice.
+const markChunk = 512
+
 // afterDelivered records that the rendered values reached the collector (only
 // those may later be evicted) and resets every recorded exemplar. A series
 // OBSERVED between the render and this call is back in Observed and is
 // deliberately not marked: its new values must still be exported before
 // eviction may touch them. An exemplar recorded in that same window is dropped
 // unseen — the one-interval recency window an exemplar has by nature.
+//
+// CHUNKED, for the reason both callers chunk their snapshot: this mutex is the
+// one Record/observe take per edge and per span — the pairing store takes it
+// from inside its OWN mutex — so every millisecond held here is a millisecond
+// in which no shard goroutine can pair or aggregate. Held whole it was a pass
+// nothing bounded: about one snapChunk hold at the 20000-series default, and
+// linear in MaxCardinality above it, i.e. the one part of an export whose stall
+// grew while the render's stayed fixed. The pointer pass is the same trick as
+// the snapshot's — a slice can be walked across lock releases, a map cannot.
+//
+// Serialized with itself and with the render by Export's exportGate, so the
+// scratch below is not shared with anything.
 func (st *Store[S]) afterDelivered() {
 	st.mu.Lock()
-	defer st.mu.Unlock()
-	for _, s := range st.series {
-		if m := s.meta(); m.State == Rendered {
-			m.State = Delivered
+	ptrs := st.pointersLocked(st.markPtrs[:0])
+	st.markPtrs = ptrs
+	st.mu.Unlock()
+
+	for start := 0; start < len(ptrs); start += markChunk {
+		end := min(start+markChunk, len(ptrs))
+		st.mu.Lock()
+		for _, s := range ptrs[start:end] {
+			// A series observed between the render and this chunk is back in
+			// Observed and is left alone, exactly as one observed before the
+			// first chunk always was; one evicted in between is no longer in
+			// the map and marking it changes nothing.
+			if m := s.meta(); m.State == Rendered {
+				m.State = Delivered
+			}
+			if st.opt.ResetExemplars != nil {
+				st.opt.ResetExemplars(s)
+			}
 		}
-		if st.opt.ResetExemplars != nil {
-			st.opt.ResetExemplars(s)
-		}
+		st.mu.Unlock()
 	}
+	clear(ptrs) // do not pin evicted series until the next export
 }
 
 // Run exports every interval until ctx is done, then once more. A non-positive

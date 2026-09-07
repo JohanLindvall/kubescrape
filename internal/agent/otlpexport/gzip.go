@@ -414,9 +414,23 @@ type pooledGzipWriter struct {
 	cache *gzipWriterCache
 }
 
+// Close is IDEMPOTENT, for the reason pooledGzipReader.releaseLocked is: the
+// cache is a warm slot backed by a sync.Pool, so a second put would hand ONE
+// *gzip.Writer to two concurrent Compress calls, which would Reset it onto two
+// different sinks and interleave one deflate stream into two gRPC message
+// buffers — two corrupt bodies the collector rejects as permanent, i.e. data
+// dropped. grpc-go Closes exactly once today; a wrapper whose safety depends
+// on a caller's discipline is one dependency bump away from that being false,
+// and the guard is a nil check. No mutex: unlike the reader half, whose
+// terminal Read races grpc-go's Close, nothing Writes to this after Close.
 func (p *pooledGzipWriter) Close() error {
-	err := p.Writer.Close()
-	putGzipWriter(p.cache, p.Writer)
+	if p.Writer == nil {
+		return nil
+	}
+	z := p.Writer
+	p.Writer = nil
+	err := z.Close()
+	putGzipWriter(p.cache, z)
 	return err
 }
 

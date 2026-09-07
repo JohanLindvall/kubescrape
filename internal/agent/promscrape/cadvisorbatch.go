@@ -332,10 +332,13 @@ func (cb *cadvisorBatcher) identityOf(labels []Label) cadvisorIdentity {
 //     arm;
 //   - a runtime whose sandbox row carries no pod attribution at all.
 //
-// Pre-existing and NOT about the fold: an unrecognised child of a pod slice
-// whose name yields no container id (kata's kata_<sandbox-id>) parses as the
-// POD's own cgroup and shares its resource — the path alone cannot tell it from
-// the pod slice, and this predicate never sees it.
+// Not about the fold, and no longer a shared resource: an unrecognised child of
+// a pod slice whose name yields no container id (kata's kata_<sandbox-id>)
+// parses as the POD's own cgroup, and the path alone cannot tell it from the pod
+// slice — this predicate never sees it. It no longer SHARES the pod's resource,
+// though: appendKey carries namespace and pod, which such a row does not have,
+// so it gets its own unattributed resource instead of racing the pod-cgroup row
+// to name the pod's.
 func isSandbox(ident cadvisorIdentity, labelledPOD, podContainer bool) bool {
 	if ident.namespace == "" || ident.pod == "" {
 		// cadvisor could not attribute the cgroup to a pod, so nothing here says
@@ -421,7 +424,24 @@ func (id cadvisorIdentity) appendKey(b []byte) []byte {
 		b = append(b, 0)
 		b = append(b, id.containerID...)
 		b = append(b, 0)
-		return appendLP(b, id.container)
+		b = appendLP(b, id.container)
+		// namespace and pod participate HERE TOO, and not only in the sibling
+		// arm. They are what cadvisor could not supply for an unattributable
+		// child of a pod slice (kata's kata_<sandbox-id>, which parses to
+		// (uid, "") exactly as the POD's own cgroup row does), so without them
+		// that row shared the pod-level resource's key — and scope() fills a
+		// resource from the FIRST ident it sees, so on a scrape where the helper
+		// row came first the pod-level resource was built with only k8s.pod.uid:
+		// no k8s.namespace.name, no k8s.pod.name and hence no service.name, i.e.
+		// no Prometheus job on container_network_* and every pod-cgroup rollup
+		// row, flapping with cadvisor's row order between scrapes. A row cadvisor
+		// could not attribute now keeps its own resource, which is the same
+		// fail-safe isSandbox's documented gaps take, and stays counted by
+		// obs.CadvisorUnresolved. Container rows are unaffected either way (their
+		// container id is in the key), and on a runtime that attributes every row
+		// — every containerd node — nothing groups differently.
+		b = appendLP(b, id.namespace)
+		return appendLP(b, id.pod)
 	}
 	// containerID must participate: a non-pod cgroup with a parseable container
 	// ID (a standalone, non-k8s container) has no namespace/pod/container labels,
@@ -798,12 +818,12 @@ func (cb *cadvisorBatcher) putFilteredLabels(attrs pcommon.Map, labels []Label, 
 // podMeta resolves pod metadata by name with a small TTL cache; nil when
 // unknown. The second value is podCacheEntry.answered: on a nil pod it says
 // whether the metadata service ANSWERED (a 404) or could not be asked.
-func (s *Scraper) podMeta(ctx context.Context, namespace, pod string) (*kubemeta.Pod, bool) {
+func (s *Scraper) podMeta(ctx context.Context, namespace, pod string, obj *objectShed) (*kubemeta.Pod, bool) {
 	key := "n\x00" + namespace + "/" + pod
 	if e, ok := s.cacheGet(key); ok {
 		return e.pod, e.pod != nil || e.answered
 	}
-	lctx, spent, may := s.metaLookup(ctx)
+	lctx, spent, may := s.metaLookup(ctx, obj)
 	if !may {
 		// The scrape has spent its metadata allowance (metabudget.go): the object
 		// keeps its label identity, exactly as it would against a service that
@@ -839,7 +859,7 @@ func (s *Scraper) podMeta(ctx context.Context, namespace, pod string) (*kubemeta
 // metadata SERVICE, and the retry that follows must be soon rather than rare.
 // Both still produce a nil here, and the cadvisor path still treats them
 // alike: the row is exported with its label identity either way.
-func (s *Scraper) containerMeta(ctx context.Context, containerID string) (*kubemeta.ContainerMetadata, bool) {
+func (s *Scraper) containerMeta(ctx context.Context, containerID string, obj *objectShed) (*kubemeta.ContainerMetadata, bool) {
 	key := "c\x00" + containerID
 	if e, ok := s.cacheGet(key); ok {
 		if e.pod == nil {
@@ -847,7 +867,7 @@ func (s *Scraper) containerMeta(ctx context.Context, containerID string) (*kubem
 		}
 		return &kubemeta.ContainerMetadata{ContainerID: containerID, Container: *e.container, Pod: *e.pod}, true
 	}
-	lctx, spent, may := s.metaLookup(ctx)
+	lctx, spent, may := s.metaLookup(ctx, obj)
 	if !may {
 		return nil, false // allowance spent; see podMeta
 	}

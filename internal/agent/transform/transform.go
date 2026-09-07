@@ -293,8 +293,23 @@ func (w *Wrapper) ExportLogs(ctx context.Context, ld plog.Logs) error {
 			return nil // everything dropped: acked, nothing to send
 		}
 		if err := w.next.ExportLogs(ctx, out); err != nil {
-			// Not counted: the producer re-offers the batch and the retry
-			// re-runs the script — see run*'s doc.
+			// On a FAILED export the two producer classes part company, and
+			// this used to apply the copy path's reasoning to both. A
+			// COPY-PATH producer re-offers the same object and the retry
+			// re-runs the script over a fresh copy, so counting here would
+			// multiply one batch's drops by the length of an outage (see
+			// run*'s doc). A HANDED-OFF producer never re-offers it — its
+			// contract is that it rebuilds from source, and for two roster
+			// members the source is already gone by now: promscrape take()s
+			// its chunk and then latches exportFailed, and cgroupstats renders
+			// from a snapshot() that RESET each window as it read it. Their
+			// drops were counted nowhere, ever, so the counter under-reported
+			// drop volume during exactly the collector outage in which an
+			// operator reads it to tell an intentional script drop from a
+			// delivery failure.
+			if HandedOff(ctx) {
+				p.logs.countDropped(dropped)
+			}
 			return err
 		}
 		p.logs.countDropped(dropped)
@@ -320,6 +335,9 @@ func (w *Wrapper) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 			return nil
 		}
 		if err := w.next.ExportMetrics(ctx, out); err != nil {
+			if HandedOff(ctx) { // counted here only for the class that will not re-run the script; see ExportLogs
+				p.metrics.countDropped(dropped)
+			}
 			return err
 		}
 		p.metrics.countDropped(dropped)
@@ -348,6 +366,9 @@ func (w *Wrapper) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 			return nil
 		}
 		if err := w.nextTraces.ExportTraces(ctx, out); err != nil {
+			if HandedOff(ctx) { // counted here only for the class that will not re-run the script; see ExportLogs
+				p.traces.countDropped(dropped)
+			}
 			return err
 		}
 		p.traces.countDropped(dropped)

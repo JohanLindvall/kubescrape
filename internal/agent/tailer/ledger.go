@@ -89,8 +89,15 @@ type file struct {
 	// Together with the inode it prevents a checkpoint from resuming into a
 	// different file (inode reuse, replaced content).
 	fp fingerprint
-	// targetDir is the watched directory of the symlink target.
+	// targetDir is the RESOLVED directory of the symlink target, cached the
+	// moment it is known (findRotated reads it to locate a rotated segment's
+	// file by name, long after the live symlink may be gone).
 	targetDir string
+	// watchedDir is the directory this file currently holds a watch REFERENCE
+	// on. Normally == targetDir; they diverge whenever watcher.Add fails
+	// (fs.inotify.max_user_watches exhausted, the directory racing away), which
+	// must not cost the cache above — see watchTarget.
+	watchedDir string
 	// dirty marks files with pending fsnotify write events.
 	dirty bool
 	// lastMod is the modtime observed by the previous sweep, used to detect

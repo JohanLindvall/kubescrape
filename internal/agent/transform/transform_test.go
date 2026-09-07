@@ -489,3 +489,67 @@ func TestAttributeMembershipIsNotAlwaysTrue(t *testing.T) {
 		t.Errorf("forwarded %q; want keep-me", got)
 	}
 }
+
+// A broken transforms file is a PERSISTING CONDITION, and the failure path had
+// no dedupe at all: every poll tick and every fsnotify event re-read the same
+// broken bytes, emitted the same full Starlark error at Warn and stepped the
+// counter — ~2,880 lines per node per day for one bad edit, on a log stream
+// the agent itself collects, with nothing distinguishing the thousandth
+// repetition from the first. The success path has always been deduped by
+// content hash; this asserts the other outcome is deduped by the same
+// identity, that a NEW broken edit is still reported, and that recovering and
+// breaking again reports again.
+func TestBrokenTransformsFileIsReportedOncePerDistinctEdit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transforms.yaml")
+	good := "logs: |\n  def transform(batch):\n      for r in batch:\n          r.attributes[\"v\"] = \"1\"\n"
+	writeAtomic(t, path, good)
+	prog, err := CompileFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := &capExp{}
+	w := Wrap(next, next, prog)
+	r := &reloader{w: w, path: path, log: testLogger(), currentHash: prog.Hash}
+
+	failed := obs.TransformReloads.WithLabelValues("failed")
+	// applyMany is the poll ticker, deterministically: whatever is on disk,
+	// read 50 times.
+	applyMany := func(content string) float64 {
+		writeAtomic(t, path, content)
+		before := failed.Value()
+		for range 50 {
+			r.apply()
+		}
+		return failed.Value() - before
+	}
+
+	if got := applyMany("logs: |\n  broken ===\n"); got != 1 {
+		t.Fatalf("one broken edit read 50 times counted %v failures, want 1", got)
+	}
+	if got := applyMany("logs: |\n  also broken ===\n"); got != 1 {
+		t.Fatalf("a DIFFERENT broken edit counted %v failures, want 1: the dedupe must not swallow a new edit", got)
+	}
+	// The last good program survived all of it.
+	if got := w.Active().Hash; got != prog.Hash {
+		t.Fatalf("active %s, want the last good %s", got, prog.Hash)
+	}
+	// Recovering clears the memory, so breaking it again reports again.
+	if got := applyMany(good + "metrics: |\n  def transform(batch): pass\n"); got != 0 {
+		t.Fatalf("a good edit counted %v failures, want 0", got)
+	}
+	if got := applyMany("logs: |\n  broken ===\n"); got != 1 {
+		t.Fatalf("breaking it again after a recovery counted %v failures, want 1", got)
+	}
+	// An unreadable file is the same condition, reported the same way.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	before := failed.Value()
+	for range 50 {
+		r.apply()
+	}
+	if got := failed.Value() - before; got != 1 {
+		t.Fatalf("a missing file read 50 times counted %v failures, want 1", got)
+	}
+}

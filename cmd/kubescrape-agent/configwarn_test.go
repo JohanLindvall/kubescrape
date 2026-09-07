@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/route"
+	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailbuffer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
@@ -137,18 +138,71 @@ func TestDerivedRateBurstWarns(t *testing.T) {
 	}
 }
 
-// Off the trace tier both sections are ignored outright (startServiceGraph says
-// so once, per section), so repeating the composition warning on every node
-// would be noise about config that does nothing.
+// Off the trace tier both sections are ignored outright — each says so once —
+// so repeating the COMPOSITION warning on top of that would be a second line
+// about config that does nothing.
 func TestNoCompositionWarningOffTheTraceTier(t *testing.T) {
 	old := *serviceGraphOn
 	*serviceGraphOn = false
 	t.Cleanup(func() { *serviceGraphOn = old })
-	if got := warnText(agentConfig{
+	got := warnText(agentConfig{
 		TailSampling:  tailOnly(),
 		TraceSampling: &tracesample.Config{Probability: 0.1},
-	}); got != "" {
-		t.Fatalf("a DaemonSet agent warned about sections it ignores: %q", got)
+	})
+	if strings.Contains(got, "PER SPAN") {
+		t.Fatalf("a DaemonSet agent warned about composing two samplers it never runs: %q", got)
+	}
+	// What it DOES say is that each section is inert here, which is the report
+	// an operator running -check-config against the shared ConfigMap needs.
+	for _, want := range []string{
+		"traceSampling configured but ignored",
+		"tailSampling configured but ignored",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+// The four tier-only sections and -ingest-span-metrics are inert off the tier,
+// and the dry run has to say so: these warnings used to live in
+// startServiceGraph, which -check-config returns before reaching, so CI read
+// `config is valid` for a ConfigMap whose sections this workload ignores and
+// the pod then printed five WARN lines saying it does. One list, both paths.
+func TestTierOnlySectionsAreReportedIgnoredOffTheTier(t *testing.T) {
+	old, oldSM := *serviceGraphOn, *spanMetrics
+	*serviceGraphOn, *spanMetrics = false, true
+	t.Cleanup(func() { *serviceGraphOn, *spanMetrics = old, oldSM })
+
+	got := warnText(agentConfig{
+		ServiceGraph:       &servicegraph.Config{},
+		ServiceGraphShards: &servicegraph.ReshardConfig{},
+		TailSampling:       tailOnly(),
+		TraceSampling:      &tracesample.Config{Probability: 0.1},
+	})
+	for _, want := range []string{
+		"serviceGraph configured but ignored",
+		"traceSampling configured but ignored",
+		"serviceGraphShards configured but ignored",
+		"tailSampling configured but ignored",
+		"-ingest-span-metrics ignored",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+// On the tier they are all being applied, so none of them is reported ignored.
+func TestTierOnlySectionsAreSilentOnTheTier(t *testing.T) {
+	withServiceGraph(t)
+	oldSM := *spanMetrics
+	*spanMetrics = true
+	t.Cleanup(func() { *spanMetrics = oldSM })
+
+	got := warnText(agentConfig{ServiceGraph: &servicegraph.Config{}, ServiceGraphShards: &servicegraph.ReshardConfig{}})
+	if strings.Contains(got, "configured but ignored") || strings.Contains(got, "-ingest-span-metrics ignored") {
+		t.Fatalf("the tier reported its own sections ignored: %q", got)
 	}
 }
 

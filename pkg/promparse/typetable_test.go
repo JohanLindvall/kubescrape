@@ -1,6 +1,7 @@
 package promparse
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -236,4 +237,68 @@ func TestTypeBudgetResetsBetweenExpositions(t *testing.T) {
 			t.Fatalf("second exposition on a pooled parser: %+v, want one RoleCounter sample", got)
 		}
 	})
+}
+
+// The HELP/UNIT budget must be charged per RETAINED family, exactly as the TYPE
+// table's is charged per NEW key — not once per DECLARATION. Exporters that
+// repeat a family's `# HELP` before every one of its samples exist (they are the
+// same ones that repeat its `# TYPE`, which the table above already accounts
+// for): at ~100 bytes a repetition the 1 MiB budget was spent after ~10k lines,
+// and from there every family declared LATER in the same exposition silently
+// lost its OTLP Description and Unit — nothing counted, nothing logged, and a
+// missing unit changes what the downstream OTLP→Prometheus rewrite names the
+// series.
+func TestMetaBudgetIsChargedPerFamilyNotPerDeclaration(t *testing.T) {
+	t.Parallel()
+	const (
+		repeats = 40_000
+		help    = "a reasonably wordy help string, of the size real exporters emit for their families"
+	)
+	var sb strings.Builder
+	sb.WriteString("# TYPE noisy_total counter\n")
+	for i := range repeats {
+		sb.WriteString("# HELP noisy_total " + help + "\n")
+		sb.WriteString("noisy_total{i=\"" + strconv.Itoa(i) + "\"} 1\n")
+	}
+	// Declared LAST, after any per-line charge would have exhausted the budget.
+	sb.WriteString("# HELP late_total the late family's help\n")
+	sb.WriteString("# UNIT late_total seconds\n")
+	sb.WriteString("# TYPE late_total counter\n")
+	sb.WriteString("late_total 1\n")
+
+	p := New(Options{OpenMetrics: true})
+	var late Sample
+	if _, err := p.Parse(strings.NewReader(sb.String()), func(s Sample) error {
+		if s.Name == "late_total" {
+			late = s
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if late.Help != "the late family's help" {
+		t.Errorf("late family's Help = %q, want it intact: the repeated HELP of an earlier family spent the budget", late.Help)
+	}
+	if late.Unit != "seconds" {
+		t.Errorf("late family's Unit = %q, want \"seconds\"", late.Unit)
+	}
+	// And the accounting must reflect what is RETAINED, not what was declared:
+	// two families' worth, not 40k.
+	if got, want := p.metaBytes, len(help)+len("noisy_total")+len("the late family's help")+len("seconds")+len("late_total"); got != want {
+		t.Errorf("metaBytes = %d, want %d (one charge per retained family)", got, want)
+	}
+}
+
+// A family REDECLARING different HELP is charged the growth and nothing more,
+// so the budget still tracks retention when the text really does change.
+func TestMetaBudgetTracksRetentionAcrossRedeclaration(t *testing.T) {
+	t.Parallel()
+	p := New(Options{})
+	body := "# HELP f short\n# HELP f a much longer help string\nf 1\n"
+	if _, err := p.Parse(strings.NewReader(body), func(Sample) error { return nil }); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got, want := p.metaBytes, len("f")+len("a much longer help string"); got != want {
+		t.Errorf("metaBytes = %d, want %d (the retained text, not the sum of declarations)", got, want)
+	}
 }

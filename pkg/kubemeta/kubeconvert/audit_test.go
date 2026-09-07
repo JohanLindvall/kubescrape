@@ -188,8 +188,11 @@ func TestAudit_FromPodByIDIndex(t *testing.T) {
 	if prev.RuntimeID != "containerd://appid1" {
 		t.Errorf("previous RuntimeID = %q", prev.RuntimeID)
 	}
-	if prev.RestartCount != 1 {
-		t.Errorf("previous RestartCount = %d, want the status's 1 (carried from the live container)", prev.RestartCount)
+	// The status's restartCount is 1 and describes the LIVE container; the
+	// incarnation that terminated to produce it ran as 0. See
+	// TestPreviousIncarnationDoesNotCarryTheLiveContainersImageOrRestartCount.
+	if prev.RestartCount != 0 {
+		t.Errorf("previous RestartCount = %d, want 0 (the status's 1 describes the live container)", prev.RestartCount)
 	}
 	cur := byID["appid2"]
 	if cur.State != "running" || !cur.Ready || cur.ExitCode != nil {

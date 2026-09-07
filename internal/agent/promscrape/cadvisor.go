@@ -125,6 +125,12 @@ type scrapeSession struct {
 	droppedFilter  int
 	droppedRelabel int
 	exportFailed   bool
+	// badExemplars is the PROTOBUF front's count of exemplars refused for
+	// their label block (the text front keeps its own on the parser and hands
+	// it over through MalformedExemplars). Both land on the same counter
+	// through reportBadExemplars: the sample was exported either way, so this
+	// is never malformed.
+	badExemplars int
 	// detail is the text parser's per-cause breakdown of this scrape's
 	// malformed count, read off the parser before it is returned to the pool
 	// (the protobuf front leaves it zero: its families fail whole, so there is

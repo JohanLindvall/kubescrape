@@ -376,9 +376,16 @@ func gvrKind(gvr schema.GroupVersionResource) string {
 // what the caller puts on kubemeta.Pod.OwnersOmitted so a truncated chain
 // cannot read as a complete one.
 //
-// The cap is applied ONLY to the emitted list. Every reference is still walked,
-// still counted when it fails to resolve, and still deduplicated by UID: the
-// bound exists to keep the DOCUMENT a constant size, not to stop looking.
+// Once the cap is reached the walk SHORT-CIRCUITS: a further reference is still
+// deduplicated by UID (so a pod naming one owner ten times spends one slot, not
+// ten) and is counted, but only as reason="owners_capped" — no lister read, no
+// resolve-failure reason of its own, and no recursion into its parents. That is
+// deliberate and it is what the cap is FOR: the legitimate maximum is two
+// references (one controller plus the one parent this resolver follows), so a
+// pod past the bound is already pathological and the cheapest correct answer is
+// to stop looking. Read the counter accordingly — a burst of owners_capped is
+// one pod's shape, and it SUBSTITUTES for whatever not_found/lister_error those
+// references would otherwise have reported rather than adding to it.
 func (r *Resolver) Resolve(namespace string, refs []metav1.OwnerReference) ([]kubemeta.Owner, int) {
 	if len(refs) == 0 {
 		return nil, 0

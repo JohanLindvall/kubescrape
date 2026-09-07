@@ -284,8 +284,11 @@ func (h *histAgg) setExemplar(idx, nbuckets int, v float64, ts pcommon.Timestamp
 func (r *Registry) clock() time.Time { return r.now() }
 
 // NewRegistry builds the aggregator from cfg (Tempo's defaults fill the zero
-// value).
-func NewRegistry(cfg Config) *Registry {
+// value). log may be nil.
+func NewRegistry(cfg Config, log *slog.Logger) *Registry {
+	if log == nil {
+		log = slog.Default()
+	}
 	cfg = cfg.withDefaults()
 	bounds := slices.Clone(cfg.HistogramBuckets)
 	slices.Sort(bounds) // Validate demands ascending; New never refuses to aggregate over it
@@ -297,7 +300,19 @@ func NewRegistry(cfg Config) *Registry {
 	// what reports it (and -check-config runs that), so New never refuses to
 	// aggregate. "0" resolves to 0 here, which is the disable branch in
 	// cumagg's eviction.
-	stale, _ := cfg.staleAfter()
+	//
+	// The fallback is not SILENT, for the reason the sibling aggregator's
+	// identical arm already gives: a start that has somehow got past Validate
+	// must not then apply a different eviction policy with nothing to grep for
+	// — with eviction off the cardinality cap becomes the one-way latch
+	// cumagg.ParseStaleAfter exists to prevent. The two arms were written
+	// differently, which is exactly the drift this package pair keeps
+	// producing.
+	stale, err := cfg.staleAfter()
+	if err != nil {
+		log.Warn("serviceGraph.staleAfter is unparseable; using the default eviction age",
+			"error", err, "staleAfter", stale)
+	}
 	r := &Registry{bounds: bounds, exemplars: ex, now: time.Now}
 	r.store = cumagg.NewStore(cumagg.Options[*edgeSeries]{
 		Scope:          scopeName,
@@ -494,13 +509,13 @@ func (r *Registry) growSnap(n int) {
 // Record stall inside a 46.7 ms render, now 1.6 ms
 // (TestRenderDoesNotStallRecord).
 func (r *Registry) snapshot(now time.Time) []edgeSnapshot {
-	// Hold 1: evict, then take the series POINTERS. One pointer write each, so
-	// this is the cheapest pass that can exist over a map — and it is what lets
-	// the expensive part be chunked, because a slice can be walked across lock
-	// releases and a map cannot.
+	// Hold 1: evict and take the series POINTERS in ONE walk (the two used to be
+	// two passes inside this hold, which visited every series twice for
+	// nothing). One pointer write each, so this is the cheapest pass that can
+	// exist over a map — and it is the only one a render cannot chunk, because
+	// a slice can be walked across lock releases and a map cannot.
 	r.store.Lock()
-	r.store.EvictLocked(now)
-	ptrs := r.store.PointersLocked(r.snapPtrs[:0])
+	ptrs := r.store.LivePointersLocked(r.snapPtrs[:0], now)
 	r.snapPtrs = ptrs
 	r.store.Unlock()
 

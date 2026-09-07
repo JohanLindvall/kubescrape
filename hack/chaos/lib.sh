@@ -113,8 +113,13 @@ PY
 }
 
 # counters <substring> — latest value of each matching kubescrape_* self-metric.
+#
+# It PROPAGATES a failed capture. It used to `return 0`, so a scenario whose
+# collector could not be read printed nothing and read as "the counter did not
+# move" — indistinguishable from the counter genuinely staying flat, on the
+# scripts whose whole job is to notice a signal.
 counters() {
-  grab metrics || return 0
+  grab metrics || return 1
   python3 - "${1:-}" "$CAP_DIR/metrics.json" <<'PY'
 import json, sys
 pat, path = sys.argv[1], sys.argv[2]
@@ -144,6 +149,65 @@ for line in open(path, errors="replace"):
 for (pod, n, at), v in sorted(seen.items()):
     print(f"    {pod} {n}{{{at}}} = {v}")
 PY
+}
+
+# counter_total <metric-name> — the SUM of that metric's latest data points
+# across every reporting pod, as a bare integer. Prints nothing and returns
+# non-zero when the collector capture cannot be read, so a caller can tell "no
+# capture" from "zero", which the human-readable `counters` cannot.
+#
+# The collector's file exporter holds every push, so the LAST value of a series
+# is its current one; a counter that has never been incremented was never
+# exported at all and reads as absent, which for a total is 0.
+counter_total() {
+  grab metrics || return 1
+  python3 - "$1" "$CAP_DIR/metrics.json" <<'PY'
+import json, sys
+name, path = sys.argv[1], sys.argv[2]
+seen = {}
+for line in open(path, errors="replace"):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    for rm in d.get("resourceMetrics", []):
+        ra = {a["key"]: list(a["value"].values())[0] for a in rm["resource"].get("attributes", [])}
+        pod = ra.get("k8s.pod.name", ra.get("service.instance.id", "?"))
+        for sm in rm.get("scopeMetrics", []):
+            for m in sm.get("metrics", []):
+                if m["name"] != name:
+                    continue
+                for t in ("gauge", "sum"):
+                    for dp in m.get(t, {}).get("dataPoints", []):
+                        at = ",".join(f'{a["key"]}={list(a["value"].values())[0]}'
+                                      for a in dp.get("attributes", []))
+                        seen[(pod, at)] = dp.get("asInt", dp.get("asDouble", 0))
+print(int(sum(float(v) for v in seen.values())))
+PY
+}
+
+# assert_no_restarts <label> — every pod matching the label selector must have
+# a restartCount of 0. A crash-and-restart can hide a scenario's whole point:
+# the process comes back, resumes, and the invariant under test passes for the
+# wrong reason.
+assert_no_restarts() {
+  local sel="$1" out
+  out=$("${KCTL[@]}" -n "$NS" get pods -l "$sel" -o \
+    jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.containerStatuses[0].restartCount}{"\n"}{end}' \
+    2>/dev/null) || fail "could not read restart counts for '$sel'"
+  [ -n "$out" ] || fail "no pods matched '$sel' — the scenario cannot have observed what it claims"
+  echo "$out" | sed 's/^/    /;s/ / restarts=/'
+  # Two awk traps, both of which made an earlier spelling of this line answer
+  # "no restarts" or "restarted" for every input: `exit 0` in the main block
+  # still runs END, and an exit THERE wins (hence the flag); and `$2 != 0` on a
+  # pod with no containerStatuses compares "" against the string "0" and is
+  # TRUE, so a Pending pod read as a restart (hence the explicit numeric test).
+  if echo "$out" | awk '$2 ~ /^[0-9]+$/ && $2 + 0 > 0 { bad = 1 } END { exit !bad }'; then
+    fail "a pod matching '$sel' restarted during the run — the invariant under test was not exercised by a running process"
+  fi
 }
 
 cleanup_writers() {

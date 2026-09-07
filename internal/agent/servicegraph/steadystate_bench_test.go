@@ -115,7 +115,7 @@ func BenchmarkConsumeSteadyStateRealisticAttrs(b *testing.B) {
 // completed edge pays for its series key and fold as it does in production.
 func BenchmarkConsumeSteadyStateIntoRegistry(b *testing.B) {
 	p := steadyStore(b, 10000, []string{"http.request.method", "peer.service"})
-	p.SetSink(NewRegistry(Config{}))
+	p.SetSink(NewRegistry(Config{}, nil))
 	td := pairingBatch(10001, 100)
 	b.ReportAllocs()
 	for b.Loop() {

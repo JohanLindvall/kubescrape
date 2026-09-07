@@ -130,3 +130,108 @@ func TestTheTwoCacheEvictionGatesAreIndependent(t *testing.T) {
 		t.Errorf("a repeat of the same condition was not throttled, got %d lines", n)
 	}
 }
+
+// The resolved-secret cache holds bearer tokens, CA bundles, client
+// certificates and client PRIVATE KEYS. Its TTL sweep used to sit INSIDE a
+// cache-miss insert, so it could not reach the entry that matters — the ref
+// that stopped being fetched, i.e. the monitor that was deleted or the pod that
+// moved off this node — and if EVERY ref went away the sweep stopped running at
+// all, leaving the whole map resident for the process lifetime. Nothing was
+// ever SERVED stale, so this is hygiene: the material must not outlive its use.
+func TestResolvedSecretsAreReleasedWhenNothingFetchesThemAgain(t *testing.T) {
+	s := New(Config{
+		Node: "n1", Interval: time.Hour, Timeout: time.Second,
+		Targets: staticTargets{}, Exporter: &captureExporter{}, StartTime: time.Now(),
+		Auth: &mapAuth{vals: map[string]string{"ns/creds/tls.key": "-----BEGIN PRIVATE KEY-----"}},
+	})
+	if _, err := s.authToken(context.Background(), "ns/creds/tls.key"); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.authCache) != 1 {
+		t.Fatalf("cache holds %d entries, want 1", len(s.authCache))
+	}
+	// Age the entry past its usefulness. Nothing asks for this ref — or any
+	// other — ever again; only the cycle still runs.
+	s.authMu.Lock()
+	e := s.authCache["ns/creds/tls.key"]
+	e.fetched = e.fetched.Add(-2 * time.Minute)
+	s.authCache["ns/creds/tls.key"] = e
+	s.authMu.Unlock()
+
+	s.cycle(context.Background())
+	if got := len(s.authCache); got != 0 {
+		t.Fatalf("cache still holds %d entries after a cycle: aged-out secret material outlives every ref that could sweep it", got)
+	}
+}
+
+// And the cache is BOUNDED, unlike its two siblings: expiry alone bounds
+// nothing under ref churn, since every entry minted inside one TTL window
+// survives the sweep.
+func TestResolvedSecretCacheIsBounded(t *testing.T) {
+	vals := map[string]string{}
+	for i := range maxAuthCacheEntries * 2 {
+		vals["ns/creds/key"+strconv.Itoa(i)] = "secret"
+	}
+	s := New(Config{
+		Node: "n1", Interval: time.Hour, Timeout: time.Second,
+		Targets: staticTargets{}, Exporter: &captureExporter{}, StartTime: time.Now(),
+		Auth: &mapAuth{vals: vals},
+	})
+	for i := range maxAuthCacheEntries * 2 {
+		if _, err := s.authToken(context.Background(), "ns/creds/key"+strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(s.authCache); got > maxAuthCacheEntries {
+		t.Fatalf("cache holds %d entries, want <= %d", got, maxAuthCacheEntries)
+	}
+}
+
+// The per-target TLS client cache had the size cap as its ONLY removal path, so
+// a cert-manager rotation (the key includes the resolved PEM, so every rotation
+// mints a new entry) left the PREVIOUS client's private key resident until 64
+// distinct materials had been seen — the process lifetime on a node with a
+// handful of TLS targets. Retirement is by LAST USE, so a client scraped every
+// cycle is never rebuilt on a timer.
+func TestSupersededTLSClientsAreRetiredBeforeTheCap(t *testing.T) {
+	s := New(Config{Node: "n1", Interval: time.Hour, Timeout: time.Second})
+	old := testTarget("https://x/metrics")
+	old.TLSServerName = "rotated.example"
+	if _, err := s.clientFor(context.Background(), old, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	hot := testTarget("https://y/metrics")
+	hot.TLSServerName = "hot.example"
+	hotClient, err := s.clientFor(context.Background(), hot, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Time passes; only the hot target keeps being scraped.
+	s.tlsMu.Lock()
+	for k, e := range s.tlsClients {
+		e.used = e.used.Add(-2 * tlsClientIdleTTL)
+		s.tlsClients[k] = e
+	}
+	s.tlsMu.Unlock()
+	if _, err := s.clientFor(context.Background(), hot, time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	// A third, distinct material: its insert is what runs the retirement.
+	third := testTarget("https://z/metrics")
+	third.TLSServerName = "third.example"
+	if _, err := s.clientFor(context.Background(), third, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(s.tlsClients); got != 2 {
+		t.Fatalf("cache holds %d clients, want 2 — the superseded one must be retired well below the %d cap", got, maxTLSClients)
+	}
+	again, err := s.clientFor(context.Background(), hot, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != hotClient {
+		t.Error("the still-used client was rebuilt: retirement must be by LAST USE, not by age")
+	}
+}

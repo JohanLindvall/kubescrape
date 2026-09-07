@@ -94,6 +94,19 @@ spec:
       containers:
         - name: kubescrape
           image: ghcr.io/johanlindvall/kubescrape:latest
+          # `:latest` with IfNotPresent, and both halves are deliberate here
+          # while being a real hazard in production: re-pushing the tag leaves
+          # this manifest byte-identical, so `kubectl apply` rolls nothing, and
+          # a manual rollout restart then reuses the `latest` layer every node
+          # already cached — a successful-looking upgrade running the old
+          # binary, with the startup line's `version=` as the only evidence.
+          # It stays because hack/e2e.sh applies these files against an image
+          # `kind load`ed from the working tree, which exists in no registry:
+          # `Always` would either fail the pull or fetch a PUBLISHED :latest
+          # over the build under test. Pin the tag to a release or an
+          # `@sha256:` digest for a real deployment (the Helm chart's
+          # `image.tag`), and the pull policy stops mattering. See
+          # docs/CONFIGURATION.md, "Accepted security residuals".
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

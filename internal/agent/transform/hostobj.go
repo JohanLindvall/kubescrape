@@ -726,7 +726,14 @@ func (p *dpObj) SetField(name string, v starlark.Value) error {
 // nature: routing splits payloads per resource, so routing one record
 // routes its whole resource group.
 func routeFn(res pcommon.Resource) starlark.Value {
-	return starlark.NewBuiltin("route", func(_ *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	return starlark.NewBuiltin("route", func(th *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		// Every builtin this package defines checks the wall clock on entry
+		// (limits.go): the between-steps checkpoint cannot see a script that
+		// spends minutes inside a handful of O(n) steps, so the builtins are
+		// the seam where an overrun is caught.
+		if err := budgetOf(th).overtime(); err != nil {
+			return nil, positioned(th, err)
+		}
 		var name string
 		if err := starlark.UnpackPositionalArgs(b.Name(), args, kwargs, 1, &name); err != nil {
 			return nil, err
@@ -743,7 +750,14 @@ func routeFn(res pcommon.Resource) starlark.Value {
 // script error, surfaced like any other (obs.TransformErrors + the export's
 // retry); the fix is a config edit, and both files hot-reload.
 func emitFn(res pcommon.Resource, em MetricEmitter) starlark.Value {
-	return starlark.NewBuiltin("emit_metric", func(_ *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	return starlark.NewBuiltin("emit_metric", func(th *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		bud := budgetOf(th)
+		// The wall-clock check every builtin here owes (limits.go), and it
+		// matters most on this one: the call materialises a Go map, renders
+		// each non-string value, and takes the metric store's lock.
+		if err := bud.overtime(); err != nil {
+			return nil, positioned(th, err)
+		}
 		var name string
 		var value starlark.Value
 		var lblDict *starlark.Dict
@@ -763,20 +777,9 @@ func emitFn(res pcommon.Resource, em MetricEmitter) starlark.Value {
 		default:
 			return nil, errors.New("emit_metric: value must be a number")
 		}
-		var lbls map[string]string
-		if lblDict != nil {
-			lbls = make(map[string]string, lblDict.Len())
-			for _, kv := range lblDict.Items() {
-				k, ok := starlark.AsString(kv[0])
-				if !ok {
-					return nil, errors.New("emit_metric: label keys must be strings")
-				}
-				v, ok := starlark.AsString(kv[1])
-				if !ok {
-					v = kv[1].String()
-				}
-				lbls[k] = v
-			}
+		lbls, err := emitLabels(th, lblDict)
+		if err != nil {
+			return nil, err
 		}
 		if em == nil {
 			return nil, fmt.Errorf("emit_metric %q: no logMetrics section is configured", name)
@@ -786,4 +789,69 @@ func emitFn(res pcommon.Resource, em MetricEmitter) starlark.Value {
 		}
 		return starlark.None, nil
 	})
+}
+
+// emitLabels materialises emit_metric's labels dict, charged.
+//
+// It was the one script-built value in this package that reached a Go
+// allocation with no bound at all: dict setitem is a documented uncharged
+// residual (limits.go), so the dict arriving here is bounded by nothing, and
+// the Go map, the per-value renders and the metric store's lock were all paid
+// for outside the invocation's budget. A non-string value goes through the
+// same projection str() does — Value.String() is the same amplifier under
+// another name.
+func emitLabels(th *starlark.Thread, d *starlark.Dict) (map[string]string, error) {
+	if d == nil {
+		return nil, nil
+	}
+	bud := budgetOf(th)
+	if int64(d.Len()) > maxSeqElems {
+		return nil, positioned(th, fmt.Errorf("emit_metric: %d labels is over the %d-element limit for one value", d.Len(), int64(maxSeqElems)))
+	}
+	if err := bud.project(satMul(int64(d.Len()), 2*bytesPerValue)); err != nil {
+		return nil, positioned(th, err)
+	}
+	lbls := make(map[string]string, d.Len())
+	cost := int64(0)
+	iter := d.Iterate()
+	defer iter.Done()
+	var key starlark.Value
+	for iter.Next(&key) {
+		k, ok := starlark.AsString(key)
+		if !ok {
+			return nil, errors.New("emit_metric: label keys must be strings")
+		}
+		val, found, err := d.Get(key)
+		if err != nil || !found {
+			continue
+		}
+		// A string label costs the map's two slots: Go strings are shared
+		// with the dict, so nothing is copied. A non-string one is RENDERED,
+		// which is str()'s amplifier under another name, so it is projected
+		// before it is built and its bytes are new.
+		v, ok := starlark.AsString(val)
+		cost += 2 * bytesPerValue
+		if !ok {
+			limit := int64(maxStringBytes)
+			if r := bud.remaining(); r < limit {
+				limit = r
+			}
+			sz := renderSize(val, 0, limit)
+			if sz > maxStringBytes {
+				return nil, positioned(th, fmt.Errorf("emit_metric: label %q would render at least %d bytes, over the %d-byte limit for one value", k, sz, int64(maxStringBytes)))
+			}
+			v = val.String()
+			cost += int64(len(v))
+		}
+		lbls[k] = v
+		// Refuse as the map fills, not once it is built: the count projection
+		// above models the slots, and a dict of long rendered values passes it.
+		if err := bud.project(cost); err != nil {
+			return nil, positioned(th, err)
+		}
+	}
+	if err := bud.spend(cost); err != nil {
+		return nil, positioned(th, err)
+	}
+	return lbls, nil
 }

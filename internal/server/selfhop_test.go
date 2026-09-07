@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"strings"
 	"testing"
 	"time"
@@ -33,9 +34,27 @@ import (
 // A hop that sets a forwarding header is a hop saying so, and that is refused
 // now. The header is still never read for an ADDRESS — see the sibling test
 // below, which is the property it must not cost.
+
+// selfHopCases is one case per forwarding header, and the VALUES are
+// deliberately varied with an empty one in the set: the doc says the PRESENCE
+// is the whole effect, and Header.Get — which cannot tell an absent header from
+// a present-and-empty one — is what that used to be implemented with. Via is
+// RFC 9110 §7.6.3's REQUIRED forwarding header, so a spec-following proxy that
+// adds nothing else reaches this too; it used to be answered 200 with its own
+// pod's identity.
+var selfHopCases = []struct{ header, value string }{
+	{"X-Forwarded-For", "10.0.0.5"},
+	{"Forwarded", "for=10.0.0.5"},
+	{"X-Real-Ip", "10.0.0.5"},
+	{"Via", "1.1 proxy"},
+	{"X-Forwarded-For", ""},
+	{"Via", ""},
+}
+
 func TestSelfRefusesAConnectionAHopDeclares(t *testing.T) {
-	for _, header := range []string{"X-Forwarded-For", "Forwarded", "X-Real-Ip"} {
-		t.Run(header, func(t *testing.T) {
+	for _, tc := range selfHopCases {
+		header := tc.header
+		t.Run(header+"="+tc.value, func(t *testing.T) {
 			st := store.New(time.Minute)
 			addNamedPod(st, "real-caller", "uid-caller", "10.0.0.5")
 			addNamedPod(st, "egress-proxy", "uid-proxy", "10.0.0.9")
@@ -46,7 +65,7 @@ func TestSelfRefusesAConnectionAHopDeclares(t *testing.T) {
 
 			req := httptest.NewRequest(http.MethodGet, "/v1/self", nil)
 			req.RemoteAddr = "10.0.0.9:41234" // the proxy re-originated it
-			req.Header.Set(header, "10.0.0.5")
+			req.Header.Set(header, tc.value)
 			w := httptest.NewRecorder()
 			api.Handler().ServeHTTP(w, req)
 
@@ -140,4 +159,24 @@ func addNamedPod(st *store.Store, name, uid, ip string) {
 		Spec:   corev1.PodSpec{NodeName: "node1", Containers: []corev1.Container{{Name: "c", Image: "img"}}},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: ip},
 	})
+}
+
+// The table above must cover forwardedHeaders — a name added to the list with
+// no case here is a refusal nothing exercises — and every name in it must be in
+// net/http's canonical form, since forwardedVia indexes the header map directly
+// rather than going through Header.Get (which canonicalises for you, and which
+// is what could not tell an empty header from an absent one).
+func TestForwardedHeaderNamesAreCanonicalAndExercised(t *testing.T) {
+	covered := map[string]bool{}
+	for _, tc := range selfHopCases {
+		covered[tc.header] = true
+	}
+	for _, h := range forwardedHeaders {
+		if got := textproto.CanonicalMIMEHeaderKey(h); got != h {
+			t.Errorf("forwardedHeaders has %q, which net/http stores as %q: the refusal never fires for it", h, got)
+		}
+		if !covered[h] {
+			t.Errorf("forwardedHeaders names %q and selfHopCases does not exercise it", h)
+		}
+	}
 }

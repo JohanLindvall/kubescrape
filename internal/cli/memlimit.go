@@ -167,6 +167,20 @@ func cgroupMemoryLimit() (int64, string, bool) {
 	return 0, "", false
 }
 
+// CgroupMemoryLimit reports THIS CONTAINER'S OWN memory limit and the file it
+// was read from, or ok=false when the workload is uncapped or the limit cannot
+// be read. It is cgroupMemoryLimit's exported face, and it exists so that the
+// claim in the file comment above — that the Go soft limit and
+// internal/agent/tailbuffer's maxSpans sizing cannot disagree about how much
+// memory this pod has — is held by ONE implementation rather than by two that
+// happen to read the same path. tailbuffer's own reader looked at the mount
+// root alone, so under cgroupns=host it saw no limit at all and sized the span
+// buffer against the NODE's RAM; it calls this now.
+//
+// A caller that wants a fallback to the host's MemTotal has to add it itself:
+// this package deliberately has none (see the file comment).
+func CgroupMemoryLimit() (int64, string, bool) { return cgroupMemoryLimit() }
+
 // limitFiles lists the files that may hold this container's own limit, most
 // specific first: the cgroup /proc/self/cgroup names, then the mount root
 // itself. A rel that would leave base is dropped entirely, so a malformed

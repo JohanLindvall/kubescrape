@@ -423,7 +423,20 @@ type Buffer struct {
 	earlyWarn    logdedupe.Throttle
 	earlyEvery   time.Duration
 
-	warnGate logdedupe.Throttle
+	// TWO gates for the two failed-export lines, never one. They describe the
+	// same downstream condition and therefore CO-OCCUR, but they are not the
+	// same event: ExportTraces' line reports a NACK (nothing is lost — the
+	// sender still holds every span and retransmits), while the drain's
+	// reports spans DESTROYED (their senders were acked at buffering time,
+	// and this line is the only one that names them). Sharing one gate let
+	// the harmless line — emitted from every concurrent receive goroutine, so
+	// far more frequent — claim the slot and suppress the loss report for the
+	// whole window, leaving an operator reading a log that says the senders
+	// have it covered while buffered spans are being dropped. Same rule, and
+	// the same reason, as the tailer's unresolved-file and metadata-budget
+	// pair.
+	nackWarn logdedupe.Throttle
+	lossWarn logdedupe.Throttle
 }
 
 // policyCounters is one policy's two decision counters (it can keep by matching
@@ -614,7 +627,7 @@ func (b *Buffer) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 		// send may be COMPOSITE (a routing fan-out, an otlpsplit into parts),
 		// so shares of it can have been delivered or spooled before the
 		// failure — at-least-once keeps those real.
-		b.warn("exporting tail-sampled spans failed; the push is NACKed (the sender's retry re-presents its own spans) and the spans that came out of the buffer are dropped from this process and counted lost — an upper bound: under a routed or size-split export, earlier shares may already have been delivered or spooled",
+		b.warn(&b.nackWarn, "exporting tail-sampled spans failed; the push is NACKed (the sender's retry re-presents its own spans) and the spans that came out of the buffer are dropped from this process and counted lost — an upper bound: under a routed or size-split export, earlier shares may already have been delivered or spooled",
 			"spans", out.spans, "buffered", mine, "error", err)
 		return err
 	}
@@ -999,7 +1012,8 @@ func (b *Buffer) Sweep(ctx context.Context) { b.drain(ctx, false) }
 func (b *Buffer) Flush(ctx context.Context) { b.drain(ctx, true) }
 
 // drain decides the due traces (or all of them) and sends the keeps as ONE
-// payload. Deciding happens under the mutex; the send never does.
+// payload. Deciding happens under the mutex — in CHUNKS, so one sweep is not
+// one hold (see decideChunk) — and the send never does.
 func (b *Buffer) drain(ctx context.Context, all bool) {
 	if b == nil {
 		return
@@ -1018,23 +1032,39 @@ func (b *Buffer) drain(ctx context.Context, all bool) {
 		// re-fill a buffer nobody will empty.
 		b.flushed = true
 	}
-	for b.head < len(b.order) {
-		e := b.order[b.head]
-		if e.gone {
-			b.head++
+	// CHUNKED, on the SWEEP path: the mutex is dropped and re-taken every
+	// decideChunk decisions, so one tick's whole due set is not a single hold.
+	// Deciding still happens under the mutex (the evaluator reads b.scratch,
+	// and remove() edits the map and the FIFO), but a decision can be
+	// arbitrarily expensive — a `type: script` policy is a Starlark call — and
+	// the receive path takes this same mutex for every push. Holding it across
+	// a backlog's worth of decisions once per tick is the stall
+	// internal/agent/servicegraph and internal/agent/spanmetrics already chunk
+	// their renders out of.
+	//
+	// Releasing it mid-sweep is safe because nothing here is carried across
+	// the gap in a form a concurrent push could invalidate: head and order are
+	// re-read every iteration (a push may append, and remove()/compact() may
+	// rewrite the prefix and reset head), `now` is sampled once ON PURPOSE so
+	// the due set stays the one this drain started with, and out is this
+	// goroutine's alone. A push landing in the gap buffers a trace this drain
+	// has not reached, which the next tick decides.
+	//
+	// The FLUSH path is deliberately ONE hold. Its first act was to latch the
+	// buffer, and take() answers that latch by deciding, itself, every trace
+	// it finds — on the assertion that a latched buffer holds only what THAT
+	// push just put there. A gap here would falsify it: a straggler landing
+	// mid-flush would sweep up other senders' already-acked, still-undecided
+	// traces and hand their spans out on ITS ack, where they are neither
+	// marked owned (so a disk buffer never sees them) nor counted lost if the
+	// push is NACKed. Shutdown is also the one moment contention does not
+	// matter — the receivers have already been asked to stop.
+	for !b.decideChunkLocked(&out, now, all) {
+		if all {
 			continue
 		}
-		reason := ""
-		if !all {
-			if now.Sub(e.first) < b.set.wait {
-				break // the FIFO is deadline-ordered: nothing behind it is due
-			}
-		} else if now.Sub(e.first) < b.set.wait {
-			// Judged before its window closed because the process is stopping.
-			reason = reasonShutdown
-		}
-		b.head++
-		b.decide(&out, e, now, reason)
+		b.mu.Unlock()
+		b.mu.Lock()
 	}
 	early, report := b.takeEarlyLocked()
 	b.mu.Unlock()
@@ -1069,11 +1099,57 @@ func (b *Buffer) drain(ctx context.Context, all bool) {
 	defer cancel()
 	if err := b.sendRetry(otlpexport.Own(sctx), out.td); err != nil {
 		b.spansLost.Add(float64(out.spans))
-		b.warn("exporting tail-sampled traces failed on the final attempt; the spans are dropped from this process (their senders were acked at buffering time) and counted lost — an upper bound: under a routed or size-split export, earlier shares may already have been delivered or spooled",
+		b.warn(&b.lossWarn, "exporting tail-sampled traces failed on the final attempt; the spans are dropped from this process (their senders were acked at buffering time) and counted lost — an upper bound: under a routed or size-split export, earlier shares may already have been delivered or spooled",
 			"spans", out.spans, "error", err)
 		return
 	}
 	b.spansKept.Add(float64(out.spans))
+}
+
+// decideChunk bounds ONE lock hold of a drain to that many decisions.
+//
+// Smaller than servicegraph's and spanmetrics' snapChunk (512), deliberately:
+// their unit is a value copy out of a map and this one is a POLICY
+// EVALUATION, which for `type: script` is a Starlark call. The lock/unlock
+// pair around each chunk costs tens of nanoseconds against at least that many
+// microseconds of decisions, so the only thing the number really trades is
+// how long a concurrent push can wait — 64 pairs to drain a backlog of 8192
+// is free.
+const decideChunk = 128
+
+// decideChunkLocked decides at most decideChunk traces and reports whether the
+// drain is FINISHED (nothing left, or the next trace is not due). Called with
+// the mutex held and returns with it held, so the caller's loop is a plain
+// unlock/lock between chunks — or, on the flush path, no unlock at all.
+//
+// Slots of already-decided traces are skipped without spending the budget:
+// they cost a pointer test, and the budget exists to bound the expensive thing
+// — Decide.
+func (b *Buffer) decideChunkLocked(out *outbound, now time.Time, all bool) bool {
+	for n := 0; n < decideChunk; {
+		if b.head >= len(b.order) {
+			return true
+		}
+		e := b.order[b.head]
+		if e.gone {
+			b.head++
+			continue
+		}
+		reason := ""
+		if !all {
+			if now.Sub(e.first) < b.set.wait {
+				// The FIFO is deadline-ordered: nothing behind it is due.
+				return true
+			}
+		} else if now.Sub(e.first) < b.set.wait {
+			// Judged before its window closed because the process is stopping.
+			reason = reasonShutdown
+		}
+		b.head++
+		b.decide(out, e, now, reason)
+		n++
+	}
+	return false
 }
 
 // sendContext is the context a drain's SEND runs on: the caller's DEADLINE
@@ -1172,7 +1248,13 @@ func (b *Buffer) reportEarly(r earlyReport) {
 		// bySomething = how many this window; the bare config name = the bound
 		// that forced them. The two must not share a key — a line carrying
 		// maxTraces twice with different meanings is worse than either.
+		// byShutdown is on the line for the reason any() gives for leaving it
+		// out of the decision to WRITE one: a graceful stop decides everything
+		// early by design and is not news on its own, but once a real bound
+		// has forced the line out, how much of the burst was the stop and how
+		// much was the bound is exactly what the operator is reading it for.
 		"bySpansPerTrace", r.spansPerTrace, "byMaxTraces", r.maxTraces, "byMaxSpans", r.maxSpans,
+		"byShutdown", r.shutdown,
 		"maxTraces", b.set.maxTraces, "maxSpans", b.set.maxSpans,
 		"maxSpansPerTrace", b.set.maxSpansPerTrace,
 		"bufferedTraces", st.Traces, "bufferedSpans", st.Spans)
@@ -1181,9 +1263,12 @@ func (b *Buffer) reportEarly(r earlyReport) {
 // earlyWarnEvery re-warns while a tail-sampling bound keeps binding.
 const earlyWarnEvery = time.Minute
 
-// warn logs at most once per warnEvery.
-func (b *Buffer) warn(msg string, args ...any) {
-	if !b.warnGate.Allow(warnEvery) {
+// warn logs at most once per warnEvery on ITS OWN gate. The gate is a
+// parameter rather than a field of the Buffer because the two callers report
+// two different events about one condition, and the loss report must never be
+// starved by the harmless one — see the fields.
+func (b *Buffer) warn(gate *logdedupe.Throttle, msg string, args ...any) {
+	if !gate.Allow(warnEvery) {
 		return
 	}
 	b.log.Warn(msg, args...)

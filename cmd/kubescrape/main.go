@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -214,10 +215,22 @@ func registerOwnerInformers(metaFactory metadatainformer.SharedInformerFactory, 
 // ownerChangeHandler bumps the owner change token on changes that can actually
 // be SEEN, which is a narrower thing than "the object was written".
 //
-// Everything this package's informers serve is UID + labels + annotations
-// (owners.Resolver.clusterScoped and Resolve, via kubemeta.CopyMeta), and UID
-// is immutable — so an update touching neither map cannot change any response
-// and must not advance the token.
+// Everything this package's informers serve is UID + labels + annotations +
+// OWNER REFERENCES (owners.Resolver.clusterScoped and Resolve, via
+// kubemeta.CopyMeta), and UID is immutable — so an update touching none of
+// those cannot change any response and must not advance the token.
+//
+// The owner references are easy to forget because they are not the object's own
+// metadata in the way the two maps are: Resolve FOLLOWS them (owners.go's
+// `for _, parent := range m.OwnerReferences { add(parent, false) }`), so a
+// ReplicaSet losing or gaining its Deployment ref — a re-adoption, a controller
+// rewriting the field, a `kubectl patch --type=json` removing it — changes the
+// Owners chain of every pod that RS owns, and with it attrs.ServiceName and
+// therefore half the Prometheus job of every series the fleet exports for that
+// workload. Nothing else would bump: the pods are untouched, so the store's
+// generation does not move either, and the memo answers 304 with a full max-age
+// for as long as nothing unrelated happens to change. Only the fields Resolve
+// SERVES are compared (see sameOwnerRefs) — blockOwnerDeletion is not one.
 //
 // COMPARING resourceVersion IS NOT THAT, and the difference is the whole
 // mechanism working or not. The API server changes the resourceVersion on every
@@ -254,13 +267,30 @@ func ownerChangeHandler(changes *owners.Changes, note func()) cache.ResourceEven
 			// than the spare bump it saves, and the spare bump is safe.
 			if okOld && okNew &&
 				maps.Equal(o.Labels, n.Labels) &&
-				maps.Equal(o.Annotations, n.Annotations) {
+				maps.Equal(o.Annotations, n.Annotations) &&
+				sameOwnerRefs(o.OwnerReferences, n.OwnerReferences) {
 				return
 			}
 			changes.Bump()
 		},
 		DeleteFunc: func(any) { note(); changes.Bump() },
 	}
+}
+
+// sameOwnerRefs compares two owner-reference lists on exactly the fields
+// owners.Resolve puts in a served kubemeta.Owner — APIVersion, Kind, Name, UID
+// and the resolved Controller bool — in ORDER, because the emitted chain is in
+// the references' own order and reordering them reorders the response (and its
+// ETag). BlockOwnerDeletion is deliberately not compared: nothing serves it, so
+// a garbage-collector rewrite of it must not invalidate the fleet's memos.
+// Controller is dereferenced rather than pointer-compared, since informer
+// deliveries do not share the *bool.
+func sameOwnerRefs(a, b []metav1.OwnerReference) bool {
+	return slices.EqualFunc(a, b, func(x, y metav1.OwnerReference) bool {
+		return x.UID == y.UID && x.Name == y.Name && x.Kind == y.Kind &&
+			x.APIVersion == y.APIVersion &&
+			(x.Controller != nil && *x.Controller) == (y.Controller != nil && *y.Controller)
+	})
 }
 
 // startServiceMonitors sets up and starts the dynamic ServiceMonitor informer.
@@ -1116,11 +1146,29 @@ func run() error {
 		log.Info("metadata api listening", "addr", *listen)
 		errCh <- srv.ListenAndServe()
 	}()
+	// UNCONDITIONAL, because the release must not be tied to one of the two
+	// arms below. A container lookup parks with no deadline but its own
+	// -wait-timeout and nothing else can wake it: the request contexts are not
+	// derived from ctx (no BaseContext), so stop() cannot reach a parked
+	// handler, and the process EXITING is what cuts it — "Empty reply from
+	// server", no status, nothing counted. The ctx.Done arm below drains
+	// through shutdownHTTP, which is the ordering that matters (before
+	// srv.Shutdown); this defer is the backstop for the ListenAndServe-error
+	// arm, which drains nothing at all. Draining twice is a no-op — the second
+	// call finds both parking spots empty — so the two do not conflict.
+	defer api.Drain()
 
 	var runErr error
 	select {
 	case err := <-errCh:
 		runErr = fmt.Errorf("http server: %w", err)
+		// Here rather than only in the deferred backstop: the deferred one runs
+		// after the remaining shutdown steps have spent their budgets, and a
+		// parked lookup wants its 503 now. The listener is gone, so nothing
+		// will ever answer one.
+		if n := api.Drain(); n > 0 {
+			log.Info("released blocked container lookups so they can be answered", "lookups", n)
+		}
 	case <-ctx.Done():
 		log.Info("shutting down")
 		shutdownStart = time.Now()
@@ -1228,13 +1276,26 @@ func shutdownHTTP(ctx context.Context, srv *http.Server, drain func() int, inFli
 }
 
 // waitFor waits for wg with a deadline, reporting whether it finished in time.
+//
+// TERMINAL PATHS ONLY. On the timeout arm it ABANDONS the goroutine blocked in
+// wg.Wait — there is no way to cancel a WaitGroup — so a caller that reached
+// this while something is genuinely stuck leaks one goroutine until the process
+// exits. Both callers are on run()'s way out (the inline join and the deferred
+// one), where that is a few milliseconds; anything else wants a context-scoped
+// wait instead of this.
+//
+// The TIMER, unlike the goroutine, is stoppable, and is stopped: time.After
+// leaves its timer armed for the whole budget, and this is called twice per
+// shutdown with a budget of up to shutdownStep.
 func waitFor(wg *sync.WaitGroup, budget time.Duration) bool {
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
+	t := time.NewTimer(budget)
+	defer t.Stop()
 	select {
 	case <-done:
 		return true
-	case <-time.After(budget):
+	case <-t.C:
 		return false
 	}
 }

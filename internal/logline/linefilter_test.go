@@ -84,3 +84,52 @@ func TestLineFilterValidation(t *testing.T) {
 		t.Errorf("empty rules = %v, %v; want nil, nil", f, err)
 	}
 }
+
+// The synthetic severity resolves ONLY through the caller's attribute lookup.
+// It is not a line field, so a record with no severity — the plain-source and
+// ingest case, where logchain.RecordSeverity returns "" — must not have a
+// tenant's own `__severity__` in its body answer an operator's rule.
+func TestSeverityIsNeverResolvedFromTheLine(t *testing.T) {
+	t.Parallel()
+	f, err := NewLineFilter([]LineRule{
+		{Action: "drop", Match: []string{SeverityKey + "=debug"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No severity on the record at all: the line must not supply one, in
+	// either format the field scan understands.
+	for _, line := range []string{
+		`{"` + SeverityKey + `":"debug","msg":"hi"}`,
+		SeverityKey + `=debug msg=hi`,
+	} {
+		if !f.Keep(nil, line) {
+			t.Errorf("line %q must keep: the body cannot forge a severity", line)
+		}
+	}
+	// A real severity still drops.
+	sev := func(k string) string {
+		if k == SeverityKey {
+			return "debug"
+		}
+		return ""
+	}
+	if f.Keep(sev, `{"msg":"hi"}`) {
+		t.Error("a record whose severity IS debug must drop")
+	}
+	// ...and a real non-matching severity is not overridden by the body.
+	info := func(k string) string {
+		if k == SeverityKey {
+			return "info"
+		}
+		return ""
+	}
+	if !f.Keep(info, `{"`+SeverityKey+`":"debug","msg":"hi"}`) {
+		t.Error("the record's own severity must win over the body")
+	}
+	// A rule set selecting only on the severity reads no line field, so the
+	// line is never parsed as JSON/logfmt at all.
+	if !f.keys.Empty() {
+		t.Errorf("KeyIndex = %v, want empty: %s is not a line field", f.keys.keys, SeverityKey)
+	}
+}

@@ -100,7 +100,7 @@ func TestConfigDurationSemantics(t *testing.T) {
 	if got := NewProcessor(Config{Wait: "nonsense"}, discardLog()).Wait(); got != DefaultWait {
 		t.Errorf("a bad wait fell back to %v, want %v", got, DefaultWait)
 	}
-	if got := NewRegistry(Config{StaleAfter: "nonsense"}).store.StaleAfter(); got != DefaultStaleAfter {
+	if got := NewRegistry(Config{StaleAfter: "nonsense"}, nil).store.StaleAfter(); got != DefaultStaleAfter {
 		t.Errorf("a bad staleAfter fell back to %v, want %v", got, DefaultStaleAfter)
 	}
 }
@@ -109,7 +109,7 @@ func TestConfigDurationSemantics(t *testing.T) {
 // branch existed from the start and was unreachable, because the old
 // time.Duration field mapped 0 to the 15m default in withDefaults.
 func TestStaleAfterZeroDisablesEviction(t *testing.T) {
-	r := NewRegistry(Config{StaleAfter: "0"})
+	r := NewRegistry(Config{StaleAfter: "0"}, nil)
 	if got := r.store.StaleAfter(); got != 0 {
 		t.Fatalf("staleAfter = %v, want 0", got)
 	}

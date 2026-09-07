@@ -262,6 +262,30 @@ func checkFlagValues() error {
 		return fmt.Errorf("-cgroup-stats-root=%q must be an absolute path (empty autodetects %s): a relative one resolves against the container's working directory and would find no cgroups while reporting no error",
 			*cgroupRoot, cgroupstats.DefaultRoot)
 	}
+	// Two ingest bounds whose ONLY documented spelling of "use the built-in
+	// default" is 0. otlpingest.NewServer normalises a non-positive value to the
+	// default, so a typed negative runs at 32 / 4 MiB in silence — and the
+	// effective-limits line prints the value that is NOT in force
+	// (ingestMaxInFlight=-1 beside a shed running at 32).
+	//
+	// The refusal is worth spelling out because THIS BINARY establishes the
+	// opposite convention one flag away: -otlp-max-send-bytes documents
+	// "negative disables", and sgMaxRecvBytes reads it that way. An operator
+	// raising a collector's max_recv_msg_size and typing -1 here to mean "no
+	// cap" gets the 4 MiB default and a ResourceExhausted on every larger push,
+	// while believing the cap is off. There is no "unbounded" here to offer
+	// them: the bound is what keeps an unauthenticated listener from being an
+	// OOM the process cannot defend against.
+	if flagWasSet("ingest-max-in-flight") && *ingestMaxInFlight < 0 {
+		return fmt.Errorf("-ingest-max-in-flight=%d is not 'unbounded': a negative value is normalised to the built-in default, and the concurrency bound then runs at a number the effective-limits line does not print (it prints the value you typed). "+
+			"Pass a positive bound, or 0 for the default; this flag has no spelling for 'no bound' — it is what keeps an unauthenticated listener from being an OOM the process cannot defend against (the neighbouring -otlp-max-send-bytes is the flag where a negative disables)",
+			*ingestMaxInFlight)
+	}
+	if flagWasSet("ingest-grpc-max-recv-bytes") && *ingestGRPCMaxRecv < 0 {
+		return fmt.Errorf("-ingest-grpc-max-recv-bytes=%d is not 'no cap': a negative value is normalised to gRPC's own default (4 MiB), and every larger push is then refused with ResourceExhausted while the cap looks disabled. "+
+			"Pass a positive byte count, or 0 for the default; unlike -otlp-max-send-bytes, this flag has no spelling for 'unbounded'",
+			*ingestGRPCMaxRecv)
+	}
 	return nil
 }
 
@@ -322,6 +346,20 @@ func kubeletBase(ep string) (string, error) {
 // one colon (its port separator) and a DNS name has none, so neither can reach
 // net.ParseIP here — which matters, because bracketing either is exactly the
 // "invalid IP-literal" refusal this whole function exists to avoid.
+//
+// The ORDER of the two readings is the load-bearing part, and it used to be the
+// other way round. Both can succeed on one string: `fd00::1:8443` is a legal
+// IPv6 address AND a legal `fd00::1` plus port 8443, because a 1-4 digit port is
+// also a legal hextet. Taking the address-only reading first therefore swallowed
+// the port into the address for every port below 10000 — 8443, 9090, 4317, 443 —
+// returning `https://[fd00::1:8443]` with err=nil, so -check-config passed and
+// all three kubelet scrapes then dialled a wrong host on the scheme's default
+// port, forever. Only a 5-digit port survived it, which is the sole reason the
+// shipped :10250 ever worked. A trailing all-decimal group is a port far more
+// often than it is the last hextet of an address someone wrote unbracketed, and
+// the address-only reading is still reachable both from this fallback (its last
+// group is not all digits, or the remainder is not an address) and from the
+// bracketed spelling, which url.Parse accepts without coming here at all.
 func bracketIPLiteralHost(ep string) (string, bool) {
 	scheme, rest, ok := strings.Cut(ep, "://")
 	if !ok {
@@ -337,20 +375,29 @@ func bracketIPLiteralHost(ep string) (string, bool) {
 	if strings.Contains(authority, "@") || strings.Count(authority, ":") < 2 {
 		return "", false
 	}
+	if i := strings.LastIndex(authority, ":"); i >= 0 {
+		if host, port := authority[:i], authority[i+1:]; allDigits(port) && net.ParseIP(host) != nil {
+			return scheme + "://" + net.JoinHostPort(host, port) + tail, true
+		}
+	}
 	if ip := net.ParseIP(authority); ip != nil { // an address with no port
 		return scheme + "://[" + authority + "]" + tail, true
 	}
-	i := strings.LastIndex(authority, ":")
-	host, port := authority[:i], authority[i+1:]
-	if port == "" || net.ParseIP(host) == nil {
-		return "", false
+	return "", false
+}
+
+// allDigits reports whether s is a non-empty run of decimal digits — the shape
+// of a port, and the only trailing group bracketIPLiteralHost will read as one.
+func allDigits(s string) bool {
+	if s == "" {
+		return false
 	}
-	for _, c := range []byte(port) {
-		if c < '0' || c > '9' {
-			return "", false
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
 		}
 	}
-	return scheme + "://" + net.JoinHostPort(host, port) + tail, true
+	return true
 }
 
 // validateConfig compiles every section of the unified config (and the
@@ -475,14 +522,18 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	if *serviceGraphOn && *serviceGraphListen == "" && *serviceGraphHTTPListen == "" {
 		return errors.New(msgShardNoListener)
 	}
-	// Two of the tier's four listeners on one address. Fatal at the real start
-	// (the second bind loses), and the chart renders three of them from values,
-	// so it is a one-value mistake — checked here for the same reason as the
-	// refusal above.
-	if *serviceGraphOn {
-		if err := serviceGraphListenersDistinct(); err != nil {
-			return err
-		}
+	// Two of this process's listeners on one address. Fatal at the real start
+	// (the second bind loses), and the chart renders three of the tier's four
+	// from values, so it is a one-value mistake — checked here for the same
+	// reason as the refusal above.
+	//
+	// UNCONDITIONAL, not under *serviceGraphOn: the collision is not a tier
+	// property. -ingest and -service-graph-ingest default to the same
+	// :4317/:4318, so combining them on one process is a CrashLoop the dry run
+	// used to sign off on, and -pprof-listen typed onto -metrics-listen's :9090
+	// needs no feature flag at all.
+	if err := listenersDistinct(); err != nil {
+		return err
 	}
 	// The SAME merge of flags and section a real start uses, so the dry run
 	// cannot accept a shard set the start rejects (the flags participate: the
@@ -494,7 +545,7 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// refusal on a workload that never reads the section at all — and one
 	// ConfigMap is shared by the DaemonSet, the events/Azure singleton and the
 	// tier, so a shard set that is valid where it is READ made every other
-	// workload exit 1 at startup. startServiceGraph warns where it is ignored.
+	// workload exit 1 at startup. configWarnings says where it is ignored.
 	if *serviceGraphOn {
 		shards, err := serviceGraphShardConfig(cfg.ServiceGraphShards)
 		if err != nil {
@@ -551,7 +602,7 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// it is READ made every other workload exit 1 at startup — the singleton
 	// unrepairably, since events.yaml exposes no extraVolumes to mount a
 	// transforms file with. Off the tier tailSampling is not read at all, and
-	// startServiceGraph's "configured but ignored" warning is already the right
+	// configWarnings' "configured but ignored" line is already the right
 	// report.
 	if *serviceGraphOn && cfg.TailSampling.Enabled() && cfg.TailSampling.UsesScript() && !prog.HasSample() {
 		return errors.New("tailSampling: a `type: script` policy requires -transforms-file with a sample: section defining decide(trace)")
@@ -767,6 +818,36 @@ func configWarnings(cfg agentConfig) []string {
 			out = append(out, fmt.Sprintf(
 				"-logs-rate-limit=%g derives a token bucket of %g (-logs-rate-burst=0 means 2x the rate), below the one whole token a line costs: the tailer raises the bucket to 1 — the refill rate stays %g/s — because a bucket that cannot hold a token pauses every file forever, or with -logs-rate-drop discards every line. Set -logs-rate-burst explicitly to choose the bucket.",
 				*logsRateLimit, burst, *logsRateLimit))
+		}
+	}
+
+	// The tier-only sections and flag on a workload that is not the tier. A
+	// configured section that silently does nothing is indistinguishable from
+	// one that is working, so each of them says so once.
+	//
+	// HERE rather than in startServiceGraph, where they used to live: that
+	// function is reached only by a real start, so -check-config — the thing an
+	// operator runs in CI to answer "is this section being applied?" — printed
+	// `config is valid` with no hint that four of the sections in the shared
+	// ConfigMap are inert on this workload, and the pod that started then
+	// printed up to five WARN lines saying they are. The promise above this
+	// function is that a dry run says exactly what a start would; these five
+	// were the one place it did not hold.
+	if !*serviceGraphOn {
+		if cfg.ServiceGraph != nil {
+			out = append(out, "serviceGraph configured but ignored: this process is not the trace tier (-service-graph=false)")
+		}
+		if c := cfg.TraceSampling; c != nil && c.Enabled() {
+			out = append(out, "traceSampling configured but ignored: traces are received by the trace tier (-service-graph), and this process is not it")
+		}
+		if cfg.ServiceGraphShards != nil {
+			out = append(out, "serviceGraphShards configured but ignored: the shard ring is read only by the trace tier (-service-graph), and this process is not it")
+		}
+		if cfg.TailSampling.Enabled() { // nil-receiver safe
+			out = append(out, "tailSampling configured but ignored: a trace can only be judged where all of its spans are, which is the trace tier (-service-graph), and this process is not it")
+		}
+		if *spanMetrics {
+			out = append(out, "-ingest-span-metrics ignored: span metrics are derived from received traces, and traces are received by the trace tier (-service-graph), which this process is not")
 		}
 	}
 

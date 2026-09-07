@@ -326,3 +326,79 @@ func TestPreviousIncarnationAllocationBudget(t *testing.T) {
 // prevSink defeats the dead-store elimination that would let the budget above
 // hold vacuously.
 var prevSink kubemeta.Container
+
+// The previous incarnation is served as HISTORY under the crashed container's
+// own ID, and the struct copy it is built from carried three fields that
+// describe the LIVE container instead — the harm the same-ID guard's comment
+// already names, applied in that branch and not in this one.
+//
+// The image is the sharp one: spec.containers[].image is mutable in place, so
+// `kubectl set image` restarts the container, leaves the crashed incarnation's
+// ID in lastState, and GET /v1/containers/{oldID} answered with the NEW image
+// and the new digest — which the tailer then stamps on every record of that
+// incarnation's still-present log file, and the cadvisor router on its series.
+// ContainerStateTerminated carries no image, so the honest answer is none.
+// RestartCount was wrong by exactly one on every restarted container, image
+// change or not: the kubelet increments it when the NEW container starts.
+func TestPreviousIncarnationDoesNotCarryTheLiveContainersImageOrRestartCount(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default", UID: "u"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			// The image was changed in place; the crashed incarnation ran the
+			// OLD one, which nothing in the API object records any more.
+			{Name: "app", Image: "app:v2"},
+		}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "app", ContainerID: "containerd://new", ImageID: "sha256:v2",
+				RestartCount: 3, Ready: true,
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ContainerID: "containerd://old", ExitCode: 1,
+				}},
+			}},
+		},
+	}
+	_, byID := FromPod(pod)
+	prev, ok := byID["old"]
+	if !ok {
+		t.Fatalf("the previous incarnation is not indexed: %v", byID)
+	}
+	if prev.Image != "" || prev.ImageID != "" {
+		t.Errorf("the previous incarnation reports image %q / imageID %q — the LIVE container's, on a record presented as history",
+			prev.Image, prev.ImageID)
+	}
+	if prev.RestartCount != 2 {
+		t.Errorf("previous RestartCount = %d, want 2: the status's 3 counts the live container's start", prev.RestartCount)
+	}
+	// The live container is untouched by any of it.
+	cur := byID["new"]
+	if cur.Image != "app:v2" || cur.ImageID != "sha256:v2" || cur.RestartCount != 3 {
+		t.Errorf("the live container lost its own image/restartCount: %+v", cur)
+	}
+}
+
+// A container replaced without the restart counter moving must not produce a
+// negative count. (Reachable in principle — a lastState beside restartCount 0 —
+// and a negative count is not a thing the model can mean.)
+func TestPreviousIncarnationRestartCountIsNeverNegative(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default", UID: "u"},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "app:v1"}}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "app", ContainerID: "containerd://new", RestartCount: 0,
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ContainerID: "containerd://old", ExitCode: 0,
+				}},
+			}},
+		},
+	}
+	_, byID := FromPod(pod)
+	if got := byID["old"].RestartCount; got != 0 {
+		t.Errorf("previous RestartCount = %d, want 0", got)
+	}
+}

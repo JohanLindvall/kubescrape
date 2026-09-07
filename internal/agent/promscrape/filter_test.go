@@ -210,7 +210,7 @@ func TestFilterSession(t *testing.T) {
 		}
 	}
 
-	// Nil filter and >64-rule fallback keep working.
+	// Nil filter, and a rule count past one bitset word.
 	var nilf *MetricFilter
 	if !nilf.session().Keep("anything", nil) {
 		t.Error("nil filter session must keep")
@@ -224,11 +224,14 @@ func TestFilterSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	bs := big.session()
-	if bs.masks != nil {
-		t.Error(">64 rules must disable the memo")
+	if bs.offsets == nil || bs.words != 2 {
+		t.Errorf("65 rules gave offsets=%v words=%d, want a live memo of 2 words", bs.offsets != nil, bs.words)
 	}
 	if bs.Keep("rule7_x", nil) || !bs.Keep("other", nil) {
-		t.Error(">64-rule fallback verdicts wrong")
+		t.Error("multi-word mask verdicts wrong")
+	}
+	if bs.Keep("rule64_x", nil) {
+		t.Error("the 65th rule (the second bitset word) did not decide")
 	}
 }
 

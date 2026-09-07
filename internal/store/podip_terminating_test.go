@@ -1,23 +1,30 @@
 package store
 
-// The pod-IP index's live-beats-terminating precedence, on all three arms that
-// implement it: the two cases in claimOneIPLocked and the comparison in
-// beatsClaimant that promotion uses.
+// The pod-IP index's precedence where a TERMINATING pod is involved, on the two
+// places that implement it: the switch in claimOneIPLocked and beatsClaimant,
+// which promotion uses.
 //
-// The rule exists because a DRAINING pod keeps phase Running for its whole grace
-// period and goes on reporting a PodIP the CNI has already handed to someone
-// else. All three arms could be deleted with the whole store and server suites
-// green, and getting it wrong is silent: GET /v1/pod-ips and GET /v1/self hand
-// back the draining pod, so the ingest peer-IP fallback stamps its name, UID and
-// owners onto the LIVE workload's pushed logs and metrics until the tombstone
-// expires.
+// The rule is that ACQUISITION ORDER decides and the terminating bit does not.
+// It reads backwards at first, because a draining pod keeps phase Running for
+// its whole grace period and goes on reporting its PodIP — but an address is
+// not released until the sandbox is torn down, so during that window the
+// drainer is still the legitimate holder. A pod whose status carries an address
+// "the CNI has already handed to someone else" is by construction the EARLIER
+// acquirer and loses on ipSeq with no help from the terminating bit; the only
+// shapes in which a live-beats-terminating arm decided anything were the ones
+// that argument does not describe, and there it INVERTED the ordering.
 //
-// What the existing coverage misses is the ORDER: TestStaleUpdateCannotReclaim
+// Getting it wrong is silent either way: GET /v1/pod-ips and GET /v1/self hand
+// back the wrong pod, so the ingest peer-IP fallback stamps its name, UID and
+// owners onto the other workload's pushed logs and metrics — and
+// kubescrape_pod_ip_contested_total does not move, noteContested excluding
+// every claim in which either side is terminating.
+//
+// What the coverage elsewhere misses is the ORDER: TestStaleUpdateCannotReclaim
 // RecycledIP and TestLateScheduledPodClaimsRecycledIP both have the live pod
-// acquiring the address LAST, so the ipSeq rule underneath already decides them
-// and the terminating arms are shadowed. Every case below gives the TERMINATING
-// pod the higher ipSeq, which is the only shape in which those arms decide
-// anything.
+// acquiring the address LAST, so they are decided by ipSeq whichever way the
+// terminating bits are read. Every case below gives the TERMINATING pod the
+// higher ipSeq, which is the only shape that tells the two rules apart.
 
 import (
 	"testing"
@@ -26,71 +33,114 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// A LIVE pod re-asserting an address a TERMINATING pod currently holds takes it,
-// even though the terminating pod acquired it later. Without the arm the live
-// pod loses on ipSeq and the address keeps resolving to the drainer.
-func TestLiveClaimantTakesTheAddressFromATerminatingHolder(t *testing.T) {
+// A DRAINING holder keeps its address against a live pod that acquired the
+// address before it and is merely re-asserting: the drainer has not released
+// anything yet, and the live pod's claim is the one the ipSeq ordering already
+// ruled stale. The hand-off happens one event later, on real evidence — the
+// drainer's deletion — via promotion.
+//
+// Before this, any status churn on the stale pod flipped the index, and the
+// flip did NOT heal when the drainer was finally deleted (releaseIPLocked
+// promotes only when the leaver still held the address): it stood until some
+// new pod genuinely acquired the address.
+func TestADrainingHolderKeepsItsAddressUntilItIsReleased(t *testing.T) {
 	s := New(time.Minute)
-	s.UpsertPod(runningPod("live-uid", "live", "1", "10.0.0.5", tOld))       // acquires first
+	s.UpsertPod(runningPod("stale-uid", "stale", "1", "10.0.0.5", tOld))     // acquires first: seq 1
 	s.UpsertPod(runningPod("drain-uid", "drain", "1", "10.0.0.5", tOld))     // later acquisition: holds it
-	s.UpsertPod(terminatingPod("drain-uid", "drain", "2", "10.0.0.5", tOld)) // now draining
+	s.UpsertPod(terminatingPod("drain-uid", "drain", "2", "10.0.0.5", tOld)) // now draining, still seq 2
 
-	// A routine update to the live pod — same address, so this is a re-assert
+	// A routine update to the stale pod — same address, so this is a re-assert
 	// and not a new acquisition: its ipSeq does not move.
-	s.UpsertPod(runningPod("live-uid", "live", "2", "10.0.0.5", tOld))
+	s.UpsertPod(runningPod("stale-uid", "stale", "2", "10.0.0.5", tOld))
 
 	np, ok := s.GetPodByIP("10.0.0.5")
-	if !ok || np.Pod.Name != "live" {
-		t.Fatalf("GetPodByIP = %q (ok=%v), want live: a draining pod's claim must yield to a live "+
-			"pod's, whichever of them acquired the address later", np.Pod.Name, ok)
+	if !ok || np.Pod.Name != "drain" {
+		t.Fatalf("GetPodByIP = %q (ok=%v), want drain: a draining pod still holds its address until its "+
+			"sandbox is torn down, so an earlier acquirer re-asserting must not take it back", np.Pod.Name, ok)
+	}
+
+	// The drainer's deletion is the release, and promotion is the hand-off.
+	s.DeletePod(types.UID("drain-uid"))
+	np, ok = s.GetPodByIP("10.0.0.5")
+	if !ok || np.Pod.Name != "stale" {
+		t.Fatalf("GetPodByIP = %q (ok=%v) after the holder was deleted, want stale: the surviving "+
+			"claimant must be promoted", np.Pod.Name, ok)
 	}
 }
 
-// The mirror: a TERMINATING pod re-asserting must not take the address back from
-// a live holder, however much later it acquired it. This is the routine case —
-// a drained pod's status updates keep carrying the recycled IP for the whole
-// grace period.
-func TestTerminatingClaimantDoesNotStealFromALiveHolder(t *testing.T) {
+// The mirror: a TERMINATING pod re-asserting must not take the address back
+// from the pod that acquired it later. This is the routine case — a drained
+// pod's status updates keep carrying the recycled IP for the whole grace
+// period.
+func TestTerminatingClaimantDoesNotStealFromTheLaterAcquirer(t *testing.T) {
 	s := New(time.Minute)
-	s.UpsertPod(runningPod("live-uid", "live", "1", "10.0.0.5", tOld))       // acquires first
-	s.UpsertPod(runningPod("drain-uid", "drain", "1", "10.0.0.5", tOld))     // later acquisition: holds it
-	s.UpsertPod(terminatingPod("drain-uid", "drain", "2", "10.0.0.5", tOld)) // draining
-	s.UpsertPod(runningPod("live-uid", "live", "2", "10.0.0.5", tOld))       // live pod takes it back
-	if np, _ := s.GetPodByIP("10.0.0.5"); np.Pod.Name != "live" {
-		t.Fatalf("setup: owner = %q, want live", np.Pod.Name)
-	}
-
-	// The drainer keeps reporting the address it no longer owns.
-	s.UpsertPod(terminatingPod("drain-uid", "drain", "3", "10.0.0.5", tOld))
+	s.UpsertPod(runningPod("drain-uid", "drain", "1", "10.0.0.5", tOld))     // acquires first: seq 1
+	s.UpsertPod(runningPod("live-uid", "live", "1", "10.0.0.5", tOld))       // later acquisition: holds it
+	s.UpsertPod(terminatingPod("drain-uid", "drain", "2", "10.0.0.5", tOld)) // draining, keeps seq 1
 
 	np, ok := s.GetPodByIP("10.0.0.5")
 	if !ok || np.Pod.Name != "live" {
 		t.Fatalf("GetPodByIP = %q (ok=%v), want live: a terminating pod re-asserting a recycled "+
-			"address must yield to the live owner, not win on its later acquisition", np.Pod.Name, ok)
+			"address must yield to the later acquirer", np.Pod.Name, ok)
+	}
+}
+
+// The ordinary hand-off still happens at the claim door when the evidence is
+// there: a pod that ACQUIRES an address a drainer is holding takes it, because
+// its acquisition is later. That is not a contested claim — noteContested
+// excludes it, an address changing hands from a drainer being the ordinary way
+// one is released rather than a window in which a lookup was wrong.
+func TestALaterAcquisitionTakesTheAddressFromADrainer(t *testing.T) {
+	s := New(time.Minute)
+	s.UpsertPod(runningPod("drain-uid", "drain", "1", "10.0.0.5", tOld))     // seq 1: holds it
+	s.UpsertPod(terminatingPod("drain-uid", "drain", "2", "10.0.0.5", tOld)) // draining
+	// A pod that had no address at all is scheduled and the CNI hands it the
+	// one the drainer is giving up: a genuine acquisition, so seq 2.
+	s.UpsertPod(runningPod("next-uid", "next", "1", "", tOld))
+	s.UpsertPod(runningPod("next-uid", "next", "2", "10.0.0.5", tOld))
+
+	np, ok := s.GetPodByIP("10.0.0.5")
+	if !ok || np.Pod.Name != "next" {
+		t.Fatalf("GetPodByIP = %q (ok=%v), want next: a genuine later acquisition must take the "+
+			"address from a drainer", np.Pod.Name, ok)
+	}
+	if got := s.ContestedPodIPs(); got != 0 {
+		t.Fatalf("ContestedPodIPs = %d, want 0: a hand-off from a terminating holder is the ordinary "+
+			"release, not a window in which a peer-IP lookup could have been wrong", got)
 	}
 }
 
 // PROMOTION applies the same precedence (beatsClaimant): when the holder is
-// deleted, a live claimant beats a terminating one that acquired the address
-// later. Only the ipSeq half of beatsClaimant was pinned, so deleting its
-// terminating comparison promoted the drainer with the suite green.
-func TestPromotionPrefersALiveClaimantOverATerminatingOne(t *testing.T) {
+// deleted, the LATER acquirer wins even when it is draining, for the reason the
+// claim path applies — it has not released the address yet, and its own
+// deletion brings the promotion round again. Only the claim path was pinned for
+// this, so deleting beatsClaimant's ipSeq comparison in favour of a terminating
+// one promoted the stale pod with the suite green.
+func TestPromotionPrefersTheLaterAcquirerEvenWhenItIsDraining(t *testing.T) {
 	s := New(time.Minute)
-	s.UpsertPod(runningPod("live-uid", "live", "1", "10.0.0.9", tOld))       // seq 1
+	s.UpsertPod(runningPod("stale-uid", "stale", "1", "10.0.0.9", tOld))     // seq 1
 	s.UpsertPod(runningPod("drain-uid", "drain", "1", "10.0.0.9", tOld))     // seq 2
 	s.UpsertPod(runningPod("owner-uid", "owner", "1", "10.0.0.9", tOld))     // seq 3: holds it
 	s.UpsertPod(terminatingPod("drain-uid", "drain", "2", "10.0.0.9", tOld)) // draining, keeps seq 2
 
 	// The holder goes away. The survivors are a live seq-1 claimant and a
-	// draining seq-2 one, so ipSeq alone would promote the drainer.
+	// draining seq-2 one.
 	s.DeletePod(types.UID("owner-uid"))
 
 	np, ok := s.GetPodByIP("10.0.0.9")
 	if !ok {
 		t.Fatal("the address resolves to nothing after its holder was deleted")
 	}
-	if np.Pod.Name != "live" {
-		t.Fatalf("promoted %q, want live: promotion must prefer a live claimant over a draining one "+
-			"before it falls back to the later acquisition", np.Pod.Name)
+	if np.Pod.Name != "drain" {
+		t.Fatalf("promoted %q, want drain: promotion must follow the claim path's precedence — the "+
+			"later acquisition, whether or not that pod is draining", np.Pod.Name)
+	}
+
+	// And when the drainer is deleted in turn, the last claimant standing gets
+	// it: nothing is stranded by preferring the drainer above.
+	s.DeletePod(types.UID("drain-uid"))
+	if np, ok := s.GetPodByIP("10.0.0.9"); !ok || np.Pod.Name != "stale" {
+		t.Fatalf("GetPodByIP = %q (ok=%v), want stale: the surviving claimant must be promoted",
+			np.Pod.Name, ok)
 	}
 }

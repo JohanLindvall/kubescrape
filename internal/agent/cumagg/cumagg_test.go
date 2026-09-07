@@ -67,12 +67,12 @@ func (h *harness) observe(key string) bool {
 func (h *harness) render(sm pmetric.ScopeMetrics, now time.Time) {
 	h.store.Lock()
 	defer h.store.Unlock()
-	h.store.EvictLocked(now)
-	if h.store.CountLocked() == 0 {
+	live := h.store.LivePointersLocked(nil, now)
+	if len(live) == 0 {
 		return
 	}
 	dps := SumMetric(sm, "calls", "", "")
-	h.store.EachLocked(func(s *series) {
+	for _, s := range live {
 		h.store.MarkRenderedLocked(s)
 		p := dps.AppendEmpty()
 		p.SetStartTimestamp(pcommon.NewTimestampFromTime(s.Start))
@@ -82,7 +82,7 @@ func (h *harness) render(sm pmetric.ScopeMetrics, now time.Time) {
 				PutExemplar(p.Exemplars(), s.ex[i])
 			}
 		}
-	})
+	}
 }
 
 func (h *harness) ExportMetrics(_ context.Context, md pmetric.Metrics) error {

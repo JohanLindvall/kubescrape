@@ -88,6 +88,10 @@ func (t *Tailer) newPipeline(f *file) {
 	}
 }
 
+// unmappedWarnEvery re-warns about entries the offset FIFO cannot position at
+// this cadence. See Tailer.unmappedWarn.
+const unmappedWarnEvery = 5 * time.Minute
+
 // traceEmitFunc builds the trace (multiline) stage's emission callback for
 // one file: it maps the emitted logical entry back to the byte ranges owed by
 // the per-stream offset FIFO and appends the entry to the batch. Entry.Lines
@@ -101,6 +105,21 @@ func (t *Tailer) traceEmitFunc(f *file) func(context.Context, multiline.Entry[ti
 		items := st.live()
 		n := min(e.Lines, len(items)) // Lines > len(items) must not happen; defensive
 		if n == 0 {
+			// Unreachable while the contract above holds, and NOT silent if it
+			// ever stops: the assembled body is dropped here without being
+			// exported, while the bytes' lastEnd has already advanced so the
+			// watermark stops holding them back and `committed` moves past them
+			// at the next commit — the exact silent shape every other give-up
+			// path in this package refuses to have. The counter is the rate;
+			// the throttled line says which file and stream, since this runs
+			// per emitted entry.
+			obs.LogEntriesUnmapped.Inc()
+			if t.unmappedWarn.Allow(unmappedWarnEvery) {
+				t.log.Warn("assembled log entry discarded: no buffered byte range to map it onto",
+					"path", f.path, "key", e.Key, "lines", e.Lines,
+					"note", "the multiline stage's line accounting disagrees with the tailer's; "+
+						"records are being dropped un-exported. Further reports are suppressed for "+unmappedWarnEvery.String())
+			}
 			return nil
 		}
 		start, end := items[0].start, items[n-1].end
@@ -441,7 +460,29 @@ func (t *Tailer) consume(ctx context.Context, f *file, draining bool) bool {
 			f.skipEnd = f.lineStart
 			continue
 		}
-		if !draining && !t.allowLine(f) {
+		if i == 0 {
+			// A blank physical line produces no record, so nothing will ever
+			// commit its byte — same class as a dropped one. Handled BEFORE
+			// the rate limiter, for the discard tail's reason one arm up: this
+			// is not a line, so it must neither spend a bucket token nor defer
+			// the whole file's reading behind a pause (read.go's loop stops on
+			// f.limited), and in DROP mode the limiter counted it into
+			// kubescrape_log_rate_limited_total{action="drop"}, whose help says
+			// "lines discarded" — a non-record inflating the operator's loss
+			// signal, on a workload that pads with blank lines by the thousand.
+			//
+			// Clearing f.limited is what the allow path below does on every
+			// consumed line, and it is load-bearing here: pending whose whole
+			// remainder is blank would otherwise drain with the pause flag
+			// still set and nothing left to clear it, and readFile would never
+			// read the file again.
+			f.limited = false
+			f.pending = f.pending[1:]
+			f.lineStart++
+			f.skipEnd = f.lineStart
+			continue
+		}
+		if !draining && !t.allowLine(f, fedAt) {
 			if !t.cfg.RateDrop {
 				// Pause: keep pending, stop reading until tokens refill.
 				if !f.limited {
@@ -462,13 +503,6 @@ func (t *Tailer) consume(ctx context.Context, f *file, draining bool) bool {
 		start := f.lineStart
 		f.pending = f.pending[i+1:]
 		f.lineStart += int64(i + 1)
-
-		if len(line) == 0 {
-			// A blank physical line produces no record, so nothing will ever
-			// commit its byte — same class as a dropped one.
-			f.skipEnd = f.lineStart
-			continue
-		}
 		t.feedLine(ctx, f, string(line), start, f.lineStart, fedAt)
 		// The batch threshold belongs HERE, where records are added. Checked
 		// once per file per sweep instead — after readFile had already consumed
@@ -495,11 +529,19 @@ func (t *Tailer) consume(ctx context.Context, f *file, draining bool) bool {
 
 // allowLine takes one token from the file's rate-limit bucket, refilling it by
 // elapsed time first. Always true when rate limiting is off.
-func (t *Tailer) allowLine(f *file) bool {
+//
+// `now` is the CALLER's clock reading, not one of its own: consume already
+// hoisted a single time.Now() out of its per-line loop (see the comment there
+// — the call was a mid-single-digit percent of BenchmarkIngestChunk's
+// cumulative profile at 6000 lines/s/node), and taking one here per physical
+// line put it straight back for every deployment with -logs-rate-limit set.
+// The cost is one refill granularity per 64 KiB read chunk, which is far below
+// the bucket's own useful resolution; consume re-stamps after a mid-chunk
+// flush, so an export outage cannot hand the bucket a stale reading either.
+func (t *Tailer) allowLine(f *file, now time.Time) bool {
 	if t.cfg.RateLimit <= 0 {
 		return true
 	}
-	now := time.Now()
 	if f.lastRefill.IsZero() {
 		f.tokens = t.cfg.RateBurst
 	} else {

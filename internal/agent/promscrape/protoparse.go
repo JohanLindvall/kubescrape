@@ -232,7 +232,7 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, err
 		case dto.MetricType_COUNTER:
 			cnt := m.GetCounter()
 			smp := Sample{Name: name, Family: name, Role: RoleCounter, Labels: labels, Value: cnt.GetValue(), TimestampMs: ts, Help: help, Unit: unit}
-			smp.Exemplar = s.protoExemplar(cnt.GetExemplar(), &ex)
+			smp.Exemplar = ss.protoExemplar(cnt.GetExemplar(), &ex)
 			if err := ss.accept(smp); err != nil {
 				return malformed, err
 			}
@@ -323,7 +323,7 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, err
 				if !ss.keep(name, labels) {
 					continue
 				}
-				if !s.addNativeHistogram(ss.cb, name, metricMeta{help: help, unit: unit}, labels, h, ts) {
+				if !ss.addNativeHistogram(name, metricMeta{help: help, unit: unit}, labels, h, ts) {
 					malformed++
 					continue
 				}
@@ -354,7 +354,7 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, err
 			for _, b := range h.GetBucket() {
 				bl := append(labels[:len(labels):len(labels)], Label{Name: "le", Value: floats.get(b.GetUpperBound())})
 				smp := Sample{Name: nameBucket, Family: name, Role: RoleHistogramBucket, Labels: bl, Value: bucketCount(b), TimestampMs: ts, Help: help, Unit: unit}
-				smp.Exemplar = s.protoExemplar(b.GetExemplar(), &ex)
+				smp.Exemplar = ss.protoExemplar(b.GetExemplar(), &ex)
 				if err := ss.accept(smp); err != nil {
 					return malformed, err
 				}
@@ -377,13 +377,41 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, err
 // for the emit call). nil when the target sent none or -scrape-exemplars is
 // off — the SAME gate the OpenMetrics text path uses, so the two formats agree
 // on what the flag means.
-func (s *Scraper) protoExemplar(pe *dto.Exemplar, scratch *Exemplar) *Exemplar {
-	if pe == nil || !s.cfg.Exemplars {
+//
+// The label block takes protoLabels' TWO guards, for protoLabels' reasons and
+// against a worse consumer. An exemplar's labels land in
+// pmetric.Exemplar.FilteredAttributes via setExemplar's PutStr, which probes
+// the map linearly before every insert, so the WRITE alone is O(labels²) inside
+// one uninterruptible call on the scrape goroutine — measured 10.5s at 80k
+// labels, and ~420k of them fit inside maxProtoMessageBytes, i.e. minutes of a
+// frozen cycle() from a target that merely answered the protobuf Accept we
+// offered.
+// The text front bounds the same block (parseLabels' maxLabelsPerSample check
+// runs for the exemplar call too), so this is the two fronts agreeing rather
+// than a new rule. A refused exemplar is a BAD exemplar, never malformed: its
+// sample is still exported, exactly as the text path's badExemplars means.
+func (ss *scrapeSession) protoExemplar(pe *dto.Exemplar, scratch *Exemplar) *Exemplar {
+	if pe == nil || !ss.s.cfg.Exemplars {
+		return nil
+	}
+	lps := pe.GetLabel()
+	if len(lps) > maxLabelsPerSample {
+		ss.badExemplars++
 		return nil
 	}
 	scratch.Labels = scratch.Labels[:0]
-	for _, lp := range pe.GetLabel() {
-		scratch.Labels = append(scratch.Labels, Label{Name: lp.GetName(), Value: lp.GetValue()})
+	for _, lp := range lps {
+		name := lp.GetName()
+		// A repeated name is refused whole, as the text front refuses the
+		// exemplar suffix that carries one: every reader here resolves a name
+		// through labelValue (FIRST match) while PutStr upserts (LAST wins), so
+		// keeping one of the two would ship an exemplar attributed to a value
+		// nothing else in the pipeline agrees on.
+		if name == "" || hasLabel(scratch.Labels, name) {
+			ss.badExemplars++
+			return nil
+		}
+		scratch.Labels = append(scratch.Labels, Label{Name: name, Value: lp.GetValue()})
 	}
 	scratch.Value = pe.GetValue()
 	scratch.TimestampMs = 0
@@ -546,8 +574,8 @@ func bucketPopulation(zero uint64, pos, neg []uint64) (uint64, bool) {
 // addNativeHistogram appends one exponential histogram point to the
 // batcher; false = undecodable, or a value no valid OTLP point can carry
 // (counted malformed by the caller).
-func (s *Scraper) addNativeHistogram(cb chunker, name string, meta metricMeta, labels []Label, h *dto.Histogram, ts int64) bool {
-	eb, ok := cb.(expSink)
+func (ss *scrapeSession) addNativeHistogram(name string, meta metricMeta, labels []Label, h *dto.Histogram, ts int64) bool {
+	eb, ok := ss.cb.(expSink)
 	if !ok {
 		return false // batcher variant without exponential support
 	}
@@ -611,13 +639,13 @@ func (s *Scraper) addNativeHistogram(cb chunker, name string, meta metricMeta, l
 	// A native histogram carries its exemplars on the family message rather
 	// than per bucket; they are point-scoped either way.
 	var exemplars []Exemplar
-	if s.cfg.Exemplars {
+	if ss.s.cfg.Exemplars {
 		var scratch Exemplar
 		for _, pe := range h.GetExemplars() {
 			if len(exemplars) >= maxExemplarsPerPoint {
 				break
 			}
-			if e := s.protoExemplar(pe, &scratch); e != nil {
+			if e := ss.protoExemplar(pe, &scratch); e != nil {
 				exemplars = append(exemplars, copyExemplar(*e))
 			}
 		}

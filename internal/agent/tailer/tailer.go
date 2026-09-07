@@ -268,7 +268,14 @@ type Tailer struct {
 	// same reason and takes one remedy, so the line names one example and how
 	// many others shared the pass rather than minting a key per path.
 	statErrWarn logdedupe.Throttle
-	batch       []entry
+	// unmappedWarn throttles traceEmitFunc's discarded-entry Warn. Keyless: the
+	// condition is a broken multiline Lines-conservation contract, which is a
+	// property of the BUILD and not of any one file, so a key per file would
+	// mint an entry for every log file on the node for one fact. It fires on
+	// the per-entry emission path, so the counter is the rate and the line is
+	// the once-in-a-while explanation.
+	unmappedWarn logdedupe.Throttle
+	batch        []entry
 	// flushed is the batch the CURRENT flush is exporting: flush swaps it out of
 	// batch (so batch is empty again the moment the export starts, as every
 	// caller's read loop requires) and walks it once more after the outcome, to

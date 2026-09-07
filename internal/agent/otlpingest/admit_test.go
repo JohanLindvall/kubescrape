@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -695,3 +696,46 @@ func TestMaxRecvBytesAdmitsLargePush(t *testing.T) {
 		t.Fatalf("5 MiB push against the default cap: err = %v, want ResourceExhausted", err)
 	}
 }
+
+// A body that is ALREADY over the cap must not be grown into.
+//
+// readAllCapped trims its last growth step to a declared Content-Length, so an
+// identity-encoded body declaring the cap fills a buffer of exactly limit+1 —
+// the LimitReader's one byte of over-cap evidence. The next iteration then found
+// len == cap with the hint no longer ahead of it and DOUBLED, copying the ~16 MiB
+// predecessor into a ~32 MiB successor while both were live: ~3x the body's
+// byte-budget charge, all of it discarded by the 413 two lines later, and
+// maxBufferBytes admits four such bodies at once on a pod the chart limits to
+// 512Mi. The budget's own accounting reported only the 16 MiB it charged.
+func TestOverCapBodyIsNotGrownIntoBeforeItIsRefused(t *testing.T) {
+	const limit = 1 << 20
+	// Every shape that reaches the growth branch already over the cap: the
+	// declaration that trims the last step exactly onto limit+1 (the 2x jump),
+	// an over-cap declaration (clamped to limit, same landing), and none at all.
+	for _, hint := range []int64{limit, limit * 8, 0} {
+		src := io.LimitReader(neverEnding{}, limit+1) // exactly what BodyReader.Read offers
+		buf, err := readAllCapped(src, hint, limit)
+		if err != nil {
+			t.Fatalf("hint %d: %v", hint, err)
+		}
+		// The caller's refusal must still fire, so the over-cap evidence has to
+		// come back: returning early is not truncating.
+		if int64(len(buf)) <= limit {
+			t.Fatalf("hint %d: read %d bytes, want the limit+1 that proves the body is over the cap",
+				hint, len(buf))
+		}
+		// One granule of slack over the evidence itself; the failure this pins
+		// is a 2x jump, which is 16 MiB of waste at the production cap.
+		if max := int64(limit) + budgetGranule; int64(cap(buf)) > max {
+			t.Errorf("hint %d: buffer capacity %d (%.2f MiB) for a body that is refused anyway; "+
+				"growth past the cap buys nothing and costs a full copy of what is already held",
+				hint, cap(buf), float64(cap(buf))/(1<<20))
+		}
+	}
+}
+
+// neverEnding feeds readAllCapped as many bytes as it asks for, so the shape
+// under test is the LimitReader's cut and nothing else.
+type neverEnding struct{}
+
+func (neverEnding) Read(p []byte) (int, error) { return len(p), nil }

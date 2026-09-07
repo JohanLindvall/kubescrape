@@ -79,19 +79,42 @@ type ServerConfig struct {
 	// marker on the APPLICATION port was never sent by an application, and
 	// attributing it by the connection's peer address would name a sibling shard.
 	//
-	// The error travels back through the same mapping as an export failure
-	// (grpcForwardStatus / HTTPForwardStatus), so a guard that must refuse
-	// PERMANENTLY returns something otlpexport.IsPermanent classifies as such
-	// (codes.InvalidArgument) and the sender sees InvalidArgument / 400.
+	// The error travels back through the same CLASSIFICATION as an export
+	// failure (grpcForwardStatus / HTTPForwardStatus), so a guard that must
+	// refuse PERMANENTLY returns something otlpexport.IsPermanent classifies as
+	// such (codes.InvalidArgument) and the sender sees InvalidArgument / 400.
+	//
+	// Its TEXT, unlike a forward failure's, reaches the sender verbatim
+	// (receiveRefusal): a forward failure's words are the collector's — its
+	// endpoint, its resolved address, its response body — and are redacted on a
+	// listener with no credentials, while this refusal is kubescrape's own
+	// sentence about the payload in front of it and is usually the only thing
+	// that tells a misconfigured hop which marker refused it. The corollary is a
+	// contract on the guard: whatever it writes here is read by an
+	// unauthenticated sender, so it must name the payload and never a
+	// destination.
 	//
 	// It runs AFTER admission (the byte budget and the in-flight slot), so a
 	// refused push releases everything it took, exactly as an accepted one does.
 	RejectTraces func(ctx context.Context, td ptrace.Traces) error
 	// Admit, when set, is consulted once per pushed RESOURCE (all three
-	// signals) before enrichment: false removes the resource from the
-	// payload — the transforms file's ingest: hook, the operator's
-	// per-sender policy on listeners nothing authenticates. Removals are
-	// counted (obs.IngestAdmissionRejected) and the push is still acked.
+	// signals) AFTER the reserved strip and BEFORE enrichment: false removes
+	// the resource from the payload — the transforms file's ingest: hook, the
+	// operator's per-sender policy on listeners nothing authenticates. Removals
+	// are counted (obs.IngestAdmissionRejected) and the push is still acked.
+	//
+	// WHAT THE HOOK SEES, because a policy is only as good as its inputs. The
+	// strip has already run, so the sender's own Kubernetes identity claim
+	// (k8s.namespace.name, the k8s.pod.*/k8s.node.name/container.* siblings) is
+	// GONE — a policy cannot be steered by a value any pod may write. Enrichment
+	// has NOT run, so the resolved identity is not there either: on this path a
+	// resource carries the sender's lookup key (container.id / k8s.pod.uid),
+	// its service triple, and whatever descriptive attributes it chose, and a
+	// hook keyed on a namespace matches nothing at all. That is deliberate on
+	// both ends — the pre-enrichment position is what keeps a rejected sender
+	// from spending a metadata lookup per resource on its way out, and the
+	// post-strip position is what keeps the hook from deciding on a forgery.
+	// Write per-sender policy against the lookup key or the service triple.
 	Admit func(attrs pcommon.Map) bool
 	// ReservedAttrs are kubescrape's own plumbing keys, stripped from every
 	// accepted payload before enrichment (see reserved.go — their consumers
@@ -191,8 +214,10 @@ type Server struct {
 	// 429s as ordinary back-pressure.
 	decodedWarns logdedupe.Throttle
 	// reserveWindow bounds how long ONE gRPC reservation may live, i.e. how long
-	// a peer may sit between its HEADERS frame and a decoded message
-	// (grpcReserveWindow). Tests shorten it to exercise the reclaim.
+	// a peer may sit between its HEADERS frame and a decoded message — the whole
+	// upload, not just the decode. It is reserveWindowFor(grpcMaxRecv), so a
+	// raised -ingest-grpc-max-recv-bytes buys the time to deliver the bigger
+	// message it just authorised. Tests shorten it to exercise the reclaim.
 	reserveWindow time.Duration
 	// grpcMaxRecv is the resolved MaxRecvBytes: the per-message gRPC cap and
 	// the tap's per-push reservation.
@@ -229,6 +254,11 @@ type Server struct {
 	// Keyless for the same reason: it is one sender emitting one shape, and a
 	// line per refusal is what an attacker would use to fill the node's disk.
 	tooDeepWarns logdedupe.Throttle
+	// forwardWarns throttles the forward-failure narration, keyed by SIGNAL
+	// (noteForwardFailure). Keyed rather than keyless because routing can send
+	// the three signals to three different destinations, and a dead logs
+	// endpoint must not suppress the line about a dead metrics one.
+	forwardWarns *logdedupe.Table
 }
 
 // NewServer creates an ingest Server.
@@ -260,11 +290,12 @@ func NewServer(cfg ServerConfig) *Server {
 		grpcMaxRecv:   recv,
 		buffer:        &byteBudget{limit: budget},
 		decoded:       &byteBudget{limit: decodedBudgetFactor * budget},
-		reserveWindow: grpcReserveWindow,
+		reserveWindow: reserveWindowFor(recv),
 		reservedWarns: logdedupe.New(len(cfg.ReservedAttrs.Resource)+len(cfg.ReservedAttrs.Element)+
 			len(cfg.ReservedAttrs.Identity), reservedWarnEvery),
 		shedWarns:      logdedupe.New(3, shedWarnEvery),      // one key per admission bound
 		chainSkipWarns: logdedupe.New(3, chainSkipWarnEvery), // one key per chain-skip reason
+		forwardWarns:   logdedupe.New(3, forwardWarnEvery),   // one key per signal
 	}
 	s.body = newBodyReader(maxIngestBody, s.buffer, log)
 	return s
@@ -469,12 +500,21 @@ func (s *Server) Run(ctx context.Context) error {
 // grpcExport is the shared shape of the three gRPC Export wrappers: stamp the
 // connection's peer address into ctx (the enricher's peer-IP fallback reads
 // it), run the signal's enrich-and-forward step, and map a failure onto a
-// status the sender's SDK retries correctly (grpcForwardStatus).
-func grpcExport(ctx context.Context, forward func(ctx context.Context) error) error {
-	if err := forward(grpcPeerCtx(ctx)); err != nil {
-		return grpcForwardStatus(err)
+// status the sender's SDK retries correctly (grpcForwardCode) carrying the
+// fixed text an unauthenticated sender is entitled to (forwardFailureText).
+// The detail goes to the log (noteForwardFailure).
+func (s *Server) grpcExport(ctx context.Context, signal string, forward func(ctx context.Context) error) error {
+	pctx := grpcPeerCtx(ctx)
+	err := forward(pctx)
+	if err == nil {
+		return nil
 	}
-	return nil
+	// This receiver's OWN refusal keeps its words (receiveRefusal); only a
+	// forward failure — whose text is the collector's — is redacted.
+	if inner, ok := receiveRefused(err); ok {
+		return grpcForwardStatus(inner)
+	}
+	return redactedForwardStatus(err, s.noteForwardFailure(signal, grpcPeerAddr(ctx), err))
 }
 
 type logsGRPC struct {
@@ -492,7 +532,7 @@ func (g *logsGRPC) Export(ctx context.Context, req plogotlp.ExportRequest) (plog
 		return plogotlp.ExportResponse{}, err
 	}
 	defer release()
-	err = grpcExport(ctx, func(ctx context.Context) error { return g.s.forwardLogs(ctx, req.Logs()) })
+	err = g.s.grpcExport(ctx, "logs", func(ctx context.Context) error { return g.s.forwardLogs(ctx, req.Logs()) })
 	if err != nil {
 		return plogotlp.ExportResponse{}, err
 	}
@@ -501,11 +541,26 @@ func (g *logsGRPC) Export(ctx context.Context, req plogotlp.ExportRequest) (plog
 
 // forwardLogs is the enrich-and-forward step for a decoded logs push, shared
 // by the gRPC and HTTP arms (each used to spell it, and the two had drifted by
-// a comment already). ctx carries the connection's peer address. In order:
-// admission (the ingest: hook, per resource, pre-enrichment), the reserved
-// strip (reserved.go), enrichment, then logAttributes + logs.rules +
-// logMetrics AFTER enrichment (logchain.go) — a payload filtered to nothing is
-// acked without a send, its drops final — and the export.
+// a comment already). ctx carries the connection's peer address. In order: the
+// reserved strip (reserved.go), admission (the ingest: hook, per resource),
+// enrichment, then logAttributes + logs.rules + logMetrics AFTER enrichment
+// (logchain.go) — a payload filtered to nothing is acked without a send, its
+// drops final — and the export.
+//
+// THE STRIP RUNS FIRST, and that order is load-bearing rather than incidental.
+// The hook is the operator's per-sender policy on a listener that authenticates
+// nothing, and it used to be handed the raw attribute map — so a policy written
+// as `resource["k8s.namespace.name"] in ("a","b")` decided on a value the
+// receiver itself refuses to trust one line later, admitting any pod in the
+// cluster that simply declared the namespace. Sanitizing first gives the hook
+// the same view of a resource as everything downstream: the sender's claim gone,
+// nothing forged left to key on. It costs no metadata lookup — both strips are
+// pure map walks — so the reason admission sits above ENRICHMENT (a rejected
+// sender must not spend a lookup per resource on its way out) is untouched.
+//
+// What the hook still cannot see is the RESOLVED identity, which enrichment
+// writes afterwards: on this path a resource has no k8s.namespace.name at all
+// unless the sender forged one. ServerConfig.Admit says so.
 //
 // The export takes transform.Handoff (logs and metrics only, never traces —
 // the tier's tap reads a forwarded trace AFTER the export): on failure the
@@ -514,8 +569,8 @@ func (g *logsGRPC) Export(ctx context.Context, req plogotlp.ExportRequest) (plog
 // deep-copying. A failed export is NOT counted: the sender will resend these
 // very records.
 func (s *Server) forwardLogs(ctx context.Context, ld plog.Logs) error {
-	s.admitLogs(ld)
 	s.sanitizeLogs(ld)
+	s.admitLogs(ld)
 	s.cfg.Enricher.EnrichLogs(ctx, ld)
 	cc, forward := s.applyLogChain(ld)
 	if !forward {
@@ -529,34 +584,36 @@ func (s *Server) forwardLogs(ctx context.Context, ld plog.Logs) error {
 	return nil
 }
 
-// forwardMetrics is forwardLogs' metrics sibling: admission, then the
-// point-less metrics die before anything downstream pays to carry them
-// (emptymetrics.go) — a push emptied by either is acked without a send — then
-// the reserved strip, enrichment and the export under the same Handoff.
+// forwardMetrics is forwardLogs' metrics sibling, in the same order and for the
+// same reason: the reserved strip, admission, then the point-less metrics die
+// before anything downstream pays to carry them (emptymetrics.go) — a push
+// emptied by either is acked without a send — then enrichment and the export
+// under the same Handoff.
 func (s *Server) forwardMetrics(ctx context.Context, in pmetric.Metrics) error {
+	s.sanitizeMetrics(in)
 	s.admitMetrics(in)
 	s.pruneEmptyMetrics(in)
 	if in.ResourceMetrics().Len() == 0 {
 		return nil
 	}
-	s.sanitizeMetrics(in)
 	md := s.cfg.Enricher.EnrichMetrics(ctx, in)
 	return s.cfg.Exporter.ExportMetrics(transform.Handoff(ctx), md)
 }
 
 // forwardTraces is the traces sibling. The loop guard (rejectTraces) runs
-// FIRST, before admission and the reserved strip — a refused payload must cost
-// no lookup and move no counter — and the export takes NO Handoff: the tier's
-// tap reads a forwarded trace after the export.
+// FIRST, before the reserved strip and admission — a refused payload must cost
+// no lookup and move no counter, and it is refused on a marker the strip would
+// otherwise have removed — and the export takes NO Handoff: the tier's tap reads
+// a forwarded trace after the export.
 func (s *Server) forwardTraces(ctx context.Context, td ptrace.Traces) error {
 	if err := s.rejectTraces(ctx, td); err != nil {
 		return err
 	}
+	s.sanitizeTraces(td)
 	s.admitTraces(td)
 	if td.ResourceSpans().Len() == 0 {
 		return nil
 	}
-	s.sanitizeTraces(td)
 	s.cfg.Enricher.EnrichTraces(ctx, td)
 	return s.cfg.Traces.ExportTraces(ctx, td)
 }
@@ -575,7 +632,7 @@ func (g *metricsGRPC) Export(ctx context.Context, req pmetricotlp.ExportRequest)
 		return pmetricotlp.ExportResponse{}, err
 	}
 	defer release()
-	err = grpcExport(ctx, func(ctx context.Context) error { return g.s.forwardMetrics(ctx, req.Metrics()) })
+	err = g.s.grpcExport(ctx, "metrics", func(ctx context.Context) error { return g.s.forwardMetrics(ctx, req.Metrics()) })
 	if err != nil {
 		return pmetricotlp.ExportResponse{}, err
 	}
@@ -624,25 +681,110 @@ func retryableStatus(st *status.Status) bool {
 // than Unavailable, but only when the sender will also read it as retryable —
 // otherwise the code is rewritten rather than relayed.
 func grpcForwardStatus(err error) error {
-	// Only definitive upstream rejections become InvalidArgument (do not
-	// retry). Everything else — diskqueue.ErrFull back-pressure, upstream 5xx,
-	// 401/403/404 windows, timeouts, unclassified failures — is retryable: the
-	// receiver is a proxy, and the sender retrying is the safe default.
-	if otlpexport.IsPermanent(err) {
-		// Already the answer this function would build (the trace tier's receive
-		// guard returns exactly this): relay it verbatim. Re-wrapping rendered
-		// the sender `code = InvalidArgument desc = rpc error: code =
-		// InvalidArgument desc = …`, burying the reason it needs one nesting deep
-		// inside the field it reads first.
-		if st, ok := status.FromError(err); ok && st.Code() == codes.InvalidArgument {
-			return err
-		}
-		return status.Error(codes.InvalidArgument, err.Error())
-	}
-	if st, ok := status.FromError(err); ok && retryableStatus(st) {
+	code := grpcForwardCode(err)
+	// Already the answer this function would build (the trace tier's receive
+	// guard returns exactly this): relay it verbatim. Re-wrapping rendered the
+	// sender `code = InvalidArgument desc = rpc error: code = InvalidArgument
+	// desc = …`, burying the reason it needs one nesting deep inside the field
+	// it reads first — and for a retryable upstream status it would also drop
+	// the details, of which RetryInfo is load-bearing (see retryableStatus).
+	if st, ok := status.FromError(err); ok && st.Code() == code {
 		return err
 	}
-	return status.Error(codes.Unavailable, err.Error())
+	return status.Error(code, err.Error())
+}
+
+// grpcForwardCode is grpcForwardStatus' classification on its own, so the
+// redacting arm (redactedForwardStatus) cannot drift from the relaying one.
+//
+// Only definitive upstream rejections become InvalidArgument (do not retry).
+// Everything else — diskqueue.ErrFull back-pressure, upstream 5xx, 401/403/404
+// windows, timeouts, unclassified failures — is retryable: the receiver is a
+// proxy, and the sender retrying is the safe default. An upstream status keeps
+// its own code where that is genuinely more informative than Unavailable, but
+// only when the sender will also read it as retryable.
+func grpcForwardCode(err error) codes.Code {
+	if otlpexport.IsPermanent(err) {
+		return codes.InvalidArgument
+	}
+	if st, ok := status.FromError(err); ok && retryableStatus(st) {
+		return st.Code()
+	}
+	return codes.Unavailable
+}
+
+// forwardFailureText is the whole of what an application-facing listener tells
+// a sender about a failed forward: the classification, and nothing else.
+//
+// What it replaces is the error's own rendering, and that was a disclosure on a
+// listener with no credentials. The text named the collector — net/http renders
+// a failed POST as `Post "https://otel-collector.monitoring:4318/v1/logs": dial
+// tcp 10.96.4.7:4318: connect: connection refused`, i.e. host, port, path and
+// resolved address — quoted the collector's own response BODY verbatim
+// (otlpexport.HTTPStatusError), and, with routing configured, flattened EVERY
+// tenant destination's error onto one line (route's partialFailure), so a
+// single push from any pod that could reach the port enumerated the fleet's
+// downstream topology. None of it is actionable by a sender: the only thing it
+// can do with a forward failure is honour the status, which the status already
+// says. The detail goes to the operator's side of the door instead
+// (Server.noteForwardFailure).
+func forwardFailureText(err error) string {
+	if otlpexport.IsPermanent(err) {
+		return "the payload was rejected downstream; retrying it will not help"
+	}
+	return "could not forward the payload; retry"
+}
+
+// redactedForwardStatus is grpcForwardStatus with the sender-facing message
+// replaced by forwardFailureText's fixed one.
+//
+// It rebuilds from the status PROTO rather than through status.Error so the
+// details survive: retryableStatus relays an upstream ResourceExhausted only
+// because it carries RetryInfo, and both the OTel SDK and the Collector drop a
+// batch on a bare one — so a redaction that dropped the detail would answer a
+// retryable condition with a status the sender treats as permanent, which is
+// the one way this change could lose data. status.Status.Proto already returns
+// a clone, so the message is ours to overwrite.
+func redactedForwardStatus(err error, msg string) error {
+	code := grpcForwardCode(err)
+	if st, ok := status.FromError(err); ok && st.Code() == code {
+		p := st.Proto()
+		p.Message = msg
+		return status.ErrorProto(p)
+	}
+	return status.Error(code, msg)
+}
+
+// forwardWarnEvery paces the forward-failure narration. A collector that cannot
+// be reached is a STATE, and every sender on the node pushes into it, so the
+// useful information is one line per signal per window rather than one per
+// push. The exporter's own destination-health report (otlpexport/report.go)
+// narrates the same outage from the sending side; this line exists because the
+// detail it carries — which tenant destination failed, what the collector
+// actually said — is the detail forwardFailureText no longer gives the sender,
+// and it must not simply vanish.
+const forwardWarnEvery = time.Minute
+
+// noteForwardFailure keeps a failed forward's detail on the operator's side of
+// the door and returns the fixed text the sender gets instead.
+func (s *Server) noteForwardFailure(signal, peer string, err error) string {
+	if allow, _ := s.forwardWarns.Allow(signal); allow {
+		s.log.Warn("ingest: forwarding a pushed payload failed; the sender is answered a status and no detail, so the detail is here",
+			"signal", signal,
+			"peer", peer,
+			"outcome", forwardOutcome(err),
+			"error", err)
+	}
+	return forwardFailureText(err)
+}
+
+// forwardOutcome labels the failure the way obs.Exports does, so the log line
+// and the export counters read the same way.
+func forwardOutcome(err error) string {
+	if otlpexport.IsPermanent(err) {
+		return "permanent"
+	}
+	return "transient"
 }
 
 type tracesGRPC struct {
@@ -658,7 +800,45 @@ func (s *Server) rejectTraces(ctx context.Context, td ptrace.Traces) error {
 	if s.cfg.RejectTraces == nil {
 		return nil
 	}
-	return s.cfg.RejectTraces(ctx, td)
+	if err := s.cfg.RejectTraces(ctx, td); err != nil {
+		return receiveRefusal{err}
+	}
+	return nil
+}
+
+// receiveRefusal marks an error the RECEIVE-path guard produced
+// (ServerConfig.RejectTraces) rather than the forward, so the two can be
+// answered differently — which they must be.
+//
+// A FORWARD failure's text belongs to the collector: the endpoint it names, the
+// address it resolved to, the body it answered with, and with routing on every
+// tenant destination's error. None of that is the sender's business and all of
+// it is disclosure on a listener with no credentials, so forwardFailureText
+// replaces it.
+//
+// A RECEIVE refusal is kubescrape's OWN sentence about the payload in front of
+// it. The tier's loop guard is the case that exists today: it names the
+// re-shard marker and nothing else, the sender that trips it is a misconfigured
+// kubescrape hop pointed at an application port, and the marker's name is the
+// only thing that tells an operator which hop to fix. So it is relayed verbatim
+// — which also means a guard OWNS what its text says to an unauthenticated
+// sender, and must not put a destination in it.
+//
+// The wrapper never reaches a classifier: receiveRefused unwraps before anything
+// calls otlpexport.IsPermanent or status.FromError, so marking a refusal cannot
+// change how it is graded.
+type receiveRefusal struct{ err error }
+
+func (r receiveRefusal) Error() string { return r.err.Error() }
+func (r receiveRefusal) Unwrap() error { return r.err }
+
+// receiveRefused returns the wrapped guard error, if that is what this is.
+func receiveRefused(err error) (error, bool) {
+	var r receiveRefusal
+	if errors.As(err, &r) {
+		return r.err, true
+	}
+	return nil, false
 }
 
 func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (ptraceotlp.ExportResponse, error) {
@@ -670,7 +850,7 @@ func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (
 		return ptraceotlp.ExportResponse{}, err
 	}
 	defer release()
-	err = grpcExport(ctx, func(ctx context.Context) error { return g.s.forwardTraces(ctx, req.Traces()) })
+	err = g.s.grpcExport(ctx, "traces", func(ctx context.Context) error { return g.s.forwardTraces(ctx, req.Traces()) })
 	if err != nil {
 		return ptraceotlp.ExportResponse{}, err
 	}
@@ -758,7 +938,16 @@ func (s *Server) servePush(w http.ResponseWriter, r *http.Request,
 	defer s.decoded.release(decoded)
 	resp, err := handle(withPeerIP(r.Context(), r.RemoteAddr))
 	if err != nil {
-		http.Error(w, err.Error(), HTTPForwardStatus(err))
+		// This receiver's own receive-path refusal keeps its words; a FORWARD
+		// failure does not (see forwardFailureText — its text named the
+		// collector, quoted its response body and, with routing on, enumerated
+		// every tenant destination, to whoever could reach an unauthenticated
+		// port). noteForwardFailure keeps that detail in the log.
+		if inner, ok := receiveRefused(err); ok {
+			http.Error(w, inner.Error(), HTTPForwardStatus(inner))
+			return
+		}
+		http.Error(w, s.noteForwardFailure(signal, r.RemoteAddr, err), HTTPForwardStatus(err))
 		return
 	}
 	WriteProto(w, resp)

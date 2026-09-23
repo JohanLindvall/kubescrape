@@ -755,7 +755,7 @@ agent:
   # tightens the GC too and no second number has to be kept in step. Set
   # GOMEMLIMIT in the pod env to override. Adding a CPU limit needs no change
   # either: Go has derived GOMAXPROCS from a cpu limit since 1.25 (go.mod pins
-  # 1.26), which is what would otherwise oversubscribe the scheduler on a big
+  # 1.27), which is what would otherwise oversubscribe the scheduler on a big
   # node.
   resources:
     requests:

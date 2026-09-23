@@ -1,6 +1,10 @@
 # Debian build stage: the agent links libsystemd (journald) via cgo, so it needs
 # a glibc toolchain and the libsystemd headers (alpine/musl has no systemd).
-FROM golang:1.26-bookworm AS build
+# Move the Go minor together with go.mod's floor (the version CI installs), and
+# keep the Debian suffix equal to the runtime's (bookworm =
+# distroless/base-debian12): the agent's glibc linkage and the .so files staged
+# below both come from this stage.
+FROM golang:1.27-bookworm AS build
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends libsystemd-dev \
 	&& rm -rf /var/lib/apt/lists/*

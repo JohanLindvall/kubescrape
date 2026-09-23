@@ -73,11 +73,11 @@ bounds, templates).
 
 ## Toolchain and build floor
 
-**Building kubescrape needs Go 1.26.6 or newer.** `go.mod` says `go 1.26.6`,
+**Building kubescrape needs Go 1.27.1 or newer.** `go.mod` says `go 1.27.1`,
 and nothing in the source needs that language version — it is a **security
-floor**. `govulncheck` at the previous `go 1.26.3` reported ten reachable
-standard-library advisories; six of them have no earlier fix, which is what
-makes the floor `.6` rather than `.4`:
+and CI-parity floor**. It was first raised (to 1.26.6) because `govulncheck` at
+`go 1.26.3` reported ten reachable standard-library advisories, six of them
+with no earlier fix:
 
 | Advisory | Package | Reached from |
 |---|---|---|
@@ -89,15 +89,26 @@ makes the floor `.6` rather than `.4`:
 | [GO-2026-6091](https://pkg.go.dev/vuln/GO-2026-6091) | `html/template` | only `hack/nhexporter`, the e2e fixture — not a shipped binary |
 
 The other four (`GO-2026-5856`, `GO-2026-5039`, `GO-2026-5038`,
-`GO-2026-5037`) are fixed in 1.26.4/1.26.5 and are closed by the same bump.
-`govulncheck -tags journald,azure,events ./...` is clean as of this writing; re-run it
-rather than trusting the directive, and raise the floor by editing `go.mod` —
-nothing else in the tree states it.
+`GO-2026-5037`) were fixed in 1.26.4/1.26.5. Go 1.27.0 carries all ten fixes:
+`govulncheck -tags journald,azure,events ./...` reports no reachable
+standard-library advisory at 1.27.0 or 1.27.1. The `.1` is therefore parity,
+not a CVE: `actions/setup-go` installs exactly the version the directive names,
+and 1.27.1 is what the images' `golang:1.27-bookworm` build stage runs, so CI
+tests the toolchain that ships. Re-run `govulncheck` rather than trusting the
+directive, and move the floor in `go.mod` and the Dockerfiles' `golang:` tag
+together.
+
+**Moving the directive changes runtime defaults, not only the toolchain.** The
+`go` line selects the binaries' default `GODEBUG` settings. The move from 1.26
+to 1.27 flips one, `tracebacklabels=1`: a crash traceback prints goroutine
+labels. Nothing kubescrape links sets one by default (gRPC's `grpc.method` label
+is opt-in via `GRPC_GO_SERVER_GOROUTINE_LABELS`). Read the release's `GODEBUG`
+history (`$(go env GOROOT)/doc/godebug.md`) whenever the minor version moves.
 
 **The directive is enforced, and it fails loudly rather than silently.** Under
-the default `GOTOOLCHAIN=auto` a machine holding an older Go downloads 1.26.6
+the default `GOTOOLCHAIN=auto` a machine holding an older Go downloads 1.27.1
 and re-execs into it; with `GOTOOLCHAIN=local` the build is refused outright
-(`go.mod requires go >= 1.26.6`). There is no configuration in which an older
+(`go.mod requires go >= 1.27.1`). There is no configuration in which an older
 toolchain quietly produces a binary carrying those ten. What the directive does
 **not** govern is everything that is not Go — see
 [Accepted security residuals](#accepted-security-residuals) for the floating
@@ -236,7 +247,7 @@ pure tail insurance; raising `GOGC` would trade memory for CPU, which is not a
 trade this code can make on an operator's behalf.
 
 **`GOMAXPROCS` needs nothing.** Go has derived it from a cgroup CPU limit since
-1.25 and `go.mod` pins 1.26 (verified: `CPUQuota=50%` yields `GOMAXPROCS=2`), so
+1.25 and `go.mod` pins 1.27 (verified: `CPUQuota=50%` yields `GOMAXPROCS=2`), so
 an operator adding `resources.limits.cpu` is already handled and
 `automaxprocs` would be a dependency for a fixed bug.
 
@@ -561,14 +572,14 @@ least loud — every render becomes `additional properties … not allowed`, and
 loose is caught by nothing until a cluster rejects the object.
 
 **4. The container base images float.** Both `Dockerfile` and
-`Dockerfile.static` build `FROM golang:1.26-bookworm`, and the runtime is
+`Dockerfile.static` build `FROM golang:1.27-bookworm`, and the runtime is
 `gcr.io/distroless/base-debian12` (`static-debian12` for the static image) —
 tags, not digests. The **Go** half of the supply chain is nailed down anyway by
-`go.mod`'s `go 1.26.6` (see [Toolchain and build floor](#toolchain-and-build-floor)):
+`go.mod`'s `go 1.27.1` (see [Toolchain and build floor](#toolchain-and-build-floor)):
 an older toolchain either upgrades itself or refuses to build. The half that
 floats is everything else, and it is not only the runtime base: the default
 (journald) image COPIES `libsystemd` plus its six transitive `.so` files out of
-the **build** stage, so a cached or mirrored `golang:1.26-bookworm` layer puts
+the **build** stage, so a cached or mirrored `golang:1.27-bookworm` layer puts
 that library into a shipped image whose Go binary is current, while glibc and
 the CA bundle come from the equally floating distroless base. Two builds of the
 same commit are therefore not guaranteed to produce the same image. Pin the bases by digest in your own build

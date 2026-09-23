@@ -13,7 +13,7 @@
 # no systemd-unit logs (kubelet, containerd), which on many distros are the
 # only place a node's Kubernetes plane can be debugged. Take it when the node's
 # journal is collected some other way, or not at all.
-FROM golang:1.26-bookworm AS build
+FROM golang:1.27-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

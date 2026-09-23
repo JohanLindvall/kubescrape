@@ -109,18 +109,33 @@ func splitEnvelope(msg []byte, fn func(raw []byte) error) error {
 	}
 	switch msg[i] {
 	case '{':
-		err := ljson.ArrayEach(msg[i:], fn, "records")
-		if errors.Is(err, ljson.ErrKeyNotFound) || errors.Is(err, ljson.ErrExpectArray) {
-			// No records array: the object IS the record. Both errors are
-			// pre-iteration (the descent fails before fn ever runs), so this
-			// cannot double-emit.
-			return fn(msg[i:])
+		obj, emitted := msg[i:], false
+		err := ljson.ArrayEach(obj, func(raw []byte) error {
+			emitted = true
+			return fn(raw)
+		}, "records")
+		if errors.Is(err, ljson.ErrKeyNotFound) || errors.Is(err, ljson.ErrExpectArray) ||
+			(err == nil && !emitted && recordsIsNull(obj)) {
+			// No records ARRAY: the object IS the record. Every arm is
+			// pre-iteration (fn never ran), so this cannot double-emit. The
+			// null arm is explicit because lightning (since v0.0.81) walks a
+			// null in the array's place as an EMPTY array, and returning that
+			// nil would drop the object with no error and nothing counted.
+			return fn(obj)
 		}
 		return err
 	case '[':
 		return ljson.ArrayEach(msg[i:], fn)
 	}
 	return errNotJSON
+}
+
+// recordsIsNull reports whether obj's "records" member is the literal null. It
+// runs only after a walk that emitted nothing, so the second pass is paid only
+// by a message that delivered no records.
+func recordsIsNull(obj []byte) bool {
+	v, err := ljson.Lookup(obj, "records")
+	return err == nil && ljson.KindOf(v) == ljson.KindNull
 }
 
 func skipWS(b []byte, i int) int {

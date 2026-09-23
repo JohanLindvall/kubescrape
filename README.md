@@ -387,15 +387,16 @@ They carry no `internal/` dependencies, so they are usable outside this module.
 
 ## Running
 
-**Building needs Go 1.26.6 or newer.** That is a security floor, not a
-language one: `go.mod` names it because it is the version that fixes the ten
-reachable standard-library advisories `govulncheck` reported at the previous
-`1.26.3` (six of which have no earlier fix — see
+**Building needs Go 1.27.1 or newer.** That is a security and CI-parity
+floor, not a language one: 1.27 carries the fixes for the ten reachable
+standard-library advisories that first raised it (see
 [Toolchain and build floor](docs/CONFIGURATION.md#toolchain-and-build-floor)
-for the list and what each is reached from). An older toolchain either
-upgrades itself (`GOTOOLCHAIN=auto`, the default) or refuses to build, so it
-cannot silently produce a vulnerable binary — but the guarantee holds only
-for the Go half: the container base images float on tags rather than digests.
+for the list and what each is reached from), and the patch level is the one
+the container image builds with, which CI installs from `go.mod`. An older
+toolchain either upgrades itself (`GOTOOLCHAIN=auto`, the default) or refuses
+to build, so it cannot silently produce a vulnerable binary — but the
+guarantee holds only for the Go half: the container base images float on tags
+rather than digests.
 
 **Both binaries set a Go soft memory limit at startup, from their own
 container's cgroup memory limit (90% of it). There is no flag.** The GC sizes

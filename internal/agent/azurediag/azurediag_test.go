@@ -161,8 +161,9 @@ func TestSplitEnvelope(t *testing.T) {
 	}{
 		{`{"records":[{"a":1},{"b":2}]}`, 2},
 		{`[{"a":1},{"b":2},{"c":3}]`, 3},
-		{`{"time":"x","category":"y"}`, 1}, // bare single record
-		{`{"records":null}`, 1},            // no records ARRAY: the object is the record
+		{`{"time":"x","category":"y"}`, 1},     // bare single record
+		{`{"records":null}`, 1},                // no records ARRAY: the object is the record
+		{`{"time":"x", "records" : null }`, 1}, // lightning walks null as [], so null is checked apart
 		{`{"records":[]}`, 0},
 		{`{"records":[{"s":"tricky \" ]} string","n":[1,[2,3]]},{"b":2}]}`, 2},
 		{"  \n[ {\"a\":1} , {\"b\":2} ]", 2},

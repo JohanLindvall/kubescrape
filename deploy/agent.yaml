@@ -393,7 +393,7 @@ spec:
           # resizes — so nothing has to be kept in step by hand. Set GOMEMLIMIT
           # in the pod env to override it; leave the CPU side alone, Go derives
           # GOMAXPROCS from a cpu limit by itself since go 1.25 (go.mod pins
-          # 1.26), which is why adding one here needs no other change.
+          # 1.27), which is why adding one here needs no other change.
           resources:
             requests:
               cpu: 50m

@@ -44,7 +44,10 @@ TAGS_STATIC ?= azure,events
 # The agent needs cgo only for journald; without that tag it builds static.
 AGENT_CGO := $(if $(findstring journald,$(TAGS)),1,0)
 
-GOLANGCI_LINT_VERSION := v2.12.2
+# The linter analyzes the standard library of the INSTALLED Go, not go.mod's, so
+# a toolchain upgrade can break lint on its own: v2.12's staticcheck panics
+# parsing Go 1.27's internal/poll ("buildir: unexpected expr *ast.KeyValueExpr").
+GOLANGCI_LINT_VERSION := v2.13.2
 # Under hack/bin like helm, never GOPATH/bin: the pin is enforced by
 # reinstalling, and a developer's own golangci-lint must not be the binary that
 # gets replaced.

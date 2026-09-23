@@ -23,7 +23,7 @@ const modulePath = "github.com/JohanLindvall/kubescrape"
 // fail: the offending import compiles, vets, lints and tests cleanly in this
 // repo forever.
 //
-// CLAUDE.md states the rule ("They must never import internal/"); this is what
+// AGENTS.md states the rule ("They must never import internal/"); this is what
 // makes it true rather than remembered.
 func TestPublicPackagesDoNotImportInternal(t *testing.T) {
 	// Pin the directory to THIS file's rather than inheriting the process CWD.

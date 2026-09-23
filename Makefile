@@ -66,7 +66,7 @@ all: build
 # (verify-tags, below). What CI adds on top is the tag-less variant's TEST run
 # (`make build test TAGS=`) and `CGO_ENABLED=1 go test -race` over the
 # concurrency-touching packages — the latter already documented as a separate
-# manual step in CLAUDE.md. `make e2e` needs docker/kind and is deliberately
+# manual step in AGENTS.md. `make e2e` needs docker/kind and is deliberately
 # separate from both.
 check: fmt-check vet lint helm-lint test verify-tags
 

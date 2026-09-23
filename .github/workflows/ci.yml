@@ -80,7 +80,7 @@ jobs:
         run: go test ./internal/obs/ -run 'TestMetricsDocIsCurrent|TestDocumentedMetricsExist'
 
       # Concurrency-touching code (store, metaclient cache, otlpingest) has
-      # targeted race exercises; CLAUDE.md asks for this pass, so run it here
+      # targeted race exercises; AGENTS.md asks for this pass, so run it here
       # rather than relying on it being remembered locally.
       - name: go test -race
         run: CGO_ENABLED=1 go test -race ./internal/store/ ./pkg/metaclient/ ./internal/agent/otlpingest/ ./internal/metrics/ ./internal/logline/ ./pkg/logattrs/
@@ -110,7 +110,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: sudo apt-get update && sudo apt-get install -y libsystemd-dev
-      # go.mod's `go` directive is a SECURITY floor (CLAUDE.md: the advisories
+      # go.mod's `go` directive is a SECURITY floor (AGENTS.md: the advisories
       # it was raised for), and the floor only holds while nothing reachable
       # is newly advisable. Run against the shipped tag set, so the journald,
       # Azure and events pipelines' dependencies are in the reachability

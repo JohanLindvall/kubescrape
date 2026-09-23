@@ -629,7 +629,7 @@ var builtins = map[string]pattern{
 	// redacted; the base64 body lines are separate records that lack the
 	// "PRIVATE KEY" telltale and pass through. The whole key is redacted only
 	// when it arrives in ONE record (a JSON-embedded key, or the OTLP-ingest
-	// path). This is documented in CLAUDE.md and the config docs; apps should
+	// path). This is documented in AGENTS.md and the config docs; apps should
 	// not log raw private keys.
 	"private-key": {
 		name:      "private-key",

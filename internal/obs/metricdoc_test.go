@@ -80,7 +80,7 @@ func renderMetricsDoc(docs []MetricDoc) string {
 	b.WriteString("This file is generated from `internal/obs/obs.go`. Regenerate with\n")
 	b.WriteString("`go test ./internal/obs/ -run TestMetricsDocIsCurrent -update-metrics-doc`;\n")
 	b.WriteString("`TestDocumentedMetricsExist` additionally fails if prose in `README.md`,\n")
-	b.WriteString("`CLAUDE.md` or any `docs/*.md` names a metric or a label that is not\n")
+	b.WriteString("`AGENTS.md` or any `docs/*.md` names a metric or a label that is not\n")
 	b.WriteString("registered.\n\n")
 	b.WriteString("## Renamed in this release\n\n")
 	b.WriteString("All of these are **wire-visible**: dashboards and alert rules selecting the\n")

@@ -997,7 +997,7 @@ func TestSecondRotationKeepsCarriedPrefix(t *testing.T) {
 // inode" property in drainGone/settledGone.
 //
 // Severity: MEDIUM — needs a deletion of the rotated file inside the outage
-// window; it is called out as a caveat in CLAUDE.md, but it is avoidable, and
+// window; it is called out as a caveat in AGENTS.md, but it is avoidable, and
 // the loss is silent (a Warn, no metric).
 func TestCarriedPrefixSurvivesRotatedFileDeletion(t *testing.T) {
 	dir := t.TempDir()

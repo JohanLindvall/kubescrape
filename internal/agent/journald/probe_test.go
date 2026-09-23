@@ -11,7 +11,7 @@ import (
 // truncated (journald.go sanitize/truncateRunes) with no counter bump and no
 // attribute on the record marking the loss. A consumer cannot distinguish a
 // truncated body from a complete one, and no metric surfaces that data was
-// dropped — silent data loss. (CLAUDE.md flags the truncation as silent.)
+// dropped — silent data loss. (AGENTS.md flags the truncation as silent.)
 // Fix: count truncations (e.g. a kubescrape_journal_truncated_total) and/or
 // stamp a log.truncated / original-length attribute on the record.
 func TestJournalTruncationCountedAndAttributed(t *testing.T) {

@@ -402,7 +402,7 @@ func TestDynamicAddAllocationBudget(t *testing.T) {
 		add     func(set *DynamicMetricSet, res pcommon.Map) func()
 	}{
 		// The tailer's shape: keys resolve from record/resource attributes
-		// through the caller's bound closures. CLAUDE.md's "matched-line
+		// through the caller's bound closures. AGENTS.md's "matched-line
 		// ~1 alloc".
 		{"attrs", 1.5, func(set *DynamicMetricSet, res pcommon.Map) func() {
 			return func() { set.Add(infoValues, infoLookup, res, `GET /api/v1/orders 200 42.5ms`) }

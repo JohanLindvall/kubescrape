@@ -47,7 +47,7 @@ func TestDocumentedMetricsExist(t *testing.T) {
 	// hand left the comparison docs and the Alloy migration guide — which name
 	// metrics too — outside a check whose generated preamble claims prose
 	// anywhere in the repo is covered.
-	files := []string{"../../README.md", "../../CLAUDE.md"}
+	files := []string{"../../README.md", "../../AGENTS.md"}
 	found, err := filepath.Glob("../../docs/*.md")
 	if err != nil {
 		t.Fatal(err)

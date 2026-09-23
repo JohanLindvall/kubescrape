@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end smoke test against a kind cluster (`make e2e`).
 #
-# CLAUDE.md has always said informer/store/API changes should be verified
+# AGENTS.md has always said informer/store/API changes should be verified
 # against a real cluster; this script is that checklist as code. It builds the
 # image, loads it into the kind cluster (created if absent — cluster-up.sh is
 # idempotent), deploys the SHIPPED manifests (deploy/*.yaml — the copy

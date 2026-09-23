@@ -9,7 +9,7 @@
 # `make image-static` (TAGS_STATIC defaults to `azure,events`: everything except
 # journald). The default image is untouched — see Dockerfile.
 #
-# The trade this image makes is exactly the one CLAUDE.md and the README name:
+# The trade this image makes is exactly the one AGENTS.md and the README name:
 # no systemd-unit logs (kubelet, containerd), which on many distros are the
 # only place a node's Kubernetes plane can be debugged. Take it when the node's
 # journal is collected some other way, or not at all.

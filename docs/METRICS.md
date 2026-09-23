@@ -33,7 +33,7 @@ Prometheus/Mimir ignore the field by default and are unaffected.
 This file is generated from `internal/obs/obs.go`. Regenerate with
 `go test ./internal/obs/ -run TestMetricsDocIsCurrent -update-metrics-doc`;
 `TestDocumentedMetricsExist` additionally fails if prose in `README.md`,
-`CLAUDE.md` or any `docs/*.md` names a metric or a label that is not
+`AGENTS.md` or any `docs/*.md` names a metric or a label that is not
 registered.
 
 ## Renamed in this release

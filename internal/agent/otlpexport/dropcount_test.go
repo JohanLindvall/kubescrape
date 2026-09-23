@@ -77,7 +77,7 @@ func logsWithN(body string, n int) plog.Logs {
 // A permanent rejection must count the RECORDS it discarded, not only the
 // batch.
 //
-// This is the drop path CLAUDE.md, the README and docs/CONFIGURATION.md all
+// This is the drop path AGENTS.md, the README and docs/CONFIGURATION.md all
 // point at as THE alert for the durable (-buffer-dir) configuration: with a
 // spool the tailer's own export returns the enqueue verdict, so the
 // collector's permanent rejections land here instead of on

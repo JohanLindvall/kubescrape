@@ -483,7 +483,7 @@ func TestDefaultSetIsDocumented(t *testing.T) {
 	docs := []string{
 		"../../../README.md",
 		"../../../docs/CONFIGURATION.md",
-		"../../../CLAUDE.md",
+		"../../../AGENTS.md",
 	}
 	for _, name := range defaultSet {
 		if _, ok := builtins[name]; !ok {

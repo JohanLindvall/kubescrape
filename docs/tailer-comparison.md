@@ -258,7 +258,7 @@ interleaving-exact tests pin the behavior being preserved):
 complexity much lower; the win is correctness-by-construction for the class of
 bug the audits kept finding. (That judgment held: the decomposition has since
 landed and the carry/gen machinery it replaced is deleted — the offset model
-described in CLAUDE.md's tailer section *is* this design.)
+described in AGENTS.md's tailer section *is* this design.)
 
 ## Verdict
 

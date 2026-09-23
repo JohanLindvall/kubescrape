@@ -88,7 +88,7 @@ const summaryPath = "/stats/summary"
 // own process, but it is still a response this agent does not control, and
 // every other body-bearing seam in this repo carries a cap (this is the same 16
 // MiB otlpingest uses for a push). No flag: a bound nobody can usefully tune is
-// a constant, and CLAUDE.md's rule is that a config surface becomes a config
+// a constant, and AGENTS.md's rule is that a config surface becomes a config
 // SECTION rather than a new flag.
 //
 // A dense node's summary is ~0.5 MB, so the cap is ~30x the realistic worst

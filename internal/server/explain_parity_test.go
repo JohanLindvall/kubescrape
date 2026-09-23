@@ -247,7 +247,7 @@ func TestExplainReportsARepeatedOfferAsAlreadyFolded(t *testing.T) {
 
 // Parity is about the VERDICTS, not about the telemetry: /v1/explain derives
 // through the same targetDedup as nodeTargets, and the package comment, README
-// and CLAUDE.md all promise it "moves no obs counters". It leaked exactly one —
+// and AGENTS.md all promise it "moves no obs counters". It leaked exactly one —
 // the ceiling refusal inside targetDedup.add, which the two sibling decision
 // signals on this same derivation (obs.TargetIdentityCollisions via
 // reportInstanceCollision, obs.MonitorTargetShadowed via the auth-conflict

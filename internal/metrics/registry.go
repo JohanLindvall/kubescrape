@@ -233,7 +233,7 @@ func (r *Registry) HistogramVec(name, desc string, buckets []float64, labelNames
 	// and obs.go's registrations run in every test binary — so this cannot reach
 	// production without failing the build first. That is the loud, immediate
 	// report a programmer error deserves, and it is a construction-time
-	// assertion, not a runtime one (nothing recovers it; see CLAUDE.md).
+	// assertion, not a runtime one (nothing recovers it; see AGENTS.md).
 	for _, k := range labelNames {
 		if k == leLabel {
 			panic("metrics: histogram " + name + " declares a label named " + leLabel +

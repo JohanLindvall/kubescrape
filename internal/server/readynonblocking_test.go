@@ -27,7 +27,7 @@ import (
 // metadata service put every node's non-blocking lookups into the readiness
 // park alongside the blocking ones, where they can spend the slots the cap
 // exists to reserve for requests that actually wait, and each refusal moves
-// kubescrape_container_lookups_shed_total — the counter CLAUDE.md deliberately
+// kubescrape_container_lookups_shed_total — the counter AGENTS.md deliberately
 // keeps apart from the drained one so that "a rolling update must not page like
 // an abuse event".
 func TestNonBlockingLookupsDoNotSpendTheReadinessParkBudget(t *testing.T) {

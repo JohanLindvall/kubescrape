@@ -992,7 +992,7 @@ func TestSplitDescribedObjectDoesNotKeepTheSendersServiceTriple(t *testing.T) {
 //
 // This test asserts the CURRENT, deliberate answer. If a later change closes
 // the hole it must fail — at which point the fix is to update it together with
-// the three places that describe the residual (this bullet, the CLAUDE.md
+// the three places that describe the residual (this bullet, the AGENTS.md
 // ingest bullet, and kubescrape_ingest_identity_stripped_total's help text),
 // never to delete it.
 func TestStolenLookupIDStillResolvesTheVictimsNamespace(t *testing.T) {
@@ -1011,7 +1011,7 @@ func TestStolenLookupIDStillResolvesTheVictimsNamespace(t *testing.T) {
 	v, ok := a.Get("k8s.namespace.name")
 	if !ok || v.Str() != "payments" {
 		t.Fatalf("k8s.namespace.name = %q (present=%v), want %q — the documented residual changed; "+
-			"update SenderIdentityStrip's lookup-key bullet, the CLAUDE.md ingest bullet and the "+
+			"update SenderIdentityStrip's lookup-key bullet, the AGENTS.md ingest bullet and the "+
 			"kubescrape_ingest_identity_stripped_total help text to match", v.Str(), ok, "payments")
 	}
 }

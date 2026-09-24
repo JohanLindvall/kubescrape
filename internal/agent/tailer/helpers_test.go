@@ -142,6 +142,11 @@ func newTestTailer(dir, checkpoint string, exp *fakeExporter) *Tailer {
 		Exporter:      exp,
 	})
 	tl.retryBackoff = 10 * time.Millisecond
+	// A vanished file is drained on the sweep that finds it gone, not after
+	// defaultGoneGrace: the gone-drain tests assert per sweep, and the grace
+	// is a wall-clock hold that its own tests exercise (TestGoneGrace*), as do
+	// the Run-driven rotation tests built on newMultilineTailer.
+	tl.goneGrace = 0
 	return tl
 }
 
@@ -358,6 +363,7 @@ func driveTailer(dir string, exp LogExporter) *Tailer {
 		Exporter:      exp,
 	})
 	tl.retryBackoff = time.Millisecond
+	tl.goneGrace = 0 // see newTestTailer
 	return tl
 }
 
@@ -378,6 +384,7 @@ func driveMultilineTailer(dir string, exp *fakeExporter) *Tailer {
 		Exporter:         exp,
 	})
 	tl.retryBackoff = time.Millisecond
+	tl.goneGrace = 0 // see newTestTailer
 	return tl
 }
 
@@ -395,6 +402,7 @@ func newSourceTailer(exp *fakeExporter, sources []Source, multiline bool) *Taile
 		Exporter:         exp,
 	})
 	tl.retryBackoff = 10 * time.Millisecond
+	tl.goneGrace = 0 // see newTestTailer
 	return tl
 }
 

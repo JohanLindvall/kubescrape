@@ -204,6 +204,11 @@ type file struct {
 	// long a goneEnd no read can reach again may pin the fd, the files-map
 	// entry and the checkpoint line.
 	goneStalledSince time.Time
+	// goneSince is when drainGone first saw this gone verdict; it is held
+	// back until defaultGoneGrace has passed, so a rename rotation's gap does
+	// not close the pipeline. Cleared with the verdict (resurrect,
+	// beginIncarnation).
+	goneSince time.Time
 	// Per-pod annotation config (podconfig.go), stamped at resolve time:
 	// excluded skips the file entirely; multiline overrides the source's
 	// stack-trace joining; podRules run before the global rules.
@@ -384,6 +389,7 @@ func (f *file) beginIncarnation(off int64) {
 	f.newTail()
 	f.committed = off
 	f.goneEnd, f.goneDrained = 0, false
+	f.goneSince = time.Time{}
 	f.restartAt(off)
 }
 

@@ -62,6 +62,17 @@ func (t *Tailer) drainGone(ctx context.Context, f *file) {
 	// flush, and a verdict left over from an earlier cycle (or a rotation
 	// drain) must not charge a cycle whose drain never ran.
 	f.drainErred = false
+	// Act on the verdict only once it has held for goneGrace (see
+	// defaultGoneGrace): until then the gone branch's stat can still find the
+	// path recreated and resurrect the file with its pipeline intact. Nothing
+	// here settles, so settledGone and chargeGoneStall leave the file alone.
+	now := time.Now()
+	if f.goneSince.IsZero() {
+		f.goneSince = now
+	}
+	if !t.stopping && now.Sub(f.goneSince) < t.goneGrace {
+		return
+	}
 	if !f.resolved {
 		// Nothing was ever read (nothing is read before it can be attributed),
 		// and with the file gone nothing can be: the content is lost. Make the
@@ -240,7 +251,7 @@ func (t *Tailer) settledGone(f *file) bool {
 
 // resurrect withdraws a gone verdict for a file whose path is proven alive
 // again — a listing (or a stat in the gone branch) racing a rename+recreate
-// rotation, or a rotated-away name taken by a new file. The three fields are
+// rotation, or a rotated-away name taken by a new file. The gone fields are
 // ONE decision and must be cleared together, which is why both callers
 // (scanDir's claimPath and sweep's gone branch) come through here: they were
 // written twice and the discovery half already disagreed, leaving goneEnd set.
@@ -266,6 +277,7 @@ func (f *file) resurrect() {
 	f.goneEnd = 0
 	f.goneDrained = false
 	f.goneStalledSince = time.Time{}
+	f.goneSince = time.Time{}
 }
 
 // release closes the file's handles and watches. After this the inode is

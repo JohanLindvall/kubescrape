@@ -332,6 +332,13 @@ type Tailer struct {
 	segmentStallLimit time.Duration
 	// drainCap bounds one drainReader call (see defaultDrainCap).
 	drainCap int64
+	// goneGrace is how long a gone verdict must hold before drainGone acts on
+	// it (see defaultGoneGrace).
+	goneGrace time.Duration
+	// stopping is set for the final sweep: a vanished file is drained and
+	// settled at once rather than after goneGrace, because nothing sweeps
+	// again and the file cannot be re-read after a restart.
+	stopping bool
 	// rateLimited is kubescrape_log_rate_limited_total for the configured
 	// action — see rateLimitedCounter.
 	rateLimited *metrics.RegCounter
@@ -404,6 +411,16 @@ const defaultDirScanEvery = 2 * time.Second
 // regression test is writing a gigabyte.
 const defaultDrainCap = 1 << 30
 
+// defaultGoneGrace is how long a file's absence must persist before drainGone
+// closes its pipeline. A rename rotation leaves the path absent until the new
+// file is created (the kubelet renames, then asks the runtime to reopen over
+// CRI), and a sweep landing in that gap used to close the multiline group
+// straddling the rotation: the trace shipped split, then the path came back and
+// was resurrected with an empty pipeline. Within the grace the gone branch's
+// stat resurrects the file first, and reopen carries the group across. A file
+// that is really gone is drained this much later, which loses nothing.
+const defaultGoneGrace = time.Second
+
 // New creates a Tailer.
 func New(cfg Config) *Tailer {
 	if cfg.PollInterval <= 0 {
@@ -471,6 +488,7 @@ func New(cfg Config) *Tailer {
 		shutdownBudget:    defaultShutdownBudget,
 		segmentStallLimit: defaultSegmentStallLimit,
 		drainCap:          defaultDrainCap,
+		goneGrace:         defaultGoneGrace,
 		statusEvery:       10 * time.Second,
 	}
 	if cfg.RateLimit > 0 {
@@ -571,6 +589,7 @@ func (t *Tailer) Run(ctx context.Context) {
 			// deadline is what makes those reachable; work that does not fit is
 			// re-read after the restart, which the offsets already guarantee.
 			sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), t.shutdownBudget)
+			t.stopping = true
 			t.sweep(sctx, true)
 			// Drain the pipelines; the emitted entries' offsets commit with
 			// the final flush, so nothing is re-read after a restart.

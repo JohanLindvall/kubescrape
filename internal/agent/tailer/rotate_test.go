@@ -1806,3 +1806,126 @@ func TestGoneDrainRegressingErrorBoundaryGivesUp(t *testing.T) {
 		t.Fatal("the given-up file's checkpoint line was not pruned")
 	}
 }
+
+// A sweep landing in a rename rotation's gap (the old name renamed away, the
+// new file not yet created) must not close the multiline group straddling the
+// rotation: the gone verdict waits out goneGrace, the next sweep finds the path
+// recreated and resurrects the file, and reopen carries the group across. It
+// used to ship the trace split — the frames as separate records — whenever the
+// gap spanned a sweep, which is what flaked TestMultilineJoinsAcrossRotation.
+func TestGoneGraceJoinsAMultilineGroupAcrossARotationGap(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newMultilineTailer(dir, "", exp, nil)
+	ctx := context.Background()
+	path := filepath.Join(dir, logName)
+
+	tl.scanDir(nil, true)
+	start, rest := panicLines()
+	writeLines(t, path, start...)
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true) // the trace's first frames are buffered
+
+	rotateAway(t, dir, 1)
+	tl.scanDir(nil, false) // the listing lands in the gap: gone
+	tl.sweep(ctx, true)    // the gone branch's stat still fails: drainGone
+	tl.flush(ctx)
+	if _, ok := tl.files[path]; !ok {
+		t.Fatal("the file was released inside the grace")
+	}
+	if _, n := panicRecords(exp); n != 0 {
+		t.Fatalf("the group was closed inside the grace: %q", exp.get())
+	}
+
+	writeLines(t, path, rest...)
+	tl.sweep(ctx, true) // the path is back: resurrect, rotate, carry the group
+	tl.sweep(ctx, true)
+	tl.stopPipeline(ctx, tl.files[path])
+	tl.flush(ctx)
+	if j, n := panicRecords(exp); j != 1 || n != 1 {
+		t.Fatalf("panic joined=%d count=%d (want 1/1 — not split): %q", j, n, exp.get())
+	}
+}
+
+// The grace delays a genuine deletion; it must not keep one. Once the verdict
+// has held for goneGrace the file drains (its unterminated final line
+// included), settles and is released.
+func TestGoneGraceStillSettlesADeletedFile(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.goneGrace = time.Hour
+	ctx := context.Background()
+	path := filepath.Join(dir, logName)
+
+	tl.scanDir(nil, true)
+	writeLog(t, dir, timeNowCRI()+" stdout F one")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.WriteString(timeNowCRI() + " stdout F two") // unterminated
+	_ = f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	if _, ok := tl.files[path]; !ok {
+		t.Fatal("the file was released inside the grace")
+	}
+
+	tl.files[path].goneSince = time.Now().Add(-2 * time.Hour) // the grace has passed
+	tl.sweep(ctx, true)
+	if _, ok := tl.files[path]; ok {
+		t.Fatal("a file gone past its grace was not released")
+	}
+	if got := exp.get(); !slices.Equal(got, []string{"one", "two"}) {
+		t.Fatalf("exported %q, want [one two]: the drained tail must ship", got)
+	}
+}
+
+// The final sweep does not wait out the grace: nothing sweeps after it, and a
+// vanished file cannot be re-read after a restart, so a deletion inside the
+// grace at shutdown would otherwise lose its unterminated final line.
+func TestGoneGraceIsSkippedByTheFinalSweep(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.goneGrace = time.Hour
+	ctx := context.Background()
+	path := filepath.Join(dir, logName)
+
+	tl.scanDir(nil, true)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.WriteString(timeNowCRI() + " stdout F last") // unterminated
+	_ = f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	tl.scanDir(nil, false)
+
+	tl.stopping = true
+	tl.sweep(ctx, true)
+	if _, ok := tl.files[path]; ok {
+		t.Fatal("the final sweep held a vanished file for the grace")
+	}
+	if got := exp.get(); !slices.Equal(got, []string{"last"}) {
+		t.Fatalf("exported %q, want [last]", got)
+	}
+}

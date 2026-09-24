@@ -66,7 +66,11 @@ type configExpect struct {
 
 // runConfigTests loads and executes the cases, reporting each failure; a
 // non-nil error means at least one case failed (the process exits non-zero).
-func runConfigTests(cfg agentConfig, transformsFile, testsFile string, log *slog.Logger) error {
+//
+// cc is what compileConfig compiled for cfg — the chains a real start builds,
+// not variants of them, and the transforms program that was just validated
+// rather than a second read of the file.
+func runConfigTests(cfg agentConfig, cc *compiledConfig, testsFile string, log *slog.Logger) error {
 	raw, err := os.ReadFile(testsFile)
 	if err != nil {
 		return err
@@ -79,32 +83,13 @@ func runConfigTests(cfg agentConfig, transformsFile, testsFile string, log *slog
 		return fmt.Errorf("%s: no tests", testsFile)
 	}
 
-	// The same compile helpers a real start (and validateConfig) uses, so the
-	// harness proves the chains production builds, not variants of them.
-	scrubber, err := compileScrub(cfg.LogScrubbing)
-	if err != nil {
-		return err
-	}
-	extractor, err := compileLogAttrs(cfg.LogAttributes)
-	if err != nil {
-		return err
-	}
-	rules, err := compileLogRules(cfg.Logs)
-	if err != nil {
-		return err
-	}
-	transforms, err := compileTransforms(transformsFile)
-	if err != nil {
-		return err
-	}
-
 	failed := 0
 	for i, tc := range tests.Tests {
 		name := tc.Name
 		if name == "" {
 			name = fmt.Sprintf("case %d", i)
 		}
-		problems := runConfigCase(cfg, scrubber, extractor, rules, transforms, tc)
+		problems := runConfigCase(cfg, cc.scrub, cc.logAttrs, cc.logRules, cc.transforms, tc)
 		if len(problems) == 0 {
 			log.Info("test-config PASS", "case", name)
 			continue
@@ -183,7 +168,7 @@ func runConfigCase(cfg agentConfig, scrubber *logscrub.Scrubber, extractor *loga
 
 	// Scrub + extract precede grouping, as in every producer; the body
 	// assertion reads the post-scrub line.
-	body, ext := chain.Line(tc.Line)
+	body, ext := chain.Line(tc.Line, false)
 	if tc.Expect.Body != "" && body != tc.Expect.Body {
 		fail("body = %q, want %q", body, tc.Expect.Body)
 	}

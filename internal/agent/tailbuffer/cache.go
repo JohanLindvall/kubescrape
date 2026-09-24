@@ -53,39 +53,74 @@ import (
 
 // decisionCache remembers verdicts by trace id. Not safe for concurrent use: it
 // lives under Buffer.mu.
+//
+// Everything is stored BY VALUE and nothing it stores holds a pointer: the map
+// fills to its cap and stays there (100000 entries by default), and a map or
+// slice whose element type carries no pointer is one the garbage collector
+// never has to scan. Entries used to be a *decision each, carrying a time.Time
+// (whose *Location is a pointer), which was one allocation per decision and a
+// hundred thousand objects for every GC cycle to mark.
 type decisionCache struct {
 	max int
 	ttl time.Duration
-	m   map[pcommon.TraceID]*decision
-	// fifo is insertion order, for capacity eviction. Entries are POINTERS and a
-	// superseded one is marked stale rather than removed from the middle, so a
-	// trace decided twice cannot have its second verdict evicted by its first
-	// slot reaching the front.
-	fifo []*decision
+	m   map[pcommon.TraceID]decision
+	// fifo is insertion order, for capacity eviction. A superseded entry is
+	// not removed from the middle: its slot names the seq of the put that
+	// wrote it, and a slot is LIVE only while the map entry for its id still
+	// carries that seq (live). So a trace decided twice cannot have its second
+	// verdict evicted by its first slot reaching the front.
+	fifo []cacheSlot
 	head int
+	// seq numbers the puts; 64 bits, so it never wraps.
+	seq uint64
+	// base is the clock reading of the first put, the zero point decision.at
+	// counts from. An offset from a reading of the CALLER's clock, rather than
+	// a wall-clock integer, so the TTL arithmetic keeps time.Time's monotonic
+	// reading (a stepped wall clock must not age every verdict at once) and
+	// stays in whatever clock a test injects.
+	base    time.Time
+	hasBase bool
 }
 
 type decision struct {
-	id pcommon.TraceID
 	// charged is WHICH rate buckets the deciding evaluation actually SPENT
 	// (see the two lifetimes above), not that it happened — per bucket, so a
 	// re-decision Peeks only the buckets this trace paid.
 	charged tailsample.ChargedMask
-	keep    bool
-	at      time.Time
-	stale   bool
+	// at is when the verdict was made, as an offset from decisionCache.base.
+	at   time.Duration
+	seq  uint64
+	keep bool
+}
+
+// cacheSlot is one FIFO position: the trace and the put that wrote it.
+type cacheSlot struct {
+	id  pcommon.TraceID
+	seq uint64
 }
 
 func newDecisionCache(limit int, ttl time.Duration) *decisionCache {
-	return &decisionCache{max: limit, ttl: ttl, m: make(map[pcommon.TraceID]*decision, min(limit, 1024))}
+	return &decisionCache{max: limit, ttl: ttl, m: make(map[pcommon.TraceID]decision, min(limit, 1024))}
+}
+
+// age is how long ago d was decided, as of now.
+func (c *decisionCache) age(d decision, now time.Time) time.Duration {
+	return now.Sub(c.base) - d.at
+}
+
+// live reports whether s is still the slot of its trace's current entry.
+func (c *decisionCache) live(s cacheSlot) bool {
+	d, ok := c.m[s.id]
+	return ok && d.seq == s.seq
 }
 
 // get returns the remembered verdict, if there is a live one. An entry past the
 // TTL answers no — its trace is a new trace as far as the window goes — but it
-// STAYS, because seen still needs it.
+// STAYS, because charged() still reads it: the spend it recorded outlives the
+// verdict (see the two lifetimes above).
 func (c *decisionCache) get(id pcommon.TraceID, now time.Time) (keep, ok bool) {
 	d, ok := c.m[id]
-	if !ok || now.Sub(d.at) >= c.ttl {
+	if !ok || c.age(d, now) >= c.ttl {
 		return false, false
 	}
 	return d.keep, true
@@ -96,11 +131,7 @@ func (c *decisionCache) get(id pcommon.TraceID, now time.Time) (keep, ok bool) {
 // Trace.Charged, so a bucket is neither billed twice for one trace nor
 // skipped for one the trace never paid it.
 func (c *decisionCache) charged(id pcommon.TraceID) tailsample.ChargedMask {
-	d, ok := c.m[id]
-	if !ok {
-		return 0
-	}
-	return d.charged
+	return c.m[id].charged // the zero value (a miss) is "spent nothing"
 }
 
 // put remembers a verdict and whether producing it billed the rate budgets,
@@ -119,17 +150,21 @@ func (c *decisionCache) charged(id pcommon.TraceID) tailsample.ChargedMask {
 // no earlier entry to accumulate over, so the two coexist only because this
 // one ORs.
 func (c *decisionCache) put(id pcommon.TraceID, keep bool, charged tailsample.ChargedMask, now time.Time) {
+	if !c.hasBase {
+		c.base, c.hasBase = now, true
+	}
 	if old, ok := c.m[id]; ok {
 		charged |= old.charged
-		old.stale = true // its FIFO slot must not evict the new entry
+		// Deleting it is what retires its FIFO slot: the slot names old.seq,
+		// which no entry carries any more, so it cannot evict the new one.
 		delete(c.m, id)
 	}
 	if len(c.m) >= c.max {
 		c.evict(now)
 	}
-	d := &decision{id: id, keep: keep, charged: charged, at: now}
-	c.m[id] = d
-	c.fifo = append(c.fifo, d)
+	c.seq++
+	c.m[id] = decision{keep: keep, charged: charged, at: now.Sub(c.base), seq: c.seq}
+	c.fifo = append(c.fifo, cacheSlot{id: id, seq: c.seq})
 	c.compact()
 }
 
@@ -139,14 +174,14 @@ func (c *decisionCache) put(id pcommon.TraceID, keep bool, charged tailsample.Ch
 // budgets — whereas reclaiming an expired tombstone is the cache working.
 func (c *decisionCache) evict(now time.Time) {
 	for c.head < len(c.fifo) {
-		d := c.fifo[c.head]
+		s := c.fifo[c.head]
 		c.head++
-		if d.stale {
-			continue
+		d, ok := c.m[s.id]
+		if !ok || d.seq != s.seq {
+			continue // a superseded slot
 		}
-		delete(c.m, d.id)
-		d.stale = true
-		if now.Sub(d.at) < c.ttl {
+		delete(c.m, s.id)
+		if c.age(d, now) < c.ttl {
 			obs.TailSampleCacheEvicted.Inc()
 		}
 		return
@@ -162,8 +197,7 @@ func (c *decisionCache) compact() {
 	// one entry per re-decision forever. A bounded map behind an unbounded
 	// slice: every late span that re-decided a trace leaked a slot for the
 	// process' life.
-	for c.head < len(c.fifo) && c.fifo[c.head].stale {
-		c.fifo[c.head] = nil
+	for c.head < len(c.fifo) && !c.live(c.fifo[c.head]) {
 		c.head++
 	}
 	// A re-decided trace's dead slot is wherever it happened to sit, not
@@ -173,13 +207,12 @@ func (c *decisionCache) compact() {
 	// cache is under its cap.
 	if len(c.fifo)-c.head > 2*len(c.m)+compactFloor {
 		n := 0
-		for _, d := range c.fifo[c.head:] {
-			if !d.stale {
-				c.fifo[n] = d
+		for _, s := range c.fifo[c.head:] {
+			if c.live(s) {
+				c.fifo[n] = s
 				n++
 			}
 		}
-		clear(c.fifo[n:])
 		c.fifo = c.fifo[:n]
 		c.head = 0
 		return
@@ -188,7 +221,6 @@ func (c *decisionCache) compact() {
 		return
 	}
 	n := copy(c.fifo, c.fifo[c.head:])
-	clear(c.fifo[n:])
 	c.fifo = c.fifo[:n]
 	c.head = 0
 }

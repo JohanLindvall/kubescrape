@@ -17,8 +17,9 @@ import (
 const leLabel = "le"
 
 // drops counts observations the series store REFUSED, for the store that owns
-// them. Every rejection path must bump one: a dropped observation that is only
-// logged (at most hourly, per series) is invisible loss.
+// them. Every rejection path must bump a counter — one of these, or the
+// series' own cappedDrops (below): a dropped observation that is only logged
+// (at most hourly, per series) is invisible loss.
 //
 // These used to be PROCESS-GLOBAL atomics, purely to dodge an import cycle with
 // obs (which imports this package, so the counters could not live there). The
@@ -28,34 +29,16 @@ const leLabel = "le"
 // Registry's (essentially impossible) refusals landed on a metric documented as
 // the log-metrics one, and six tests had to do before/after arithmetic to
 // isolate themselves from every other test in the package.
+//
+// The CARDINALITY-CAP refusals are deliberately not here: they are counted per
+// series (series.cappedDrops), because a cap refusal is per metric by nature
+// and a set-wide count had to be kept beside a mutex-guarded per-name map that
+// every refusal on every series of the set serialised on. See
+// DynamicMetricSet.DroppedCappedByMetric.
 type drops struct {
-	capped   atomic.Uint64
 	nan      atomic.Uint64
 	negative atomic.Uint64
 	retained atomic.Uint64
-
-	mu       sync.Mutex
-	byMetric map[string]uint64
-}
-
-// Capped counts observations rejected because the series' label-set
-// cardinality cap was reached (a new label combination could not be admitted).
-func (d *drops) Capped() uint64 { return d.capped.Load() }
-
-// CappedByMetric reports cap-refused observations per metric name.
-//
-// The cap frees slots only through idleness, so one burst of high-cardinality
-// labels blinds a metric for maxAge + the grace window — 24h by default. An
-// aggregate counter says that happened; it does not say to WHICH metric, which
-// is the only thing an operator can act on.
-func (d *drops) CappedByMetric() map[string]float64 {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	out := make(map[string]float64, len(d.byMetric))
-	for k, v := range d.byMetric {
-		out[k] = float64(v)
-	}
-	return out
 }
 
 // NaN counts observations rejected because the extracted value was not
@@ -69,25 +52,14 @@ func (d *drops) NaN() uint64 { return d.nan.Load() }
 // series.refuseNegative for why those two and not the other kinds.
 func (d *drops) Negative() uint64 { return d.negative.Load() }
 
-// Retained counts undelivered export chunks dropped because the
-// re-offer buffer was full — a collector outage lasting longer than
-// maxRetainedResources can hold. These ARE lost observations, and they are the
-// only ones the retention cannot save.
+// Retained counts undelivered SAMPLES dropped because the re-offer buffer was
+// full — a collector outage longer than maxRetainedSamples/maxRetainedResources
+// can hold — or because the collector rejected their chunk permanently. These
+// ARE lost observations, and they are the only ones the retention cannot save.
 func (d *drops) Retained() uint64 { return d.retained.Load() }
 
-// addRetained counts n dropped undelivered resources.
+// addRetained counts n dropped undelivered samples.
 func (d *drops) addRetained(n uint64) { d.retained.Add(n) }
-
-// recordCapped counts one cap-refused observation for metric.
-func (d *drops) recordCapped(metric string) {
-	d.capped.Add(1)
-	d.mu.Lock()
-	if d.byMetric == nil {
-		d.byMetric = map[string]uint64{}
-	}
-	d.byMetric[metric]++
-	d.mu.Unlock()
-}
 
 // seriesKind selects how observations accumulate and how the series exports.
 type seriesKind int
@@ -214,7 +186,7 @@ type sample struct {
 	resource string
 	count    uint64
 	// counts holds a histogram's CUMULATIVE observation count per finite bucket
-	// bound (series.buckets minus the +Inf entry; the +Inf figures are value/
+	// bound (series.bounds; the +Inf figures are value/
 	// count — the sum and total). A histogram keeps ONE sample per label set
 	// rather than one per bucket stream: fifteen map entries and fifteen full
 	// label strings per label set cost ~15x what a counter does, made
@@ -224,9 +196,10 @@ type sample struct {
 	// entry per label set makes a partial family unrepresentable. Nil for
 	// every non-histogram.
 	counts []uint64
-	// start is the epoch second this cumulative stream began accumulating: the
-	// admission of the sample, or the last idle reset that genuinely zeroed it.
-	// It becomes StartTimeUnixNano on every exported point.
+	// start is the epoch second this stream began accumulating: the admission of
+	// the sample (see streamStart), or, for a GAUGE only, the last idle reset
+	// that zeroed it — a cumulative kind is never zeroed while it lives (see
+	// snapshot). It becomes StartTimeUnixNano on every exported point.
 	//
 	// It is NOT the export time. StartTimeUnixNano == TimeUnixNano is the OTLP
 	// encoding for a point that RESET at that instant, and snapshot does not
@@ -239,24 +212,41 @@ type sample struct {
 	start   int64
 	initial bool
 	// sealed marks an aggregation window as already emitted; the next observed
-	// value starts a fresh window (min/max/avg/first/last gauges).
+	// value starts a fresh window (the windowed gauge actions: min/max/avg/sum/
+	// count — see gaugeAction).
 	sealed bool
+	// final is set only on an EMITTED copy (snapshot's output), never on a
+	// stored sample: it says the store no longer holds this value for a later
+	// export to re-read — the grace delete unlinked it, a gauge's idle reset
+	// zeroed it, or it is the first emission of an aggregation window that the
+	// next observation replaces. It is what a failed export decides on
+	// (DynamicMetricSet.retain): a final sample has no other copy and is
+	// retained; any other is re-read from the store at the next export and is
+	// handed back to it instead (series.rearm).
+	final bool
+
+	// key is the sample's FULL 128-bit identity. On a stored sample it is what
+	// series.find compares (with expiringSample.next chaining the samples whose
+	// keys share a low half — together they are why series.db can be a
+	// map[uint64] without narrowing identity to 64 bits; see there). An emitted
+	// copy carries it too, which is what lets series.rearm find the live sample
+	// a failed export read in one probe instead of a walk.
+	key xxh3.Uint128
 }
 
 type expiringSample struct {
 	sample
 	when int64 // epoch seconds of the last observation
 	// exported reports whether the CURRENT value has already reached an export.
-	// The idle reset must never zero counts that no export has carried: maxAge
-	// may legally be shorter than the export interval, in which case every
-	// observation between two exports would otherwise be observed and destroyed
-	// without ever being emitted.
+	// The idle and grace-delete branches of snapshot emit a value no export has
+	// carried before going quiet on it: maxAge may legally be shorter than the
+	// export interval, in which case every observation between two exports
+	// would otherwise be observed and dropped without ever being emitted. A
+	// FAILED export clears it again (series.rearm), since the value it read
+	// never arrived.
 	exported bool
 
-	// key is the sample's FULL 128-bit identity and next chains the samples
-	// whose keys share a low half. Together they are why series.db can be a
-	// map[uint64] without narrowing identity to 64 bits — see there.
-	key  xxh3.Uint128
+	// next chains the samples whose keys share a low half (see sample.key).
 	next *expiringSample
 }
 
@@ -293,11 +283,36 @@ type series struct {
 	// len(db) is therefore NOT the series count (a chain of two is one map
 	// entry and two series): count is, and it is what the cardinality cap
 	// reads.
+	//
+	// A SERIES is one (resource, label-combination) pair, since observeFold
+	// XORs the resource's accumulator into the key, and that holds for every
+	// kind: a histogram is one sample carrying its whole per-bucket
+	// distribution (sample.counts). The store used to key histograms per
+	// bucket STREAM and translate the cap through a derived maxStreams budget;
+	// the translation is gone with the layout.
+	//
+	// The RESOURCE half is what makes the cap a memory bound (the store
+	// retains a serialization of the whole resource per entry), and it is also
+	// what surprises: one agent-wide set serves every pod on the node, so a
+	// rule matching N pods draws its label combinations from ONE pool and the
+	// per-pod budget is maxSize/N. Do not "fix" that by dropping the resource
+	// from the key — a label-set-only cap is unbounded in resources, which is
+	// exactly what cardinalityCap (compile.go) and maxStreamCap defend against.
 	db    map[uint64]*expiringSample
 	count int
-	name  string
-	desc  string
-	kind  seriesKind
+	// cappedDrops counts the observations this series REFUSED because its
+	// cardinality cap was reached (warnCapped, under mu). It is per series
+	// rather than on the shared drops because a cap refusal is per metric by
+	// nature — rules sharing a name share one series, so this IS the per-metric
+	// count an operator acts on — and because the set-wide form needed a
+	// mutex-guarded per-name map that every refusal on every series of a set
+	// serialised on, which is exactly the shape a cardinality blow-up fed from
+	// several ingest goroutines takes. Atomic because the export-time reader
+	// (DynamicMetricSet.DroppedCappedByMetric) does not take mu.
+	cappedDrops atomic.Uint64
+	name        string
+	desc        string
+	kind        seriesKind
 	// role selects the vocabulary the refusal lines use; see seriesRole.
 	role seriesRole
 	// refuseNegative is set for the kinds whose exported form is MONOTONIC, and
@@ -330,43 +345,38 @@ type series struct {
 	// atomic load per observation paying for one.
 	now func() int64
 
-	action  gaugeAction // gauge fold mode; ignored for other kinds
-	maxSize int         // cap on distinct SERIES (config maxCardinality)
-	// db is keyed per SERIES — one entry per (resource, label-combination)
-	// pair, since observeFold XORs the resource's accumulator into the key —
-	// and per PAIR for every kind, a histogram being one sample carrying its
-	// whole per-bucket distribution (sample.counts), so len(db) compares
-	// against maxSize directly. The store used to key histograms per bucket
-	// STREAM and translate the cap through a derived maxStreams budget; the
-	// translation is gone with the layout.
-	//
-	// The RESOURCE half is what makes the cap a memory bound (the store
-	// retains a serialization of the whole resource per entry), and it is also
-	// what surprises: one agent-wide set serves every pod on the node, so a
-	// rule matching N pods draws its label combinations from ONE pool and the
-	// per-pod budget is maxSize/N. Do not "fix" that by dropping the resource
-	// from the key — a label-set-only cap is unbounded in resources, which is
-	// exactly what cardinalityCap (compile.go) and maxStreamCap defend against.
-	expiration int64 // seconds of inactivity before a combination expires
-	lastWarn   int64 // epoch seconds of the last cardinality warning
+	action     gaugeAction // gauge fold mode; ignored for other kinds
+	maxSize    int         // cap on distinct SERIES (config maxCardinality); count is what it reads
+	expiration int64       // seconds of inactivity before a combination expires
+	lastWarn   int64       // epoch seconds of the last cardinality warning (see hourly)
 	// lastNonFinite is the epoch second of the last non-finite-value notice,
-	// throttled the same way and for the same reason as lastWarn. Both are
-	// hand-rolled rather than internal/logdedupe because this package's clock
-	// is INJECTABLE (series.now, the store.now pattern) and logdedupe reads
-	// time.Now directly: a throttle a test cannot step past would make these
-	// two lines the only untestable behaviour in the file.
+	// throttled the same way and for the same reason as lastWarn (see hourly).
 	lastNonFinite int64
 	// lastNegative is the epoch second of the last negative-value notice,
 	// throttled separately from lastNonFinite: the two conditions co-occur on a
 	// rule whose extraction is simply wrong, and one shared gate would let
 	// whichever fired first silence the other for the hour.
 	lastNegative int64
-	log          *slog.Logger
+	// log is the logger the refusal lines go to; nil means slog.Default() AT
+	// THE CALL (see logger). Never resolved at construction: every Registry
+	// series is built in obs's package-level var blocks, before either main
+	// calls slog.SetDefault, and a logger captured there is the stdlib bridge —
+	// its lines come out as `level=INFO msg="WARN ..."` with every attribute
+	// flattened into the message, or not at all under a Warn-level handler.
+	log *slog.Logger
 
-	// buckets are the histogram boundaries with +Inf appended; nil for
-	// non-histograms.
-	buckets []float64
-	// lastWarn rate-limits the cardinality-cap notice.
+	// created is the epoch second this series was built, on its own clock. It
+	// floors a counter's declared start (streamStart): the backdate is a claim
+	// that the counter was zero for three minutes before its first observation,
+	// which is true only of time THIS process could have observed — see
+	// counterBaselineSeconds.
+	created int64
+
+	// bounds are a histogram's FINITE bucket bounds — what sample.counts
+	// indexes — and nil for every other kind. The +Inf bucket is not stored:
+	// its figures are the sample's own value/count (the sum and the total),
+	// and every reader wanted the finite bounds alone.
+	bounds []float64
 }
 
 // seriesSpec configures a new series.
@@ -375,8 +385,11 @@ type seriesSpec struct {
 	kind       seriesKind
 	// role selects the refusal lines' vocabulary. Both doors state it
 	// explicitly — compile.go passes roleLogMetric and registry.go
-	// roleSelfMetric — so which product a series belongs to is never a
-	// zero-value coincidence one edit away from being wrong.
+	// roleSelfMetric — but roleLogMetric IS the zero value, so omitting it at
+	// compile.go changes nothing and only the Registry's door can regress
+	// silently. That door is pinned end to end by
+	// TestRegistryRefusalSpeaksTheSelfMetricVocabulary, which goes through
+	// Registry.Counter rather than building a series by hand.
 	role       seriesRole
 	action     gaugeAction
 	maxSize    int
@@ -399,10 +412,6 @@ var defaultBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 
 func expirationSeconds(d time.Duration) int64 { return int64(math.Ceil(d.Seconds())) }
 
 func newSeries(spec seriesSpec) *series {
-	log := spec.log
-	if log == nil {
-		log = slog.Default()
-	}
 	dr := spec.drops
 	if dr == nil {
 		dr = &drops{}
@@ -423,27 +432,45 @@ func newSeries(spec seriesSpec) *series {
 		action:         spec.action,
 		maxSize:        spec.maxSize,
 		expiration:     expirationSeconds(spec.expiration),
-		log:            log,
+		log:            spec.log,
 	}
+	s.created = s.epoch()
 	if spec.kind == kindHistogram {
-		s.initBuckets(spec.buckets)
+		s.bounds = slices.Clone(effectiveBuckets(spec.buckets))
 	}
 	return s
+}
+
+// logger is the series' logger, resolved at the CALL so a process that
+// installs its handler after building its series (every Registry series is
+// built at package init) still gets its refusal lines in that handler.
+func (s *series) logger() *slog.Logger {
+	if s.log != nil {
+		return s.log
+	}
+	return slog.Default()
+}
+
+// effectiveBuckets is the ONE spelling of "no buckets configured means
+// defaultBuckets", for a histogram's configured bounds: newSeries stores it,
+// sameBuckets compares against it, and compileRule sizes the bucket-slot
+// budget from it.
+func effectiveBuckets(b []float64) []float64 {
+	if len(b) == 0 {
+		return defaultBuckets
+	}
+	return b
 }
 
 // sameBuckets reports whether a fresh registration of this kind with these
 // bounds would produce the buckets this series already has. Only a histogram
 // has any (newSeries ignores the field otherwise), and the comparison is
-// against the NORMALIZED form: empty means defaultBuckets, and initBuckets
-// appends the +Inf bound.
+// against the NORMALIZED form (effectiveBuckets).
 func (s *series) sameBuckets(kind seriesKind, buckets []float64) bool {
 	if kind != kindHistogram {
 		return true
 	}
-	if len(buckets) == 0 {
-		buckets = defaultBuckets
-	}
-	return slices.Equal(s.buckets[:len(s.buckets)-1], buckets)
+	return slices.Equal(s.bounds, effectiveBuckets(buckets))
 }
 
 // epoch reads the series' clock: the injected one in tests, the process's
@@ -455,21 +482,26 @@ func (s *series) epoch() int64 {
 	return coarseEpoch()
 }
 
-// initBuckets sorts out the histogram bucket bounds (+Inf appended).
-func (s *series) initBuckets(buckets []float64) {
-	if len(buckets) == 0 {
-		buckets = defaultBuckets
-	}
-	s.buckets = append(append([]float64(nil), buckets...), math.Inf(1))
-}
+// refusalOrigin says where a refused value came from, for the refusal line's
+// remedy — the one part of the line that differs by source.
+type refusalOrigin uint8
 
-// bounds are the histogram's finite bucket bounds — what sample.counts indexes.
-func (s *series) bounds() []float64 { return s.buckets[:len(s.buckets)-1] }
+const (
+	// originFeed is the series' own feed: a logMetrics rule's
+	// value/valueRegexp for a log-derived series, code for a Registry one.
+	originFeed refusalOrigin = iota
+	// originScript is a transform script's emit_metric (EmitDirect), whose
+	// value the script computed — hostobj hands a Starlark float through with
+	// no finiteness or sign check — so a remedy naming "the rule's
+	// value/valueRegexp" sent the operator to a source that played no part.
+	originScript
+)
 
 // refuse reports whether value must not be admitted, counting and (at most
-// hourly) naming the reason. It is the ONE value guard, shared by both observe
-// doors so they cannot drift — the per-line path and the registry's
-// pre-hashed path used to spell the non-finite half separately.
+// hourly) naming the reason. It is the ONE value guard, shared by every
+// observe door so they cannot drift — the per-line path and the registry's
+// pre-hashed path used to spell the non-finite half separately, and
+// EmitDirect checks through it with its own origin.
 //
 // Order matters: -Inf is negative AND non-finite, and it is reported as
 // non-finite, which is the sharper diagnosis (the extraction produced a value
@@ -479,21 +511,57 @@ func (s *series) bounds() []float64 { return s.buckets[:len(s.buckets)-1] }
 // and one bool field read; the counting and the log line live in the note*
 // helpers, off this path. The allocation budgets in bench_test.go observe
 // finite non-negative values and reach neither.
-func (s *series) refuse(value float64) bool {
+func (s *series) refuse(value float64, from refusalOrigin) bool {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		// Inf too, and for the same reason: ParseFloat accepts "inf"/"Infinity"
 		// from a log line, and Inf is ABSORBING under every accumulate path —
 		// one such observation pins a counter, summary or histogram sum at Inf
 		// for the whole maxAge (24h by default), which no later real value can
 		// undo. Counted, never admitted.
-		s.noteNonFinite(value)
+		//
+		// The counter alone (kubescrape_log_metrics_dropped_nan_total) says the
+		// extraction is producing garbage but not WHICH rule's, and a set holds
+		// every metric on the node — so the operator had a rising number and no
+		// way to reach the `value`/`valueRegexp` that produced it. The line is
+		// the context the counter cannot carry; the counter stays the rate.
+		s.noteRefused(&s.drops.nan, &s.lastNonFinite, value, "non-finite",
+			"the value is NaN or Inf, which would poison every aggregate this metric feeds",
+			s.dropNote(from))
 		return true
 	}
 	if value < 0 && s.refuseNegative {
-		s.noteNegative(value)
+		// The counter says the rate; only the line can reach the rule. It is a
+		// WARN and not a Debug because the alternative to refusing was a SILENT
+		// lie: the value folded in, the exported cumulative sum went DOWN on an
+		// unchanged StartTimestamp, and every rate() over it read an undeclared
+		// counter reset and added the new total on top of the old one. Nothing
+		// downstream can detect that, so the refusal is the only place it can
+		// ever be reported.
+		s.noteRefused(&s.drops.negative, &s.lastNegative, value, "negative",
+			"this metric exports a MONOTONIC sum, and folding a decrease into it on an unchanged start timestamp is a counter reset that rate() would read as one and add on top of everything already counted",
+			s.negativeNote(from))
 		return true
 	}
 	return false
+}
+
+// dropNote is the remedy a refused non-finite value carries: the role's,
+// unless a transform script supplied the value.
+func (s *series) dropNote(from refusalOrigin) string {
+	if from == originScript {
+		return "the value was passed to a transform script's emit_metric(...), not extracted by a rule, so check what the script computes for this metric; " +
+			"the running total is kubescrape_log_metrics_dropped_nan_total"
+	}
+	return s.role.dropNote()
+}
+
+// negativeNote is dropNote for the negative-value refusal.
+func (s *series) negativeNote(from refusalOrigin) string {
+	if from == originScript {
+		return "the value was passed to a transform script's emit_metric(...), not extracted by a rule; a signed quantity belongs on a metric declared " +
+			"type: gauge or type: histogram with bounds covering it; the running total is kubescrape_log_metrics_dropped_negative_total"
+	}
+	return s.role.negativeNote()
 }
 
 // observe records value for the given data-point label set, resource, and extra
@@ -515,11 +583,14 @@ func (s *series) observe(lbls labels, value float64, resAccum xxh3.Uint128, res 
 // exceed — so every kind is a single hash and a single map probe per
 // observation.
 func (s *series) observeFold(lbls labels, value float64, res resourceFold, resLabels labels) {
-	if s.refuse(value) {
+	if s.refuse(value, originFeed) {
 		return
 	}
 	now := s.epoch()
-	base := s.baseAccum(lbls)
+	// Order-independent. A histogram's caller-supplied "le" is refused at the
+	// doors it can arrive through (rejectHistogramLe, EmitDirect), so the hot
+	// path never probes for it.
+	base := lbls.hashAccum()
 	rk := res.accum
 	if len(resLabels) > 0 {
 		// Only a resource label can override a resource key, so only a rule
@@ -539,7 +610,7 @@ func (s *series) observeFold(lbls labels, value float64, res resourceFold, resLa
 // label sets, so the accumulators AND the finalized hash are precomputed at
 // construction; a bump pays neither the label rehash nor the avalanche.
 func (s *series) observePreHashed(lbls labels, hash xxh3.Uint128, value float64, res pcommon.Map) {
-	if s.refuse(value) {
+	if s.refuse(value, originFeed) {
 		return
 	}
 	now := s.epoch()
@@ -585,15 +656,6 @@ func (s *series) materialize(lbls labels, hash xxh3.Uint128) {
 	s.admit(hash, lbls, now, emptyResource, nil)
 }
 
-// baseAccum hashes the caller's data-point labels once (order-independent).
-//
-// It used to strip a caller-supplied "le" from a histogram's identity here, via
-// the fold-out. That moved to the two doors an "le" can arrive through —
-// rejectHistogramLe at config compile and EmitDirect for a script's label map —
-// so the hot path no longer probes every histogram observation for a label that
-// is now refused before it can be observed.
-func (s *series) baseAccum(lbls labels) xxh3.Uint128 { return lbls.hashAccum() }
-
 // admit inserts a new sample for a previously unseen label combination, or
 // returns nil (warning at most hourly) when the cardinality cap is reached. It
 // runs only on the cold path, so serializing the label set here is cheap.
@@ -607,7 +669,7 @@ func (s *series) admit(hash xxh3.Uint128, lbls labels, now int64, res pcommon.Ma
 		when:   now,
 	}
 	if s.kind == kindHistogram {
-		samp.counts = make([]uint64, len(s.bounds()))
+		samp.counts = make([]uint64, len(s.bounds))
 	}
 	s.link(samp, hash)
 	return samp
@@ -683,15 +745,29 @@ func (s *series) all() iter.Seq[*expiringSample] {
 // after it. A point whose start equals its own timestamp encodes a reset, so
 // stamping the zeros with their own timestamp would put the very defect this
 // field exists to remove back on the one point that is easiest to get wrong.
-// Three minutes is the two-minute backdate plus one more step of headroom; a
-// counter was zero before its first observation, so the claim is true.
+// Three minutes is the two-minute backdate plus one more step of headroom.
+//
+// The claim the backdate makes — "this counter was zero for those three
+// minutes" — is true only of time THIS PROCESS was there to observe, so
+// streamStart floors it at the series' construction. Without the floor it was
+// false across every restart: the series identity survives one (a self-metric's
+// instance is the node, a log-derived counter is keyed by the pod it describes)
+// and a rolling update replaces a pod in well under a minute, so the new
+// process's synthetic zeros — and the start they carry — landed BEFORE the old
+// process's final samples of the same series. A backend without an
+// out-of-order window refuses such a point (Prometheus refuses the whole
+// request carrying it); one with a window stores a zero between two old
+// samples, a fake reset that makes increase() count the pre-restart total a
+// second time. renderNumber drops whichever zero the floor puts at or before
+// the start.
 const counterBaselineSeconds = 3 * 60
 
-// streamStart is the start-of-accumulation stamp a stream admitted (or reset)
-// at now should carry.
+// streamStart is the start-of-accumulation stamp a stream admitted at now
+// should carry. A gauge's idle reset stamps now itself (see snapshot); a
+// cumulative kind is never reset while it lives.
 func (s *series) streamStart(now int64) int64 {
 	if s.kind == kindCounter {
-		return now - counterBaselineSeconds
+		return max(now-counterBaselineSeconds, s.created)
 	}
 	return now
 }
@@ -707,80 +783,67 @@ func (s *series) streamStart(now int64) int64 {
 // all. Both strings are materialized only on the hourly branch, so the refusal
 // path itself stays as cheap as it was.
 func (s *series) warnCapped(lbls labels, now int64, res pcommon.Map, resLabels labels) {
-	s.drops.recordCapped(s.name)
-	if now-s.lastWarn >= 3600 {
-		s.lastWarn = now
+	s.cappedDrops.Add(1)
+	if hourly(&s.lastWarn, now) {
 		// WARN, not Info: observations are being DROPPED and the cap frees
 		// slots only through idleness, so the metric is blind for maxAge plus
 		// the grace window (24h by default). Info is for lifecycle an operator
 		// reads without asking; a refusal is the definition of a Warn here.
-		s.log.Warn("max series count reached for log metric; further label combinations are refused until existing ones idle out",
+		s.logger().Warn("max series count reached for log metric; further label combinations are refused until existing ones idle out",
 			"metric", s.name, "labels", lbls.String(), "resource", resourceString(res, resLabels),
 			"series", s.count, "maxSeries", s.maxSize)
 	}
 }
 
-// noteNonFinite counts a refused NaN/Inf observation and names the metric at
-// most hourly.
+// hourly reports whether a refusal line throttled on *last may be written at
+// now, and claims the hour when it may (the caller holds the owning series'
+// mu). The three refusal lines — the cardinality cap, a non-finite value, a
+// negative one — each keep their OWN stamp: they co-occur on a rule whose
+// extraction is simply wrong, and one shared gate would let whichever fired
+// first silence the others for the hour.
 //
-// The counter alone (kubescrape_log_metrics_dropped_nan_total) says the
-// extraction is producing garbage but not WHICH rule's, and a set holds every
-// metric on the node — so the operator had a rising number and no way to reach
-// the `value`/`valueRegexp` that produced it. The log line is the context the
-// counter cannot carry; the counter stays the rate.
-//
-// The lock is taken only on this branch (the caller has not taken it yet, and
-// a finite observation never comes here), so the warm path is untouched — the
-// allocation budgets in bench_test.go observe finite values and never reach it.
-func (s *series) noteNonFinite(value float64) {
-	s.drops.nan.Add(1)
-	now := s.epoch()
-	s.mu.Lock()
-	warn := now-s.lastNonFinite >= 3600
-	if warn {
-		s.lastNonFinite = now
+// Hand-rolled rather than internal/logdedupe because this package's clock is
+// INJECTABLE (series.now, the store.now pattern) and logdedupe reads time.Now
+// directly: a throttle a test cannot step past would make these lines the only
+// untestable behaviour in the file.
+func hourly(last *int64, now int64) bool {
+	if now-*last < 3600 {
+		return false
 	}
-	s.mu.Unlock()
-	if !warn {
-		return
-	}
-	// dropped is the whole SET's total, not this metric's: the per-metric
-	// breakdown exists only for the cardinality cap (drops.byMetric), and
-	// adding a second per-metric map on a refusal path would be a map write per
-	// bad line for a number the line itself already localises.
-	s.log.Warn("dropping a non-finite "+s.role.what()+" observation; the value is NaN or Inf, which would poison every aggregate this metric feeds",
-		"metric", s.name, "value", strconv.FormatFloat(value, 'g', -1, 64),
-		"dropped", s.drops.NaN(), "note", s.role.dropNote())
+	*last = now
+	return true
 }
 
-// noteNegative counts a refused negative observation on a monotonic kind and
-// names the metric at most hourly.
+// noteRefused counts a refused observation on n and names the metric at most
+// hourly (throttled on *last): "dropping a <adjective> <role> observation;
+// <why>", with the value, the running total and the remedy.
 //
-// The counter says the rate; only the line can reach the rule. It is a WARN
-// and not a Debug because the alternative to refusing was a SILENT lie: the
-// value folded in, the exported cumulative sum went DOWN on an unchanged
-// StartTimestamp, and every rate() over it read an undeclared counter reset and
-// added the new total on top of the old one. Nothing downstream can detect
-// that, so the refusal is the only place it can ever be reported.
+// The lock is taken only on this branch (refuse's caller has not taken it yet,
+// and an admissible observation never comes here), so the warm path is
+// untouched — the allocation budgets in bench_test.go observe finite
+// non-negative values and never reach it. The message is assembled only on
+// the hourly branch, so a rule refusing every line pays one atomic add and one
+// lock per line, not a string build. It throttles per SERIES because a
+// workload feeding a bad value does it on every line, and one sweep goroutine
+// serves every log file on the node.
 //
-// Throttled and locked exactly like noteNonFinite, and for the same reason: a
-// workload logging a negative delta does it on every line, and one sweep
-// goroutine serves every log file on the node.
-func (s *series) noteNegative(value float64) {
-	s.drops.negative.Add(1)
+// dropped is the owning store's total (the whole set's, for a log-derived
+// metric), not this metric's: the per-metric
+// breakdown exists only for the cardinality cap (series.cappedDrops), and a
+// second per-metric counter on a refusal path would be one more write per bad
+// line for a number the line itself already localises.
+func (s *series) noteRefused(n *atomic.Uint64, last *int64, value float64, adjective, why, note string) {
+	n.Add(1)
 	now := s.epoch()
 	s.mu.Lock()
-	warn := now-s.lastNegative >= 3600
-	if warn {
-		s.lastNegative = now
-	}
+	warn := hourly(last, now)
 	s.mu.Unlock()
 	if !warn {
 		return
 	}
-	s.log.Warn("dropping a negative "+s.role.what()+" observation; this metric exports a MONOTONIC sum, and folding a decrease into it on an unchanged start timestamp is a counter reset that rate() would read as one and add on top of everything already counted",
+	s.logger().Warn("dropping a "+adjective+" "+s.role.what()+" observation; "+why,
 		"metric", s.name, "value", strconv.FormatFloat(value, 'g', -1, 64),
-		"dropped", s.drops.Negative(), "note", s.role.negativeNote())
+		"dropped", n.Load(), "note", note)
 }
 
 // record folds one observation into a sample. Gauges apply their action;
@@ -834,7 +897,7 @@ func (s *series) record(samp *expiringSample, value float64) {
 	samp.value += value
 	samp.count++
 	if s.kind == kindHistogram {
-		for i, bound := range s.bounds() {
+		for i, bound := range s.bounds {
 			if value <= bound {
 				samp.counts[i]++
 			}
@@ -844,8 +907,8 @@ func (s *series) record(samp *expiringSample, value float64) {
 
 // emit copies a sample out for a snapshot's caller. The value copy alone is
 // not enough for a histogram: counts aliases the live per-bucket array, which
-// keeps counting (and is cleared on idle reset) after s.mu is released, and
-// export retention legitimately holds emitted samples across intervals.
+// keeps counting after s.mu is released, and export retention legitimately
+// holds emitted samples across intervals.
 func (samp *expiringSample) emit() sample {
 	out := samp.sample
 	if out.counts != nil {
@@ -854,9 +917,17 @@ func (samp *expiringSample) emit() sample {
 	return out
 }
 
-// snapshot returns the live samples. Combinations idle past their expiration
-// are reset, and deleted after a further four-minute grace period, so stale
-// series stop being exported.
+// emitFinal is emit for a value the store is about to stop holding (see
+// sample.final).
+func (samp *expiringSample) emitFinal() sample {
+	out := samp.emit()
+	out.final = true
+	return out
+}
+
+// snapshot returns the live samples. A combination idle past its expiration
+// stops being exported, and is deleted after a further four-minute grace
+// period; a GAUGE is also zeroed when it goes idle.
 func (s *series) snapshot() []sample {
 	now := s.epoch()
 	s.mu.Lock()
@@ -868,13 +939,13 @@ func (s *series) snapshot() []sample {
 			// Deleting the sample: emit it first if this value never reached an
 			// export. With the export interval past maxAge+grace (both legal and
 			// unclamped) a sample observed just after one export is deleted at
-			// the next, unseen — the same never-exported loss the idle-reset
-			// branch below guards against, one branch up. Aggregating gauges emit
+			// the next, unseen — the same never-exported loss the idle branch
+			// below guards against, one branch up. Aggregating gauges emit
 			// their windowed aggregate (as the aggregating branch does); a value
 			// observed once, then idled straight past the grace before any
 			// snapshot ran the aggregating branch, is otherwise destroyed unseen.
 			if !samp.exported {
-				emit := samp.emit()
+				emit := samp.emitFinal()
 				if s.aggregating() {
 					emit.value = s.aggregateValue(&samp.sample)
 				}
@@ -892,6 +963,11 @@ func (s *series) snapshot() []sample {
 			// handled.
 			emit := samp.sample
 			emit.value = s.aggregateValue(&samp.sample)
+			// Only a window's FIRST emission is final: the next observation
+			// replaces it, so the store may never hold it again. A re-emission
+			// of a sealed window the store still holds is not, and a failed
+			// export of it needs nothing kept — the first emission already was.
+			emit.final = !samp.sealed
 			out = append(out, emit)
 			samp.initial = false
 			samp.sealed = true
@@ -899,25 +975,44 @@ func (s *series) snapshot() []sample {
 			continue
 		}
 		if idle > 0 {
-			// Idle past its expiration: zero it so a later re-appearance starts a
-			// fresh count. But emit it first if this value has never been
-			// exported — with maxAge below the export interval, the observation
-			// would otherwise be destroyed having never left the process.
+			// Idle past its expiration: stop exporting it. But emit it first if
+			// this value has never been exported — with maxAge below the export
+			// interval, the observation would otherwise leave the export stream
+			// having never left the process.
+			if s.kind != kindGauge {
+				// A CUMULATIVE kind keeps its value, its count and its start.
+				// It used to be zeroed here, with the start moved, and the zero
+				// never sent (it was marked exported) — so a series re-observed
+				// inside the grace window went from its old total straight to
+				// the new small one under a new start. Start-aware consumers read
+				// that as a reset; the Prometheus-lineage backends this ships
+				// into discard StartTimeUnixNano (see renderNumber) and read it
+				// as the counter running backwards, so increase()/rate()
+				// undercounted by the whole old total whenever the new total
+				// caught up with it. A gap followed by the same cumulative
+				// stream is valid OTLP for both. The grace delete, followed by
+				// a fresh admit with its baseline zeros, stays the only real
+				// reset of a cumulative stream.
+				if !samp.exported {
+					out = append(out, samp.emit())
+				}
+				samp.initial = false
+				samp.exported = true
+				continue
+			}
+			// A gauge is zeroed so a later re-appearance of a running
+			// (inc/dec/add/sub) gauge starts from nothing; its emit is final,
+			// since the value is gone from the store once this branch ends.
 			if !samp.exported {
-				out = append(out, samp.emit())
+				out = append(out, samp.emitFinal())
 			}
 			samp.initial = false
 			samp.count = 0
 			samp.value = 0
-			clear(samp.counts)
-			// The ONE place a live sample's accumulation genuinely restarts, so
-			// the one place start moves. The emit above copied the pre-reset
-			// sample, so it keeps the old start; everything after this carries
-			// the new one, which is what tells a consumer the drop to zero was a
-			// reset and not a counter running backwards. (The grace-DELETE
-			// branch above needs no equivalent: the sample is gone, and a later
-			// re-appearance is a fresh admit.)
-			samp.start = s.streamStart(now)
+			// The one place a live sample's accumulation restarts, so the one
+			// place its start moves — to NOW. streamStart's backdate exists
+			// only for a counter's synthetic zeros, and a gauge renders none.
+			samp.start = now
 			samp.exported = true // the zero needs no further emission
 			continue
 		}
@@ -928,31 +1023,33 @@ func (s *series) snapshot() []sample {
 	return out
 }
 
-// rearmInitial re-marks the zero-baseline flag on the samples of a FAILED
-// export. snapshot consumes `initial` optimistically; the Registry has no
-// retention (unlike DynamicMetricSet, whose retained raw samples re-render
-// the baseline themselves), so without the re-arm a collector outage at the
-// first export permanently ate every counter's synthetic zero point — the
-// exact first-ramp loss the baselines exist to prevent. Failure-path only;
-// the linear db walk is irrelevant at self-telemetry cardinality.
-func (s *series) rearmInitial(samples []sample) {
-	var want map[string]struct{}
-	for i := range samples {
-		if samples[i].initial {
-			if want == nil {
-				want = make(map[string]struct{})
-			}
-			want[samples[i].resource+"\x00"+samples[i].labels] = struct{}{}
-		}
-	}
-	if want == nil {
+// rearm hands a FAILED export's claims back to the live samples it read.
+// snapshot consumes two flags optimistically — `initial` (the counter baseline
+// zeros ride on the first export) and `exported` (the idle and grace-delete
+// branches emit only a value no export has carried) — and an export that never
+// arrived must give both back, or the next one skips the baseline and a series
+// that goes quiet before a delivery is never emitted again at all.
+//
+// Only a NON-final sample is re-armed: a final one is no longer in the store
+// (the caller retains it instead — DynamicMetricSet.retain). An aggregating
+// series needs nothing: its window's FIRST emission is final and retained, and
+// clearing `exported` on a re-emission would have the grace delete emit that
+// same window a second time. Failure-path only; one probe per sample.
+func (s *series) rearm(samples []sample) {
+	if s.aggregating() {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for e := range s.all() {
-		if _, ok := want[e.resource+"\x00"+e.labels]; ok {
-			e.initial = true
+	for i := range samples {
+		if samples[i].final {
+			continue
+		}
+		if e := s.find(samples[i].key); e != nil {
+			e.exported = false
+			if samples[i].initial {
+				e.initial = true
+			}
 		}
 	}
 }

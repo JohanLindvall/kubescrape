@@ -26,6 +26,16 @@ func (s stubSecrets) Get(_ context.Context, _, _, _ string) (string, error) { re
 
 const testScrapeToken = "s3cr3t-shared-token"
 
+// staticTokens is a fixed scrape-auth accept set: the one token, or no token
+// source at all for "" (a Server built without a configured token, which
+// Validate refuses and authorizedForScrapeAuth fails closed on).
+func staticTokens(tok string) func() []string {
+	if tok == "" {
+		return nil
+	}
+	return func() []string { return []string{tok} }
+}
+
 // scrapeAuthServer builds a server with -scrape-auth-secrets enabled, one
 // monitor referencing monitoring/tok/token, and the given expected token.
 func scrapeAuthServer(t *testing.T, token string) *httptest.Server {
@@ -44,14 +54,14 @@ func scrapeAuthServer(t *testing.T, token string) *httptest.Server {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(New(Config{
-		Store:           store.New(time.Minute),
-		Services:        services.NewIndex(),
-		Monitors:        monitors,
-		Resolver:        stubResolver{},
-		MaxWait:         500 * time.Millisecond,
-		Ready:           closedChan(),
-		Secrets:         stubSecrets{value: "the-scrape-token"},
-		ScrapeAuthToken: token,
+		Store:            store.New(time.Minute),
+		Services:         services.NewIndex(),
+		Monitors:         monitors,
+		Resolver:         stubResolver{},
+		MaxWait:          500 * time.Millisecond,
+		Ready:            closedChan(),
+		Secrets:          stubSecrets{value: "the-scrape-token"},
+		ScrapeAuthTokens: staticTokens(token),
 	}).Handler())
 	t.Cleanup(srv.Close)
 	return srv
@@ -87,7 +97,7 @@ func TestScrapeAuthSecretsRequireToken(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "-scrape-auth-token-file") {
 		t.Fatalf("error should name the missing flag: %v", err)
 	}
-	if err := (Config{Secrets: stubSecrets{}, ScrapeAuthToken: testScrapeToken}).Validate(); err != nil {
+	if err := (Config{Secrets: stubSecrets{}, ScrapeAuthTokens: staticTokens(testScrapeToken)}).Validate(); err != nil {
 		t.Fatalf("secrets + token: %v", err)
 	}
 	if err := (Config{}).Validate(); err != nil {
@@ -182,7 +192,7 @@ func TestOnlyScrapeAuthIsAuthenticated(t *testing.T) {
 	srv = httptest.NewServer(New(Config{
 		Store: st, Services: services.NewIndex(), Monitors: monitors,
 		Resolver: stubResolver{}, MaxWait: 500 * time.Millisecond, Ready: closedChan(),
-		Secrets: stubSecrets{value: "x"}, ScrapeAuthToken: testScrapeToken,
+		Secrets: stubSecrets{value: "x"}, ScrapeAuthTokens: staticTokens(testScrapeToken),
 	}).Handler())
 	t.Cleanup(srv.Close)
 

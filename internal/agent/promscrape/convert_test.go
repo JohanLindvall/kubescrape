@@ -13,19 +13,49 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"github.com/JohanLindvall/kubescrape/pkg/promparse"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
-// A family name reused across incompatible metric shapes (a histogram family
-// then a bare number sample of the same name) must skip the colliding sample,
-// count it (obs.ScrapeCollisions), and leave the rest of the scrape intact —
-// the numberDataPoint default branch.
+// convertExposition runs an exposition through the parser and a fresh converter
+// into a batcher, returning the converter (for its counts) and the exported
+// metrics by name.
+func convertExposition(t *testing.T, body string) (*converter, map[string]pmetric.Metric) {
+	t.Helper()
+	bt := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
+	conv := newConverter(bt, nil)
+	p := promparse.New(promparse.Options{MaxLineBytes: 1 << 20})
+	if _, err := p.Parse(strings.NewReader(body), func(s Sample) error {
+		return conv.add(s)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.finish(); err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]pmetric.Metric{}
+	if bt.count() == 0 {
+		return conv, byName
+	}
+	metrics := bt.take().ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
+	for i := 0; i < metrics.Len(); i++ {
+		byName[metrics.At(i).Name()] = metrics.At(i)
+	}
+	return conv, byName
+}
+
+// A bare sample named after a histogram FAMILY — which neither exposition format
+// defines — must not claim the family's OTLP name: it is refused and counted
+// malformed, and the histogram and the rest of the scrape survive. It used to
+// arrive as a gauge named `lat`; here, after the family flushed, that gauge hit
+// the Histogram-shaped metric and was dropped as a collision, which is the
+// benign order (see TestBareHistogramFamilyNameInsideItsRunIsRefused for the
+// one that lost the whole histogram).
 func TestNumberSampleOnHistogramFamilySkipped(t *testing.T) {
 	// The bare "lat 42" arrives AFTER the histogram family flushed (the family
-	// switch at ok_total emits it), so the name is already claimed by a
-	// Histogram-shaped metric when the number sample reaches the batcher.
+	// switch at ok_total emits it).
 	body := `# TYPE lat histogram
 lat_bucket{le="1"} 5
 lat_bucket{le="+Inf"} 7
@@ -36,31 +66,107 @@ ok_total 1
 lat 42
 `
 	before := obs.ScrapeCollisions.Value()
-	bt := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
-	conv := newConverter(bt, nil)
-	p := newParser(promparse.Options{MaxLineBytes: 1 << 20})
-	if _, err := p.Parse(strings.NewReader(body), func(s Sample) error {
-		return conv.add(s)
-	}); err != nil {
-		t.Fatal(err)
+	conv, byName := convertExposition(t, body)
+	if got := obs.ScrapeCollisions.Value() - before; got != 0 {
+		t.Fatalf("collision delta = %v, want 0: the bare sample must be refused before it reaches a batcher", got)
 	}
-	if err := conv.finish(); err != nil {
-		t.Fatal(err)
+	if conv.malformed != 1 {
+		t.Fatalf("malformed = %d, want 1 (the bare lat sample)", conv.malformed)
 	}
-
-	if got := obs.ScrapeCollisions.Value() - before; got != 1 {
-		t.Fatalf("collision delta = %v, want 1 (the bare lat sample)", got)
-	}
-	metrics := bt.take().ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
-	byName := map[string]pmetric.MetricType{}
-	for i := 0; i < metrics.Len(); i++ {
-		byName[metrics.At(i).Name()] = metrics.At(i).Type()
-	}
-	if byName["lat"] != pmetric.MetricTypeHistogram {
+	if m, ok := byName["lat"]; !ok || m.Type() != pmetric.MetricTypeHistogram {
 		t.Fatalf("lat = %v, want the Histogram (the number sample must not claim it)", byName["lat"])
 	}
-	if byName["ok_total"] != pmetric.MetricTypeSum {
+	if m, ok := byName["ok_total"]; !ok || m.Type() != pmetric.MetricTypeSum {
 		t.Fatalf("rest of the scrape lost: %v", byName)
+	}
+}
+
+// The collision branch itself (numberDataPoint's default arm) still guards a
+// name reused across incompatible shapes: here a family REDECLARED as a gauge
+// after its histogram flushed.
+func TestNumberSampleOnRedeclaredHistogramNameCollides(t *testing.T) {
+	// ok_total between them flushes the histogram first, so the Histogram-
+	// shaped metric owns the name when the gauge sample reaches the batcher.
+	body := `# TYPE lat histogram
+lat_bucket{le="+Inf"} 7
+lat_count 7
+# TYPE ok counter
+ok_total 1
+# TYPE lat gauge
+lat 42
+`
+	before := obs.ScrapeCollisions.Value()
+	conv, byName := convertExposition(t, body)
+	if got := obs.ScrapeCollisions.Value() - before; got != 1 {
+		t.Fatalf("collision delta = %v, want 1 (the gauge sample)", got)
+	}
+	if conv.malformed != 0 {
+		t.Fatalf("malformed = %d, want 0: a declared gauge is not malformed", conv.malformed)
+	}
+	if m, ok := byName["lat"]; !ok || m.Type() != pmetric.MetricTypeHistogram {
+		t.Fatalf("lat = %v, want the Histogram that claimed the name first", byName["lat"])
+	}
+}
+
+// histPoints renders a Histogram metric's points as attribute string ->
+// (count, bucket counts), for comparing two conversions of one family.
+func histPoints(t *testing.T, m pmetric.Metric) map[string]string {
+	t.Helper()
+	if m.Type() != pmetric.MetricTypeHistogram {
+		t.Fatalf("%s is %v, want a Histogram", m.Name(), m.Type())
+	}
+	out := map[string]string{}
+	dps := m.Histogram().DataPoints()
+	for i := 0; i < dps.Len(); i++ {
+		dp := dps.At(i)
+		out[fmt.Sprint(dp.Attributes().AsRaw())] = fmt.Sprint(dp.Count(), dp.BucketCounts().AsRaw())
+	}
+	return out
+}
+
+// Inside the family's own run the bare name was the destructive order: it
+// arrived as a GAUGE named `lat` before the family flushed, claimed the OTLP
+// name, and every accumulated histogram point then collided and was dropped —
+// the whole histogram lost with malformed=0. Classifying it as the family's own
+// is not enough on its own either: carrying an `le` label, the stray would fold
+// in as a BUCKET, fabricating an attribute-less point or silently rewriting a
+// real label set's counts. Each shape must leave the histogram exactly as it is
+// without the stray, and count one malformed line.
+func TestBareHistogramFamilyNameInsideItsRunIsRefused(t *testing.T) {
+	const head = "# TYPE lat histogram\n" +
+		"lat_bucket{path=\"/a\",le=\"1\"} 1\n" +
+		"lat_bucket{path=\"/a\",le=\"+Inf\"} 2\n" +
+		"lat_count{path=\"/a\"} 2\n"
+	const tail = "lat_bucket{path=\"/b\",le=\"1\"} 3\n" +
+		"lat_bucket{path=\"/b\",le=\"+Inf\"} 4\n" +
+		"lat_count{path=\"/b\"} 4\n"
+	_, clean := convertExposition(t, head+tail)
+	want := histPoints(t, clean["lat"])
+	if len(want) != 2 {
+		t.Fatalf("baseline has %d points, want 2: %v", len(want), want)
+	}
+	for _, stray := range []string{
+		"lat 42\n",
+		"lat{le=\"1\"} 42\n",
+		"lat{path=\"/a\",le=\"1\"} 42\n",
+	} {
+		t.Run(strings.TrimSpace(stray), func(t *testing.T) {
+			before := obs.ScrapeCollisions.Value()
+			conv, got := convertExposition(t, head+stray+tail)
+			if d := obs.ScrapeCollisions.Value() - before; d != 0 {
+				t.Errorf("collision delta = %v, want 0", d)
+			}
+			if conv.malformed != 1 {
+				t.Errorf("malformed = %d, want 1 (the stray line)", conv.malformed)
+			}
+			m, ok := got["lat"]
+			if !ok {
+				t.Fatalf("the histogram was lost: %v", got)
+			}
+			if pts := histPoints(t, m); fmt.Sprint(pts) != fmt.Sprint(want) {
+				t.Errorf("points = %v, want %v unchanged by the stray line", pts, want)
+			}
+		})
 	}
 }
 
@@ -84,7 +190,7 @@ huge_count 1e300
 `
 	bt := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
 	conv := newConverter(bt, nil)
-	p := newParser(promparse.Options{MaxLineBytes: 1 << 20})
+	p := promparse.New(promparse.Options{MaxLineBytes: 1 << 20})
 	if _, err := p.Parse(strings.NewReader(body), func(s Sample) error {
 		return conv.add(s)
 	}); err != nil {
@@ -169,7 +275,7 @@ func descriptions(md pmetric.Metrics) map[string]string {
 func convertBody(t *testing.T, cb chunker, body string, openMetrics bool) {
 	t.Helper()
 	conv := newConverter(cb, nil)
-	p := newParser(promparse.Options{MaxLineBytes: 1 << 20, OpenMetrics: openMetrics})
+	p := promparse.New(promparse.Options{MaxLineBytes: 1 << 20, OpenMetrics: openMetrics})
 	if _, err := p.Parse(strings.NewReader(body), func(s Sample) error { return conv.add(s) }); err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +372,7 @@ func TestDescriptionsChargedToSizeEstimate(t *testing.T) {
 	help := strings.Repeat("x", 300)
 	build := func(withHelp bool) (est, encoded int) {
 		var body strings.Builder
-		for i := 0; i < 20; i++ {
+		for i := range 20 {
 			if withHelp {
 				fmt.Fprintf(&body, "# HELP fam%02d %s\n# UNIT fam%02d seconds\n", i, help, i)
 			}
@@ -302,7 +408,7 @@ func serve(t *testing.T, body string) string {
 func TestChunksStayUnderCollectorLimit(t *testing.T) {
 	var body strings.Builder
 	body.WriteString("# TYPE http_requests counter\n")
-	for i := 0; i < 20000; i++ {
+	for i := range 20000 {
 		_, _ = fmt.Fprintf(&body, `http_requests_total{namespace="some-namespace-name",pod="workload-abcdef1234-xyz%05d",container="application-container",method="GET",path="/api/v1/resource/subresource/%05d",status="200",instance="10.244.13.%d:8080",job="some-long-job-name"} %d`+"\n", i, i, i%255, i)
 	}
 	exp := &captureExporter{}
@@ -335,7 +441,7 @@ func TestHistogramFamilyDoesNotOvershoot(t *testing.T) {
 	var body strings.Builder
 	body.WriteString("# TYPE latency histogram\n")
 	bounds := []string{"0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "+Inf"}
-	for i := 0; i < 12000; i++ {
+	for i := range 12000 {
 		lbl := fmt.Sprintf(`handler="/api/v1/some/reasonably/long/path/%05d",method="GET",namespace="some-namespace-name",pod="workload-abcdef1234-xyz%05d"`, i, i)
 		for j, b := range bounds {
 			fmt.Fprintf(&body, "latency_bucket{%s,le=\"%s\"} %d\n", lbl, b, j+1)
@@ -371,7 +477,7 @@ func TestHistogramFamilyDoesNotOvershoot(t *testing.T) {
 func TestPartialScrapeExportedOnSampleLimit(t *testing.T) {
 	var body strings.Builder
 	body.WriteString("# TYPE things counter\n")
-	for i := 0; i < 500; i++ {
+	for i := range 500 {
 		_, _ = fmt.Fprintf(&body, "things_total{i=\"%d\"} %d\n", i, i)
 	}
 	exp := &captureExporter{}
@@ -395,7 +501,7 @@ func TestPartialScrapeExportedOnSampleLimit(t *testing.T) {
 func TestPartialScrapeExportedOnTruncatedBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", "100000") // promise more than we send
-		for i := 0; i < 50; i++ {
+		for i := range 50 {
 			_, _ = fmt.Fprintf(w, "things_total{i=\"%d\"} %d\n", i, i)
 		}
 		w.(http.Flusher).Flush()
@@ -430,7 +536,7 @@ func TestExemplarChunksStayUnderCollectorLimit(t *testing.T) {
 	var body strings.Builder
 	body.WriteString("# TYPE lat histogram\n")
 	ex := `# {zvalue="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",wvalue="ffffffffffffffffffffffffffffffffffffffffffffffff"} 0.5`
-	for i := 0; i < 6000; i++ {
+	for i := range 6000 {
 		for b, le := range []string{"0.001", "0.01", "0.1", "1", "10", "+Inf"} {
 			_, _ = fmt.Fprintf(&body, `lat_bucket{i="%06d",le=%q} %d %s`+"\n", i, le, b+1, ex)
 		}
@@ -480,7 +586,7 @@ rpc_count 4
 `
 	bt := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
 	conv := newConverter(bt, nil)
-	p := newParser(promparse.Options{MaxLineBytes: 1 << 20})
+	p := promparse.New(promparse.Options{MaxLineBytes: 1 << 20})
 	if _, err := p.Parse(strings.NewReader(body), func(s Sample) error { return conv.add(s) }); err != nil {
 		t.Fatal(err)
 	}
@@ -525,5 +631,59 @@ func TestExemplarTimestampOverflowFallsBack(t *testing.T) {
 	setExemplar(ex, Exemplar{Value: 1}, fallback)
 	if ex.Timestamp() != fallback {
 		t.Fatalf("absent: got %d, want the fallback %d", ex.Timestamp(), fallback)
+	}
+}
+
+// An exemplar's trace_id/span_id become the OTLP id fields when the value is
+// EXACTLY an id's hex encoding, and an attribute otherwise. Decoding them used
+// to cost hex.DecodeString's heap copy per id per exemplar and, for an
+// over-long value (the target's choice), an allocation of half its length
+// before the length check refused it. Both are compared against a baseline
+// rather than pinned to a number, so the pdata cost of the exemplar itself is
+// not what this measures.
+func TestExemplarIDsDecodeWithoutAllocating(t *testing.T) {
+	fallback := pcommon.NewTimestampFromTime(time.Unix(1700000000, 0))
+	const traceHex, spanHex = "4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7"
+	withIDs := Exemplar{Value: 1, Labels: []Label{{Name: "trace_id", Value: traceHex}, {Name: "span_id", Value: spanHex}}}
+
+	ex := pmetric.NewExemplar()
+	setExemplar(ex, withIDs, fallback)
+	if got := ex.TraceID().String(); got != traceHex {
+		t.Fatalf("trace id = %q, want %q", got, traceHex)
+	}
+	if got := ex.SpanID().String(); got != spanHex {
+		t.Fatalf("span id = %q, want %q", got, spanHex)
+	}
+	if n := ex.FilteredAttributes().Len(); n != 0 {
+		t.Fatalf("a decoded id also landed as an attribute: %d attributes", n)
+	}
+
+	// Anything that is not exactly an id stays an attribute, verbatim.
+	long := strings.Repeat("ab", 1<<16) // valid hex, far too long
+	for _, v := range []string{traceHex[:31], traceHex + "00", "zz" + traceHex[2:], long} {
+		ex := pmetric.NewExemplar()
+		setExemplar(ex, Exemplar{Value: 1, Labels: []Label{{Name: "trace_id", Value: v}}}, fallback)
+		if !ex.TraceID().IsEmpty() {
+			t.Fatalf("value of %d bytes decoded into a trace id", len(v))
+		}
+		if got, ok := ex.FilteredAttributes().Get("trace_id"); !ok || got.Str() != v {
+			t.Fatalf("value of %d bytes did not stay the trace_id attribute", len(v))
+		}
+	}
+
+	if testrace.Enabled {
+		return // -race perturbs allocation counts; the verdicts above still ran
+	}
+	allocs := func(e Exemplar) float64 {
+		ex := pmetric.NewExemplar()
+		setExemplar(ex, e, fallback) // first write creates any attribute
+		return testing.AllocsPerRun(200, func() { setExemplar(ex, e, fallback) })
+	}
+	if base, got := allocs(Exemplar{Value: 1}), allocs(withIDs); got > base {
+		t.Errorf("an exemplar carrying trace_id+span_id costs %v allocs, one carrying neither %v: decoding an id must not allocate", got, base)
+	}
+	other := allocs(Exemplar{Value: 1, Labels: []Label{{Name: "other", Value: long}}})
+	if got := allocs(Exemplar{Value: 1, Labels: []Label{{Name: "trace_id", Value: long}}}); got > other {
+		t.Errorf("an over-long trace_id costs %v allocs, the same value under another name %v: it must be refused by length before anything is decoded", got, other)
 	}
 }

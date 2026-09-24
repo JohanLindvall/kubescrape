@@ -310,6 +310,34 @@ func TestEmptyReservedConfigStripsNothing(t *testing.T) {
 	}
 }
 
+// The metrics sibling walks every metric's Metadata and every data point of
+// all five types through dataPointAttrs, the shared per-point iterator: the
+// clean case must stay free there too, so neither the iterator nor the loop
+// body may escape.
+func TestSanitizeCleanMetricsIsAllocationFree(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("the race detector's bookkeeping allocations make the ceiling meaningless")
+	}
+	s := NewServer(ServerConfig{ReservedAttrs: testReserved()})
+	md := pmetric.NewMetrics()
+	sm := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+	g := sm.Metrics().AppendEmpty().SetEmptyGauge()
+	sum := sm.Metrics().AppendEmpty().SetEmptySum()
+	h := sm.Metrics().AppendEmpty().SetEmptyHistogram()
+	eh := sm.Metrics().AppendEmpty().SetEmptyExponentialHistogram()
+	su := sm.Metrics().AppendEmpty().SetEmptySummary()
+	for range 8 {
+		g.DataPoints().AppendEmpty().Attributes().PutStr("app.attr", "v")
+		sum.DataPoints().AppendEmpty().Attributes().PutStr("app.attr", "v")
+		h.DataPoints().AppendEmpty().Attributes().PutStr("app.attr", "v")
+		eh.DataPoints().AppendEmpty().Attributes().PutStr("app.attr", "v")
+		su.DataPoints().AppendEmpty().Attributes().PutStr("app.attr", "v")
+	}
+	if got := testing.AllocsPerRun(100, func() { s.sanitizeMetrics(md) }); got != 0 {
+		t.Errorf("sanitizing a clean metrics payload allocates %.1f times, want 0", got)
+	}
+}
+
 // The element walk runs per record on the request path of an unauthenticated
 // listener; the clean case — every payload from a well-behaved sender — must
 // stay free.
@@ -324,11 +352,11 @@ func TestSanitizeCleanLogsIsAllocationFree(t *testing.T) {
 	ra.Identity = NewEnricher(Config{}).SenderIdentityStrip()
 	s := NewServer(ServerConfig{ReservedAttrs: ra})
 	ld := plog.NewLogs()
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		rl := ld.ResourceLogs().AppendEmpty()
 		rl.Resource().Attributes().PutStr("service.name", "app")
 		lrs := rl.ScopeLogs().AppendEmpty().LogRecords()
-		for j := 0; j < 4; j++ {
+		for range 4 {
 			lr := lrs.AppendEmpty()
 			lr.Attributes().PutStr("app.attr", "v")
 		}

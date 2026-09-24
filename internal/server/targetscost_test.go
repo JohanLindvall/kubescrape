@@ -29,12 +29,12 @@ import (
 // PodsOnNode, per-pod owner and namespace enrichment, target derivation, the
 // sort and a full json.Marshal — and then threw the body away.
 //
-// The clock is HELD STILL here, and that is not a convenience: it is the only
-// way a revalidation lands inside the memo's window, because the window and the
-// max-age the response advertises are the same duration. This test therefore
-// pins the MECHANISM and says nothing about whether a DaemonSet agent ever
-// reaches it — TestNodeTargetsMemoServesAConformingClient below is the one
-// that answers that, and the answer is no.
+// The clock is HELD STILL here, so the test pins the MECHANISM under either
+// validation path: it would pass on the wall-clock fallback too, whose window
+// and the max-age the response advertises are the same duration. Whether a
+// DaemonSet agent polling past the TTL reaches the memo is
+// TestNodeTargetsMemoServesAConformingClient's question below — and with the
+// change token wired, it does.
 func TestNodeTargetsRevalidationDoesNotRebuild(t *testing.T) {
 	f := targetsFixture{pods: 20, services: 5, cacheTTL: 10 * time.Second}
 	s := f.build(t)
@@ -223,6 +223,9 @@ func TestNodeTargetsMemoRebuildsWhenAnySourceChanges(t *testing.T) {
 				Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.9.9"},
 			})
 		}},
+		// A force-deleted or node-lost pod gets a Delete with no terminating
+		// update before it, so the delete itself must move the node's token.
+		{"pod deleted", func() { s.store.DeletePod("pod-uid-0") }},
 		{"owner caches", func() { ownerGen.Add(1) }},
 		{"services index", func() {
 			s.services.Upsert(&corev1.Service{
@@ -255,6 +258,55 @@ func TestNodeTargetsMemoRebuildsWhenAnySourceChanges(t *testing.T) {
 					"advance on change is how this serves a stale target list.", tc.source, status)
 			}
 		})
+	}
+}
+
+// The pod half of the change token is PER NODE, because the derivation reads
+// only PodsOnNode(node). With the store-wide token, one readiness flip, restart
+// or Job pod ANYWHERE in the cluster — and every sweep that removed a tombstone
+// — lapsed every node's memo, so the memo's advertised win existed only on a
+// cluster with no pod churn at all. Churn on another node must leave this
+// node's revalidation a memo hit; churn on this node must still rebuild it.
+func TestNodeTargetsMemoIgnoresPodChurnOnOtherNodes(t *testing.T) {
+	f := targetsFixture{pods: 5, services: 2, cacheTTL: 10 * time.Second}
+	s := f.build(t)
+	now := time.Now()
+	s.now = func() time.Time { return now }
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	url := srv.URL + "/v1/nodes/node1/targets"
+	etag := getETag(t, url, "")
+
+	far := func(rv string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "far-pod", Namespace: "prod", UID: "far-uid", ResourceVersion: rv,
+				Labels:      map[string]string{"app": "web"},
+				Annotations: map[string]string{"prometheus.io/scrape": "true", "prometheus.io/port": "9090"},
+			},
+			Spec:   corev1.PodSpec{NodeName: "node-far-away"},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.9.9.9"},
+		}
+	}
+	builds := s.targetBuilds.Load()
+	s.store.UpsertPod(far("1"))
+	s.store.UpsertPod(far("2"))
+	s.store.DeletePod("far-uid")
+	if status, _ := conditionalGet(t, url, etag); status != http.StatusNotModified {
+		t.Fatalf("revalidation after churn on another node = %d, want 304", status)
+	}
+	if got := s.targetBuilds.Load() - builds; got != 0 {
+		t.Fatalf("pod churn on another node cost %d derivations of node1's targets, want 0: "+
+			"node1's list cannot contain another node's pods", got)
+	}
+
+	// The same kind of change on node1 itself is noticed.
+	moved := far("3")
+	moved.UID, moved.Name, moved.Spec.NodeName = "near-uid", "near-pod", "node1"
+	s.store.UpsertPod(moved)
+	builds = s.targetBuilds.Load()
+	if status, _ := conditionalGet(t, url, etag); status == http.StatusNotModified && s.targetBuilds.Load() == builds {
+		t.Fatal("a pod added to node1 was answered from the memo: the per-node token did not move")
 	}
 }
 
@@ -493,7 +545,7 @@ func TestOneMonitorViaTwoServicesIsNotReportedAsShadowed(t *testing.T) {
 // A sub-second -metadata-cache-ttl must still reach the memo, on BOTH of
 // nodeTargetsNotModified's branches.
 //
-// max-age has second granularity, so cacheControl rounds a sub-second TTL up:
+// max-age has second granularity, so maxAgeSeconds rounds a sub-second TTL up:
 // the 200 says max-age=1 and a conforming client revalidates a second later.
 // The memo floored instead — the token branch to int(500ms/1s) = 0, the
 // wall-clock branch to a remaining window that can never reach a second — and
@@ -515,10 +567,20 @@ func TestSubSecondCacheTTLStillReachesTheNodeTargetsMemo(t *testing.T) {
 		// max-age necessarily outlives) — a second agent during a rolling
 		// update, an operator's curl loop, a client whose cache was evicted.
 		advance time.Duration
+		// expired marks a revalidation arriving after the memo's own
+		// builtAt+TTL on the wall-clock branch. That branch never refreshes
+		// builtAt, so a lapsed memo must REBUILD — the sub-second round-up is
+		// for a remainder that is still positive, and granting it to a
+		// negative one answered 304 max-age=1 to every later revalidation,
+		// forever, so a changed target list was never served. The rebuild
+		// still answers 304 here (the list is unchanged, so its ETag is too);
+		// what distinguishes the two is that the store was consulted.
+		expired bool
 	}{
-		{"change token", false, time.Second},
+		{"change token", false, time.Second, false},
 		// A deployment that has not wired every source.
-		{"wall-clock fallback", true, 200 * time.Millisecond},
+		{"wall-clock fallback", true, 200 * time.Millisecond, false},
+		{"wall-clock fallback past the ttl", true, 600 * time.Millisecond, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			const ttl = 500 * time.Millisecond
@@ -555,7 +617,17 @@ func TestSubSecondCacheTTLStillReachesTheNodeTargetsMemo(t *testing.T) {
 			if status != http.StatusNotModified || tag != etag {
 				t.Fatalf("revalidation answered %d with tag %s, want 304 with %s", status, tag, etag)
 			}
-			if got := s.targetBuilds.Load() - builds; got != 0 {
+			got := s.targetBuilds.Load() - builds
+			if tc.expired {
+				if got != 1 {
+					t.Errorf("derivations for a revalidation %s after a memo with a %s TTL was built = %d, "+
+						"want 1: the memo has lapsed and the wall-clock branch never refreshes builtAt, so "+
+						"granting it the sub-second round-up would answer every later revalidation from it",
+						tc.advance, ttl, got)
+				}
+				return
+			}
+			if got != 0 {
 				t.Errorf("derivations for a revalidation under a %s TTL = %d, want 0: the memo "+
 					"floored its grant to 0 where the 200 rounded up to 1, so the client it "+
 					"handed max-age=1 to can never reach it", ttl, got)

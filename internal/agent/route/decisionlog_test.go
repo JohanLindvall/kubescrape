@@ -12,9 +12,11 @@ import (
 	"strings"
 	"testing"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
@@ -68,7 +70,7 @@ func TestRoutingDecisionIsExplainedAtDebug(t *testing.T) {
 	}
 	// slog writes level= itself; a second pair of that name destroys the
 	// record's severity for a logfmt reader (found live on the cluster).
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
 		if n := strings.Count(line, " level="); n != 1 {
 			t.Errorf("line has %d ` level=` pairs, want exactly 1 (slog's own): %q", n, line)
 		}
@@ -112,6 +114,98 @@ func TestEverySignalNamesItselfInTheDecisionLine(t *testing.T) {
 		}
 		if out := dump(); !strings.Contains(out, "signal="+tc.signal) {
 			t.Errorf("%s export did not name its signal:\n%s", tc.signal, out)
+		}
+	}
+}
+
+// The Debug line's reasons and worked examples come from decide asked to
+// narrate, the routing from decide through match — and the two differ in how
+// they reach the namespace half: the narration scans the globs (the memo keeps
+// no patterns), the split asks the memo. This pins that asking for the
+// narration never changes WHERE a resource goes, on every branch, on a routed
+// Router and on the destination-less one (the self chain's preRoute), with
+// match run twice so the memo's answer is compared as well as the scan's.
+func TestNarratedDecisionIsTheRoutingDecision(t *testing.T) {
+	type resource struct {
+		name   string
+		attrs  func(pcommon.Map)
+		reason string // the branch decide must name on the routed Router
+	}
+	resources := []resource{
+		{"marker naming a route beats the namespace", func(m pcommon.Map) {
+			m.PutStr(ScriptMarker, "tenant-b")
+			m.PutStr(namespaceAttr, "team-a-one")
+		}, "scriptMarker"},
+		{"marker naming no route", func(m pcommon.Map) { m.PutStr(ScriptMarker, "nope") }, "scriptMarkerNamesNoRoute"},
+		{"non-string marker", func(m pcommon.Map) { m.PutInt(ScriptMarker, 7) }, "scriptMarkerNamesNoRoute"},
+		{"no namespace attribute", func(pcommon.Map) {}, "noNamespaceAttribute"},
+		{"glob hit", func(m pcommon.Map) { m.PutStr(namespaceAttr, "team-a-one") }, "namespaceGlob"},
+		{"exact hit on the second route", func(m pcommon.Map) { m.PutStr(namespaceAttr, "team-b") }, "namespaceGlob"},
+		{"glob hit past a malformed glob", func(m pcommon.Map) { m.PutStr(namespaceAttr, "team-c") }, "namespaceGlob"},
+		{"glob miss", func(m pcommon.Map) { m.PutStr(namespaceAttr, "kube-system") }, "noGlobMatched"},
+		{"non-string namespace", func(m pcommon.Map) { m.PutInt(namespaceAttr, 5) }, "noGlobMatched"},
+	}
+	routers := map[string]*Router{
+		"routed": New(&capDest{}, []Destination{
+			{Name: "tenant-a", Namespaces: []string{"team-a-*"}, Exporter: &capDest{}},
+			{Name: "tenant-b", Namespaces: []string{"team-b"}, Exporter: &capDest{}},
+			{Name: "tenant-c", Namespaces: []string{"[", "team-c"}, Exporter: &capDest{}},
+		}),
+		"destination-less": New(&capDest{}, nil),
+	}
+	before := obs.RouteUnknown.Value()
+	for rname, r := range routers {
+		for _, tc := range resources {
+			res := pcommon.NewResource()
+			tc.attrs(res.Attributes())
+			v := r.decide(res.Attributes(), true)
+			for pass := range 2 { // the scan, then the memo
+				if want, _ := r.match(res, false); v.idx != want {
+					t.Errorf("%s router, %s (pass %d): the narrated decision says destination %d, match() routes to %d",
+						rname, tc.name, pass, v.idx, want)
+				}
+			}
+			if rname == "routed" && v.reason != tc.reason {
+				t.Errorf("%s router, %s: the narrated decision names branch %q, want %q", rname, tc.name, v.reason, tc.reason)
+			}
+		}
+	}
+	if got := obs.RouteUnknown.Value() - before; got != 0 {
+		t.Errorf("explaining a routing decision moved kubescrape_routed_unknown_total by %v; the narration must move no counter", got)
+	}
+}
+
+// The decision line's COUNTS are split's own answer, never the narration's
+// re-run of decide: whatever the narrated decision says, the
+// routed/defaulted/byRoute numbers must be the destinations the router actually
+// used. Driven with answers the narrated decision disagrees with, so a line
+// counting its own re-derivation shows up as the wrong numbers.
+func TestDecisionLineCountsWhatSplitDecided(t *testing.T) {
+	dests := []Destination{{Name: "tenant-a", Namespaces: []string{"team-a-*"}, Exporter: &capDest{}}}
+	ld := nsLogs("team-a-one", "kube-system") // decided: tenant-a, then default
+	res := func(i int) pcommon.Resource { return ld.ResourceLogs().At(i).Resource() }
+
+	for _, tc := range []struct {
+		name   string
+		groups []int
+		whole  int
+		want   []string
+	}{
+		{"split", []int{-1, -1}, -1, []string{"routed=0", "defaulted=2", `byRoute="tenant-a=0"`, "routing split this export"}},
+		{"fast path to one route", nil, 0, []string{"routed=2", "defaulted=0", `byRoute="tenant-a=2"`, "route=tenant-a"}},
+		{"fast path to the default chain", nil, -1, []string{"routed=0", "defaulted=2", `byRoute="tenant-a=0"`, "default chain (no split)"}},
+	} {
+		r, dump := debugRouter(&capDest{}, dests)
+		r.explainExport("logs", 2, res, tc.groups, tc.whole)
+		out := dump()
+		for _, want := range tc.want {
+			if !strings.Contains(out, want) {
+				t.Errorf("%s: the decision line does not carry %q — it is counting something other than split's answer:\n%s", tc.name, want, out)
+			}
+		}
+		// The REASONS stay the narrated decision's: they name the branch, not the count.
+		if !strings.Contains(out, "namespaceGlob=1") || !strings.Contains(out, "noGlobMatched=1") {
+			t.Errorf("%s: the reasons histogram lost the decided branches:\n%s", tc.name, out)
 		}
 	}
 }

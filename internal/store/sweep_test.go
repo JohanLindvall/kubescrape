@@ -8,7 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// Sweep runs under the EXCLUSIVE write lock, on Run's ticker (ttl/4, capped at
+// sweep runs under the EXCLUSIVE write lock, on Run's ticker (ttl/4, capped at
 // a minute). Every container lookup, every pod lookup and every node-targets
 // request waits behind it, and the informer's own upserts queue up too, so its
 // cost has to be proportional to what actually expired — not to the size of
@@ -66,7 +66,7 @@ func sweepCost(t *testing.T, pods, batch int) time.Duration {
 		}
 		clk.Advance(2 * time.Minute)
 		start := time.Now()
-		s.Sweep()
+		s.sweep()
 		if d := time.Since(start); d < best {
 			best = d
 		}
@@ -78,7 +78,7 @@ func sweepCost(t *testing.T, pods, batch int) time.Duration {
 }
 
 // A lapsed pod must take its NAME index entry with it too. Nothing else ever
-// revisits byPodName — Sweep is the last event in a record's life — so an entry
+// revisits byPodName — sweep is the last event in a record's life — so an entry
 // left behind keeps the whole kubemeta.Pod reachable for the process lifetime,
 // one per expired tombstone, on a cluster whose pod names never repeat (Jobs,
 // CronJobs, any generateName workload).
@@ -102,7 +102,7 @@ func TestSweepDropsTheNameIndexEntry(t *testing.T) {
 	s.UpsertPod(makePod("live", "pod-live", "node1", "1", map[string]string{"app": "abcdef000001"}))
 
 	clk.Advance(2 * time.Minute)
-	s.Sweep()
+	s.sweep()
 
 	s.mu.RLock()
 	names, pods := len(s.byPodName), len(s.pods)
@@ -142,7 +142,7 @@ func TestSweepReclaimsAContainerLeftBehindByAResurrectedPod(t *testing.T) {
 	}
 
 	clk.Advance(2 * time.Minute)
-	s.Sweep()
+	s.sweep()
 
 	s.mu.RLock()
 	_, stale := s.byContainer["bbbb02"]
@@ -198,7 +198,7 @@ func TestSweepLeavesNothingExpiredBehind(t *testing.T) {
 	}
 
 	clk.Advance(2 * time.Minute)
-	s.Sweep()
+	s.sweep()
 
 	pods, containers := s.Stats()
 	if pods != len(live) {
@@ -242,7 +242,7 @@ func TestSweepReleasesThePendingListItGrewForABurst(t *testing.T) {
 	}
 
 	clk.Advance(2 * time.Minute)
-	s.Sweep()
+	s.sweep()
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -252,6 +252,107 @@ func TestSweepReleasesThePendingListItGrewForABurst(t *testing.T) {
 	if cap(s.pending) > maxIdlePendingStamps {
 		t.Errorf("the drained pending list still holds the burst's array (cap %d, peak %d): "+
 			"a rollout's high-water mark stays resident for the process lifetime", cap(s.pending), peak)
+	}
+}
+
+// The drained case above is the easy one. Under steady churn the list never
+// drains to zero — a fresh, unexpired stamp arrives between every two sweeps —
+// and releasing the burst's array only at zero kept the rollout's peak resident
+// behind a handful of live entries for as long as the churn lasted. The array
+// must be sized by what it HOLDS, and must not then be re-allocated on every
+// sweep by the churn that keeps it small.
+func TestSweepGivesBackABurstsArrayWhileChurnKeepsItNonEmpty(t *testing.T) {
+	s, clk := newTestStore(time.Minute)
+	const n = 4000
+	for i := range n {
+		uid := fmt.Sprintf("burst-%d", i)
+		s.UpsertPod(makePod(uid, uid, "node1", "1",
+			map[string]string{"app": fmt.Sprintf("bbbb%06d", i)}))
+		s.DeletePod(types.UID(uid))
+	}
+	s.mu.RLock()
+	peak := cap(s.pending)
+	s.mu.RUnlock()
+	if peak < n {
+		t.Fatalf("the burst did not grow the pending list (cap %d for %d deletes)", peak, n)
+	}
+
+	churn := func(i int) {
+		uid := fmt.Sprintf("churn-%d", i)
+		s.UpsertPod(makePod(uid, uid, "node1", "1",
+			map[string]string{"app": fmt.Sprintf("cccc%06d", i)}))
+		s.DeletePod(types.UID(uid))
+	}
+	// One pod deleted per 30s, a sweep after each: the burst lapses at the
+	// third tick, and from then on the list always holds the one or two churn
+	// stamps that have not.
+	var arrays []*pendingExpiry
+	for i := range 10 {
+		clk.Advance(30 * time.Second)
+		churn(i)
+		s.sweep()
+		s.mu.RLock()
+		l, c := len(s.pending), cap(s.pending)
+		if c > 0 {
+			arrays = append(arrays, &s.pending[:1][0])
+		}
+		s.mu.RUnlock()
+		if l == 0 {
+			t.Fatalf("tick %d: the list drained to zero, so this no longer exercises the churn case", i)
+		}
+		if i >= 2 && c > maxIdlePendingStamps {
+			t.Fatalf("tick %d: %d live stamps in an array of %d (peak %d): the burst's high-water mark "+
+				"stays resident for as long as churn keeps the list non-empty", i, l, c, peak)
+		}
+	}
+	// Once shrunk, the churn reuses one array rather than re-allocating per sweep.
+	for i := 4; i < len(arrays); i++ {
+		if arrays[i] != arrays[3] {
+			t.Errorf("sweep %d re-allocated the pending array: a shrink must not thrash under churn", i)
+		}
+	}
+}
+
+// Shrinking is by occupancy, and the new array is at least half full: the
+// arithmetic that keeps a shrink from being undone by the very next append.
+func TestShrinkPendingIsByOccupancy(t *testing.T) {
+	big := maxIdlePendingStamps * 8
+	for _, tc := range []struct {
+		name         string
+		len, cap     int
+		wantCap      int // 0 = nil
+		wantSameBack bool
+	}{
+		{"small arrays are always kept", 10, maxIdlePendingStamps, maxIdlePendingStamps, true},
+		{"a quarter full is kept", big / 4, big, big, true},
+		{"a drained burst is released", 0, big, 0, false},
+		{"a sparse burst shrinks to the floor", 10, big, maxIdlePendingStamps, false},
+		{"a large remainder keeps twice its length", big/4 - 1, big, 2 * (big/4 - 1), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := make([]pendingExpiry, tc.len, tc.cap)
+			for i := range p {
+				p[i].id = fmt.Sprint(i)
+			}
+			got := shrinkPending(p)
+			if tc.wantCap == 0 {
+				if got != nil {
+					t.Fatalf("cap %d, want the array released", cap(got))
+				}
+				return
+			}
+			if cap(got) != tc.wantCap || len(got) != tc.len {
+				t.Fatalf("len/cap = %d/%d, want %d/%d", len(got), cap(got), tc.len, tc.wantCap)
+			}
+			if same := cap(got) > 0 && &got[:1][0] == &p[:1][0]; same != tc.wantSameBack {
+				t.Fatalf("returned the same array = %v, want %v", same, tc.wantSameBack)
+			}
+			for i := range got {
+				if got[i].id != fmt.Sprint(i) {
+					t.Fatalf("entry %d = %q after the shrink: survivors must keep their order", i, got[i].id)
+				}
+			}
+		})
 	}
 }
 
@@ -266,7 +367,7 @@ func TestSweepRetiresAPodWithNoUID(t *testing.T) {
 	s.DeletePod("")
 
 	clk.Advance(2 * time.Minute)
-	s.Sweep()
+	s.sweep()
 
 	if pods, containers := s.Stats(); pods != 0 || containers != 0 {
 		t.Errorf("the sweep left pods=%d containers=%d behind", pods, containers)
@@ -282,7 +383,7 @@ func TestSweepRemovesTheLapsedPodsContainers(t *testing.T) {
 	s.UpsertPod(makePod("uid-2", "pod-2", "node1", "1", map[string]string{"app": "bbbb02"}))
 	s.DeletePod("uid-1")
 	clk.Advance(2 * time.Minute)
-	s.Sweep()
+	s.sweep()
 
 	if _, ok := s.GetPodByUID("uid-1"); ok {
 		t.Error("the expired pod is still resolvable")

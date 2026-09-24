@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -75,7 +76,7 @@ func (c *captureExporter) calls() int {
 func fwdTraceID(n uint64) pcommon.TraceID {
 	n++
 	var id pcommon.TraceID
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		id[i] = byte(n >> (8 * i))
 		id[8+i] = byte((n * 0x9e3779b97f4a7c15) >> (8 * i))
 	}
@@ -84,7 +85,7 @@ func fwdTraceID(n uint64) pcommon.TraceID {
 
 func fwdSpanID(n uint64) pcommon.SpanID {
 	var id pcommon.SpanID
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		id[i] = byte((n + 1) >> (8 * i))
 	}
 	return id
@@ -157,11 +158,11 @@ func realisticBatch(traces, internalPerTrace int) ptrace.Traces {
 	ss := rs.ScopeSpans().AppendEmpty()
 	ss.Scope().SetName("go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp")
 	ss.Scope().SetVersion("0.58.0")
-	for i := 0; i < traces; i++ {
+	for i := range traces {
 		tid := fwdTraceID(uint64(i))
 		realisticSpan(ss.Spans().AppendEmpty(), ptrace.SpanKindServer, tid, fwdSpanID(uint64(i)*10), pcommon.SpanID{})
 		realisticSpan(ss.Spans().AppendEmpty(), ptrace.SpanKindClient, tid, fwdSpanID(uint64(i)*10+1), fwdSpanID(uint64(i)*10))
-		for j := 0; j < internalPerTrace; j++ {
+		for j := range internalPerTrace {
 			realisticSpan(ss.Spans().AppendEmpty(), ptrace.SpanKindInternal, tid, fwdSpanID(uint64(i)*10+2+uint64(j)), fwdSpanID(uint64(i)*10+1))
 		}
 	}
@@ -174,7 +175,7 @@ func fakeShards(t testing.TB, n int) (map[string]TracesExporter, []*captureExpor
 	t.Helper()
 	m := make(map[string]TracesExporter, n)
 	caps := make([]*captureExporter, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		c := &captureExporter{}
 		caps[i] = c
 		m[fmt.Sprintf("shard-%d", i+1)] = c
@@ -278,7 +279,7 @@ func TestBothHalvesOfATraceLandOnOneShard(t *testing.T) {
 		rs := td.ResourceSpans().AppendEmpty()
 		realisticResource(rs.Resource(), svc)
 		ss := rs.ScopeSpans().AppendEmpty()
-		for i := 0; i < traces; i++ {
+		for i := range traces {
 			realisticSpan(ss.Spans().AppendEmpty(), kind, fwdTraceID(uint64(i)), fwdSpanID(uint64(i)), pcommon.SpanID{})
 		}
 		return td
@@ -398,7 +399,7 @@ func TestSpansWithNoTraceIDStayLocal(t *testing.T) {
 	rs := td.ResourceSpans().AppendEmpty()
 	realisticResource(rs.Resource(), "checkout")
 	ss := rs.ScopeSpans().AppendEmpty()
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		realisticSpan(ss.Spans().AppendEmpty(), ptrace.SpanKindClient, pcommon.TraceID{}, fwdSpanID(uint64(i)), pcommon.SpanID{})
 	}
 	local, err := r.Reshard(context.Background(), td)
@@ -415,6 +416,40 @@ func TestSpansWithNoTraceIDStayLocal(t *testing.T) {
 	}
 	if st := r.Stats(); st.SpansUnkeyed != 10 {
 		t.Errorf("SpansUnkeyed = %d, want 10", st.SpansUnkeyed)
+	}
+}
+
+// A MIXED batch — trace-id-less spans before and after keyed spans whose traces
+// hash to several shards — is the one shape where the single-owner pass looks
+// at the unkeyed spans and then bails out to the split pass, which looks at
+// them again. Each unkeyed span must be counted exactly once however many
+// passes see it, and none may be counted from the zeroed shells the split
+// leaves behind in the input.
+func TestUnkeyedSpansInAMixedShardedBatchAreCountedOnce(t *testing.T) {
+	clients, _ := fakeShards(t, 2)
+	r := testResharder(t, clients, 0)
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	realisticResource(rs.Resource(), "checkout")
+	ss := rs.ScopeSpans().AppendEmpty()
+	const before, after, keyed = 5, 4, 64
+	for i := range before {
+		realisticSpan(ss.Spans().AppendEmpty(), ptrace.SpanKindClient, pcommon.TraceID{}, fwdSpanID(uint64(i)), pcommon.SpanID{})
+	}
+	for i := range keyed {
+		realisticSpan(ss.Spans().AppendEmpty(), ptrace.SpanKindServer, fwdTraceID(uint64(i)), fwdSpanID(uint64(100+i)), pcommon.SpanID{})
+	}
+	for i := range after {
+		realisticSpan(ss.Spans().AppendEmpty(), ptrace.SpanKindClient, pcommon.TraceID{}, fwdSpanID(uint64(200+i)), pcommon.SpanID{})
+	}
+	if n := len(ownersOf(r, td)); n < 2 {
+		t.Fatalf("the keyed spans hash to %d remote shard(s); the test needs the split path", n)
+	}
+	if _, err := r.Reshard(context.Background(), td); err != nil {
+		t.Fatalf("Reshard: %v", err)
+	}
+	if got := r.Stats().SpansUnkeyed; got != before+after {
+		t.Errorf("SpansUnkeyed = %d, want %d", got, before+after)
 	}
 }
 
@@ -477,7 +512,7 @@ func TestForwardedPayloadKeepsFullFidelity(t *testing.T) {
 	ss.SetSchemaUrl("https://opentelemetry.io/schemas/1.30.0")
 	// Two traces, so the payload actually splits rather than taking the
 	// single-owner fast path; keep pushing until one lands on the peer.
-	for i := 0; i < 64; i++ {
+	for i := range 64 {
 		realisticSpan(ss.Spans().AppendEmpty(), ptrace.SpanKindClient, fwdTraceID(uint64(i)), fwdSpanID(uint64(i)), pcommon.SpanID{})
 	}
 	if _, err := r.Reshard(context.Background(), td); err != nil {
@@ -529,6 +564,131 @@ func TestFailedHopFailsThePush(t *testing.T) {
 	}
 	if st := r.Stats(); st.SendsFailed == 0 {
 		t.Errorf("stats = %+v, want a failed send", st)
+	}
+}
+
+// ownersOf reports which peer shards own a share of td, without consuming it.
+func ownersOf(r *Resharder, td ptrace.Traces) map[string]bool {
+	out := map[string]bool{}
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		sss := rss.At(i).ScopeSpans()
+		for j := 0; j < sss.Len(); j++ {
+			spans := sss.At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				if o := r.ownerOf(spans.At(k)); o != r.self {
+					out[o] = true
+				}
+			}
+		}
+	}
+	return out
+}
+
+// A healthy owner that accepted its share has exported AND counted it — the
+// owner's taps count after its own successful export, which says nothing about
+// a sibling's — so a push that fails on a sibling and is retried re-counts it.
+// While one shard is down that would be EVERY push touching it: the healthy
+// owners' edges and RED counters multiplied by the senders' retry count. The
+// shard whose last send failed is therefore sent its share first, and alone,
+// so the refusal lands before anything healthy has been handed a span.
+func TestAHealthyOwnerIsNotReDeliveredWhileASiblingIsDown(t *testing.T) {
+	clients, caps := fakeShards(t, 2)
+	boom := errors.New("connection refused")
+	caps[0].err = boom
+	down, healthy := caps[0], caps[1]
+	r := testResharder(t, clients, 0)
+	if owners := ownersOf(r, realisticBatch(20, 0)); len(owners) != 2 {
+		t.Fatalf("the fixture batch reaches %d peer shards, want both: %v", len(owners), owners)
+	}
+
+	for i := range 20 {
+		if _, err := r.Reshard(context.Background(), realisticBatch(20, 0)); !errors.Is(err, boom) {
+			t.Fatalf("push %d: err = %v, want the down shard's refusal", i, err)
+		}
+	}
+	if got := down.calls(); got != 20 {
+		t.Errorf("the down shard was offered %d shares, want 20 (one per push)", got)
+	}
+	// The first push discovers the failure with the healthy share already in
+	// flight beside it; every later one refuses before sending it.
+	if got := healthy.calls(); got > 1 {
+		t.Errorf("the healthy owner received its share %d times across 20 retried pushes, want at most once: each extra delivery re-counts its edges and RED metrics", got)
+	}
+
+	// Recovery: the suspect answers, is cleared, and the rest follow.
+	down.mu.Lock()
+	down.err = nil
+	down.mu.Unlock()
+	before := healthy.calls()
+	if _, err := r.Reshard(context.Background(), realisticBatch(20, 0)); err != nil {
+		t.Fatalf("push after recovery: %v", err)
+	}
+	if healthy.calls() != before+1 {
+		t.Errorf("after the down shard recovered the healthy owner was not sent its share")
+	}
+	if r.failing["shard-1"].Load() {
+		t.Error("a shard that answered is still flagged as failing")
+	}
+}
+
+// Every owner that refuses its share is counted and named in the error — the
+// serial loop stopped at the first, so SendsFailed could move at most once per
+// push however many owners were down.
+func TestEveryFailedOwnerIsCounted(t *testing.T) {
+	clients, caps := fakeShards(t, 3)
+	boom1, boom2 := errors.New("shard-1 refused"), errors.New("shard-2 refused")
+	caps[0].err, caps[1].err = boom1, boom2
+	r := testResharder(t, clients, 0)
+	td := realisticBatch(200, 0)
+	if owners := ownersOf(r, td); len(owners) != 3 {
+		t.Fatalf("the fixture batch reaches %d peer shards, want 3", len(owners))
+	}
+	_, err := r.Reshard(context.Background(), td)
+	if !errors.Is(err, boom1) || !errors.Is(err, boom2) {
+		t.Errorf("error = %v, want it to wrap both refusals", err)
+	}
+	if got := r.Stats().SendsFailed; got != 2 {
+		t.Errorf("SendsFailed = %d, want 2 (one per owner that refused)", got)
+	}
+}
+
+// barrierExporter accepts only once `want` sends are in flight at the same time,
+// or fails after a deadline: a serial fan-out never gets past its first send.
+type barrierExporter struct {
+	entered *atomic.Int32
+	want    int32
+	all     chan struct{}
+	once    *sync.Once
+}
+
+func (b barrierExporter) ExportTraces(context.Context, ptrace.Traces) error {
+	if b.entered.Add(1) == b.want {
+		b.once.Do(func() { close(b.all) })
+	}
+	select {
+	case <-b.all:
+		return nil
+	case <-time.After(3 * time.Second):
+		return errors.New("the shares were not in flight together: the fan-out is serial")
+	}
+}
+
+// A hop is synchronous through the owner's own export to the collector, so a
+// serial fan-out made a push spanning every shard wait for the SUM of N-1 such
+// round trips, holding an entry in-flight slot throughout. The shares go out
+// together: the push costs the slowest hop.
+func TestRemoteSharesAreSentConcurrently(t *testing.T) {
+	var entered atomic.Int32
+	b := barrierExporter{entered: &entered, want: 3, all: make(chan struct{}), once: new(sync.Once)}
+	clients := map[string]TracesExporter{"shard-1": b, "shard-2": b, "shard-3": b}
+	r := testResharder(t, clients, 0)
+	td := realisticBatch(200, 0)
+	if owners := ownersOf(r, td); len(owners) != 3 {
+		t.Fatalf("the fixture batch reaches %d peer shards, want 3", len(owners))
+	}
+	if _, err := r.Reshard(context.Background(), td); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -957,7 +1117,7 @@ func TestSpansWithNoTraceIDAreCountedOnASingleShardTier(t *testing.T) {
 	rs := td.ResourceSpans().AppendEmpty()
 	realisticResource(rs.Resource(), "checkout")
 	ss := rs.ScopeSpans().AppendEmpty()
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		realisticSpan(ss.Spans().AppendEmpty(), ptrace.SpanKindClient, pcommon.TraceID{}, fwdSpanID(uint64(i)), pcommon.SpanID{})
 	}
 	// One well-formed span, so the count is the unkeyed subset and not the batch.

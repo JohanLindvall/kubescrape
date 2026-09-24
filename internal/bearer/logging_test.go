@@ -19,8 +19,9 @@ func capture() (*slog.Logger, *bytes.Buffer) {
 }
 
 // A read failure with NOTHING to fall back on used to be entirely silent here:
-// the error goes to the caller, and Get — the shape a token PROVIDER must
-// have — drops it. The symptom was a 401 storm with no line naming the file.
+// the error goes to the caller, which reports it as its OWN failure (an export,
+// a scrape), and Get — the shape a token PROVIDER must have — drops it. No line
+// said the cause was a credential file, or named it.
 func TestClientWithNoTokenEverReadWarnsAndCounts(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "absent")
 	log, buf := capture()
@@ -31,11 +32,16 @@ func TestClientWithNoTokenEverReadWarnsAndCounts(t *testing.T) {
 		t.Fatalf("Get = %q, want empty", got)
 	}
 	line := buf.String()
-	if !strings.Contains(line, "level=WARN") || !strings.Contains(line, "unauthenticated") {
+	// The consequence, stated as what the callers actually do: a Token caller
+	// fails the request locally and sends nothing, so "requests are going out
+	// unauthenticated" sent an operator looking for 401s nobody received.
+	if !strings.Contains(line, "level=WARN") || !strings.Contains(line, "every request that needs it fails") {
 		t.Errorf("want a WARN naming the consequence, got:\n%s", line)
 	}
-	if !strings.Contains(line, "path="+path) {
-		t.Errorf("the warn must name the file; got:\n%s", line)
+	// tokenFile, the vocabulary's key for a credential file's PATH (internal/cli),
+	// so one grep finds this line beside every other token-file line.
+	if !strings.Contains(line, "tokenFile="+path) {
+		t.Errorf("the warn must name the file as tokenFile=; got:\n%s", line)
 	}
 	if got := readErrors(t, roleClient) - before; got != 1 {
 		t.Errorf("kubescrape_bearer_token_read_errors_total{role=client} moved by %v, want 1", got)

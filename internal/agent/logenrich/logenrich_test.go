@@ -254,6 +254,58 @@ func TestZonelessParsedTimeKeepsTheProducerTimestamp(t *testing.T) {
 	}
 }
 
+// A ZONED parsed time wins over the producer's, but only if an OTLP timestamp
+// can hold it: pcommon.NewTimestampFromTime is uint64(t.UnixNano()), which
+// wraps a pre-1970 instant into a value centuries in the future and is
+// undefined past 2262. Those used to replace the producer's accurate time with
+// the wrapped value — 1969-12-31T23:59:59Z shipped as 18446744072709551616 —
+// with no counter moving. They are refused like a zone-less stamp: counted, and
+// the record keeps what it had (0 with no producer timestamp, "unset").
+func TestUnrepresentableParsedTimeIsRefused(t *testing.T) {
+	ingest := time.Date(2026, 1, 2, 8, 4, 5, 0, time.UTC)
+	for _, line := range []string{
+		`{"time":"1969-12-31T23:59:59Z","msg":"x"}`,
+		`{"ts":"1900-01-01T00:00:00Z","msg":"x"}`,
+		`{"timestamp":"1600-01-01T00:00:00Z","msg":"x"}`,
+		`{"time":"0001-01-02T00:00:00Z","msg":"x"}`,
+		`{"time":"1970-01-01T00:00:00Z","msg":"x"}`, // zero is "unset" on the wire
+		`{"time":"2300-01-01T00:00:00Z","msg":"x"}`,
+	} {
+		for _, producer := range []time.Time{ingest, {}} {
+			lr := newRecord()
+			var want pcommon.Timestamp
+			if !producer.IsZero() {
+				want = pcommon.NewTimestampFromTime(producer)
+				lr.SetTimestamp(want)
+			}
+			before := obs.LogEnrichTimeRejected.Value()
+			Apply(lr, line)
+			if got := lr.Timestamp(); got != want {
+				t.Errorf("line %s, producer %v: timestamp = %d (%v), want the untouched %d",
+					line, producer, uint64(got), got.AsTime(), uint64(want))
+			}
+			if got := obs.LogEnrichTimeRejected.Value() - before; got != 1 {
+				t.Errorf("line %s, producer %v: rejection counted %v times, want 1", line, producer, got)
+			}
+		}
+	}
+	// The edges of what IS representable still win.
+	for _, tc := range []struct {
+		line string
+		want time.Time
+	}{
+		{`{"time":"1970-01-01T00:00:01Z","msg":"x"}`, time.Unix(1, 0)},
+		{`{"time":"2262-01-01T00:00:00Z","msg":"x"}`, time.Date(2262, 1, 1, 0, 0, 0, 0, time.UTC)},
+	} {
+		lr := newRecord()
+		lr.SetTimestamp(pcommon.NewTimestampFromTime(ingest))
+		Apply(lr, tc.line)
+		if got := lr.Timestamp().AsTime(); !got.Equal(tc.want) {
+			t.Errorf("line %s: timestamp = %v, want %v", tc.line, got, tc.want)
+		}
+	}
+}
+
 // TestAzureAttributeKeys pins the record attributes an Azure-shaped line
 // stamps, and the SHAPE of each value — the pair is what makes the key names
 // load-bearing rather than cosmetic.

@@ -148,9 +148,9 @@ func TestDrainDecodesOnlyWhenOverTheSendCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var rawSends int32
+	var rawSends atomic.Int32
 	s, decodes := countingSink(t, t.TempDir(), len(encoded)/2, func(context.Context, []byte) error {
-		atomic.AddInt32(&rawSends, 1)
+		rawSends.Add(1)
 		return nil
 	})
 	if err := s.enqueue(ld); err != nil {
@@ -161,7 +161,7 @@ func TestDrainDecodesOnlyWhenOverTheSendCap(t *testing.T) {
 	if n := atomic.LoadInt32(decodes); n != 1 {
 		t.Errorf("an over-cap payload decoded %d times, want 1 (otlpsplit needs the structure)", n)
 	}
-	if n := atomic.LoadInt32(&rawSends); n != 0 {
+	if n := rawSends.Load(); n != 0 {
 		t.Errorf("an over-cap payload took the raw path %d times; it must go through the splitting send", n)
 	}
 }

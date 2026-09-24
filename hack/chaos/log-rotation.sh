@@ -21,35 +21,20 @@ NODE="${NODE:-$("${KCTL[@]}" get nodes -o jsonpath='{.items[1].metadata.name}')}
 COUNT="${COUNT:-2000}"
 PAD="${PAD:-2000}"   # bytes of padding per line: COUNT*PAD must cross 1Mi several times
 
+# The rotation-specific loss counters: a rotated-away segment given up on as
+# unrecoverable, and an unterminated final line of a renamed file. Baselined
+# rather than required to be zero, because they are cumulative and `make chaos`
+# runs the scenarios back to back (lib.sh, loss_baseline).
+LOSS_METRICS=(kubescrape_log_prefix_lost_total kubescrape_log_torn_final_lines_total)
+BASELINE="$CAP_DIR/log-rotation.baseline.json"
+say "loss-counter baseline"
+loss_baseline "$BASELINE" "${LOSS_METRICS[@]}" || \
+  fail "could not read the collector's metrics capture before the run — without a baseline the loss-counter assertion would be vacuous"
+
 say "writer: $COUNT lines of ~${PAD}B on $NODE (~$((COUNT * PAD / 1024 / 1024))MiB, so the kubelet rotates repeatedly)"
-"${KCTL[@]}" -n default delete pod chaos-rot-writer --ignore-not-found --grace-period=0 --force >/dev/null 2>&1
-cat <<EOF | "${KCTL[@]}" apply -f - >/dev/null
-apiVersion: v1
-kind: Pod
-metadata: {name: chaos-rot-writer, namespace: default, labels: {app: chaos-writer}}
-spec:
-  restartPolicy: Never
-  nodeName: $NODE
-  containers:
-    - name: w
-      image: busybox:1.36
-      imagePullPolicy: IfNotPresent
-      command:
-        - /bin/sh
-        - -c
-        - |
-          pad=\$(head -c $PAD /dev/zero | tr '\\0' 'x')
-          i=0
-          while [ \$i -lt $COUNT ]; do
-            i=\$((i+1))
-            echo "$MARK seq=\$i \$pad"
-            # Fast enough to rotate several times, slow enough that the tailer
-            # is following a LIVE file rather than reading a finished one.
-            sleep 0.02
-          done
-          sleep 3600
-EOF
-"${KCTL[@]}" -n default wait --for=condition=Ready pod/chaos-rot-writer --timeout=120s >/dev/null
+# 0.02s a line: fast enough to rotate several times, slow enough that the
+# tailer is following a LIVE file rather than reading a finished one.
+writer_pod chaos-rot-writer "$NODE" "$MARK" "$COUNT" 0.02 "$PAD"
 info "writer ready at $(date -Iseconds)"
 
 say "waiting for the writer to finish and the tailer to drain every segment"
@@ -72,12 +57,10 @@ fi
 info "rotations observed: $((ROTATED - 1))"
 
 say "verdict"
-if gap_report "$MARK" "$COUNT"; then
-  echo
-  echo "CHAOS PASS: no line lost across $((ROTATED - 1)) kubelet log rotations"
-else
-  echo
-  fail "lines were lost across rotation"
-fi
-say "rotation-specific loss counters (all must be zero or absent)"
-counters torn; counters prefix_lost
+gap_report "$MARK" "$COUNT" || fail "lines were lost across rotation"
+
+say "rotation-specific loss counters (none may have moved since the baseline)"
+assert_losses_flat "$BASELINE" "${LOSS_METRICS[@]}"
+
+echo
+echo "CHAOS PASS: no line lost across $((ROTATED - 1)) kubelet log rotations, and no agent counted a loss"

@@ -332,7 +332,7 @@ func TestAddConcurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
-	for g := 0; g < 8; g++ {
+	for g := range 8 {
 		wg.Add(1)
 		go func(g int) {
 			defer wg.Done()
@@ -346,7 +346,7 @@ func TestAddConcurrent(t *testing.T) {
 				}
 				return ""
 			}
-			for i := 0; i < 500; i++ {
+			for range 500 {
 				set.Add(nil, lookup, noRes(), "")
 			}
 		}(g)

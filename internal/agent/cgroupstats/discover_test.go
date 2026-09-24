@@ -136,7 +136,7 @@ func TestDiscoverDedupesTheConmonSiblingScope(t *testing.T) {
 	if len(found) != 1 {
 		t.Fatalf("found %d entries, want 1 (the conmon sibling must fold into the container): %+v", len(found), found)
 	}
-	if base := filepath.Base(found[0].path); base != "crio-"+cid+".scope" {
+	if base := filepath.Base(found[0].dir); base != "crio-"+cid+".scope" {
 		t.Errorf("kept %q, want the container's own scope (the shorter basename)", base)
 	}
 }
@@ -156,7 +156,7 @@ func TestDiscoverConmonDedupeIsOrderIndependent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(found) != 1 || filepath.Base(found[0].path) != "crio-"+cid+".scope" {
+	if len(found) != 1 || filepath.Base(found[0].dir) != "crio-"+cid+".scope" {
 		t.Fatalf("got %+v, want only the container's own scope", found)
 	}
 }
@@ -272,6 +272,61 @@ func TestTrackedContainerIsRepointedAtItsOwnScope(t *testing.T) {
 	}
 }
 
+// A re-point is announced only once it has HAPPENED. The line used to precede
+// the open, so a better path that could not be opened was reported as adopted
+// while the container kept sampling the supervisor — and since the better path
+// stays listed, every discovery pass re-entered the re-point and repeated the
+// false line.
+func TestARepointThatCannotOpenIsNotAnnounced(t *testing.T) {
+	h := newHarness(t)
+	cid := hexID(4)
+	pod := filepath.Join(h.root, "kubepods.slice", "kubepods-burstable.slice",
+		"kubepods-burstable-pod"+systemdUID(5)+".slice")
+	conmon := filepath.Join(pod, "crio-conmon-"+cid+".scope")
+	own := filepath.Join(pod, "crio-"+cid+".scope")
+	makeContainer(t, conmon, 1000, 4<<20, 0)
+	h.discover()
+	if got := h.tracked[cid]; got == nil || got.dir != conmon {
+		t.Fatalf("the first pass tracked %v, want the only path there was", got)
+	}
+
+	// The container's own scope appears without memory.stat: listed, shorter,
+	// and not openable.
+	writeFile(t, filepath.Join(own, fileCPUStat), cpuStat(1000))
+	writeFile(t, filepath.Join(own, fileMemCurrent), "536870912\n")
+	h.log.Reset()
+	opens := obs.CgroupOpenErrors.Value()
+	const passes = 4
+	for range passes {
+		h.advance(DefaultDiscoverInterval)
+		h.discover()
+	}
+	if got := h.tracked[cid]; got == nil || got.dir != conmon {
+		t.Fatalf("tracked %v, want the container still on the scope it could open", got)
+	}
+	if strings.Contains(h.log.String(), "re-pointed") {
+		t.Errorf("a re-point that never happened was announced:\n%s", h.log.String())
+	}
+	if got := obs.CgroupOpenErrors.Value() - opens; got != passes {
+		t.Errorf("open errors moved by %v in %d passes, want %d: the failure arm's counter is its only signal", got, passes, passes)
+	}
+
+	// Once the scope opens, the re-point happens and says so exactly once,
+	// naming where it came from.
+	writeFile(t, filepath.Join(own, fileMemStat), memStat(0))
+	h.discover()
+	if got := h.tracked[cid]; got == nil || got.dir != own {
+		t.Fatalf("tracked %v, want the container's own scope", got)
+	}
+	out := h.log.String()
+	if n := strings.Count(out, "re-pointed"); n != 1 {
+		t.Errorf("%d re-point lines, want 1:\n%s", n, out)
+	}
+	if !strings.Contains(out, "from="+conmon) || !strings.Contains(out, "to="+own) {
+		t.Errorf("the re-point line does not name both paths:\n%s", out)
+	}
+}
+
 // The reverse ordering happens at the END of a container's life: its own scope
 // is removed while conmon lingers. Following the listing DOWN to the supervisor
 // there would reproduce the same defect at the other end, so a re-point only
@@ -354,6 +409,19 @@ func TestAGoneContainerIsNotRepointedAndKeepsItsFinalWindow(t *testing.T) {
 	if got := obs.CgroupWindowsDropped.WithLabelValues("too_short").Value(); got != beforeShort {
 		t.Errorf("windows_dropped{too_short} moved to %v from %v: a container that WAS measured must not be reported as too short-lived to describe", got, beforeShort)
 	}
+
+	// Declining the re-point defers it, it does not forfeit it: once the final
+	// flush has retired the gone entry, the next pass tracks the id afresh at
+	// the path that is there now — its own scope, open and sampling. A gone
+	// entry that lingered past its flush (or an id stuck in the seen or pending
+	// sets) would leave the live container unmeasured for its whole life.
+	h.discover()
+	if c := h.tracked[cid]; c == nil || c.dir != own || !c.open || c.gone {
+		if c == nil {
+			t.Fatalf("after the final flush the id is not tracked again; the live container at %s goes unmeasured", own)
+		}
+		t.Errorf("after the final flush the id is tracked at %q (open=%v gone=%v), want its own scope %q, open and not gone", c.dir, c.open, c.gone, own)
+	}
 }
 
 // A root that becomes unlistable after startup is a persisting STATE — the
@@ -381,6 +449,11 @@ func TestAnUnlistableRootWarnsOnceNotEveryPass(t *testing.T) {
 
 	h.log.Reset()
 	before := obs.CgroupDiscoveryErrors.WithLabelValues("root").Value()
+	// h.t advances because discover takes it, so the passes model the loop
+	// honestly — but the LOG throttle does not read h.t: logdedupe.Throttle
+	// reads the wall clock, and five passes run in well under readWarnEvery of
+	// it. What this asserts is therefore "not once per pass", not the
+	// per-minute cadence; a throttle that latched forever would pass it too.
 	for range 5 {
 		h.t = h.t.Add(DefaultDiscoverInterval)
 		h.discover()
@@ -390,6 +463,73 @@ func TestAnUnlistableRootWarnsOnceNotEveryPass(t *testing.T) {
 	}
 	if got := obs.CgroupDiscoveryErrors.WithLabelValues("root").Value(); got != before+5 {
 		t.Errorf("discovery_errors{root} = %v, want %v: the throttle is on the LINE, never on the counter", got, before+5)
+	}
+}
+
+// The two listing complaints hold SEPARATE throttles because they are two
+// different failures with two different fixes — an unreadable root is a
+// missing mount and a silent pipeline, an unreadable subtree is one directory
+// inside a working hierarchy — and a mount that flaps between the two must not
+// have whichever fired first silence the other for the throttle window. Both
+// ORDERS are driven: a shared throttle fails either one, but a mis-wiring that
+// makes one arm also claim the other's slot shows only in the order where
+// that arm fires first.
+func TestRootAndPartialListingWarnIndependently(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read a 0000 directory")
+	}
+	for _, rootFirst := range []bool{true, false} {
+		name := "partial then root"
+		if rootFirst {
+			name = "root then partial"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			makeContainer(t, systemdContainerDir(h.root, 1, hexID(1)), 0, 100<<20, 0)
+			h.discover()
+			h.log.Reset()
+			t.Cleanup(func() { _ = os.Chmod(h.root, 0o700) })
+
+			// An unreadable root, discovered once, then restored.
+			unreadableRoot := func() {
+				if err := os.Chmod(h.root, 0o000); err != nil {
+					t.Fatal(err)
+				}
+				h.t = h.t.Add(DefaultDiscoverInterval)
+				h.discover()
+				if err := os.Chmod(h.root, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A directory beside kubepods.slice that cannot be listed, inside
+			// a root that can — discovered once, then made readable again.
+			unreadableSubtree := func() {
+				locked := filepath.Join(h.root, "kubelet.slice")
+				if err := os.Mkdir(locked, 0o000); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+				h.t = h.t.Add(DefaultDiscoverInterval)
+				h.discover()
+				if err := os.Chmod(locked, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if rootFirst {
+				unreadableRoot()
+				unreadableSubtree()
+			} else {
+				unreadableSubtree()
+				unreadableRoot()
+			}
+
+			root := strings.Count(h.log.String(), "cgroup discovery failed")
+			partial := strings.Count(h.log.String(), "could not list part of the hierarchy")
+			if root != 1 || partial != 1 {
+				t.Errorf("an unreadable root and an unreadable subtree (%s) logged %d root and %d partial-listing lines, want 1 and 1: "+
+					"one complaint's throttle must not silence the other\n%s", name, root, partial, h.log.String())
+			}
+		})
 	}
 }
 

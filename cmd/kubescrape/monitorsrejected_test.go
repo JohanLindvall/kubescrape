@@ -28,7 +28,7 @@ func brokenSM(ns, name, rv string) *unstructured.Unstructured {
 // always mean "watched, and none rejected".
 func TestMonitorsRejectedHookEmitsOnlyWatchedKinds(t *testing.T) {
 	ix := servicemonitors.NewIndex()
-	if _, err := ix.UpsertChanged(brokenSM("team-a", "web", "1")); err == nil {
+	if _, _, err := ix.UpsertChanged(brokenSM("team-a", "web", "1")); err == nil {
 		t.Fatal("the broken ServiceMonitor parsed; the fixture no longer exercises the rejected path")
 	}
 
@@ -74,7 +74,7 @@ func TestMonitorsRejectedGaugePublishesTheIndexState(t *testing.T) {
 	if v, ok := read(); !ok || v != 0 {
 		t.Fatalf("fresh index: gauge = (%v, %v), want (0, published)", v, ok)
 	}
-	if _, err := ix.UpsertChanged(brokenSM("team-a", "web", "1")); err == nil {
+	if _, _, err := ix.UpsertChanged(brokenSM("team-a", "web", "1")); err == nil {
 		t.Fatal("the broken ServiceMonitor parsed")
 	}
 	if v, ok := read(); !ok || v != 1 {

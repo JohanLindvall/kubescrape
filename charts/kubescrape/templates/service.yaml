@@ -23,10 +23,9 @@
   nobody is going to remember this paragraph.
 */}}
 {{- $scrapeAuthKey := .Values.service.scrapeAuthToken.key | default "token" }}
-{{- $scrapeAuthSecret := .Values.service.scrapeAuthToken.existingSecret }}
+{{- $scrapeAuthSecret := include "kubescrape.scrapeAuthSecretName" . }}
 {{- $scrapeAuthToken := .Values.service.scrapeAuthToken.value }}
-{{- if and .Values.service.scrapeAuthSecrets (not $scrapeAuthSecret) }}
-{{- $scrapeAuthSecret = printf "%s-scrape-auth" .Release.Name }}
+{{- if and .Values.service.scrapeAuthSecrets (not .Values.service.scrapeAuthToken.existingSecret) }}
 {{- if not $scrapeAuthToken }}
 {{- $existing := (lookup "v1" "Secret" .Release.Namespace $scrapeAuthSecret) }}
 {{- if and $existing (index $existing.data $scrapeAuthKey) }}
@@ -127,7 +126,7 @@ spec:
         # kubescrape's own agents discover prometheus.io/* annotations, so the
         # service's runtime metrics are scraped like any other pod's.
         prometheus.io/scrape: "true"
-        prometheus.io/port: {{ (split ":" .Values.metrics.listen)._1 | quote }}
+        prometheus.io/port: {{ include "kubescrape.port" .Values.metrics.listen | quote }}
         prometheus.io/path: /metrics
       {{- end }}
     spec:
@@ -139,32 +138,15 @@ spec:
       topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- /* Pod-level seccomp. Kubernetes' own default is Unconfined, which is
-             LOOSER than what a plain `docker run` gets, and PodSecurity's
-             `restricted` profile rejects a pod without RuntimeDefault outright
-             — so on a namespace labelled restricted these pods used to fail
-             ADMISSION, which on a first install looks like the chart being
-             broken. Set `seccompProfile: null` to omit the field entirely —
-             NOT `{}`, which cannot work: helm COALESCES a user map onto the
-             chart's default map, so an empty one arrives here as the default
-             `{type: RuntimeDefault}` and renders. Only an explicit null
-             removes the key. */}}
-      {{- with .Values.seccompProfile }}
-      securityContext:
-        seccompProfile:
-          {{- toYaml . | nindent 10 }}
+      {{- /* Pod-level seccomp: see kubescrape.podSecurityContext. */}}
+      {{- if .Values.seccompProfile }}
+      {{- include "kubescrape.podSecurityContext" . | nindent 6 }}
       {{- end }}
       containers:
         - name: kubescrape
           image: {{ include "kubescrape.image" . }}
           imagePullPolicy: {{ include "kubescrape.imagePullPolicy" . }}
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65532
-            capabilities:
-              drop: ["ALL"]
+          {{- include "kubescrape.nonRootSecurityContext" . | nindent 10 }}
           args:
             - -listen={{ .Values.service.listen }}
             - -self-metrics-interval={{ .Values.service.selfMetricsInterval }}
@@ -175,7 +157,7 @@ spec:
             {{- /* The token file is mandatory here: the binary refuses to
                    serve Secret material on an unauthenticated endpoint. */}}
             - -scrape-auth-secrets=true
-            - -scrape-auth-token-file=/etc/kubescrape/scrape-auth/{{ $scrapeAuthKey }}
+            - -scrape-auth-token-file={{ include "kubescrape.scrapeAuthTokenPath" . }}
             {{- end }}
             {{- /* The OTLP output carries the service's own self-metrics push. */}}
             - -otlp-endpoint={{ .Values.service.otlp.endpoint }}
@@ -189,15 +171,18 @@ spec:
             {{- end }}
             - -otlp-timeout={{ .Values.service.otlp.timeout }}
             {{- if .Values.service.otlp.bearerTokenSecret.name }}
-            - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.service.otlp.bearerTokenSecret.key }}
+            - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.service.otlp.bearerTokenSecret.key | default "token" }}
             {{- end }}
             - -log-level={{ .Values.logLevel }}
             - -metrics-listen={{ if .Values.metrics.enabled }}{{ .Values.metrics.listen }}{{ end }}
             {{- with .Values.pprofListen }}
             - -pprof-listen={{ . }}
             {{- end }}
-            {{- range .Values.service.extraArgs }}
-            - {{ . }}
+            {{- /* toYaml, not `- {{ . }}`: a bare plain scalar turns "-x=a: b" into a
+                   MAP and silently truncates "-x=y #z" at the comment marker.
+                   The two singletons already rendered it this way. */}}
+            {{- with .Values.service.extraArgs }}
+            {{- toYaml . | nindent 12 }}
             {{- end }}
           {{- if or .Values.service.otlp.bearerTokenSecret.name .Values.service.scrapeAuthSecrets }}
           volumeMounts:
@@ -214,10 +199,10 @@ spec:
           {{- end }}
           ports:
             - name: http
-              containerPort: {{ (split ":" .Values.service.listen)._1 | int }}
+              containerPort: {{ include "kubescrape.port" .Values.service.listen | int }}
             {{- if .Values.metrics.enabled }}
             - name: metrics
-              containerPort: {{ (split ":" .Values.metrics.listen)._1 | int }}
+              containerPort: {{ include "kubescrape.port" .Values.metrics.listen | int }}
             {{- end }}
           readinessProbe:
             httpGet: {path: /readyz, port: http}
@@ -311,10 +296,10 @@ spec:
   ingress:
     # 1. The metadata API, plus /healthz, /readyz and /debug.
     - ports:
-        - port: {{ (split ":" .Values.service.listen)._1 | int }}
+        - port: {{ include "kubescrape.port" .Values.service.listen | int }}
     {{- if .Values.metrics.enabled }}
     # 2. The Prometheus scrape port.
     - ports:
-        - port: {{ (split ":" .Values.metrics.listen)._1 | int }}
+        - port: {{ include "kubescrape.port" .Values.metrics.listen | int }}
     {{- end }}
 {{- end }}

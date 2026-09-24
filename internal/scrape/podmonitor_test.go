@@ -8,6 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 func TestPodMonitorTargets(t *testing.T) {
@@ -34,8 +35,8 @@ func TestPodMonitorTargets(t *testing.T) {
 	}
 	// Endpoint auth/TLS/relabelings are stamped onto the target.
 	ts = PodMonitorTargets(pod, "ns/pm", servicemonitors.Endpoint{
-		Port: "metrics", Scheme: "https", InsecureSkipVerify: true,
-		BearerSecret: "ns/tok/token",
+		Port: "metrics", Scheme: "https",
+		ScrapeAuth: kubemeta.ScrapeAuth{InsecureSkipVerify: true, AuthSecret: "ns/tok/token"},
 		MetricRelabelings: []servicemonitors.RelabelRule{
 			{Action: "drop", SourceLabels: []string{"__name__"}, Regex: "go_.*"},
 		},
@@ -83,14 +84,19 @@ func TestEveryEndpointFieldReachesTheTarget(t *testing.T) {
 	v := reflect.ValueOf(&ep).Elem()
 	typ := v.Type()
 	want := map[string]string{} // field name -> sentinel
-	for i := range typ.NumField() {
-		f := typ.Field(i)
-		if f.Type.Kind() != reflect.String || notStampedVerbatim[f.Name] {
+	// VisibleFields on BOTH walks, not NumField: the auth/TLS strings are
+	// promoted from the embedded kubemeta.ScrapeAuth, and a top-level walk
+	// would stop at the struct and cover none of the credential refs.
+	for _, f := range reflect.VisibleFields(typ) {
+		if f.Anonymous || f.Type.Kind() != reflect.String || notStampedVerbatim[f.Name] {
 			continue
 		}
 		sentinel := "sentinel-" + f.Name
-		v.Field(i).SetString(sentinel)
+		v.FieldByIndex(f.Index).SetString(sentinel)
 		want[f.Name] = sentinel
+	}
+	if _, ok := want["AuthCredentials"]; !ok {
+		t.Fatal("the sweep did not reach the promoted auth/TLS strings")
 	}
 	ep.Path = "/sentinel-path"
 	ep.Scheme = "https"
@@ -104,9 +110,9 @@ func TestEveryEndpointFieldReachesTheTarget(t *testing.T) {
 	// Collect every string the target carries.
 	var carried []string
 	tv := reflect.ValueOf(got)
-	for i := range tv.NumField() {
-		if tv.Field(i).Kind() == reflect.String {
-			carried = append(carried, tv.Field(i).String())
+	for _, f := range reflect.VisibleFields(tv.Type()) {
+		if fv := tv.FieldByIndex(f.Index); !f.Anonymous && fv.Kind() == reflect.String {
+			carried = append(carried, fv.String())
 		}
 	}
 	haystack := strings.Join(carried, "\x00")

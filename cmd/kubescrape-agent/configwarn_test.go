@@ -1,13 +1,18 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
+	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailbuffer"
+	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
@@ -16,7 +21,8 @@ import (
 
 // withServiceGraph turns the trace tier on for the duration of a test: the
 // combination below only matters where traces are actually received, and
-// startServiceGraph already says so for every other workload.
+// the config summary's tierOnlySections line already says so for every other
+// workload.
 func withServiceGraph(t *testing.T) {
 	t.Helper()
 	old := *serviceGraphOn
@@ -86,6 +92,51 @@ func TestSupportedHeadTailCombinationIsSilent(t *testing.T) {
 	}); got != "" {
 		t.Fatalf("probability + maxSpansPerSecond below a tail sampler is supported and must be silent, got: %q", got)
 	}
+	// A cap-only section keeps every trace, so its (defaulted-on) guard rails
+	// have no dropped trace to rescue fragments of: naming keepErrors here
+	// would tell the operator to change a field with no effect.
+	if got := warnText(agentConfig{
+		TailSampling:  tailOnly(),
+		TraceSampling: &tracesample.Config{MaxSpansPerSecond: 5000}, // keepErrors UNSET
+	}); got != "" {
+		t.Fatalf("maxSpansPerSecond alone below a tail sampler drops no trace and must be silent, got: %q", got)
+	}
+}
+
+// A tier dimension list the aggregators will shorten must say so from
+// -check-config, not only from the start that shortens it: the constructors
+// were the only thing that warned, and they never run in a dry run.
+func TestDroppedTierDimensionsWarnFromADryRun(t *testing.T) {
+	withServiceGraph(t)
+	old := *spanMetrics
+	*spanMetrics = true
+	t.Cleanup(func() { *spanMetrics = old })
+
+	got := warnText(agentConfig{
+		ServiceGraph: &servicegraph.Config{Dimensions: []string{"http.route", "http.route", ""}},
+		TraceMetrics: &spanmetrics.Config{Dimensions: []string{"span.name", "http.route", "http.route"}},
+	})
+	for _, want := range []string{
+		`serviceGraph.dimensions[1] "http.route" is ignored: it repeats an earlier entry`,
+		`serviceGraph.dimensions[2] "" is ignored: it is empty`,
+		`traceMetrics.dimensions[0] "span.name" is ignored`,
+		`traceMetrics.dimensions[2] "http.route" is ignored: it repeats an earlier entry`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the dry run does not say %q:\n%s", want, got)
+		}
+	}
+
+	// Off the tier the sections are inert (and warned about as such); with
+	// -ingest-span-metrics off the generator is never built, so its list is
+	// not judged either.
+	*spanMetrics = false
+	if got := warnText(agentConfig{TraceMetrics: &spanmetrics.Config{Dimensions: []string{""}}}); strings.Contains(got, "traceMetrics.dimensions") {
+		t.Errorf("a traceMetrics list nothing will read was judged: %q", got)
+	}
+	if got := warnText(agentConfig{ServiceGraph: &servicegraph.Config{Dimensions: []string{"http.route"}}}); got != "" {
+		t.Errorf("a clean serviceGraph dimension list warned: %q", got)
+	}
 }
 
 // Either section alone is fine.
@@ -153,43 +204,50 @@ func TestNoCompositionWarningOffTheTraceTier(t *testing.T) {
 		t.Fatalf("a DaemonSet agent warned about composing two samplers it never runs: %q", got)
 	}
 	// What it DOES say is that each section is inert here, which is the report
-	// an operator running -check-config against the shared ConfigMap needs.
-	for _, want := range []string{
-		"traceSampling configured but ignored",
-		"tailSampling configured but ignored",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("missing %q in:\n%s", want, got)
-		}
+	// an operator running -check-config against the shared ConfigMap needs —
+	// once, at Info, in the config summary (TestTierOnlySectionsAreReportedIgnoredOffTheTier).
+	if got := tierOnlySections(agentConfig{TailSampling: tailOnly(), TraceSampling: &tracesample.Config{Probability: 0.1}}); strings.Join(got, ",") != "traceSampling,tailSampling" {
+		t.Errorf("tierOnlySections = %v, want both samplers reported inert", got)
 	}
 }
 
-// The four tier-only sections and -ingest-span-metrics are inert off the tier,
-// and the dry run has to say so: these warnings used to live in
+// The tier-only sections and -ingest-span-metrics are inert off the tier,
+// and the dry run has to say so: these reports used to live in
 // startServiceGraph, which -check-config returns before reaching, so CI read
-// `config is valid` for a ConfigMap whose sections this workload ignores and
-// the pod then printed five WARN lines saying it does. One list, both paths.
+// `config is valid` for a ConfigMap whose sections this workload ignores.
+//
+// The SECTIONS are reported once at INFO in the config summary, never as
+// warnings: the chart documents putting them into the one ConfigMap all three
+// workloads mount, so a correct deployment used to log four WARN lines per node
+// per start. The FLAG is on this workload's own command line, so it still warns.
 func TestTierOnlySectionsAreReportedIgnoredOffTheTier(t *testing.T) {
+	restoreSummaryFlags(t)
 	old, oldSM := *serviceGraphOn, *spanMetrics
 	*serviceGraphOn, *spanMetrics = false, true
 	t.Cleanup(func() { *serviceGraphOn, *spanMetrics = old, oldSM })
 
-	got := warnText(agentConfig{
+	cfg := agentConfig{
 		ServiceGraph:       &servicegraph.Config{},
 		ServiceGraphShards: &servicegraph.ReshardConfig{},
 		TailSampling:       tailOnly(),
 		TraceSampling:      &tracesample.Config{Probability: 0.1},
-	})
-	for _, want := range []string{
-		"serviceGraph configured but ignored",
-		"traceSampling configured but ignored",
-		"serviceGraphShards configured but ignored",
-		"tailSampling configured but ignored",
-		"-ingest-span-metrics ignored",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("missing %q in:\n%s", want, got)
+		TraceMetrics:       &spanmetrics.Config{},
+	}
+	got := warnText(cfg)
+	if !strings.Contains(got, "-ingest-span-metrics ignored") {
+		t.Errorf("the tier-only FLAG must still warn, got:\n%s", got)
+	}
+	for _, section := range []string{"serviceGraph", "serviceGraphShards", "traceSampling", "tailSampling", "traceMetrics"} {
+		if strings.Contains(got, section+" configured but ignored") {
+			t.Errorf("section %s in the shared ConfigMap is reported as a WARNING on every node:\n%s", section, got)
 		}
+	}
+	line := summaryLines(t, cfg)["tier-only config sections present; only the trace tier (-service-graph) reads them, so they are inert on this workload"]
+	if line == nil {
+		t.Fatal("the config summary does not report the inert tier-only sections")
+	}
+	if want := "serviceGraph,serviceGraphShards,traceSampling,tailSampling,traceMetrics"; line["sections"] != want {
+		t.Errorf("sections = %q, want %q", line["sections"], want)
 	}
 }
 
@@ -200,9 +258,86 @@ func TestTierOnlySectionsAreSilentOnTheTier(t *testing.T) {
 	*spanMetrics = true
 	t.Cleanup(func() { *spanMetrics = oldSM })
 
-	got := warnText(agentConfig{ServiceGraph: &servicegraph.Config{}, ServiceGraphShards: &servicegraph.ReshardConfig{}})
-	if strings.Contains(got, "configured but ignored") || strings.Contains(got, "-ingest-span-metrics ignored") {
+	cfg := agentConfig{ServiceGraph: &servicegraph.Config{}, ServiceGraphShards: &servicegraph.ReshardConfig{},
+		TraceMetrics: &spanmetrics.Config{}}
+	got := warnText(cfg)
+	if strings.Contains(got, "configured but ignored") || strings.Contains(got, "-ingest-span-metrics ignored") ||
+		strings.Contains(got, "configured but inert") {
 		t.Fatalf("the tier reported its own sections ignored: %q", got)
+	}
+	if inert := tierOnlySections(cfg); len(inert) != 0 {
+		t.Fatalf("the tier reported its own sections inert: %v", inert)
+	}
+}
+
+// traceMetrics is read by the span-metrics generator alone, which the tier
+// builds only under -ingest-span-metrics. On the tier WITHOUT that flag the
+// section derives nothing, and nothing said so — the one tier-only section
+// the reports above forgot.
+func TestTraceMetricsOnATierWithoutSpanMetricsWarns(t *testing.T) {
+	withServiceGraph(t)
+	oldSM := *spanMetrics
+	*spanMetrics = false
+	t.Cleanup(func() { *spanMetrics = oldSM })
+
+	got := warnText(agentConfig{TraceMetrics: &spanmetrics.Config{}})
+	for _, want := range []string{"traceMetrics configured but inert", "-ingest-span-metrics"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("warning %q does not name %q", got, want)
+		}
+	}
+	// No section, nothing to say.
+	if got := warnText(agentConfig{}); strings.Contains(got, "traceMetrics") {
+		t.Fatalf("warned about a traceMetrics section that is not configured: %q", got)
+	}
+}
+
+// Every config section is classified as tier-only or not, in ONE list the
+// report reads (tierOnly) — so a new section cannot be forgotten the way
+// traceMetrics was. Adding a section to agentConfig fails this test until it
+// is placed on one side, with a reason if it is tier-only.
+func TestEveryConfigSectionIsClassified(t *testing.T) {
+	everywhere := map[string]bool{
+		"resourceAttributes": true, "logs": true, "logAttributes": true, "logMetrics": true,
+		"metrics": true, "routing": true, "logScrubbing": true, "export": true,
+	}
+	tier := map[string]bool{}
+	for _, sec := range tierOnly {
+		tier[sec.name] = true
+	}
+	var sections []string
+	for _, name := range sectionNames() {
+		if name == "" {
+			continue
+		}
+		sections = append(sections, name)
+		switch {
+		case tier[name] && everywhere[name]:
+			t.Errorf("section %q is classified both ways", name)
+		case !tier[name] && !everywhere[name]:
+			t.Errorf("section %q is not classified: add it to tierOnly (configwarn.go) if only the trace tier reads it, or to this test's list if every workload may", name)
+		}
+	}
+	for name := range tier {
+		if !slices.Contains(sections, name) {
+			t.Errorf("tierOnly names %q, which is not an agentConfig section", name)
+		}
+	}
+	// And each tier-only entry's predicate recognises its own section, or the
+	// report silently skips it: a config carrying ALL of them must report all
+	// of them off the tier.
+	old := *serviceGraphOn
+	*serviceGraphOn = false
+	t.Cleanup(func() { *serviceGraphOn = old })
+	all := agentConfig{
+		ServiceGraph:       &servicegraph.Config{},
+		ServiceGraphShards: &servicegraph.ReshardConfig{},
+		TailSampling:       tailOnly(),
+		TraceSampling:      &tracesample.Config{Probability: 0.1},
+		TraceMetrics:       &spanmetrics.Config{},
+	}
+	if got := tierOnlySections(all); len(got) != len(tierOnly) {
+		t.Errorf("tierOnlySections(all tier-only sections) = %v, want all %d of them", got, len(tierOnly))
 	}
 }
 
@@ -298,7 +433,7 @@ func TestInertTraceSamplingSectionWarns(t *testing.T) {
 	// Silent shapes. A rate cap alone IS sampling (an overload valve), a
 	// fraction is the whole point, `probability: 1` is an honest explicit
 	// keep-everything, and off the tier the section is ignored wholesale — with
-	// startServiceGraph saying so once, per section.
+	// the config summary's tierOnlySections line saying so once, at Info.
 	for _, tc := range []struct {
 		name string
 		cfg  agentConfig
@@ -387,5 +522,99 @@ func TestLogAttributesIdentityWarningStaysResourceScoped(t *testing.T) {
 	}
 	if lg := warnText(attrRules("ns", "k8s.namespace.name", logattrs.TargetLog)); strings.Contains(lg, "RESOLVED-IDENTITY") {
 		t.Fatalf("a record-target lift of an identity key forges nothing and must not warn: %q", lg)
+	}
+}
+
+// A plain source that opts into the parse: hook while no hook is loaded ships
+// every line UNPARSED: startLogs wires the hook only when a transforms program
+// exists, and the wrapper answers "not parsed" when it defines no parse:. It
+// used to be silent everywhere — validateConfig accepted it, configWarnings
+// said nothing and a start logged nothing — while the sibling `type: script`
+// tail policy was cross-checked against HasSample. Driven through the real
+// compileConfig, so the program the report reads is the one a start compiles,
+// not a stand-in.
+func TestParseScriptSourceWithoutAParseHookWarns(t *testing.T) {
+	oldLogs := *logsOn
+	*logsOn = true
+	t.Cleanup(func() { *logsOn = oldLogs })
+
+	cfg := agentConfig{Logs: &tailer.SourcesConfig{Sources: []tailer.Source{
+		{Name: "app", Include: []string{"/var/log/app/*.log"}},
+		{Name: "build", Include: []string{"/var/log/build/*.log"}, ParseScript: true},
+	}}}
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	noParse := write("no-parse.yaml", "ingest: |\n  def admit(resource):\n      return True\n")
+	withParse := write("parse.yaml", "parse: |\n  def parse(line):\n      return None\n")
+
+	warnings := func(t *testing.T, transformsFile string) string {
+		t.Helper()
+		cc, err := compileConfig(cfg, transformsFile)
+		if err != nil {
+			t.Fatalf("compileConfig(%q): %v", transformsFile, err)
+		}
+		return strings.Join(parseScriptWarnings(cfg, cc.transforms.HasParse()), "\n")
+	}
+	for _, tc := range []struct{ name, file string }{
+		{"no -transforms-file", ""},
+		{"a transforms file with no parse: section", noParse},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := warnings(t, tc.file)
+			for _, want := range []string{`logs.sources[1] ("build")`, "parseScript", "no parse: hook", "unparsed"} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("warning %q does not name %q", got, want)
+				}
+			}
+			if strings.Contains(got, `"app"`) {
+				t.Fatalf("a source that did not opt in was reported: %q", got)
+			}
+		})
+	}
+	// Silent where the hook exists, and where nothing tails the sources.
+	if got := warnings(t, withParse); got != "" {
+		t.Fatalf("a loaded parse: hook still warned: %q", got)
+	}
+	*logsOn = false
+	if got := warnings(t, ""); got != "" {
+		t.Fatalf("a -logs=false workload warned about sources it never reads: %q", got)
+	}
+}
+
+// The no-persistence warning describes journald as much as the tailer —
+// journald has no cursor file of its own, so it resumes at the journal TAIL —
+// and it used to live inside startLogs, behind -logs, where a journald-only
+// agent could never be told.
+func TestPositionsWarningCoversJournald(t *testing.T) {
+	logs, journald, pos := *logsOn, *journaldOn, *positionsFile
+	t.Cleanup(func() { *logsOn, *journaldOn, *positionsFile = logs, journald, pos })
+
+	*logsOn, *journaldOn, *positionsFile = false, true, ""
+	got := strings.Join(configWarnings(agentConfig{}), "\n")
+	if !strings.Contains(got, "-positions-file") || !strings.Contains(got, "journal") {
+		t.Fatalf("a journald-only agent with no positions file was not told it starts at the tail: %q", got)
+	}
+
+	// The tailer's half still warns...
+	*logsOn, *journaldOn = true, false
+	if got := strings.Join(configWarnings(agentConfig{}), "\n"); !strings.Contains(got, "-positions-file") {
+		t.Fatalf("a tailing agent with no positions file was not warned: %q", got)
+	}
+
+	// ...and neither pipeline has offsets to lose, or the file is configured.
+	*logsOn, *journaldOn = false, false
+	if got := strings.Join(configWarnings(agentConfig{}), "\n"); strings.Contains(got, "-positions-file") {
+		t.Fatalf("warned about persistence with nothing that persists offsets: %q", got)
+	}
+	*logsOn, *journaldOn, *positionsFile = true, true, "/var/lib/kubescrape/positions.json"
+	if got := strings.Join(configWarnings(agentConfig{}), "\n"); strings.Contains(got, "-positions-file") {
+		t.Fatalf("warned about a positions file that IS configured: %q", got)
 	}
 }

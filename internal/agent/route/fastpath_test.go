@@ -30,7 +30,7 @@ func (d *noopDest) ExportMetrics(context.Context, pmetric.Metrics) error { d.n++
 // node / cadvisor-rollup shape).
 func defaultLogs(n int) plog.Logs {
 	ld := plog.NewLogs()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		rl := ld.ResourceLogs().AppendEmpty()
 		if i%2 == 0 {
 			rl.Resource().Attributes().PutStr("k8s.namespace.name", "unrouted-"+strconv.Itoa(i))

@@ -78,6 +78,13 @@ func main() {
 		Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01},
 	})
 
+	// The exemplar-bearing child, bound once. The assertion is UNCHECKED on
+	// purpose: every client_golang counter child implements ExemplarAdder, and
+	// if that ever stops being true a fixture whose job is to emit exemplars
+	// must crash at startup rather than quietly stop emitting them.
+	ok200 := counter.WithLabelValues("200").(prometheus.ExemplarAdder)
+	exemplar := prometheus.Labels{"trace_id": "abcdef0123456789abcdef0123456789"}
+
 	go func() {
 		r := rand.New(rand.NewSource(1))
 		for i := 0; ; i++ {
@@ -90,13 +97,7 @@ func main() {
 			classic.Observe(v)
 			// Exemplars ride the protobuf exposition too, under the same
 			// -scrape-exemplars gate as the text path.
-			if o, ok := counter.WithLabelValues("200").(prometheus.ExemplarAdder); ok {
-				o.AddWithExemplar(1, prometheus.Labels{
-					"trace_id": "abcdef0123456789abcdef0123456789",
-				})
-			} else {
-				counter.WithLabelValues("200").Inc()
-			}
+			ok200.AddWithExemplar(1, exemplar)
 			if i%17 == 0 {
 				counter.WithLabelValues("500").Inc()
 			}
@@ -111,8 +112,10 @@ func main() {
 	if os.Getenv("FORCE_PROTO") == "1" {
 		// A MISBEHAVING target: answer protobuf whatever the scraper asked
 		// for. This is the shape the agent must refuse when the operator did
-		// not enable -scrape-native-histograms — the decode is unbounded and
-		// gzip-amplified, and the TARGET must not get to choose it.
+		// not enable -scrape-native-histograms — the decode materialises each
+		// message whole (up to promscrape's 4 MiB per-message cap, decoding
+		// to many times that in heap) and is gzip-amplified, and the TARGET
+		// must not get to choose it.
 		http.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			r.Header.Set("Accept", "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited")
 			inner.ServeHTTP(w, r)

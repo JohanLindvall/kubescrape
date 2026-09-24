@@ -89,7 +89,7 @@ func assertCappedDocument(t *testing.T, s *Server, doc explainDoc, wantCapped in
 // accumulator refuses four of the Service's.
 func TestExplainNamesTheServicePortsTheCeilingRefused(t *testing.T) {
 	var podPorts, svcPorts []string
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		podPorts = append(podPorts, strconv.Itoa(9000+i))
 		svcPorts = append(svcPorts, strconv.Itoa(9100+i))
 	}
@@ -200,7 +200,7 @@ func newMonitorIndex(t *testing.T, name string, eps []any) *servicemonitors.Inde
 func TestExplainNamesTheMonitorEndpointsTheCeilingRefused(t *testing.T) {
 	const endpoints = 20
 	eps := make([]any, 0, endpoints)
-	for i := 0; i < endpoints; i++ {
+	for i := range endpoints {
 		eps = append(eps, map[string]any{"port": "http", "path": "/m" + strconv.Itoa(i)})
 	}
 	s, srv := capFixture(t, nil, monitorSelectedService(), newMonitorIndex(t, "sm-many", eps))
@@ -230,7 +230,7 @@ func TestExplainNamesTheMonitorEndpointsTheCeilingRefused(t *testing.T) {
 func TestExplainNamesThePodMonitorEndpointsTheCeilingRefused(t *testing.T) {
 	const endpoints = 20
 	eps := make([]any, 0, endpoints)
-	for i := 0; i < endpoints; i++ {
+	for i := range endpoints {
 		eps = append(eps, map[string]any{"port": "metrics", "path": "/pm" + strconv.Itoa(i)})
 	}
 	monitors := servicemonitors.NewIndex()

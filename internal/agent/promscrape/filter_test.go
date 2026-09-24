@@ -38,6 +38,34 @@ func LoadMetricsConfig(path string) (*MetricFilters, []*Splitter, error) {
 	return filters, splitters, nil
 }
 
+// keepReference is the unmemoized definition of a filter's verdict — the rules
+// in order, the first whose name regex and label matchers all accept the series
+// deciding, a series no rule matches kept — which the memoizing session must
+// agree with. It lives here and not in filter.go because no pipeline runs it:
+// every one filters through session(), and a production copy was a second,
+// unexercised spelling of first-match-wins. Safe on a nil filter.
+func keepReference(f *MetricFilter, name string, labels []Label) bool {
+	if f == nil {
+		return true
+	}
+	for _, r := range f.rules {
+		if r.name != nil && !r.name.MatchString(name) {
+			continue
+		}
+		matched := true
+		for _, m := range r.labels {
+			if !m.re.MatchString(labelValue(labels, m.name)) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return !r.drop
+		}
+	}
+	return true
+}
+
 func mustFilters(t *testing.T, pipelines map[string][]FilterRule) *MetricFilters {
 	t.Helper()
 	f, err := NewMetricFilters(pipelines)
@@ -59,7 +87,7 @@ func TestMetricFilterRules(t *testing.T) {
 		},
 	})
 
-	targets := f.filterFor(pipelineTargets)
+	targets := f.filterFor(pipelineTargets).session()
 	cases := []struct {
 		name   string
 		labels []Label
@@ -77,7 +105,7 @@ func TestMetricFilterRules(t *testing.T) {
 		}
 	}
 
-	cad := f.filterFor(pipelineCadvisor)
+	cad := f.filterFor(pipelineCadvisor).session()
 	if !cad.Keep("container_network_receive_bytes_total", []Label{{Name: "interface", Value: "eth0"}}) {
 		t.Error("eth0 network series must survive")
 	}
@@ -115,6 +143,39 @@ func TestMetricFilterValidation(t *testing.T) {
 	}
 }
 
+// Every scrape pipeline in filterPipelineNames is registered by the list alone:
+// a rule under its name reaches filterFor(name), and reaches NO other
+// pipeline. The second half is the regression that storing only the non-nil
+// filters would introduce — filterFor falls back to the targets filter for a
+// name it has no entry for, so a targets-only drop would silently apply to
+// cadvisor, node and summary as well.
+func TestEveryFilterPipelineGetsOnlyItsOwnRules(t *testing.T) {
+	for _, p := range filterPipelineNames {
+		if p == filterAllPipeline {
+			continue
+		}
+		f := mustFilters(t, map[string][]FilterRule{p: {{Action: "drop", Metrics: `probe_.+`}}})
+		for _, q := range filterPipelineNames {
+			if q == filterAllPipeline {
+				continue
+			}
+			kept := f.filterFor(q).session().Keep("probe_total", nil)
+			if q == p && kept {
+				t.Errorf("a %q rule does not reach filterFor(%q): the name is listed but never compiled", p, q)
+			}
+			if q != p && !kept {
+				t.Errorf("a %q-only drop rule was applied to the %q pipeline", p, q)
+			}
+		}
+	}
+	// The concrete shape of the regression: a targets-only rule, cadvisor's
+	// own series.
+	f := mustFilters(t, map[string][]FilterRule{pipelineTargets: {{Action: "drop", Metrics: `container_.+`}}})
+	if !f.filterFor(pipelineCadvisor).session().Keep("container_cpu_usage_seconds_total", nil) {
+		t.Error("a targets-only drop rule was applied to the cadvisor pipeline")
+	}
+}
+
 func TestLoadMetricsConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "metrics.yaml")
 	if err := os.WriteFile(path, []byte(`
@@ -136,7 +197,7 @@ splitters:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if f.filterFor(pipelineTargets).Keep("go_threads", nil) {
+	if f.filterFor(pipelineTargets).session().Keep("go_threads", nil) {
 		t.Fatal("go_threads must be dropped")
 	}
 	if len(sp) != 1 {
@@ -177,8 +238,8 @@ func TestScrapeWithFilter(t *testing.T) {
 	}
 }
 
-// The memoizing session must agree with the direct Keep on ordering and
-// label-conditional rules, including repeated names (the cached path).
+// The memoizing session must agree with the unmemoized reference on ordering
+// and label-conditional rules, including repeated names (the cached path).
 func TestFilterSession(t *testing.T) {
 	f, err := newMetricFilter([]FilterRule{
 		{Action: "keep", Metrics: "container_network_.+", Labels: map[string]string{"interface": "eth0"}},
@@ -205,8 +266,8 @@ func TestFilterSession(t *testing.T) {
 		if got := fs.Keep(c.name, c.labels); got != c.want {
 			t.Errorf("session Keep(%q, %v) = %v, want %v", c.name, c.labels, got, c.want)
 		}
-		if got := f.Keep(c.name, c.labels); got != c.want {
-			t.Errorf("direct Keep(%q, %v) = %v, want %v", c.name, c.labels, got, c.want)
+		if got := keepReference(f, c.name, c.labels); got != c.want {
+			t.Errorf("reference Keep(%q, %v) = %v, want %v", c.name, c.labels, got, c.want)
 		}
 	}
 

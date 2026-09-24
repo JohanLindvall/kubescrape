@@ -1,7 +1,9 @@
 package cumagg
 
 import (
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -108,9 +110,16 @@ func truncLen(v string) int {
 // half-edge waiting for its partner. The slice Trunc returns still points into
 // the sender's string, so retaining it pins the whole thing — a 4 MiB span name
 // held for staleAfter by a 256-byte label, which is precisely the bound
-// MaxLabelBytes claims to provide and did not. Cloning only on the truncating
-// branch leaves the ordinary short value allocation-free, and this runs once per
-// ADMITTED series, never per span.
+// MaxLabelBytes claims to provide and did not.
+//
+// It clones only on the truncating branch, so an ordinary value costs a length
+// compare and nothing else. Call it where a value is actually KEPT, not on the
+// way past: a newly admitted series' labels (once per series), a half-edge the
+// pairing store holds for a Wait, and servicegraph's service name (once per
+// RESOURCE per push, shared by every half-edge that resource's spans store). A
+// value that is only consumed — a key part, or the arriving half that completes
+// a pair and is emitted on the spot — takes Trunc, and cloning it there would
+// allocate per span for a string that is dropped at once.
 func Retain(v string) string {
 	if len(v) <= MaxLabelBytes {
 		return v
@@ -118,12 +127,137 @@ func Retain(v string) string {
 	return strings.Clone(v[:truncLen(v)])
 }
 
-// AttrStr is an attribute's value as a string, or "" when it is absent.
+// AttrStr is an attribute's value as a string (ValueStr), or "" when it is
+// absent.
 func AttrStr(m pcommon.Map, key string) string {
 	if v, ok := m.Get(key); ok {
-		return v.AsString()
+		return ValueStr(v)
 	}
 	return ""
+}
+
+// DimValue resolves one configured dimension: the span attribute first, the
+// resource attribute as the fallback, and ok=false when neither is set. A span
+// attribute that RENDERS empty (see rendersEmpty) falls through to the
+// resource, exactly as comparing AttrStr to "" would.
+//
+// It is the ONE spelling of that precedence for both aggregators — a deliberate
+// divergence from Tempo, which reads the resource first, and one the two had to
+// agree on without anything tying them together: spanmetrics' key loop and
+// label loop, and servicegraph's per-half dimensions, were three copies of it.
+// Within spanmetrics a drift between the copies would make a series' KEY
+// disagree with the labels it RENDERS (distinct tuples merging into one label
+// set, or one tuple rendering two). It returns the Value rather than its string
+// so a key can append it without materializing it (AppendValueKeyPart); DimStr
+// is the rendered form.
+func DimValue(spanAttrs, resAttrs pcommon.Map, key string) (pcommon.Value, bool) {
+	if v, ok := spanAttrs.Get(key); ok && !rendersEmpty(v) {
+		return v, true
+	}
+	return resAttrs.Get(key)
+}
+
+// DimStr is DimValue's label value, "" when neither the span nor the resource
+// sets it.
+func DimStr(spanAttrs, resAttrs pcommon.Map, key string) string {
+	if v, ok := DimValue(spanAttrs, resAttrs, key); ok {
+		return ValueStr(v)
+	}
+	return ""
+}
+
+// rendersEmpty reports whether v.AsString() is "", without calling it: an empty
+// value, an empty string, or empty bytes (base64 of nothing). Every other type
+// renders something — a number, a bool, and even an empty map or slice ("{}",
+// "[]") — so TestRendersEmptyIsAsStringEmpty holds it to AsString for all of
+// them.
+func rendersEmpty(v pcommon.Value) bool {
+	switch v.Type() {
+	case pcommon.ValueTypeEmpty:
+		return true
+	case pcommon.ValueTypeStr:
+		return v.Str() == ""
+	case pcommon.ValueTypeBytes:
+		return v.Bytes().Len() == 0
+	}
+	return false
+}
+
+// ValueStr is v.AsString() — byte for byte, so a key or label built from either
+// is the same one — without the heap allocation AsString makes for the Int an
+// operator most often configures as a dimension.
+//
+// pdata renders an Int through strconv.FormatInt, which serves 0-99 from a
+// static table and ALLOCATES for everything else, so an HTTP or gRPC status
+// code dimension (http.response.status_code=200) cost one allocation per span
+// in spanmetrics and one per half-edge in servicegraph, on the two receive
+// paths whose budget tests assert zero — tests whose fixtures only ever set
+// string attributes, which is why they never saw it. [0, smallInts) is served
+// from a table of static strings instead. That is also what makes it free where
+// the value is RETAINED (servicegraph holds a half-edge's dimensions for a
+// Wait): a table entry pins nothing. Every other type and range falls through
+// to AsString — Bool is already allocation-free there (FormatBool returns
+// constants), and pdata's Double formatting is internal to pcommon and not
+// worth re-deriving at the risk of a key that disagrees with its label.
+func ValueStr(v pcommon.Value) string {
+	switch v.Type() {
+	case pcommon.ValueTypeStr:
+		return v.Str()
+	case pcommon.ValueTypeInt:
+		if n := v.Int(); n >= 0 && n < smallInts {
+			return smallIntStrs()[n]
+		}
+	}
+	return v.AsString()
+}
+
+// smallInts bounds ValueStr's table: every HTTP status code, every gRPC status
+// code and every well-known port.
+const smallInts = 1000
+
+// smallIntStrs is ValueStr's table, built on first use so an importer that
+// never renders an Int attribute pays nothing for it. The entries are slices of
+// ONE backing string, so building it is a few allocations in the process' life
+// rather than one per entry.
+var smallIntStrs = sync.OnceValue(func() *[smallInts]string {
+	var ends [smallInts]int
+	buf := make([]byte, 0, 3*smallInts)
+	for n := range smallInts {
+		buf = strconv.AppendInt(buf, int64(n), 10)
+		ends[n] = len(buf)
+	}
+	t := new([smallInts]string)
+	all, start := string(buf), 0
+	for n, end := range ends {
+		t[n] = all[start:end]
+		start = end
+	}
+	return t
+})
+
+// AppendValueKeyPart appends v as one key part: exactly
+// AppendKeyPart(dst, Trunc(v.AsString())), byte for byte, so a key built from
+// the Value and the label rendered from its string (ValueStr, cut by Retain)
+// stay one function of the attribute — a key finer or coarser than its label is
+// a duplicate series or a merged one. What it adds is that nothing is
+// materialized on the way: an Int is formatted into a stack buffer at ANY
+// magnitude, where ValueStr's table covers only small ones, so a key-only path
+// (spanmetrics' per-span series key) pays nothing for an Int dimension of any
+// value. TestAppendValueKeyPartMatchesTheRenderedString pins the equality for
+// every value type.
+func AppendValueKeyPart(dst []byte, v pcommon.Value) []byte {
+	switch v.Type() {
+	case pcommon.ValueTypeStr:
+		return AppendKeyPart(dst, Trunc(v.Str()))
+	case pcommon.ValueTypeInt:
+		var digits [20]byte // len("-9223372036854775808")
+		d := strconv.AppendInt(digits[:0], v.Int(), 10)
+		// AppendKeyPart's uvarint length prefix, which for a length under 0x80
+		// is the length itself in one byte — and an int64 is at most 20 digits.
+		dst = append(dst, byte(len(d)))
+		return append(dst, d...)
+	}
+	return AppendKeyPart(dst, Trunc(ValueStr(v)))
 }
 
 // SpanSeconds is a span's own measured duration. An unset or clock-skewed end

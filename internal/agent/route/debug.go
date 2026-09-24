@@ -20,7 +20,6 @@ package route
 import (
 	"context"
 	"log/slog"
-	"path"
 	"strconv"
 	"strings"
 
@@ -54,58 +53,29 @@ func (r *Router) debugEnabled() bool {
 	return r.logger().Enabled(context.Background(), slog.LevelDebug)
 }
 
-// why re-derives one resource's routing verdict for the narration. It
-// deliberately does NOT call match: match's reporting arm counts
-// obs.RouteUnknown and warns, and an explanation must never move an operator's
-// counters or duplicate their warnings.
+// explainExport narrates one export's routing. groups and whole are split's
+// answer: groups is nil on the uncopied fast path (where no group slice was
+// ever built), which forwards the whole payload to whole — a route index, or
+// -1 for the default chain.
 //
-// idx is the destination index (-1 = default), reason names the branch taken,
-// and ns/pat are whatever the branch had to show for itself.
-func (r *Router) why(res pcommon.Resource) (idx int, ns, pat, reason string) {
-	attrs := res.Attributes()
-	if v, ok := attrs.Get(ScriptMarker); ok {
-		want := v.Str()
-		for i, d := range r.dests {
-			if d.Name == want {
-				return i, "", "", "scriptMarker"
-			}
-		}
-		return -1, "", "", "scriptMarkerNamesNoRoute"
-	}
-	v, ok := attrs.Get(namespaceAttr)
-	if !ok {
-		// The commonest surprise, and the one a counter cannot distinguish: the
-		// self-metrics, node and cadvisor-rollup resources carry no namespace at
-		// all, so they can only ever be default — routing them needs a
-		// script marker, not another glob.
-		return -1, "", "", "noNamespaceAttribute"
-	}
-	ns = v.Str()
-	for i, d := range r.dests {
-		for _, p := range d.Namespaces {
-			if ok, _ := path.Match(p, ns); ok {
-				return i, ns, p, "namespaceGlob"
-			}
-		}
-	}
-	return -1, ns, "", "noGlobMatched"
-}
-
-// explainExport narrates one export's routing. groups is split's answer, or nil
-// for the all-default fast path (where no group slice was ever built).
-//
-// The counts come from the SAME derivation the samples do, so the line cannot
-// claim a split the router did not take.
-func (r *Router) explainExport(signal string, n int, res func(int) pcommon.Resource, groups []int) {
+// The counts (routed, defaulted, byRoute) are split's OWN answer — groups[i],
+// or whole for every resource on the fast path — so the line cannot claim a
+// split the router did not take. The reasons and the worked examples come from
+// decide, the one derivation split's match also runs, asked to narrate.
+func (r *Router) explainExport(signal string, n int, res func(int) pcommon.Resource, groups []int, whole int) {
 	var (
 		byRoute  = make([]int, len(r.dests))
 		reasons  = map[string]int{}
 		samples  []string
 		def, rtd int
 	)
-	for i := 0; i < n; i++ {
-		idx, ns, pat, reason := r.why(res(i))
-		reasons[reason]++
+	for i := range n {
+		v := r.decide(res(i).Attributes(), true)
+		idx := whole
+		if groups != nil {
+			idx = groups[i]
+		}
+		reasons[v.reason]++
 		if idx >= 0 {
 			byRoute[idx]++
 			rtd++
@@ -113,7 +83,7 @@ func (r *Router) explainExport(signal string, n int, res func(int) pcommon.Resou
 			def++
 		}
 		if len(samples) < debugSamples {
-			samples = append(samples, sample(r.destName(idx), ns, pat, reason))
+			samples = append(samples, sample(r.destName(idx), v.ns, v.pat, v.reason))
 		}
 	}
 	args := []any{
@@ -135,7 +105,12 @@ func (r *Router) explainExport(signal string, n int, res func(int) pcommon.Resou
 	if groups == nil {
 		// Said explicitly: the fast path forwards the caller's payload
 		// UNCOPIED, so an operator reading this line knows no split happened at
-		// all — not merely that every group happened to be the default one.
+		// all — not merely that every group happened to go to one place.
+		if whole >= 0 {
+			args = append(args, "route", r.destName(whole))
+			r.logger().Debug("routing sent this whole export to one route (no split, no copy)", args...)
+			return
+		}
 		r.logger().Debug("routing sent this whole export to the default chain (no split)", args...)
 		return
 	}
@@ -166,7 +141,7 @@ func sample(dest, ns, pat, reason string) string {
 // consecutive lines can be compared by eye (and by a test) rather than
 // re-shuffled by map iteration.
 func reasonOrder(m map[string]int) []string {
-	all := []string{"scriptMarker", "namespaceGlob", "noGlobMatched", "noNamespaceAttribute", "scriptMarkerNamesNoRoute"}
+	all := []string{reasonScriptMarker, reasonNamespaceGlob, reasonNoGlobMatched, reasonNoNamespace, reasonMarkerNamesNoRoute}
 	out := make([]string, 0, len(m))
 	for _, k := range all {
 		if m[k] > 0 {

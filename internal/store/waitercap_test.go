@@ -30,8 +30,7 @@ import (
 func TestTheDefaultCapIsTheCapTheStoreApplies(t *testing.T) {
 	s := New(time.Minute)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	// Distinct, well-formed IDs no upsert will ever supply: each parks on its
 	// own waiter, and cancelling the context at the end releases them all.
 	for i := range DefaultMaxWaiters {
@@ -71,8 +70,7 @@ func TestTheDefaultCapIsTheCapTheStoreApplies(t *testing.T) {
 // exceeded by exactly the number of lookups sitting in the other spot.
 func TestTheTwoParkingSpotsShareOneBudget(t *testing.T) {
 	t.Run("an external park denies a waiter", func(t *testing.T) {
-		s := New(time.Minute)
-		s.SetMaxWaiters(2)
+		s := New(time.Minute, WithMaxWaiters(2))
 		for i := range 2 {
 			if !s.TryPark() {
 				t.Fatalf("external park %d refused below the cap of 2", i)
@@ -107,10 +105,8 @@ func TestTheTwoParkingSpotsShareOneBudget(t *testing.T) {
 	})
 
 	t.Run("a waiter denies an external park", func(t *testing.T) {
-		s := New(time.Minute)
-		s.SetMaxWaiters(1)
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+		s := New(time.Minute, WithMaxWaiters(1))
+		ctx := t.Context()
 		go func() { _, _, _ = s.GetContainer(ctx, fmt.Sprintf("%064x", 1)) }()
 		deadline := time.Now().Add(10 * time.Second)
 		for s.BlockedLookups() < 1 {
@@ -131,16 +127,14 @@ func TestTheTwoParkingSpotsShareOneBudget(t *testing.T) {
 	})
 }
 
-// The cap is settable, and a Store built by New starts at the default. This is
-// the wiring -max-blocked-lookups rides on; without it the documented knob would
-// be a flag that changes nothing.
-func TestNewStoreStartsAtTheDefaultCapAndSetOverridesIt(t *testing.T) {
-	s := New(0)
-	if s.maxWaiters != DefaultMaxWaiters {
+// The cap is settable at construction, and a Store built without the option
+// starts at the default. This is the wiring -max-blocked-lookups rides on;
+// without it the documented knob would be a flag that changes nothing.
+func TestNewStoreStartsAtTheDefaultCapAndTheOptionOverridesIt(t *testing.T) {
+	if s := New(0); s.maxWaiters != DefaultMaxWaiters {
 		t.Fatalf("New store maxWaiters = %d, want DefaultMaxWaiters = %d", s.maxWaiters, DefaultMaxWaiters)
 	}
-	s.SetMaxWaiters(DefaultMaxWaiters * 3)
-	if s.maxWaiters != DefaultMaxWaiters*3 {
-		t.Fatalf("after SetMaxWaiters, maxWaiters = %d, want %d", s.maxWaiters, DefaultMaxWaiters*3)
+	if s := New(0, WithMaxWaiters(DefaultMaxWaiters*3)); s.maxWaiters != DefaultMaxWaiters*3 {
+		t.Fatalf("New with WithMaxWaiters: maxWaiters = %d, want %d", s.maxWaiters, DefaultMaxWaiters*3)
 	}
 }

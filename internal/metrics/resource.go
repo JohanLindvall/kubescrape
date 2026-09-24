@@ -55,9 +55,10 @@ func (l labels) resAccum() xxh3.Uint128 {
 // It is otlpingest's maxObservedResourceAttrs because that is where the one
 // BOUNDED wire path stops observing at all: nothing arriving through the
 // ingest LOG chain can pay the fallback. It is NOT a bound on what reaches
-// this store. The unbounded door is EmitDirect — a transform script's
+// this store. The widest door is EmitDirect — a transform script's
 // emit_metric folding the SENDER's own resource at whatever width the sender
-// chose, with nothing between the two that caps or dedupes it; resourceAccum
+// chose up to the 1024 attributes past which emit_metric skips the observation
+// (transform's maxEmitResourceAttrs), with nothing that dedupes it; resourceAccum
 // documents it, because the same door is why that fold had to become total.
 // It is the reason this is a fallback and not a refusal.
 //
@@ -118,12 +119,14 @@ const resourceIdentityAttrs = 64
 // THE DOOR IT REACHES THIS STORE THROUGH IS EmitDirect: a transform script's
 // emit_metric folds whatever resource the payload in front of it carries, and
 // for an ingested METRICS or TRACES push that is the SENDER's own — at
-// whatever width, with whatever repeated keys, the sender chose. otlpingest's
+// whatever width up to emit_metric's 1024-attribute skip, with whatever
+// repeated keys, the sender chose. otlpingest's
 // dedupeResourceKeys does NOT cover it: that runs on the LOG chain only, and
 // there only for a resource narrow enough to be OBSERVED, since it sits behind
 // the same 64-attribute cap — so the widest resources are precisely the ones
-// it skips. Hence a resource arriving here can be undeduped AND unbounded in
-// width, which is why resourceIdentityAttrs is a fallback and not a refusal.
+// it skips. Hence a resource arriving here can be undeduped AND sixteen times
+// wider than 64, which is why resourceIdentityAttrs is a fallback and not a
+// refusal.
 // Every other producer hands over a resource built from a Go map, which cannot
 // repeat a key.
 //

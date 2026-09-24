@@ -79,6 +79,15 @@ type PollConfig[T any] struct {
 	// different fix.
 	What string
 	Log  *slog.Logger
+	// After, when non-nil, holds the FIRST lookup until it is closed (or the
+	// context ends). It is for a resolver whose answer cannot exist yet when
+	// Poll is started — the metadata service reads its own pod out of a store
+	// the informers have not filled — where the first attempt is a miss by
+	// construction: a Warn, an error-outcome lookup and a recovery line on
+	// every clean start, all of them describing nothing but startup order.
+	// nil starts at once (the agent's lookups, whose answer is another
+	// process's to give).
+	After <-chan struct{}
 	// stopped, when non-nil, is closed once the background resolver has
 	// exited. Unexported because only this package's tests set it: production
 	// stops a resolver by cancelling its context and never waits for it, while
@@ -115,12 +124,10 @@ func Poll[T any](ctx context.Context, resolve func(context.Context) (*T, error),
 		what = fmt.Sprintf("%T", zero)
 	}
 	var current atomic.Pointer[T]
-	var failures atomic.Int64
-	// firstFailure is when the current run of failures began, so the recovery
-	// line can say how long the value was stale. Only the resolver goroutine
-	// touches it (fetch runs nowhere else), so it needs no synchronization.
-	var firstFailure time.Time
-	var reWarn logdedupe.Throttle
+	// outage is the current run of failed lookups, so the recovery line can
+	// say how long the value was stale. Only the resolver goroutine touches it
+	// (fetch runs nowhere else), so it needs no synchronization.
+	var outage logdedupe.Outage
 	if cfg.Initial != nil {
 		current.Store(cfg.Initial)
 	}
@@ -145,34 +152,30 @@ func Poll[T any](ctx context.Context, resolve func(context.Context) (*T, error),
 			// indistinguishable from a resolution that later succeeded, and
 			// this lookup is the one whose failure has no other symptom than
 			// missing attributes on somebody else's dashboard.
-			switch n := failures.Add(1); {
-			case n == 1:
-				firstFailure = time.Now()
-				reWarn.Allow(reWarnInterval) // claim the slot the Warn below occupies
+			now := time.Now()
+			switch first, loud := outage.Fail(now, reWarnInterval); {
+			case first:
 				log.Warn("resolving "+what+" failed; retrying", "error", err)
-			case reWarn.Allow(reWarnInterval):
+			case loud:
 				log.Warn("resolving "+what+" is still failing", "error", err,
-					"attempts", n, "since", time.Since(firstFailure).Round(time.Second))
+					"failures", outage.Failures(), "outage", outage.Lasted(now))
 			default:
 				log.Debug("resolving "+what, "error", err)
 			}
 			return nil
 		}
-		if n := failures.Load(); n > 0 {
-			// The RECOVERY, which had no line at all: a warn that simply stops
-			// says nothing, and the value it stamps had been stale for the
-			// whole outage.
-			log.Info("resolving "+what+" succeeded again", "attempts", n,
-				"since", time.Since(firstFailure).Round(time.Second))
+		// The RECOVERY, which had no line at all: a warn that simply stops
+		// says nothing, and the value it stamps had been stale for the whole
+		// outage. Recover also ends the run, so the FIRST failure of each NEW
+		// outage is a Warn again — latched, every outage after the first was
+		// Debug-only, and a process that resolved once at startup and then
+		// could not re-resolve (a recycled pod IP, a store that dropped the
+		// record, an RBAC change) went on stamping stale pod labels with
+		// nothing above Debug to say so.
+		if n, lasted, ok := outage.Recover(time.Now()); ok {
+			log.Info("resolving "+what+" succeeded again", "failures", n, "outage", lasted)
 		}
 		current.Store(v)
-		// Reset, so the FIRST failure of each NEW outage is a Warn again.
-		// Latched, this counter made every outage after the first Debug-only:
-		// a process that resolved once at startup and then could not
-		// re-resolve — a recycled pod IP, a store that dropped the record, an
-		// RBAC change — went on reporting resolved=1 and stamping stale pod
-		// labels with nothing above Debug to say so.
-		failures.Store(0)
 		return v
 	}
 	// Read on the CALLER's goroutine, not inside the resolver: the resolver
@@ -183,6 +186,13 @@ func Poll[T any](ctx context.Context, resolve func(context.Context) (*T, error),
 	go func() {
 		if cfg.stopped != nil {
 			defer close(cfg.stopped)
+		}
+		if cfg.After != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-cfg.After:
+			}
 		}
 		var v *T
 		for backoff := first; ; backoff = min(backoff*2, cfg.Refresh) {
@@ -224,10 +234,19 @@ func Poll[T any](ctx context.Context, resolve func(context.Context) (*T, error),
 // match at all — but it is the thing to look at if the attributes ever look
 // like someone else's.
 func StartPod(ctx context.Context, resolve func(context.Context) (*kubemeta.Pod, error), refresh time.Duration, log *slog.Logger) func() *kubemeta.Pod {
+	return StartPodAfter(ctx, resolve, refresh, nil, log)
+}
+
+// StartPodAfter is StartPod whose first lookup waits for after to close (see
+// PollConfig.After) — for a process whose own pod reaches the resolver's source
+// only after Poll starts. A nil after is StartPod.
+func StartPodAfter(ctx context.Context, resolve func(context.Context) (*kubemeta.Pod, error), refresh time.Duration, after <-chan struct{}, log *slog.Logger) func() *kubemeta.Pod {
 	if log == nil {
 		log = slog.Default()
 	}
-	return Poll(ctx, resolve, podPollConfig(refresh, log))
+	cfg := podPollConfig(refresh, log)
+	cfg.After = after
+	return Poll(ctx, resolve, cfg)
 }
 
 // podPollConfig is StartPod's Poll configuration, extracted so a test can run

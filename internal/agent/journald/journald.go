@@ -20,28 +20,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
-	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/backoff"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
-	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
-	"github.com/JohanLindvall/kubescrape/internal/clip"
+	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
-	"github.com/JohanLindvall/kubescrape/internal/logline"
-	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
-
-// ScopeName is the OTLP instrumentation-scope name on every journal record
-// (wire-visible: Loki/Elastic see it as a label, so changing it splits every
-// journal stream at the upgrade boundary).
-const ScopeName = "github.com/JohanLindvall/kubescrape/agent/journald"
 
 // LogExporter sends one OTLP logs payload.
 type LogExporter interface {
@@ -57,7 +46,9 @@ type Config struct {
 	// empty reads everything.
 	Units []string
 	// Positions persists the last exported cursor across restarts (nil = no
-	// persistence; every start then begins at the tail).
+	// persistence; every start then begins at the tail). It is written at
+	// most every cursorPersistEvery and once more at shutdown, so a hard kill
+	// replays up to that much (saveCursor).
 	Positions *positions.Store
 
 	BatchSize     int           // flush after this many entries
@@ -72,26 +63,15 @@ type Config struct {
 	// parts before sending.
 	MaxBatchBytes int
 
-	// Enrich parses metadata out of each message (timestamp, severity,
-	// trace/span IDs, exception details, ...) into the record's OTLP fields
-	// and attributes; an explicit level in the message wins over the journal
-	// priority.
-	Enrich bool
-	// LogAttrs lifts configured keys out of structured messages onto the
-	// record as resource/scope/log attributes (nil = none).
-	LogAttrs *logattrs.Extractor
-	// Scrub redacts sensitive values from message bodies before anything
-	// copies from them (nil disables).
-	Scrub *logscrub.Scrubber
-	// Rules are ordered keep/drop/sample rules over journal entries, evaluated
-	// AFTER enrichment (so the synthetic __severity__ key sees the enriched
-	// severity) and AFTER LogMetrics (so metrics observe every entry, including
-	// dropped ones) — the same order and semantics as the tailer's logs.rules.
-	Rules *logline.LineFilter
-	// LogMetrics derives configured metrics from each journal entry, before the
-	// rules run. The journal is dominated by kubelet/containerd chatter, which
-	// is exactly the volume you want to count and then drop.
-	LogMetrics *metrics.DynamicMetricSet
+	// Chain is the per-record log chain every producer runs (scrub → lift →
+	// enrich → log-metrics → rules; see logchain.Config for each lever): the
+	// same levers, in the same order and with the same semantics, as the
+	// tailer's. Enrichment's explicit level wins over the journal priority;
+	// rules run after log-metrics, so a metric counts every entry, and the
+	// journal is dominated by kubelet/containerd chatter, which is exactly the
+	// volume to count and then drop. Chain.Scrub is applied where the batch
+	// entry is BUILT, before the record exists (stream), not by the chain.
+	Chain logchain.Config
 
 	// Attrs builds the exported resource attributes (nil = defaults).
 	Attrs *attrs.Builder
@@ -165,28 +145,46 @@ type Reader struct {
 	// window so a unit that goes quiet stops appearing rather than being
 	// remembered forever as live.
 	unitDebug *logdedupe.Table
-	// unitCounts is the per-batch scratch behind that report, reused so the
-	// summary costs no allocation per settle. It is only ever filled when
-	// Debug is enabled.
-	unitCounts map[string]int
-	// exportFailures counts the consecutive failed export attempts of the batch
-	// currently being retried in place, so the recovery can say how long the
-	// collector was refusing it. Reset by a successful flush.
-	exportFailures     int
-	exportFailingSince time.Time
-	open               openFunc
+	// unitCounts is the per-batch scratch behind that report, keyed by group
+	// (entry.groupUnit) and reused so the summary costs no allocation per
+	// settle. It is only ever filled when Debug is enabled.
+	unitCounts map[string]unitTally
+	// exportOutage is the run of consecutive failed export attempts of the
+	// batch currently being retried in place, so the recovery can say how long
+	// the collector was refusing it. Ended by a successful flush.
+	exportOutage logdedupe.Outage
+	open         openFunc
 
 	batch       []entry
 	batchBytes  int    // summed body sizes of the buffered entries
 	cursor      string // last successfully exported cursor
 	batchCursor string // cursor of the newest buffered entry
+	// savedCursor is the cursor the positions file holds as far as this reader
+	// knows (the one it loaded, or the last it wrote), and lastCursorSave when
+	// it last wrote one. cursorPersistEvery rate-limits those writes — see
+	// saveCursor — and now is the clock it reads, injectable for tests (the
+	// store.now pattern).
+	savedCursor        string
+	lastCursorSave     time.Time
+	cursorPersistEvery time.Duration
+	now                func() time.Time
+	// cursorOutage narrates an unwritable positions file: the first failure of
+	// each outage warns, the repeats at most every cursorWarnEvery, and the
+	// first write that lands after one says so (saveCursor).
+	cursorOutage logdedupe.Outage
 	// pending is the batch converted to OTLP, held across export retries
 	// under logchain.Pending's convert-once/clear-with-the-batch discipline.
 	pending logchain.Pending
 }
 
+// unitTally is one group's line in the per-unit Debug report.
+type unitTally struct {
+	name    string // the name the group's resource carries (entry.groupUnit)
+	entries int
+}
+
 type entry struct {
-	unit      string // resource grouping key
+	unit      string // _SYSTEMD_UNIT; see groupUnit for the resource's name
 	body      string
 	ts        time.Time
 	severity  plog.SeverityNumber
@@ -222,6 +220,7 @@ func New(cfg Config) *Reader {
 	}
 	return &Reader{
 		cfg: cfg, log: cfg.Logger, open: openJournal,
+		cursorPersistEvery: cursorPersistEvery, now: time.Now,
 		// One gate per defect class, built here so reportDefect's lookup can
 		// never mint one lazily on the reader goroutine's hot path — and so a
 		// class added without a gate reports its counter and stays silent
@@ -231,13 +230,14 @@ func New(cfg Config) *Reader {
 			defectNoTimestamp: {},
 		},
 		unitDebug:  logdedupe.New(maxDebugUnits, unitDebugEvery),
-		unitCounts: make(map[string]int, 16),
+		unitCounts: make(map[string]unitTally, 16),
 	}
 }
 
 // Run reads until ctx is done, restarting the reader on any failure.
 func (r *Reader) Run(ctx context.Context) {
 	r.cursor = r.loadCursor()
+	r.savedCursor = r.cursor
 	// Lifecycle, once, and the one journald fact an operator needs on a first
 	// live run: WHERE this reader starts. With no stored cursor the source
 	// seeks to the journal TAIL, so everything already in the journal is never
@@ -249,11 +249,7 @@ func (r *Reader) Run(ctx context.Context) {
 	// The cursor is opaque and can be long, so its length stands in for it —
 	// enough to tell "resuming" from "empty" without putting an unbounded
 	// token on every startup line.
-	start := "tail"
-	if r.cursor != "" {
-		start = "cursor"
-	}
-	r.log.Info("journal reader starting", "start", start, "dir", r.cfg.Dir,
+	r.log.Info("journal reader starting", "start", r.startLabel(), "dir", r.cfg.Dir,
 		"units", len(r.cfg.Units), "interval", r.cfg.FlushInterval,
 		"cursorPersisted", r.cfg.Positions != nil)
 	bo := backoff.New(r.cfg.RestartBackoff)
@@ -300,18 +296,21 @@ func (r *Reader) Run(ctx context.Context) {
 	if err := r.flush(fctx); err != nil {
 		r.log.Warn("final journal flush failed", "error", err)
 	}
+	// Whatever the final flush did: r.cursor only ever holds a cursor whose
+	// batch settled, so writing it is always safe, and it is what the
+	// rate-limited saves during the run may still owe (saveCursor).
+	r.saveCursor(true)
 }
+
+// cursorPersistEvery is how often a committed cursor is written to the
+// positions file — the tailer's checkpoint cadence, and for the same reason
+// (saveCursor).
+const cursorPersistEvery = 10 * time.Second
 
 // shutdownFlushBudget bounds the final flush above. It matches the tailer's
 // defaultShutdownBudget and the agent's other final exports; the sum has to fit
 // inside the pod's terminationGracePeriodSeconds.
 const shutdownFlushBudget = 10 * time.Second
-
-// defectWarnEvery throttles the read-side repair warning. The condition is a
-// PRODUCER writing something the journal cannot hand over intact, which
-// persists for as long as that producer runs, so the useful information is one
-// line naming a unit — the rate belongs to the counter.
-const defectWarnEvery = 5 * time.Minute
 
 // maxDebugUnits and unitDebugEvery bound the per-unit Debug report (see
 // Reader.unitDebug). A node runs tens of units, so the cap is only ever reached
@@ -342,27 +341,20 @@ func (r *Reader) stream(ctx context.Context) error {
 	// from re-reading the ConfigMap. Guarded because the Join allocates, and
 	// once per source open (a restart, not a batch) either way.
 	if r.log.Enabled(ctx, slog.LevelDebug) {
-		start := "tail"
-		if r.cursor != "" {
-			start = "cursor"
-		}
-		r.log.Debug("journal source opened", "start", start, "dir", r.cfg.Dir,
+		r.log.Debug("journal source opened", "start", r.startLabel(), "dir", r.cfg.Dir,
 			"units", strings.Join(r.cfg.Units, ","))
 	}
 
-	clear(r.batch)
-	r.batch = r.batch[:0]
-	r.batchBytes = 0
-	r.batchCursor = ""
-	// The CONVERTED payload belongs to the batch just discarded, and must go
-	// with it: this reopen re-reads those entries from the committed cursor
-	// (logchain.Pending's restart-clear case). Only a SOURCE failure gets here
-	// with anything buffered — an export failure retries in place — and even
-	// that path flushes first (the !ok arm below runs before the read error is
-	// returned), so the clear is normalisation rather than a live loss path. It
-	// stays because the alternative, a payload outliving the batch it describes,
-	// exports the PREVIOUS batch and then commits the NEW one's cursor.
-	r.pending.Discard()
+	// The CONVERTED payload belongs to the batch discarded here, and goes with
+	// it (resetBatch): this reopen re-reads those entries from the committed
+	// cursor (logchain.Pending's restart-clear case). Only a SOURCE failure gets
+	// here with anything buffered — an export failure retries in place — and
+	// even that path flushes first (the !ok arm below runs before the read error
+	// is returned), so the clear is normalisation rather than a live loss path.
+	// It stays because the alternative, a payload outliving the batch it
+	// describes, exports the PREVIOUS batch and then commits the NEW one's
+	// cursor.
+	r.resetBatch()
 
 	// A reader goroutine bound to this source hands entries over so the flush
 	// ticker still fires while no entries arrive. It must stop before src.close
@@ -437,10 +429,10 @@ func (r *Reader) stream(ctx context.Context) error {
 				}
 			}
 			body, origLen := r.sanitize(e.message, e.unit)
-			if r.cfg.Scrub != nil {
+			if r.cfg.Chain.Scrub != nil {
 				// Scrub before anything copies from the body (logattrs
 				// lifting, enrich's exception attributes, batch accounting).
-				body = r.cfg.Scrub.Scrub(body)
+				body = r.cfg.Chain.Scrub.Scrub(body)
 			}
 			// Flush BEFORE the entry that would push the batch over the byte
 			// cap. A single entry already over the cap still exports alone
@@ -458,106 +450,6 @@ func (r *Reader) stream(ctx context.Context) error {
 				}
 			}
 		}
-	}
-}
-
-// utf8Replacement stands in for each invalid byte, U+FFFD.
-const utf8Replacement = "�"
-
-// sanitize makes one journal message exportable: valid UTF-8 (the journal
-// stores raw bytes) and capped at MaxEntryBytes without splitting a rune.
-// origLen reports the RAW journal length — captured before the UTF-8
-// replacement, whose replacement runes would otherwise inflate/deflate the
-// advertised original size.
-//
-// Two things it must not do, both on the SINGLE reader goroutine that also
-// flushes, so a stall here is a stall for every unit on the node:
-//
-// Validate what it is about to throw away. strings.ToValidUTF8 walks a string
-// rune by rune and is ~31x slower than utf8.ValidString on the overwhelmingly
-// common already-valid input (1 MiB: 2.07 ms against 67 µs), so it is gated on
-// a ValidString probe and, past the cap, runs only over the bytes that survive
-// the cut. Same lesson as logscrub's secretKVCandidate: the admission IS the
-// cost.
-//
-// Hand back a reslice of anything longer than the body. clip.Runes ends in
-// s[:n], which pins the WHOLE string it cut for the life of the batch while
-// batchBytes counts only the truncated length — so MaxBatchBytes, documented
-// as "a soft bound that keeps a batch from growing large in memory", bounded
-// nothing. Measured at MaxEntryBytes 1 KiB over 1024 x 64 KiB messages:
-// 1.00 MB accounted, 64.15 MB live. Defaults are nearly immune (both are
-// 1 MiB), so it bit exactly the operator who LOWERED the entry cap to bound
-// memory. BOTH truncating branches therefore clone, which is the half that
-// had to be said twice: the under-cap branch cuts the ToValidUTF8
-// INTERMEDIATE rather than the raw message, so its reslice pinned the
-// validated copy instead (2-3x the accounted bytes rather than 64x — a
-// message of many separate invalid runs grows by two bytes per run — and
-// flushRetry holds the batch in place for a whole collector outage). The
-// whole-message branch cannot alias anything the batch does not already own.
-func (r *Reader) sanitize(msg, unit string) (body string, origLen int) {
-	raw := len(msg)
-	if raw <= r.cfg.MaxEntryBytes {
-		if utf8.ValidString(msg) {
-			return msg, 0
-		}
-		r.reportDefect(defectInvalidUTF8, unit)
-		msg = strings.ToValidUTF8(msg, utf8Replacement)
-		if len(msg) <= r.cfg.MaxEntryBytes {
-			return msg, 0
-		}
-		// A replacement rune is wider than the byte it replaces, so a message
-		// that fit before validation need not fit after it. Cloned for the
-		// reason above: msg is the validated copy, and the cut would otherwise
-		// pin all of it.
-		return strings.Clone(clip.Runes(msg, r.cfg.MaxEntryBytes)), raw
-	}
-	cut := clip.Runes(msg, r.cfg.MaxEntryBytes)
-	if !utf8.ValidString(cut) {
-		// Only the SURVIVING bytes are probed here (the cut already happened),
-		// so an over-cap message whose invalid bytes were all past the cut
-		// reports no defect — correct: the exported body is byte-identical to
-		// what the producer wrote for as far as it goes, and the truncation
-		// itself is already carried by log.truncated and
-		// kubescrape_journal_truncated_total.
-		r.reportDefect(defectInvalidUTF8, unit)
-		// Fresh allocation, so the second cut aliases only itself; clone below
-		// is then a cheap copy of at most MaxEntryBytes.
-		cut = clip.Runes(strings.ToValidUTF8(cut, utf8Replacement), r.cfg.MaxEntryBytes)
-	}
-	return strings.Clone(cut), raw
-}
-
-// Defect label values for kubescrape_journal_entry_defects_total. Spelled once
-// here because they are metric label values as well as log values, and the
-// metric's help text enumerates exactly these.
-const (
-	defectInvalidUTF8 = "invalid_utf8"
-	defectNoTimestamp = "no_timestamp"
-)
-
-// reportDefect counts one read-side repair and, throttled, says which unit
-// produced it.
-//
-// The counter is unconditional (it is the rate, and a unit logging raw bytes
-// does this on every message); the line is throttled keylessly PER DEFECT CLASS
-// (see defectWarn), because the condition is a PRODUCER and one example unit is
-// what an operator acts on — keying per unit would let a node with many
-// misbehaving units flood on the same fact, while keying by nothing at all let
-// one defect class hide the other. Both arguments are already-materialised
-// strings, so no Enabled guard is warranted.
-func (r *Reader) reportDefect(defect, unit string) {
-	obs.JournalEntryDefects.WithLabelValues(defect).Inc()
-	gate, ok := r.defectWarn[defect]
-	if !ok || !gate.Allow(defectWarnEvery) {
-		return
-	}
-	switch defect {
-	case defectInvalidUTF8:
-		r.log.Warn("journal message is not valid UTF-8; the invalid bytes are replaced before export, so the exported body differs from what the producer wrote",
-			"unit", unit, "defect", defect)
-	default:
-		r.log.Warn("journal entry carried no timestamp; the record is dated with this agent's clock at read time, not the producer's",
-			"unit", unit, "defect", defect)
 	}
 }
 
@@ -641,17 +533,13 @@ func (r *Reader) flushRetry(ctx context.Context) error {
 			// The recovery half. Without it a collector outage produces a
 			// warning per retry and then silence, and the only way to learn
 			// that delivery resumed is to watch a counter stop moving.
-			if r.exportFailures > 0 {
-				r.log.Info("journal export recovered", "failures", r.exportFailures,
-					"outage", time.Since(r.exportFailingSince).Round(time.Second))
-				r.exportFailures, r.exportFailingSince = 0, time.Time{}
+			if failures, lasted, ok := r.exportOutage.Recover(time.Now()); ok {
+				r.log.Info("journal export recovered", "failures", failures, "outage", lasted)
 			}
 			return nil
 		}
-		if r.exportFailures == 0 {
-			r.exportFailingSince = time.Now()
-		}
-		r.exportFailures++
+		now := time.Now()
+		r.exportOutage.Fail(now, 0) // every attempt is loud: the backoff spaces them
 		if ctx.Err() != nil {
 			// Cancelled DURING the export: that attempt really was made and its
 			// failure really was counted, so this arm only avoids the backoff.
@@ -663,8 +551,8 @@ func (r *Reader) flushRetry(ctx context.Context) error {
 		// the outage by.
 		r.log.Warn("journal export failed; retrying the same batch (re-reading it would re-observe its log metrics)",
 			"entries", len(r.batch), "error", err, "backoff", bo.Delay(),
-			"failures", r.exportFailures,
-			"outage", time.Since(r.exportFailingSince).Round(time.Second))
+			"failures", r.exportOutage.Failures(),
+			"outage", r.exportOutage.Lasted(now))
 		bo.Sleep(ctx)
 	}
 }
@@ -691,7 +579,12 @@ func (r *Reader) flush(ctx context.Context) error {
 		r.settleBatch(ctx, 0)
 		return nil
 	}
-	if err := r.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
+	// route.Reoffer: flushRetry re-sends this same payload until it settles, so
+	// a router splitting it (only a transform script's route() does — journal
+	// resources carry no namespace) may hold the default share back while a
+	// tenant route fails instead of spooling one copy per attempt
+	// (route/reoffer.go).
+	if err := r.cfg.Exporter.ExportLogs(route.Reoffer(ctx), ld); err != nil {
 		if logchain.SettlePermanent(err, r.log, "journal batch", ld.LogRecordCount(),
 			logchain.SettleCounters{Batches: obs.JournalDropped, Records: obs.JournalDroppedRecords},
 			"entries", len(r.batch)) {
@@ -751,22 +644,44 @@ func (r *Reader) settleBatch(ctx context.Context, delivered int) {
 	// terminal path meets exactly once per batch (a retried export must not
 	// re-report the batch it is still holding).
 	r.debugBatch(ctx, delivered, truncated)
+	cursor := r.batchCursor
+	r.resetBatch()
+	if cursor != "" {
+		// The commit is IN MEMORY at once — it is where a reader restart
+		// reopens — and durable at the positions file's cadence (saveCursor).
+		r.cursor = cursor
+		persisted := r.saveCursor(false)
+		// The commit is what a restart resumes from, so an operator chasing a
+		// gap needs to see that it moved (and whether the positions file holds
+		// it yet: with no positions store it never will). The cursor itself is
+		// opaque and unbounded, so its length stands in for it — the same
+		// substitution the startup line makes. Every argument is a field read
+		// or a len.
+		r.log.Debug("journal cursor committed", "cursorLen", len(r.cursor),
+			"persisted", persisted)
+	}
+}
+
+// resetBatch empties the batch and everything that describes it — the bodies
+// its backing array pins, the byte and cursor accounting, and the converted
+// payload (logchain.Pending's clear-with-the-batch discipline). A stream
+// (re)open and a settle are the two places a batch ends.
+func (r *Reader) resetBatch() {
 	clear(r.batch)
 	r.batch = r.batch[:0]
 	r.batchBytes = 0
-	// The converted payload belongs to the batch that is now gone.
+	r.batchCursor = ""
 	r.pending.Discard()
-	if r.batchCursor != "" {
-		r.cursor = r.batchCursor
-		r.saveCursor()
-		// The commit is what a restart resumes from, so an operator chasing a
-		// gap needs to see that it moved (and, with no positions store, that
-		// it will not survive the restart). The cursor itself is opaque and
-		// unbounded, so its length stands in for it — the same substitution
-		// the startup line makes. Every argument is a field read or a len.
-		r.log.Debug("journal cursor committed", "cursorLen", len(r.cursor),
-			"persisted", r.cfg.Positions != nil)
+}
+
+// startLabel names where the source opens: at the committed cursor, or — with
+// none stored — at the journal TAIL, so nothing already in the journal is
+// exported (see Run).
+func (r *Reader) startLabel() string {
+	if r.cursor != "" {
+		return "cursor"
 	}
+	return "tail"
 }
 
 // debugBatch reports one settled batch and the units in it, at Debug.
@@ -782,19 +697,19 @@ func (r *Reader) debugBatch(ctx context.Context, delivered, truncated int) {
 	}
 	clear(r.unitCounts)
 	for i := range r.batch {
-		// The ident fallback convert applies, so the unit named here is the
-		// one the exported resource carries (systemd.unit for a real unit,
-		// the syslog identifier otherwise).
-		unit := r.batch[i].unit
-		if unit == "" {
-			unit = r.batch[i].ident
-		}
-		r.unitCounts[unit]++
+		// Tallied by convert's GROUP key and named by the same rule, so one
+		// line here is one resource there, named as that resource is: a syslog
+		// identifier equal to a real unit's name is two groups, and an entry
+		// carrying neither is "journald".
+		name, key := r.batch[i].groupUnit()
+		t := r.unitCounts[key]
+		t.name, t.entries = name, t.entries+1
+		r.unitCounts[key] = t
 	}
 	r.log.Debug("journal batch settled", "entries", len(r.batch), "records", delivered,
 		"units", len(r.unitCounts), "bytes", r.batchBytes, "truncated", truncated)
-	for unit, n := range r.unitCounts {
-		allow, saturated := r.unitDebug.Allow(unit)
+	for key, t := range r.unitCounts {
+		allow, saturated := r.unitDebug.Allow(key)
 		if saturated {
 			// logdedupe's rule: the table suppresses new keys rather than
 			// clearing, and says so once. Reached only through a producer
@@ -803,154 +718,9 @@ func (r *Reader) debugBatch(ctx context.Context, delivered, truncated int) {
 				"count", maxDebugUnits)
 		}
 		if allow {
-			r.log.Debug("journal unit active", "unit", unit, "entries", n)
+			r.log.Debug("journal unit active", "unit", t.name, "entries", t.entries)
 		}
 	}
-}
-
-// convert groups the batch into one resource per unit.
-//
-// The per-record half — line attributes, enrichment, log-metrics (which see
-// EVERY entry) and the keep/drop rules (which run after enrichment, so
-// __severity__ selects on the ENRICHED severity) — is the chain every log
-// producer in this repo runs (internal/agent/logchain). What stays here is the
-// unit's RESOURCE and the grouping.
-//
-// Bodies are already scrubbed: journald redacts where it builds the batch
-// entry, before the record exists, so the chain's Scrub is nil.
-func (r *Reader) convert() plog.Logs {
-	ld := plog.NewLogs()
-	// Every other log producer names its scope (tailer, events); the
-	// journal's records once shipped with an empty otel_scope_name.
-	groups := logchain.NewGroups(ld, ScopeName, 4)
-	sink := &recordSink{r: r, observed: pcommon.NewTimestampFromTime(time.Now())}
-	chain := logchain.NewChain[string](logchain.Config{
-		LogAttrs:   r.cfg.LogAttrs,
-		Enrich:     r.cfg.Enrich,
-		LogMetrics: r.cfg.LogMetrics,
-		Rules:      r.cfg.Rules,
-	}, false)
-	for _, e := range r.batch {
-		body, extracted := chain.Line(e.body)
-		unit := e.unit
-		groupKey := unit
-		if unit == "" {
-			unit = e.ident
-			// Tag ident-derived groups: a syslog identifier that happens to
-			// equal another entry's full unit name must not share its group —
-			// the group's resource carries systemd.unit only for real units,
-			// so sharing mis-attributes whichever entry arrives second.
-			groupKey = "i\x02" + unit
-		}
-		key := chain.GroupKey(groupKey, extracted)
-		// The group is built BEFORE the record because metric and rule
-		// resolution reads the group's own resource; a group the rules empty is
-		// pruned below rather than never created (the tailer, whose resolution
-		// uses the FILE's resource, can be lazy instead — same payload).
-		sink.e, sink.unit = e, unit
-		sink.e.body = body // identical while Scrub is nil; not a fact to rely on
-		ent := groups.Get(key, extracted, sink)
-		sink.sl = ent.SL
-		chain.Emit(sink, logchain.Input[string]{
-			Body: body, Lifted: extracted, Resource: ent.Res, BoundKey: key,
-		})
-	}
-	// An all-dropped unit leaves an empty group behind; prune so the payload
-	// carries no record-less ResourceLogs.
-	logchain.Prune(ld)
-	return ld
-}
-
-// recordSink is the chain's Producer for journal entries: the group a kept
-// record lands in, and what the journal knows about the record.
-type recordSink struct {
-	r        *Reader
-	sl       plog.ScopeLogs
-	e        entry
-	unit     string // e.unit with the ident fallback applied
-	observed pcommon.Timestamp
-}
-
-func (s *recordSink) Dest() plog.LogRecordSlice { return s.sl.LogRecords() }
-
-// FillResource builds a fresh unit group's resource. Identity attributes go
-// in before Build so templates and the filter see them.
-func (s *recordSink) FillResource(res pcommon.Resource) {
-	name := s.unit
-	if name == "" {
-		name = "journald"
-	}
-	res.Attributes().PutStr("service.name", strings.TrimSuffix(name, ".service"))
-	if s.e.unit != "" {
-		res.Attributes().PutStr("systemd.unit", s.e.unit)
-	}
-	actx := attrs.Context{}
-	if s.r.cfg.NodeInfo != nil {
-		actx.Node = s.r.cfg.NodeInfo()
-	}
-	s.r.cfg.Attrs.Build(res, actx)
-}
-
-func (s *recordSink) Stamp(lr plog.LogRecord) {
-	e := s.e
-	lr.SetTimestamp(pcommon.NewTimestampFromTime(e.ts))
-	lr.SetObservedTimestamp(s.observed)
-	lr.SetSeverityNumber(e.severity)
-	lr.SetSeverityText(e.sevText)
-	lr.Body().SetStr(e.body)
-	if e.origLen > 0 {
-		lr.Attributes().PutBool(logchain.AttrTruncated, true)
-		lr.Attributes().PutInt(logchain.AttrOriginalLength, int64(e.origLen))
-	}
-	if e.ident != "" {
-		lr.Attributes().PutStr("syslog.identifier", e.ident)
-	}
-	if e.pid != 0 {
-		lr.Attributes().PutInt("process.pid", e.pid)
-	}
-	if e.transport != "" {
-		lr.Attributes().PutStr("systemd.transport", e.transport)
-	}
-}
-
-// severity maps a syslog priority (0-7) to OTLP severity, following the
-// mapping in the OpenTelemetry logs data model.
-//
-// The top three syslog severities are FATAL, not ERROR: emergency is FATAL3
-// (23), alert FATAL2 (22), critical FATAL (21). This used to map them onto
-// FATAL/ERROR3/ERROR2 — one grade too low across the board, and contradicted
-// one line away by the enrich package's own syslogSeverity table, which
-// logenrich.Apply then OVERWROTE the number with whenever it managed to parse
-// the message. The same journal entry therefore reported a different severity
-// depending on whether its body happened to look like a log line to a parser,
-// which is the one thing a severity must not depend on.
-//
-// The text stays the source's own syslog word (the data model asks SeverityText
-// to carry the original), lowercase — which is now the casing every producer in
-// the repo uses, and the casing enrich writes when it overwrites. The grading
-// the six canonical level names flatten away survives in the NUMBER: emerg,
-// alert and crit are all "fatal" to enrich but 23/22/21 here, and notice is
-// INFO2 rather than INFO.
-func severity(priority string) (plog.SeverityNumber, string) {
-	switch priority {
-	case "0":
-		return plog.SeverityNumberFatal3, "emerg"
-	case "1":
-		return plog.SeverityNumberFatal2, "alert"
-	case "2":
-		return plog.SeverityNumberFatal, "crit"
-	case "3":
-		return plog.SeverityNumberError, "err"
-	case "4":
-		return plog.SeverityNumberWarn, "warning"
-	case "5":
-		return plog.SeverityNumberInfo2, "notice"
-	case "6":
-		return plog.SeverityNumberInfo, "info"
-	case "7":
-		return plog.SeverityNumberDebug, "debug"
-	}
-	return plog.SeverityNumberUnspecified, ""
 }
 
 func (r *Reader) loadCursor() string {
@@ -960,12 +730,60 @@ func (r *Reader) loadCursor() string {
 	return ""
 }
 
-// saveCursor persists the committed cursor to the shared positions store.
-func (r *Reader) saveCursor() {
+// saveCursor persists the committed cursor to the shared positions store and
+// reports whether the store now holds it.
+//
+// It is RATE-LIMITED to cursorPersistEvery unless forced (Run's end), because
+// the write is not a cursor write: positions.Store rewrites the WHOLE shared
+// document — every tailed file's offset as well — with write + fsync + rename +
+// directory fsync, under the mutex the tailer's own saves take. Measured at
+// ~11 ms per save (12 ms with 1000 tracked files), and the byte-identical skip
+// inside the store can never fire here because the cursor moves on every batch.
+// Once per batch was 5x the tailer's deliberate 10s cadence at the default 2s
+// flush, and one fsync'd rewrite per 1024 entries serialised with the export
+// while a cursor resume reads a backlog.
+//
+// What the limit costs is replay, never loss: the stored cursor stays a lower
+// bound on what was delivered (r.cursor only ever holds a settled batch's
+// cursor), so a hard kill re-reads at most one interval of entries — the
+// at-least-once duplicates a crash already produced. The ONE exception is a
+// store holding NO cursor yet: a reopen with an empty cursor seeks to the
+// journal TAIL, so everything delivered before the first write would be
+// unrecoverable-and-unreplayed rather than replayed. The first commit is
+// therefore written at once, keeping that window exactly as narrow as it was.
+func (r *Reader) saveCursor(force bool) bool {
 	if r.cfg.Positions == nil {
-		return
+		return false
 	}
+	switch r.cursor {
+	case "":
+		return false
+	case r.savedCursor:
+		return true
+	}
+	now := r.now()
+	if !force && r.savedCursor != "" && now.Sub(r.lastCursorSave) < r.cursorPersistEvery {
+		return false
+	}
+	r.lastCursorSave = now
 	if err := r.cfg.Positions.SetJournalCursor(r.cursor); err != nil {
-		r.log.Warn("writing journal cursor to positions file", "error", err)
+		// Throttled, like the tailer's write to the SAME store: a read-only
+		// mount or a full disk persists, and the write is retried every
+		// cursorPersistEvery — six identical lines a minute from every node for
+		// one unchanging fact, which kubescrape_positions_save_errors_total
+		// already counts. The first failure of every run warns.
+		if _, loud := r.cursorOutage.Fail(now, cursorWarnEvery); loud {
+			r.log.Warn("writing journal cursor to positions file", "error", err)
+		}
+		return false
 	}
+	if failures, lasted, ok := r.cursorOutage.Recover(now); ok {
+		r.log.Info("journal cursor write recovered", "failures", failures, "outage", lasted)
+	}
+	r.savedCursor = r.cursor
+	return true
 }
+
+// cursorWarnEvery re-warns about an unwritable positions file at this cadence
+// — the tailer's, for the same store.
+const cursorWarnEvery = time.Minute

@@ -113,3 +113,33 @@ func TestResyncFastPathStillResurrectsAndStillUpdates(t *testing.T) {
 	}
 	clk.Advance(time.Second)
 }
+
+// A delivery with NO resourceVersion is never a resync, whichever half of the
+// short-circuit sees it (the read-locked probe or the write-locked re-check).
+// The informer always sets one, so only a hand-built pod — a test fixture, an
+// embedder — lacks it, and for those two empty strings say nothing about the
+// content: believing them silently dropped a re-upsert carrying a recycled pod
+// IP or a restarted container, while services.Index.Upsert, which cites this
+// path as its precedent, had always treated empty as changed.
+func TestVersionlessPodReUpsertIsApplied(t *testing.T) {
+	s, _ := newTestStore(time.Minute)
+	first := resyncPod("")
+	s.UpsertPod(first)
+
+	moved := resyncPod("")
+	moved.Status.PodIP = "10.1.2.4"
+	moved.Status.ContainerStatuses[0].ContainerID = "containerd://cccc3333"
+	before := s.generation()
+	s.UpsertPod(moved)
+
+	if np, ok := s.GetPodByIP("10.1.2.4"); !ok || np.Pod.UID != "uid-1" {
+		t.Fatalf("GetPodByIP(new address) = %+v, ok=%v: a versionless re-upsert was read as a resync and dropped", np.Pod.UID, ok)
+	}
+	if _, ok := s.GetPodByIP("10.1.2.3"); ok {
+		t.Error("the old address still resolves after the pod moved off it")
+	}
+	mustGet(t, s, "cccc3333")
+	if s.generation() == before {
+		t.Error("the change token did not move for an applied versionless update")
+	}
+}

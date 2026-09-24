@@ -22,26 +22,39 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
-// LogPos is one log file's committed position and identity fingerprint.
+// LogPos is one log file's committed position and identity fingerprint:
+// Offset is the committed offset within the CURRENT incarnation at the path,
+// identified by Inode plus the head fingerprint.
 type LogPos struct {
 	Offset          int64  `json:"offset"`
 	Inode           uint64 `json:"inode"`
 	FingerprintLen  int64  `json:"fpLen,omitempty"`
 	FingerprintHash uint64 `json:"fpHash,omitempty"`
-	// Pending names the rotated-away files whose tails are still part of a
-	// multi-line group buffered across one or more rotations, oldest first. On
-	// restart they are re-read in order before the current file so the group
-	// reconstructs without loss even across several rotations.
+	// Pending names the rotated-away incarnations of this path whose bytes are
+	// not yet fully committed, oldest first — EVERY such incarnation, not only
+	// those holding part of a multi-line group buffered across the rotation (a
+	// plain rename whose fed range has not committed yet is one too). On
+	// restart they are re-read in order before the current file, so nothing
+	// they owe is lost and a straddling group reconstructs even across several
+	// rotations.
 	Pending []Prefix `json:"pending,omitempty"`
 }
 
-// Prefix identifies the unexported tail of a rotated-away log file.
+// Prefix identifies the owed, not-yet-committed range of a rotated-away
+// incarnation of a log file, by inode plus head fingerprint.
 type Prefix struct {
 	Inode           uint64 `json:"inode"`
 	FingerprintLen  int64  `json:"fpLen,omitempty"`
 	FingerprintHash uint64 `json:"fpHash,omitempty"`
-	From            int64  `json:"from"`
-	To              int64  `json:"to"`
+	// From is the commit PROGRESS within the rotated file, not the start of
+	// the range it once owed: a restart re-reads only [From, To).
+	From int64 `json:"from"`
+	// To is the end of the owed range, or -1 when it is unknown — a drain that
+	// ended unfinished (a mid-drain export failure or the per-drain cap), or a
+	// rotation that happened while the agent was down or while no descriptor
+	// was held — in which case the replay reads the rotated file to EOF and
+	// pins To there.
+	To int64 `json:"to"`
 }
 
 // doc is the on-disk shape.
@@ -70,6 +83,14 @@ type Store struct {
 	// an older build, or hand-edited, and its bytes are not ours to assume.
 	written      [16]byte
 	writtenValid bool
+	// logsJSON caches the encoded log section, re-encoded only when it changed
+	// (logsDirty): see encode. It retains one encoded copy of the section —
+	// ~19 KB at 100 tracked files, ~580 KB at 3000 (BenchmarkMarshal's long
+	// containerd paths) — in exchange for not re-marshalling that whole
+	// unchanged map, by reflection and under s.mu, on every journald cursor
+	// commit.
+	logsJSON  []byte
+	logsDirty bool
 }
 
 // Open loads the store at path, tolerating a missing or corrupt file (it
@@ -78,7 +99,7 @@ type Store struct {
 // existing log to its end and then overwrite the good file on the next Save,
 // silently losing the entire unshipped window the file exists to protect.
 func Open(path string) (*Store, error) {
-	s := &Store{path: path}
+	s := &Store{path: path, logsDirty: true}
 	// Sweep temp files left by saves that died between CreateTemp and Rename
 	// (the exact "<base>.tmp-*" shape save creates; nothing ever renames or
 	// reuses one, so they would accumulate forever). Removing a temp that
@@ -215,7 +236,7 @@ func (s *Store) SetLogs(m map[string]LogPos) error {
 		v.Pending = clonePrefixes(v.Pending)
 		logs[k] = v
 	}
-	s.doc.Logs = logs
+	s.doc.Logs, s.logsDirty = logs, true
 	return s.save()
 }
 
@@ -232,7 +253,7 @@ func (s *Store) SetLogs(m map[string]LogPos) error {
 func (s *Store) SetLogsOwned(m map[string]LogPos) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.doc.Logs = m
+	s.doc.Logs, s.logsDirty = m, true
 	return s.save()
 }
 
@@ -291,7 +312,7 @@ func (s *Store) SetJournalCursor(cursor string) error {
 // wins" already permitted exactly that ordering (see write); as soon as this
 // process makes any progress its next save writes.
 func (s *Store) save() error {
-	data, err := json.Marshal(&s.doc)
+	data, err := s.encode()
 	if err != nil {
 		obs.PositionsSaveErrors.Inc()
 		return err
@@ -310,6 +331,52 @@ func (s *Store) save() error {
 	}
 	s.written, s.writtenValid = sum, true
 	return nil
+}
+
+// encode renders the document save writes, byte-identical to
+// json.Marshal(&s.doc) (TestEncodeMatchesMarshal) — so the on-disk format and
+// save's identity skip are unchanged — but re-marshals the log section only
+// when it CHANGED since the last encode. SetJournalCursor runs once per settled
+// journald batch (every -journald-flush-interval, 2s by default), and it used to
+// re-marshal the tailer's whole unchanged map with it: ~6000 allocations and
+// ~1.5 MB allocated at 3000 tracked files, under the mutex the tailer's saves
+// wait on, where the cursor-only encode is 3 allocations (BenchmarkMarshal).
+// The caller holds the mutex.
+func (s *Store) encode() ([]byte, error) {
+	if s.logsDirty {
+		s.logsJSON = nil
+		if len(s.doc.Logs) > 0 { // omitempty: an empty section is omitted
+			b, err := json.Marshal(s.doc.Logs)
+			if err != nil {
+				return nil, err // still dirty: the next encode retries
+			}
+			s.logsJSON = b
+		}
+		s.logsDirty = false
+	}
+	var cursor []byte
+	if s.doc.JournalCursor != "" {
+		c, err := json.Marshal(s.doc.JournalCursor)
+		if err != nil {
+			return nil, err
+		}
+		cursor = c
+	}
+	const logsKey, cursorKey = `"logs":`, `"journalCursor":`
+	data := make([]byte, 0, len(logsKey)+len(s.logsJSON)+len(cursorKey)+len(cursor)+3)
+	data = append(data, '{')
+	if s.logsJSON != nil {
+		data = append(data, logsKey...)
+		data = append(data, s.logsJSON...)
+	}
+	if cursor != nil {
+		if s.logsJSON != nil {
+			data = append(data, ',')
+		}
+		data = append(data, cursorKey...)
+		data = append(data, cursor...)
+	}
+	return append(data, '}'), nil
 }
 
 // write is save's I/O half: unique temp file, fsync, rename, best-effort

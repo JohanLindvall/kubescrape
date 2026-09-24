@@ -1,168 +1,14 @@
 package promscrape
 
 import (
-	"encoding/hex"
 	"math"
 	"slices"
-	"strconv"
 	"strings"
-	"time"
-
-	"go.opentelemetry.io/collector/pdata/pcommon"
-	"go.opentelemetry.io/collector/pdata/pmetric"
-
-	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // maxExemplarsPerPoint bounds the exemplars attached to one histogram data
 // point (one per bucket line otherwise).
 const maxExemplarsPerPoint = 16
-
-// sink receives converted points; implemented by batcher (one resource per
-// target) and cadvisorBatcher (one resource per pod/container).
-type sink interface {
-	addNumber(s Sample, monotonic bool)
-	addHistogram(family string, acc *histAcc)
-	addSummary(family string, acc *summAcc)
-}
-
-// metricMeta is a family's exposition "# HELP"/"# UNIT", carried to whichever
-// batcher creates the OTLP metric. It is a per-FAMILY fact: the parser resolves
-// it once per family and the batchers stamp it once per metric, never per
-// sample.
-type metricMeta struct{ help, unit string }
-
-func sampleMeta(s Sample) metricMeta { return metricMeta{help: s.Help, unit: s.Unit} }
-
-// apply stamps the description and unit on a newly created metric and returns
-// the bytes they add to the chunk-size estimate. The charge is not optional:
-// the estimate is what keeps a chunk under the collector's 4 MiB receive limit,
-// and a resource-per-object batcher (split, cadvisor) carries its own copy of
-// every descriptor — uncharged HELP text would flush past the limit.
-func (mm metricMeta) apply(m pmetric.Metric) int {
-	n := 0
-	if mm.help != "" {
-		m.SetDescription(mm.help)
-		n += len(mm.help) + metaFieldBytes
-	}
-	if mm.unit != "" {
-		m.SetUnit(mm.unit)
-		n += len(mm.unit) + metaFieldBytes
-	}
-	return n
-}
-
-// Size estimation for byte-bounded chunking. A collector's default gRPC
-// receive limit is 4 MiB and applies to the DECOMPRESSED message, so a batch
-// bounded only by a data-point count can be rejected wholesale (10k points of
-// a label-rich family marshal to >5 MiB) — every export of that target would
-// then fail, losing all of its metrics. These constants approximate the OTLP
-// protobuf encoding (measured within a few percent, always slightly low, which
-// the default BatchBytes headroom absorbs).
-//
-// The non-point bytes are NOT rounding error: the split and cadvisor batchers
-// emit one ResourceMetrics per DESCRIBED OBJECT (pod, container), each carrying
-// a full enriched attribute set plus its own copy of every metric descriptor.
-// Counting only data points underestimated a kube-state-metrics split by ~2x —
-// 10k points flushed at an estimated 3 MiB and encoded to 6.7 MiB, past the
-// very limit the estimate exists to respect. Every resource and metric is
-// therefore charged where it is created.
-const (
-	pointOverheadBytes = 32 // timestamps, value, framing of one data point
-	attrOverheadBytes  = 8  // per-attribute protobuf framing
-	// One explicit bound + its count. BOTH are packed fixed64 in OTLP
-	// (HistogramDataPoint.explicit_bounds is a double, bucket_counts is
-	// fixed64 — NOT varint; only the EXPONENTIAL histogram's counts are
-	// varint), so a bucket costs a flat 8+8. Charging 12 made a bucket-heavy
-	// family encode ~33% over its estimate and flush past the 4 MiB gRPC
-	// limit the estimate exists to respect.
-	bucketBytes         = 16
-	histFixedBytes      = 16 // count + sum
-	quantileBytes       = 18 // quantile + value
-	exemplarBytes       = 48 // value, timestamp, trace/span ids (labels charged separately)
-	resOverheadBytes    = 24 // ResourceMetrics + Resource + ScopeMetrics framing
-	metricOverheadBytes = 16 // one Metric: descriptor framing, type wrapper, temporality
-	// metaFieldBytes is one description/unit string field's protobuf framing
-	// (tag + length varint), charged on top of the text so the estimate cannot
-	// come in UNDER the encoded size of a description-heavy batch.
-	metaFieldBytes = 3
-)
-
-// The instrumentation scope names stamped on every emitted ScopeMetrics.
-const (
-	scopeName         = "github.com/JohanLindvall/kubescrape/agent/promscrape"
-	scopeNameCadvisor = "github.com/JohanLindvall/kubescrape/agent/promscrape/cadvisor"
-	scopeNameSummary  = "github.com/JohanLindvall/kubescrape/agent/promscrape/summary"
-)
-
-// resourceBytes estimates the encoded size of one ResourceMetrics' non-point
-// content: the resource attributes plus the framing of the resource, its scope,
-// the scope name and the scope VERSION.
-//
-// The version is charged for the same reason the name is: every creation site
-// stamps obs.ScopeVersion, which is a 40-char VCS revision in a shipped build,
-// and the split and cadvisor batchers create one ScopeMetrics per DESCRIBED
-// OBJECT — thousands per scrape on a KSM target, i.e. hundreds of kilobytes
-// encoded and counted nowhere. A `go test` binary carries no VCS stamp, so the
-// chunk-size guard tests see the 7-char fallback and cannot notice the
-// omission; the shipped estimate was the one running short.
-func resourceBytes(res pcommon.Resource, scopeName string) int {
-	n := resOverheadBytes + len(scopeName) + len(obs.ScopeVersion) + metaFieldBytes
-	res.Attributes().Range(func(k string, v pcommon.Value) bool {
-		n += len(k) + len(v.AsString()) + attrOverheadBytes
-		return true
-	})
-	return n
-}
-
-// labelBytes estimates the encoded size of a label set.
-func labelBytes(labels []Label) int {
-	n := 0
-	for _, l := range labels {
-		n += len(l.Name) + len(l.Value) + attrOverheadBytes
-	}
-	return n
-}
-
-// exemplarSize estimates one exemplar's encoded size INCLUDING its labels:
-// only trace_id/span_id become fixed-size fields — every other label lands in
-// FilteredAttributes, unbounded by the parser (OpenMetrics allows 128 chars of
-// label runes). The old flat 48-byte charge let a 6k-series histogram whose
-// exemplars carried two ~50-char labels flush at an estimated 3 MiB and
-// encode to 8.6 MiB — past the 4 MiB collector receive limit the estimate
-// exists to respect.
-func exemplarSize(e *Exemplar) int {
-	return exemplarBytes + labelBytes(e.Labels)
-}
-
-// numberBytes estimates the encoded size of one number data point.
-func numberBytes(s Sample) int {
-	n := pointOverheadBytes + labelBytes(s.Labels)
-	if s.Exemplar != nil {
-		n += exemplarSize(s.Exemplar)
-	}
-	return n
-}
-
-// histBytes estimates the encoded size of one histogram data point.
-func histBytes(acc *histAcc) int {
-	// +8 for the overflow count: OTLP always carries one more bucket_count
-	// than explicit_bound, and a family whose exposition omitted +Inf has no
-	// entry in acc.buckets to charge it against. Over-charging by one slot is
-	// safe; under-charging flushes past the collector's receive limit.
-	n := pointOverheadBytes + histFixedBytes + labelBytes(acc.labels) +
-		len(acc.buckets)*bucketBytes + 8
-	for i := range acc.exemplars {
-		n += exemplarSize(&acc.exemplars[i])
-	}
-	return n
-}
-
-// summBytes estimates the encoded size of one summary data point.
-func summBytes(acc *summAcc) int {
-	return pointOverheadBytes + histFixedBytes + labelBytes(acc.labels) +
-		len(acc.quantiles)*quantileBytes
-}
 
 // maxFamilyAccBytes bounds the heap the converter RETAINS while accumulating
 // one histogram/summary family. Holding accumulators for the current family
@@ -185,6 +31,13 @@ func summBytes(acc *summAcc) int {
 // comfortably above that, and a plain family of tens of thousands of label sets
 // fits easily.
 const maxFamilyAccBytes = 16 << 20
+
+// maxAccPresize caps converter.bucketHint/quantHint: a real histogram carries a
+// few dozen buckets at most (Prometheus' defaults are 11 plus +Inf), and the
+// presized capacity is uncharged, so a larger hint would only let a target
+// that alternates wide and narrow series park slack the family budget does not
+// see (at most maxAccPresize x bucketRetainBytes = 1 KiB per accumulator).
+const maxAccPresize = 64
 
 // The charge constants approximate RETAINED HEAP, and are deliberately NOT the
 // pointOverheadBytes/attrOverheadBytes family above, which estimate the OTLP
@@ -256,6 +109,16 @@ type converter struct {
 	// accumulator + bucket slice per label set per family.
 	histFree []*histAcc
 	summFree []*summAcc
+	// bucketHint and quantHint presize a NEW accumulator's buckets/quantiles
+	// from the previous label set's count (every series of a family normally
+	// carries the same bucket layout), so a fresh accumulator costs one
+	// allocation instead of one per doubling. The freelists start empty on
+	// every scrape — a converter lives for one — so without the hint the
+	// largest histogram/summary family paid ~9 allocations per series.
+	// Capped at maxAccPresize: presized capacity is not charged to the family
+	// budget (nor is a recycled accumulator's retained capacity), so the cap is
+	// what bounds that uncharged slack per accumulator.
+	bucketHint, quantHint int
 	// malformed counts component samples that cannot participate in their
 	// family (a bucket without le, a summary row without quantile); the
 	// caller folds it into the parser's malformed count.
@@ -351,12 +214,22 @@ func (c *converter) add(s Sample) error {
 	}
 	switch s.Role {
 	case RoleHistogramBucket:
+		if s.Name == s.Family {
+			// The bare family name, which no histogram series carries (a real
+			// bucket is `<family>_bucket` on both fronts). Refused before the
+			// le parse, not after: with an `le` label of its own the stray line
+			// would otherwise fold into the family as a BUCKET — fabricating a
+			// point, or silently rewriting a real label set's counts.
+			c.malformed++
+			return nil
+		}
 		le, ok := labelFloat(s.Labels, "le")
 		if !ok {
 			c.malformed++ // bucket without le
 			return nil
 		}
-		if !validCount(s.Value) {
+		cum, ok := countOf(s.Value)
+		if !ok {
 			c.malformed++ // uint64(negative/NaN) wraps to ~9.2e18 garbage
 			return nil
 		}
@@ -372,7 +245,7 @@ func (c *converter) add(s Sample) error {
 			c.dropped++
 			return nil
 		}
-		acc.buckets = append(acc.buckets, cumBucket{le: le, cum: uint64(s.Value)})
+		acc.buckets = append(acc.buckets, cumBucket{le: le, cum: cum})
 		// A refused exemplar is not a refused sample: the point ships without
 		// it, exactly as it does past maxExemplarsPerPoint.
 		if s.Exemplar != nil && len(acc.exemplars) < maxExemplarsPerPoint && c.charge(exemplarRetained(s.Exemplar)) {
@@ -386,7 +259,8 @@ func (c *converter) add(s Sample) error {
 		}
 		acc.sum, acc.hasSum = s.Value, true
 	case RoleHistogramCount:
-		if !validCount(s.Value) {
+		count, ok := countOf(s.Value)
+		if !ok {
 			c.malformed++
 			return nil
 		}
@@ -395,7 +269,7 @@ func (c *converter) add(s Sample) error {
 			c.dropped++
 			return nil
 		}
-		acc.count, acc.hasCount = uint64(s.Value), true
+		acc.count, acc.hasCount = count, true
 	case RoleSummaryQuantile:
 		q, ok := labelFloat(s.Labels, "quantile")
 		if !ok || !validQuantile(q) {
@@ -421,7 +295,8 @@ func (c *converter) add(s Sample) error {
 		}
 		acc.sum, acc.hasSum = s.Value, true
 	case RoleSummaryCount:
-		if !validCount(s.Value) {
+		count, ok := countOf(s.Value)
+		if !ok {
 			c.malformed++
 			return nil
 		}
@@ -430,7 +305,7 @@ func (c *converter) add(s Sample) error {
 			c.dropped++
 			return nil
 		}
-		acc.count, acc.hasCount = uint64(s.Value), true
+		acc.count, acc.hasCount = count, true
 	case RoleCounter:
 		c.b.addNumber(s, true)
 		return c.check()
@@ -461,6 +336,13 @@ func (c *converter) flushFamily() error {
 		if acc, ok := c.hists[key]; ok {
 			delete(c.hists, key)
 			c.b.addHistogram(c.family, acc)
+			// Recycled with its slices' CAPACITY, so their contents are cleared
+			// first — across the whole capacity, not just the length: accBytes
+			// is released below, and a [:0] alone would keep every label and
+			// exemplar string of this family alive on the freelist, uncharged,
+			// for the rest of the scrape.
+			clear(acc.labels[:cap(acc.labels)])
+			clear(acc.exemplars[:cap(acc.exemplars)])
 			*acc = histAcc{labels: acc.labels[:0], buckets: acc.buckets[:0], exemplars: acc.exemplars[:0]}
 			c.histFree = append(c.histFree, acc)
 			// A family can hold thousands of label sets: check for a full chunk
@@ -474,6 +356,7 @@ func (c *converter) flushFamily() error {
 		if acc, ok := c.summs[key]; ok {
 			delete(c.summs, key)
 			c.b.addSummary(c.family, acc)
+			clear(acc.labels[:cap(acc.labels)]) // see the histogram arm
 			*acc = summAcc{labels: acc.labels[:0], quantiles: acc.quantiles[:0]}
 			c.summFree = append(c.summFree, acc)
 			if err == nil {
@@ -481,13 +364,18 @@ func (c *converter) flushFamily() error {
 			}
 		}
 	}
+	clear(c.order) // the keys are label fingerprints: text this family charged
 	c.order = c.order[:0]
 	clear(c.hists)
 	clear(c.summs)
 	// The budget is released with the state it charged. It must move with the
 	// maps — a charge left standing over a cleared family would refuse the NEXT
 	// family's accumulators, which is the "silently exports nothing after the
-	// first big family" shape of the same bug.
+	// first big family" shape of the same bug. And the state must really GO
+	// with it: every reuse buffer above is cleared before it is truncated, or a
+	// scrape of families whose label count DECREASES keeps one long value per
+	// position alive past the charge that bounded it (measured 130 MiB retained
+	// from 128 in-budget histogram families).
 	c.accBytes = 0
 	return err
 }
@@ -521,7 +409,11 @@ func (c *converter) hist(s Sample) *histAcc {
 		} else {
 			acc = &histAcc{}
 		}
-		acc.labels = appendLabelsExcept(acc.labels[:0], s.Labels, "le")
+		if prev := c.lastHistAcc; prev != nil {
+			c.bucketHint = min(len(prev.buckets), maxAccPresize)
+		}
+		acc.labels = appendLabelsExcept(slices.Grow(acc.labels[:0], len(s.Labels)), s.Labels, "le")
+		acc.buckets = slices.Grow(acc.buckets[:0], c.bucketHint)
 		acc.meta = sampleMeta(s) // per family: any component series carries it
 		c.hists[key] = acc
 		c.order = append(c.order, key)
@@ -554,7 +446,11 @@ func (c *converter) summ(s Sample) *summAcc {
 		} else {
 			acc = &summAcc{}
 		}
-		acc.labels = appendLabelsExcept(acc.labels[:0], s.Labels, "quantile")
+		if prev := c.lastSummAcc; prev != nil {
+			c.quantHint = min(len(prev.quantiles), maxAccPresize)
+		}
+		acc.labels = appendLabelsExcept(slices.Grow(acc.labels[:0], len(s.Labels)), s.Labels, "quantile")
+		acc.quantiles = slices.Grow(acc.quantiles[:0], c.quantHint)
 		acc.meta = sampleMeta(s)
 		c.summs[key] = acc
 		c.order = append(c.order, key)
@@ -577,13 +473,14 @@ func (c *converter) summ(s Sample) *summAcc {
 // instead of re-probing the map. A miss is always safe: it just does the full
 // work, so a reordered label set costs correctness nothing.
 func (c *converter) labelKey(labels []Label, except string) bool {
-	c.keyLbl = c.keyLbl[:0]
-	for _, l := range labels {
-		if l.Name != except {
-			c.keyLbl = append(c.keyLbl, l)
-		}
-	}
-	if except == c.lastExcept && labelsEqual(c.keyLbl, c.lastLbl) {
+	// Resliced, not cleared, on this per-sample path: past this call's length
+	// the scratch may still hold an earlier, longer label set — of THIS family
+	// only, since forgetLabelKey clears its whole capacity when the family
+	// closes (see flushFamily). lastLbl below follows the same rule.
+	c.keyLbl = appendLabelsExcept(c.keyLbl[:0], labels, except)
+	// The parser interns names and values per scrape, so the element-wise
+	// string comparisons are overwhelmingly pointer-equal.
+	if except == c.lastExcept && slices.Equal(c.keyLbl, c.lastLbl) {
 		return true // keyBuf still fingerprints exactly this set
 	}
 	// Remember the set AS FED: the next call compares its own pre-sort filtered
@@ -612,468 +509,47 @@ func (c *converter) labelKey(labels []Label, except string) bool {
 	return false
 }
 
-// labelsEqual reports whether two label lists are identical element-wise. The
-// parser interns names and values per scrape, so the string comparisons are
-// overwhelmingly pointer-equal.
-func labelsEqual(a, b []Label) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].Name != b[i].Name || a[i].Value != b[i].Value {
-			return false
-		}
-	}
-	return true
-}
-
 // forgetLabelKey invalidates the labelKey memo. It MUST run wherever the cached
 // accumulators stop being the right answer — the accumulators are recycled
 // through the freelists, so a stale pointer would fold one label set's
 // components into another's point.
 func (c *converter) forgetLabelKey() {
-	c.lastExcept = ""         // never a real except-name (only "le"/"quantile"), so it can never match
-	c.lastLbl = c.lastLbl[:0] // drop the interned string refs too
+	c.lastExcept = "" // never a real except-name (only "le"/"quantile"), so it can never match
+	// Drop the string refs too, from the memo AND the sort scratch it was built
+	// from, across their whole CAPACITY — a bare [:0] keeps them alive, and
+	// labelKey only reslices, so the tail can hold any label set of the family
+	// that is closing. The next labelKey rebuilds both.
+	clear(c.lastLbl[:cap(c.lastLbl)])
+	c.lastLbl = c.lastLbl[:0]
+	clear(c.keyLbl[:cap(c.keyLbl)])
+	c.keyLbl = c.keyLbl[:0]
 	c.lastHistAcc, c.lastSummAcc = nil, nil
 }
 
-func appendLabelsExcept(dst []Label, labels []Label, except string) []Label {
-	for _, l := range labels {
-		if l.Name != except {
-			dst = append(dst, l)
-		}
-	}
-	return dst
-}
-
-// validCount reports whether a cumulative count/bucket value can be a uint64:
-// uint64(negative, NaN, +Inf or ≥2^63) is implementation-defined (~9.2e18 on
-// amd64), so such exposition is counted malformed instead of exported as
-// garbage. The upper bound mirrors the OM timestamp guard in promparse: the
-// float64 comparison against 2^63 is exact (both representable).
-func validCount(v float64) bool {
-	return v >= 0 && v < (1<<63) && !math.IsNaN(v)
-}
-
-// labelFloat parses a numeric label value — `le` on a histogram bucket, or
-// `quantile` on a summary. Both decide where a point LANDS, so a nonsense value
-// is not a nonsense label, it is a corrupted distribution.
+// countOf converts a cumulative count, or a bucket's count, into the uint64
+// OTLP takes. It is the ONE conversion both fronts apply — the classic
+// histogram/summary converter here and the native (exponential) histogram path
+// in protoparse.go — so a float count converts identically whichever
+// representation carried it. They used to differ: the classic side truncated
+// and refused anything at or past 2^63, the native side rounded and accepted
+// up to 2^64, so one float histogram exported different counts depending on
+// its encoding.
 //
-// strconv.ParseFloat happily returns NaN for "NaN"/"nan" and ±Inf for
-// "Inf"/"Infinity", and this was the only gate on either label. A single junk
-// row from a scraped target — which is whatever a pod annotation or a
-// ServiceMonitor points at, not necessarily anything the operator wrote —
-// therefore entered the bucket accumulator with an unorderable bound, and the
-// sort that establishes the cumulative bucket order put it wherever the
-// comparison happened to fall. +Inf is the ONE exception and is legitimate: it
-// is the histogram's mandatory overflow bucket.
-func labelFloat(labels []Label, name string) (float64, bool) {
-	v, err := strconv.ParseFloat(labelValue(labels, name), 64)
-	if err != nil {
-		return 0, false // missing label or unparseable value
-	}
-	if math.IsNaN(v) || math.IsInf(v, -1) {
+// A negative, NaN or out-of-range value is not a count and is refused (counted
+// malformed by the caller) rather than converted: uint64() of a value outside
+// [0, 2^64) is implementation-dependent — ~9.2e18 on amd64 for a negative one
+// — and would ship as a garbage bucket. [2^63, 2^64) IS representable, so it
+// converts exactly. A fractional count (a float histogram) is rounded to
+// nearest, the whole cost of accepting one. float64(math.MaxUint64) is exactly
+// 2^64, so the bound compares exactly.
+func countOf(v float64) (uint64, bool) {
+	if math.IsNaN(v) || v < 0 || v >= math.MaxUint64 {
 		return 0, false
 	}
-	return v, true
+	return uint64(math.Round(v)), true
 }
 
 // validQuantile bounds a summary's `quantile` label to the [0,1] the Prometheus
 // exposition format defines. Outside it the value is not a quantile at all, and
 // an OTLP consumer reading `quantile: 42` has no way to render it.
 func validQuantile(q float64) bool { return q >= 0 && q <= 1 }
-
-// --- batcher emission ---
-
-// metricByName resolves the batch's metric for a family name, with a
-// last-seen fast path (samples arrive family-ordered).
-func (b *batcher) metricByName(name string) (pmetric.Metric, bool) {
-	if b.lastOK && name == b.lastName {
-		return b.lastMetric, true
-	}
-	m, ok := b.byName[name]
-	if ok {
-		b.lastName, b.lastMetric, b.lastOK = name, m, true
-	}
-	return m, ok
-}
-
-// remember indexes a newly created metric; the descriptor's bytes are charged
-// at the creation site via chargeDescriptor.
-func (b *batcher) remember(name string, m pmetric.Metric) {
-	b.byName[name] = m
-	b.lastName, b.lastMetric, b.lastOK = name, m, true
-}
-
-// expHistBytes estimates one exponential histogram point's encoded size.
-func expHistBytes(p *expPoint) int {
-	// 9 bytes/bucket (max sint64 varint) not 3: a busy cumulative counter's
-	// bucket count needs 4-5 bytes and can reach 9 near 2^63, so a
-	// dense-bucket point must not be under-charged into an over-cap batch —
-	// the byte bound is the ONE guard against wholesale collector rejection.
-	n := pointOverheadBytes + histFixedBytes + labelBytes(p.labels) +
-		16 + // zero threshold + zero count
-		(len(p.pos)+len(p.neg))*9 + 16 // varint bucket counts + span framing
-	for i := range p.exemplars {
-		n += exemplarSize(&p.exemplars[i])
-	}
-	return n
-}
-
-// addExponential appends one native-histogram point as an OTLP exponential
-// histogram (cumulative; the schema IS the OTLP scale — both are base-2).
-func (b *batcher) addExponential(family string, p expPoint) {
-	m, ok := b.metricByName(family)
-	if !ok {
-		m = b.sm.Metrics().AppendEmpty()
-		m.SetName(family)
-		shapeExponentialHistogram(m)
-		b.bytes += chargeDescriptor(m, family, p.meta)
-		b.remember(family, m)
-	}
-	dp, ok := exponentialDataPoint(m, b.startTS)
-	if !ok {
-		return
-	}
-	dp.SetTimestamp(pointTS(p.ts, b.scrapeTS))
-	fillExponentialPoint(dp, p)
-	putLabels(dp.Attributes(), p.labels)
-	for _, e := range p.exemplars {
-		setExemplar(dp.Exemplars().AppendEmpty(), e, b.scrapeTS)
-	}
-	b.points++
-	b.bytes += expHistBytes(&p)
-}
-
-// fillExponentialPoint copies one decoded native histogram onto an OTLP
-// exponential-histogram point (the schema IS the OTLP scale — both are
-// base-2). The sibling of fillHistogramPoint/fillSummaryPoint; timestamps and
-// attributes stay with the batcher, which owns them.
-func fillExponentialPoint(dp pmetric.ExponentialHistogramDataPoint, p expPoint) {
-	dp.SetScale(p.schema)
-	dp.SetZeroCount(p.zeroCount)
-	dp.SetZeroThreshold(p.zeroTh)
-	dp.SetCount(p.count)
-	if p.hasSum {
-		dp.SetSum(p.sum)
-	}
-	dp.Positive().SetOffset(p.posOffset)
-	dp.Positive().BucketCounts().FromRaw(p.pos)
-	dp.Negative().SetOffset(p.negOffset)
-	dp.Negative().BucketCounts().FromRaw(p.neg)
-}
-
-// addNumber emits a gauge or (monotonic cumulative) sum data point.
-func (b *batcher) addNumber(s Sample, monotonic bool) {
-	m, ok := b.metricByName(s.Name)
-	if !ok {
-		m = b.sm.Metrics().AppendEmpty()
-		m.SetName(s.Name)
-		shapeNumber(m, monotonic)
-		b.bytes += chargeDescriptor(m, s.Name, sampleMeta(s))
-		b.remember(s.Name, m)
-	}
-
-	dp, ok := numberDataPoint(m, b.startTS)
-	if !ok {
-		return
-	}
-	dp.SetDoubleValue(s.Value)
-	dp.SetTimestamp(pointTS(s.TimestampMs, b.scrapeTS))
-	putLabels(dp.Attributes(), s.Labels)
-	if s.Exemplar != nil {
-		setExemplar(dp.Exemplars().AppendEmpty(), *s.Exemplar, b.scrapeTS)
-	}
-	b.points++
-	b.bytes += numberBytes(s)
-}
-
-// addHistogram emits one Histogram data point from accumulated cumulative
-// buckets: bounds exclude +Inf, bucket counts are de-cumulated, the overflow
-// bucket is derived from the total count.
-func (b *batcher) addHistogram(family string, acc *histAcc) {
-	m, ok := b.metricByName(family)
-	if !ok {
-		m = b.sm.Metrics().AppendEmpty()
-		m.SetName(family)
-		shapeHistogram(m)
-		b.bytes += chargeDescriptor(m, family, acc.meta)
-		b.remember(family, m)
-	}
-	dp, ok := histogramDataPoint(m, b.startTS)
-	if !ok {
-		return
-	}
-	dp.SetTimestamp(pointTS(acc.ts, b.scrapeTS))
-	fillHistogramPoint(dp, acc)
-	putLabels(dp.Attributes(), acc.labels)
-	for _, e := range acc.exemplars {
-		setExemplar(dp.Exemplars().AppendEmpty(), e, b.scrapeTS)
-	}
-	b.points++
-	b.bytes += histBytes(acc)
-}
-
-// cmpFloat orders two floats for slices.SortFunc; a non-capturing comparator
-// keeps the sort closure off the heap (unlike sort.Slice, which also boxes the
-// slice and swaps via reflection).
-func cmpFloat(a, b float64) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	default:
-		return 0
-	}
-}
-
-// fillHistogramPoint converts accumulated cumulative buckets into the OTLP
-// shape: bounds exclude +Inf, bucket counts are de-cumulated, the overflow
-// bucket is derived from the total count.
-func fillHistogramPoint(dp pmetric.HistogramDataPoint, acc *histAcc) {
-	slices.SortFunc(acc.buckets, func(a, b cumBucket) int { return cmpFloat(a.le, b.le) })
-	// Deduplicate repeated le values (keep the last occurrence).
-	buckets := acc.buckets[:0]
-	for i, bk := range acc.buckets {
-		if i+1 < len(acc.buckets) && acc.buckets[i+1].le == bk.le {
-			continue
-		}
-		buckets = append(buckets, bk)
-	}
-
-	total := acc.count
-	if !acc.hasCount {
-		if n := len(buckets); n > 0 {
-			total = buckets[n-1].cum
-		}
-	}
-	dp.SetCount(total)
-	if acc.hasSum {
-		dp.SetSum(acc.sum)
-	}
-
-	bounds := dp.ExplicitBounds()
-	counts := dp.BucketCounts()
-	// run is the cumulative count this point has EMITTED so far, which is what
-	// the next difference must be taken against — not the exposition's own
-	// previous cum. OTLP requires sum(bucket_counts) == count, and deriving each
-	// bucket from a number that was never emitted breaks that on any exposition
-	// whose cumulative counts are not monotonic or disagree with its _count:
-	// `h_bucket{le="1"} 9` beside `h_count 3` shipped counts=[9 0] against
-	// count=3, and a decreasing pair (le=1 -> 10, le=2 -> 5, _count 10) shipped
-	// [10 0 5] = 15 against 10. Such a point is not merely wrong, it is invalid
-	// OTLP: a validating collector may reject the whole chunk, which would cost
-	// every OTHER target in it. Clamping into [run, total] makes the identity
-	// hold BY CONSTRUCTION for every input, and leaves a well-formed histogram
-	// (cums non-decreasing, total >= the last one) byte-identical.
-	//
-	// The two clamps say different things and both are the conservative reading:
-	// a cumulative count cannot decrease (keep the frontier — what the retired
-	// monotonicDiff did, except that it compared against the un-emitted cum and
-	// so let the error back in one bucket later), and no bound may claim more
-	// observations than the population the exposition declares in _count.
-	var run uint64
-	for _, bk := range buckets {
-		if math.IsInf(bk.le, 1) {
-			continue
-		}
-		bounds.Append(bk.le)
-		cum := max(bk.cum, run)
-		cum = min(cum, total)
-		counts.Append(cum - run)
-		run = cum
-	}
-	// Overflow bucket: everything above the last finite bound. run <= total
-	// holds above, so this closes the point to exactly count.
-	counts.Append(total - run)
-}
-
-// addSummary emits one Summary data point from accumulated quantiles.
-func (b *batcher) addSummary(family string, acc *summAcc) {
-	m, ok := b.metricByName(family)
-	if !ok {
-		m = b.sm.Metrics().AppendEmpty()
-		m.SetName(family)
-		shapeSummary(m)
-		b.bytes += chargeDescriptor(m, family, acc.meta)
-		b.remember(family, m)
-	}
-	dp, ok := summaryDataPoint(m, b.startTS)
-	if !ok {
-		return
-	}
-	dp.SetTimestamp(pointTS(acc.ts, b.scrapeTS))
-	fillSummaryPoint(dp, acc)
-	putLabels(dp.Attributes(), acc.labels)
-	b.points++
-	b.bytes += summBytes(acc)
-}
-
-// fillSummaryPoint sets count, sum and sorted quantile values.
-func fillSummaryPoint(dp pmetric.SummaryDataPoint, acc *summAcc) {
-	if acc.hasCount {
-		dp.SetCount(acc.count)
-	}
-	if acc.hasSum {
-		dp.SetSum(acc.sum)
-	}
-	slices.SortFunc(acc.quantiles, func(a, b quantileValue) int { return cmpFloat(a.q, b.q) })
-	// Deduplicate repeated quantiles (keep the last occurrence), mirroring the
-	// bucket path: duplicate series lines ("0.5" and "0.50") otherwise emit
-	// two entries for one quantile, which a downstream OTLP→Prometheus
-	// translation renders as duplicate samples of the same series.
-	for i, qv := range acc.quantiles {
-		if i+1 < len(acc.quantiles) && acc.quantiles[i+1].q == qv.q {
-			continue
-		}
-		q := dp.QuantileValues().AppendEmpty()
-		q.SetQuantile(qv.q)
-		q.SetValue(qv.v)
-	}
-}
-
-// pointTS is the sample's own timestamp (ms) or the scrape time when it carried
-// none. Shared by all three batchers and setExemplar.
-func pointTS(tsMs int64, scrapeTS pcommon.Timestamp) pcommon.Timestamp {
-	if tsMs > 0 {
-		// A ms value beyond this wraps the int64 nanosecond product and would
-		// stamp the point with a wildly wrong time (a far-future timestamp
-		// silently became a 1970s one). Fall back to the scrape time, which is
-		// the same thing an absent timestamp gets.
-		if tsMs > math.MaxInt64/int64(time.Millisecond) {
-			return scrapeTS
-		}
-		return pcommon.Timestamp(tsMs * int64(time.Millisecond))
-	}
-	// Zero means "no timestamp"; a NEGATIVE one (the classic format's
-	// timestamp is a signed int64, so `foo 1 -1` parses cleanly) is pre-epoch,
-	// which pcommon.Timestamp's unsigned model cannot represent — the uint64
-	// cast turned -1 ms into a year-2554 stamp. Same fallback as absent.
-	return scrapeTS
-}
-
-// numberDataPoint appends a data point of m's kind — Sum stamps the cumulative
-// start time. ok is false, counted as a name collision, when m is neither a Sum
-// nor a Gauge (a family name reused across incompatible metric shapes).
-//
-// histogramDataPoint/exponentialDataPoint/summaryDataPoint below are its
-// bucketed-kind siblings: one type-mismatch → obs.ScrapeCollisions → bail
-// decision for all three batchers (it used to be open-coded eight times), with
-// the cumulative start time stamped on the appended point. The caller sets the
-// point's own timestamp — which batcher clock applies is the caller's business.
-func numberDataPoint(m pmetric.Metric, startTS pcommon.Timestamp) (pmetric.NumberDataPoint, bool) {
-	switch m.Type() {
-	case pmetric.MetricTypeSum:
-		dp := m.Sum().DataPoints().AppendEmpty()
-		dp.SetStartTimestamp(startTS)
-		return dp, true
-	case pmetric.MetricTypeGauge:
-		return m.Gauge().DataPoints().AppendEmpty(), true
-	default:
-		obs.ScrapeCollisions.Inc()
-		return pmetric.NumberDataPoint{}, false
-	}
-}
-
-func histogramDataPoint(m pmetric.Metric, startTS pcommon.Timestamp) (pmetric.HistogramDataPoint, bool) {
-	if m.Type() != pmetric.MetricTypeHistogram {
-		obs.ScrapeCollisions.Inc()
-		return pmetric.HistogramDataPoint{}, false
-	}
-	dp := m.Histogram().DataPoints().AppendEmpty()
-	dp.SetStartTimestamp(startTS)
-	return dp, true
-}
-
-func exponentialDataPoint(m pmetric.Metric, startTS pcommon.Timestamp) (pmetric.ExponentialHistogramDataPoint, bool) {
-	if m.Type() != pmetric.MetricTypeExponentialHistogram {
-		obs.ScrapeCollisions.Inc()
-		return pmetric.ExponentialHistogramDataPoint{}, false
-	}
-	dp := m.ExponentialHistogram().DataPoints().AppendEmpty()
-	dp.SetStartTimestamp(startTS)
-	return dp, true
-}
-
-func summaryDataPoint(m pmetric.Metric, startTS pcommon.Timestamp) (pmetric.SummaryDataPoint, bool) {
-	if m.Type() != pmetric.MetricTypeSummary {
-		obs.ScrapeCollisions.Inc()
-		return pmetric.SummaryDataPoint{}, false
-	}
-	dp := m.Summary().DataPoints().AppendEmpty()
-	dp.SetStartTimestamp(startTS)
-	return dp, true
-}
-
-// The shape funcs initialize a just-created metric's kind, shared by all three
-// batchers. Top-level funcs, never per-point closures: the split and cadvisor
-// batchers pass them as the `shape` argument on allocation-pinned paths.
-func shapeNumber(m pmetric.Metric, monotonic bool) {
-	if monotonic {
-		sum := m.SetEmptySum()
-		sum.SetIsMonotonic(true)
-		sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-	} else {
-		m.SetEmptyGauge()
-	}
-}
-
-func shapeHistogram(m pmetric.Metric) {
-	m.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-}
-
-func shapeExponentialHistogram(m pmetric.Metric) {
-	m.SetEmptyExponentialHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-}
-
-func shapeSummary(m pmetric.Metric) { m.SetEmptySummary() }
-
-// chargeDescriptor stamps a newly created metric's HELP/UNIT and returns the
-// descriptor's full contribution to the chunk-size estimate: name, framing and
-// the description/unit text. It is the ONE spelling of that charge (there were
-// six): a resource-per-object batcher (split, cadvisor) repeats every
-// descriptor per described object, so an uncharged or half-charged descriptor
-// flushes past the collector's 4 MiB receive limit the estimate exists to
-// respect. TestBucketHeavyHistogramStaysUnderCollectorLimit guards the sum.
-func chargeDescriptor(m pmetric.Metric, name string, meta metricMeta) int {
-	return len(name) + metricOverheadBytes + meta.apply(m)
-}
-
-func putLabels(attrs pcommon.Map, labels []Label) {
-	attrs.EnsureCapacity(len(labels))
-	for _, l := range labels {
-		attrs.PutStr(l.Name, l.Value)
-	}
-}
-
-// setExemplar maps an exposition exemplar onto an OTLP exemplar: trace_id
-// and span_id labels become the trace/span fields, everything else becomes
-// filtered attributes.
-func setExemplar(ex pmetric.Exemplar, e Exemplar, fallbackTS pcommon.Timestamp) {
-	ex.SetDoubleValue(e.Value)
-	// Through pointTS, never a bare ms→ns multiplication: the parser bounds
-	// timestamps to int64 MILLISECONDS, so a far-future exemplar timestamp
-	// would wrap the nanosecond product exactly as a sample's would — same
-	// guard, same scrape-time fallback.
-	ex.SetTimestamp(pointTS(e.TimestampMs, fallbackTS))
-	for _, l := range e.Labels {
-		switch l.Name {
-		case "trace_id":
-			var id pcommon.TraceID
-			if b, err := hex.DecodeString(l.Value); err == nil && len(b) == len(id) {
-				copy(id[:], b)
-				ex.SetTraceID(id)
-				continue
-			}
-		case "span_id":
-			var id pcommon.SpanID
-			if b, err := hex.DecodeString(l.Value); err == nil && len(b) == len(id) {
-				copy(id[:], b)
-				ex.SetSpanID(id)
-				continue
-			}
-		}
-		ex.FilteredAttributes().PutStr(l.Name, l.Value)
-	}
-}

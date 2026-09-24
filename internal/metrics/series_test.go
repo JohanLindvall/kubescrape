@@ -7,7 +7,9 @@ import (
 	"context"
 	"log/slog"
 	"math"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -150,11 +152,8 @@ func TestEvictThenReadmitAtCap(t *testing.T) {
 	s.observe(labels{}.set("u", "a"), 1, xxh3.Uint128{}, emptyResource, nil)
 
 	s.observe(labels{}.set("u", "b"), 1, xxh3.Uint128{}, emptyResource, nil)
-	if got := s.drops.Capped(); got != 1 {
+	if got := s.cappedDrops.Load(); got != 1 {
 		t.Fatalf("cap drops = %d, want 1", got)
-	}
-	if got := s.drops.CappedByMetric()["c"]; got != 1 {
-		t.Fatalf("cap drops for metric c = %v, want 1", got)
 	}
 
 	// Past expiration + 4 min grace: the sweep deletes u=a. Its single
@@ -180,12 +179,71 @@ func TestEvictThenReadmitAtCap(t *testing.T) {
 	}
 }
 
-// TestExpiryEmitsBeforeDiscarding: the snapshot idle-reset used to zero a
+// TestCappedDropsAreReportedPerMetricAndOnlyOnceTheyHappen pins what
+// kubescrape_log_metrics_dropped_capped_total{metric} reads: the count per
+// metric NAME (two rules sharing a name share one series, so they must be
+// counted once, not once per rule), and nothing at all for a metric that has
+// dropped nothing — the family is documented as absent until something drops.
+// The counts live on the series, so this walks the set rather than a set-wide
+// map; the concurrent half is what -race checks for the lock-free refusal path.
+func TestCappedDropsAreReportedPerMetricAndOnlyOnceTheyHappen(t *testing.T) {
+	setTimeForTest(time.Unix(1_700_520_000, 0))
+	defer testEpoch.Store(0)
+
+	set, err := newTestSet([]Dynamic{
+		{Name: "a_total", Type: CounterType, Value: "1", MaxCardinality: 1},
+		{Name: "a_total", Type: CounterType, Value: "1", MaxCardinality: 1, Match: []string{"source=second"}},
+		{Name: "b_total", Type: CounterType, Value: "1", MaxCardinality: 1},
+		{Name: "quiet_total", Type: CounterType, Value: "1", MaxCardinality: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := set.DroppedCappedByMetric(); len(got) != 0 {
+		t.Fatalf("before any refusal = %v, want empty (the family is absent until something drops)", got)
+	}
+	emit := func(name, u string) {
+		t.Helper()
+		if err := set.EmitDirect(name, 1, map[string]string{"u": u}, noRes()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	emit("quiet_total", "0")
+	emit("a_total", "0")
+	emit("b_total", "0")
+
+	// Concurrent refusals on two series of ONE set: the shape a cardinality
+	// blow-up fed from several ingest goroutines takes.
+	const workers, each = 4, 50
+	var wg sync.WaitGroup
+	for w := range workers {
+		wg.Go(func() {
+			for i := range each {
+				name := "a_total"
+				if w%2 == 1 {
+					name = "b_total"
+				}
+				_ = set.EmitDirect(name, 1, map[string]string{"u": strconv.Itoa(w*each + i + 1)}, noRes())
+			}
+		})
+	}
+	wg.Wait()
+
+	got := set.DroppedCappedByMetric()
+	want := map[string]float64{"a_total": workers / 2 * each, "b_total": workers / 2 * each}
+	if len(got) != len(want) || got["a_total"] != want["a_total"] || got["b_total"] != want["b_total"] {
+		t.Fatalf("DroppedCappedByMetric = %v, want %v (quiet_total absent, a_total counted once despite two rules)", got, want)
+	}
+}
+
+// TestExpiryEmitsBeforeDiscarding: the snapshot idle branch used to zero a
 // non-aggregating sample WITHOUT emitting it — with maxAge shorter than the
 // export interval (legal; nothing clamps it), every observation made since
 // the last export was silently destroyed: observed at t, exported never.
 // Regression guard for the fix: an observation must appear in at least one
-// export before the idle reset may zero it (expiringSample.exported).
+// export before the idle branch goes quiet on it (expiringSample.exported) —
+// and, the counter being cumulative, the idle branch must not zero it either,
+// so a re-observation continues the running total.
 func TestExpiryEmitsBeforeDiscarding(t *testing.T) {
 	t0 := int64(1_700_510_000)
 	setTimeForTest(time.Unix(t0, 0))
@@ -196,20 +254,18 @@ func TestExpiryEmitsBeforeDiscarding(t *testing.T) {
 	s.observe(labels{}.set("k", "v"), 1, xxh3.Uint128{}, emptyResource, nil)
 
 	setTimeForTest(time.Unix(t0+30, 0)) // first export 30s later
-	var total float64
-	for _, samp := range s.snapshot() {
-		total += samp.value
+	first := s.snapshot()
+	if len(first) != 1 || first[0].value != 1 {
+		t.Fatalf("first export = %+v, want the idle sample of value 1: it was never exported, so the idle branch must emit it", first)
 	}
 	setTimeForTest(time.Unix(t0+31, 0))
 	s.observe(labels{}.set("k", "v"), 1, xxh3.Uint128{}, emptyResource, nil)
 	setTimeForTest(time.Unix(t0+32, 0))
-	for _, samp := range s.snapshot() {
-		total += samp.value
-	}
-	// Two increments happened; the cumulative counter as seen across exports
-	// must reach 2. The idle reset silently ate the first one (total == 1).
-	if total != 2 {
-		t.Fatalf("counter total across exports = %v, want 2: an observation was zeroed by the idle reset before ever being exported", total)
+	last := s.snapshot()
+	// Two increments happened; the cumulative counter's last export must carry
+	// both.
+	if len(last) != 1 || last[0].value != 2 {
+		t.Fatalf("last export = %+v, want the cumulative 2: the idle branch zeroed the counter", last)
 	}
 }
 
@@ -495,12 +551,12 @@ func TestHistogramIdleEmitThroughExport(t *testing.T) {
 	setTimeForTest(time.Unix(t0+75, 0))
 	idle := &capExporter{} // inspect the idle export in isolation
 	if err := set.Export(context.Background(), idle, 0); err != nil {
-		t.Fatal(err) // idle reset: the point must still carry all buckets
+		t.Fatal(err) // idle emit: the point must still carry all buckets
 	}
 
 	m, ok := idle.find("lat_seconds")
 	if !ok {
-		t.Fatal("histogram not exported on the idle reset")
+		t.Fatal("histogram not exported by the idle branch")
 	}
 	dp := m.Histogram().DataPoints().At(0)
 	if dp.Count() != 2 {
@@ -528,7 +584,8 @@ func TestHistogramIdleEmitThroughExport(t *testing.T) {
 // distribution — an observation that lands only in the upper buckets must not
 // narrow what the point reports (with the old one-sample-per-bucket layout
 // that was a real bug; with counts on one sample it is structural, and this
-// pins the emitted copy plus the reset that follows it).
+// pins the emitted copy). The live distribution is NOT reset by going idle (a
+// histogram is cumulative), and the emitted copy must not move with it.
 func TestHistogramIdleEmitKeepsAllBuckets(t *testing.T) {
 	t0 := int64(1_700_600_000)
 	setTimeForTest(time.Unix(t0, 0))
@@ -547,7 +604,7 @@ func TestHistogramIdleEmitKeepsAllBuckets(t *testing.T) {
 	setTimeForTest(time.Unix(t0+15, 0))
 	s.observe(lbls, 8, xxh3.Uint128{}, emptyResource, nil) // lands only in le>=10
 
-	setTimeForTest(time.Unix(t0+75, 0)) // past maxAge -> idle reset branch
+	setTimeForTest(time.Unix(t0+75, 0)) // past maxAge -> idle branch (no reset: cumulative)
 	out := s.snapshot()
 	if len(out) != 1 {
 		t.Fatalf("idle snapshot emitted %d samples, want 1", len(out))
@@ -565,16 +622,18 @@ func TestHistogramIdleEmitKeepsAllBuckets(t *testing.T) {
 		t.Fatalf("+Inf count = %d, want 2", sm.count)
 	}
 
-	// The reset that followed the emit zeroed the live distribution — and the
-	// emitted copy above must NOT have been zeroed with it (counts is cloned).
-	for _, samp := range s.db {
-		if samp.count != 0 {
-			t.Fatalf("idle reset kept count = %d, want 0", samp.count)
+	// The live distribution kept counting — and an observation after the
+	// snapshot must not reach the emitted copy (counts is cloned: export
+	// retention and the render both read it after the lock is released).
+	s.observe(lbls, 0.5, xxh3.Uint128{}, emptyResource, nil)
+	for i, c := range sm.counts {
+		if c != want[i] {
+			t.Fatalf("emitted counts = %v after a later observation, want %v: the emitted copy aliases the live array", sm.counts, want)
 		}
-		for i, c := range samp.counts {
-			if c != 0 {
-				t.Fatalf("idle reset kept bucket %d = %d, want 0", i, c)
-			}
+	}
+	for samp := range s.all() {
+		if samp.count != 3 {
+			t.Fatalf("live count = %d, want 3: going idle must not reset a cumulative histogram", samp.count)
 		}
 	}
 }
@@ -733,8 +792,8 @@ func TestCardinalityWarningNamesTheResourceThatWasRefused(t *testing.T) {
 		r := res(pod)
 		s.observe(lbls, 1, resourceAccum(r), r, nil)
 	}
-	if len(s.db) != 1 || s.drops.Capped() != 1 {
-		t.Fatalf("want one admitted series and one capped drop; db=%d capped=%d", len(s.db), s.drops.Capped())
+	if len(s.db) != 1 || s.cappedDrops.Load() != 1 {
+		t.Fatalf("want one admitted series and one capped drop; db=%d capped=%d", len(s.db), s.cappedDrops.Load())
 	}
 
 	line := buf.String()

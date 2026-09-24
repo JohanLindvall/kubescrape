@@ -22,7 +22,7 @@ import (
 
 func buildLogs(resources, recordsPer, bodyLen int) plog.Logs {
 	ld := plog.NewLogs()
-	for r := 0; r < resources; r++ {
+	for r := range resources {
 		rl := ld.ResourceLogs().AppendEmpty()
 		res := rl.Resource().Attributes()
 		res.PutStr("service.name", fmt.Sprintf("svc-%d", r))
@@ -31,7 +31,7 @@ func buildLogs(resources, recordsPer, bodyLen int) plog.Logs {
 		res.PutStr("k8s.node.name", "node-01.internal.example.com")
 		sl := rl.ScopeLogs().AppendEmpty()
 		sl.Scope().SetName("test")
-		for i := 0; i < recordsPer; i++ {
+		for i := range recordsPer {
 			lr := sl.LogRecords().AppendEmpty()
 			lr.Body().SetStr(strings.Repeat("x", bodyLen))
 			lr.Attributes().PutStr("log.iostream", "stdout")

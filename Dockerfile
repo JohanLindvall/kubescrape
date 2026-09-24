@@ -14,9 +14,11 @@ RUN go mod download
 COPY . .
 # Optional pipelines ride POSITIVE build tags and the default here is the full
 # set, so this image is exactly what it has always been (see the Makefile's
-# TAGS). Dropping `journald` from TAGS builds a cgo-free agent — but then use
-# Dockerfile.static / `make image-static`, which puts it on a smaller base
-# instead of shipping libsystemd for nothing.
+# TAGS). Dropping `journald` from TAGS builds a cgo-free agent — but then build
+# Dockerfile.static, which puts it on a smaller base instead of shipping
+# libsystemd for nothing. `make image` does that by itself for a TAGS without
+# journald (and `make image-static` is that case); only a direct `docker build`
+# of this file needs telling.
 ARG TAGS=journald,azure,events
 # The metadata service is fully static; the agent is cgo when it carries the
 # journald pipeline (it links libsystemd) and static otherwise.
@@ -35,8 +37,12 @@ RUN case "$TAGS" in *journald*) CGO=1 ;; *) CGO=0 ;; esac; \
 # unbuildable on an arm64 host ("not found" at the COPY, hence no `make image`
 # and no `make e2e` there) — the architecture hack/cluster-up.sh and
 # hack/ensure-helm.sh both go out of their way to support. The directory is
-# derived from where libsystemd actually is, so a missing library fails the build
-# loudly rather than shipping an agent the dynamic linker refuses to start.
+# derived from where libsystemd actually is, and a library ON THE LIST below that
+# goes missing fails the build loudly (the cp matches nothing). The list itself
+# is kept by hand, so that is all the build can promise: a NEW dependency
+# libsystemd picks up in a base-image bump is not on it, builds fine, and ships
+# an agent the dynamic linker refuses to start. CI's `image` job is what catches
+# that — it builds this image and starts both binaries inside it.
 RUN set -eu; \
 	dir="$(dirname "$(ls /usr/lib/*-linux-gnu/libsystemd.so.0 | head -n1)")"; \
 	mkdir -p "/staging$dir"; \

@@ -88,14 +88,64 @@ func Pod(res pcommon.Resource, pod kubemeta.Pod) {
 		a.PutStr("service.name", name)
 	}
 
+	var nsLabels map[string]string
+	if pod.NamespaceMetadata != nil {
+		nsLabels = pod.NamespaceMetadata.Labels
+	}
+	if len(pod.Labels)+len(nsLabels) > bulkLabelThreshold {
+		putLabelsBulk(a, pod.Labels, nsLabels)
+		return
+	}
 	for k, v := range pod.Labels {
 		a.PutStr(prefixedKey(podLabelKeys, podLabelPrefix, k), v)
 	}
-	if pod.NamespaceMetadata != nil {
-		for k, v := range pod.NamespaceMetadata.Labels {
-			a.PutStr(prefixedKey(nsLabelKeys, nsLabelPrefix, k), v)
-		}
+	for k, v := range nsLabels {
+		a.PutStr(prefixedKey(nsLabelKeys, nsLabelPrefix, k), v)
 	}
+}
+
+// bulkLabelThreshold is the label count above which Pod stamps labels in ONE
+// linear pass instead of one PutStr each.
+//
+// pcommon.Map.PutStr scans the map for an existing key before it appends, so n
+// labels cost O(n^2) key compares — and a label COUNT is tenant-authored and
+// bounded only by the API server's object size (the metadata service
+// deliberately does not cap labels: they are selection input). Build runs per
+// RESOURCE per cycle (per pod and per container on the cadvisor scrape, per
+// target, per described object on a split), so one pod with tens of thousands
+// of labels spent seconds of the node agent's scrape budget on every cycle:
+// measured 0.5 s at 10k labels and 7 s at 40k, against ~14 ms and ~43 ms on
+// the bulk path. pdata has no append-without-lookup, and Map.FromRaw is its
+// only O(n) bulk write.
+//
+// Below the threshold the PutStr loop stays: it is the allocation-budgeted
+// path every real pod takes (TestBuildAllocationBudget), and at a few dozen
+// labels the quadratic term is noise. Merge takes its bulk path above the same
+// source size, for the same quadratic.
+const bulkLabelThreshold = 64
+
+// putLabelsBulk writes the prefixed pod and namespace labels into a with the
+// same result the PutStr loop gives — a label OVERWRITES a same-named
+// attribute already on the resource, and every other attribute keeps its type
+// and value — in time linear in the attribute count: the map round-trips
+// through AsRaw/FromRaw, which rebuilds it in one pass.
+//
+// Two differences from the PutStr loop, neither observable to anything in this
+// repo: attribute ORDER follows Go map iteration (the labels' order was
+// already random, and every resource identity fold is order-independent), and
+// a key the resource carried TWICE collapses to its last value, where Get
+// would have read the first — Build's inputs never carry a duplicate.
+func putLabelsBulk(a pcommon.Map, podLabels, nsLabels map[string]string) {
+	raw := a.AsRaw()
+	for k, v := range podLabels {
+		raw[prefixedKey(podLabelKeys, podLabelPrefix, k)] = v
+	}
+	for k, v := range nsLabels {
+		raw[prefixedKey(nsLabelKeys, nsLabelPrefix, k)] = v
+	}
+	// FromRaw fails only on a value type AsRaw never produces, so the error is
+	// unreachable here; the map is fully rebuilt either way.
+	_ = a.FromRaw(raw)
 }
 
 // The prefixed attribute key for a label is memoized: label VALUES are data,
@@ -125,12 +175,12 @@ func prefixedKey(c *genCache[string], prefix, key string) string {
 }
 
 // Container adds the container-level resource attributes on top of Pod's.
-// Empty fields are omitted, never stamped as "", for Pod's reason and one
-// sharper: k8s.container.name is a RESERVED-IDENTITY key (see
-// ReservedIdentity), so on the ingest path a resolved lookup OVERWRITES
-// whatever a sender declared with what this function stamps — an empty value
-// there would replace a conformant SDK's honest container name with nothing,
-// on every resource it resolves.
+// Empty fields are omitted, never stamped as "", for Pod's reason: an empty
+// k8s.container.name (or container.id) would enter series identity and
+// log-metric label sets as a value rather than an absence. (There is no
+// sender value for an empty stamp to blank on the ingest path: the
+// application-facing receivers strip a sender's own k8s.container.name at
+// receipt, before enrichment runs — otlpingest.Enricher.SenderIdentityStrip.)
 func Container(res pcommon.Resource, c kubemeta.Container) {
 	a := res.Attributes()
 	if c.Name != "" {
@@ -213,17 +263,94 @@ func Identity(res pcommon.Resource) {
 }
 
 // FillAbsent adds src's attributes to dst, never overwriting a key dst already
-// has. It is how every "someone else knows more about this resource" merge in
-// the agent is applied — the ingest enricher over a sender's resource, the
-// self-metadata stamping over a process's own identity — because in both the
-// existing value is the authoritative one.
-func FillAbsent(src, dst pcommon.Map) {
+// has — Merge with nothing replaced. The self-metadata stamping applies it
+// over a process's own identity, where the existing value is the
+// authoritative one.
+func FillAbsent(src, dst pcommon.Map) { Merge(src, dst, nil) }
+
+// Merge writes src's attributes into dst: a key dst lacks is added, and a key
+// dst already has is replaced only when replace(key) reports true (nil
+// replaces nothing). src is only READ. It is the one "someone else knows more
+// about this resource" merge: FillAbsent, the ingest enricher's resolved-wins
+// merge over a sender's resource, and the split path's overwrite of a
+// described object's.
+//
+// It is linear in the attribute count whatever the sizes. The obvious per-key
+// loop is not: pcommon.Map's Get and PutEmpty each SCAN for the key, so it
+// costs O(|src| x (|dst|+|src|)) key compares — and on the ingest path both
+// sides are tenant-authored: src carries the resolved pod's labels (a count
+// bounded only by the API server's object size; attrs.Pod already stamps them
+// in one pass for that reason) and dst is the sender's resource, merged once
+// per resource of every push. Above bulkLabelThreshold src attributes the
+// merge therefore rebuilds dst in one pass (mergeBulk); at or below it the
+// loop stays — allocation-free, order-preserving, and linear in |dst| for a
+// src that small.
+func Merge(src, dst pcommon.Map, replace func(key string) bool) {
+	if src.Len() > bulkLabelThreshold {
+		mergeBulk(src, dst, replace)
+		return
+	}
 	src.Range(func(k string, v pcommon.Value) bool {
-		if _, exists := dst.Get(k); !exists {
+		if _, exists := dst.Get(k); !exists || (replace != nil && replace(k)) {
 			v.CopyTo(dst.PutEmpty(k))
 		}
 		return true
 	})
+}
+
+// mergeBulk is Merge in one pass. Each output key's source is decided through
+// a Go map, the output is allocated by ONE Map.FromRaw of placeholder values —
+// pdata's only linear bulk write — and the values then go in: dst's are MOVED
+// (a pointer move, so a sender's structured value is never boxed through
+// AsRaw nor deep-copied, the cost attrs.Pod's AsRaw round trip can afford on
+// label strings and this path cannot on sender content), src's are copied.
+//
+// Two differences from the per-key loop, neither observable to anything in
+// this repo: attribute ORDER follows Go map iteration (every resource
+// identity fold is order-independent), and a key dst carried TWICE collapses
+// to one entry — the first, which is what Get reads and what the loop would
+// have written into — where the loop left the later copy on the wire beside
+// it. When nothing is added or replaced dst is left exactly as it was, as the
+// loop leaves it.
+func mergeBulk(src, dst pcommon.Map, replace func(key string) bool) {
+	type slot struct {
+		v       pcommon.Value
+		fromSrc bool
+	}
+	slots := make(map[string]slot, dst.Len()+src.Len())
+	dst.Range(func(k string, v pcommon.Value) bool {
+		if _, dup := slots[k]; !dup {
+			slots[k] = slot{v: v}
+		}
+		return true
+	})
+	changed := false
+	src.Range(func(k string, v pcommon.Value) bool {
+		if _, exists := slots[k]; !exists || (replace != nil && replace(k)) {
+			slots[k] = slot{v: v, fromSrc: true}
+			changed = true
+		}
+		return true
+	})
+	if !changed {
+		return
+	}
+	keys := make(map[string]any, len(slots))
+	for k := range slots {
+		keys[k] = nil
+	}
+	out := pcommon.NewMap()
+	// Every value is nil, which FromRaw maps to an empty Value: it cannot fail.
+	_ = out.FromRaw(keys)
+	out.Range(func(k string, ov pcommon.Value) bool {
+		if s := slots[k]; s.fromSrc {
+			s.v.CopyTo(ov)
+		} else {
+			s.v.MoveTo(ov)
+		}
+		return true
+	})
+	out.MoveTo(dst)
 }
 
 // PrefixInstance prepends prefix (+ "-") to service.instance.id so resources
@@ -284,14 +411,15 @@ var identityKeys = func() []string {
 }()
 
 // IdentityKeys returns (a copy of) every fixed resource-attribute key this
-// package's built-in mapping can emit, sorted. It exists for consumers that
-// must treat "an attribute naming WHO a resource is" as a closed set — the
-// ingest splitter strips exactly these from a sender's resource before
-// re-labelling it as a described object's (a key the described object LACKS
-// would otherwise survive from the exporter onto the object it describes,
-// since the overwrite only replaces keys the builder emits for THAT object).
-// The list had been re-spelled there by hand and drifted when Service grew
-// k8s.service.name/uid; deriving it here is what pins it.
+// package's built-in mapping can EMIT, sorted — the builder's own emission
+// set, and nothing a sender alone might set. It is NOT the list a receiver
+// strips: SenderIdentityKeys extends it with the sender-only keys
+// (container.name), and that superset is what the ingest splitter removes
+// from a sender's resource before re-labelling it as a described object's.
+// This one stays exported as the independent oracle for that superset —
+// otlpingest's senderidentity_test asserts the splitter's list covers every
+// key the builder can emit, which comparing SenderIdentityKeys with itself
+// could not.
 func IdentityKeys() []string {
 	return slices.Clone(identityKeys)
 }

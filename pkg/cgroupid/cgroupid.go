@@ -37,8 +37,10 @@ func Identity(id string) (podUID, containerID string) {
 // slice, still reports true; a caller that must exclude it needs evidence the
 // path does not carry (see isSandbox in internal/agent/promscrape).
 //
-// Runs once per cadvisor sample, so the path is walked in place (substring
-// slices) rather than split into an allocated segment slice.
+// Sits on the cadvisor scrape's per-row path — its caller memoizes the result
+// per distinct path, falling back to a call per row once the memo is full — so
+// the path is walked in place (substring slices) rather than split into an
+// allocated segment slice.
 func Parse(id string) (podUID, containerID string, podContainer bool) {
 	segs, podSeg, cidSeg := 0, -1, -1
 	for start := 0; start < len(id); {
@@ -95,8 +97,9 @@ func Parse(id string) (podUID, containerID string, podContainer bool) {
 // leaves a caller cross-checking a by-name lookup with nothing to check
 // against, so under a static pod's cgroup an unrelated pod that happens to
 // share the name is accepted — the whole control plane's cgroups on every node
-// (see resolveContext in internal/agent/promscrape, which reads a mirror pod's
-// annotations to decide whether it answers for the uid a path carries).
+// (see podAnswersFor in internal/agent/promscrape's metaresolve.go, which every
+// by-name resolution consults: it reads a mirror pod's annotations to decide
+// whether it answers for the uid a path carries).
 //
 // 32 hex digits are also unambiguous where this is used: a segment reaches the
 // test only after a literal "pod" prefix inside a cgroup path the kubelet

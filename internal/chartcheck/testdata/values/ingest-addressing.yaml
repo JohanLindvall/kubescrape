@@ -1,0 +1,12 @@
+# The two ways the chart gives an application an address for "the agent on MY
+# node" (values.yaml, agent.ingest): the internalTrafficPolicy: Local Service
+# and the hostPort binding. Both used to be rendered by no fixture, so a
+# template edit that dropped internalTrafficPolicy — turning the Service into
+# the round-robin ClusterIP the docs warn against — or lost a hostPort line
+# would have changed nothing any test could see.
+agent:
+  ingest:
+    enabled: true
+    hostPort: true
+    service:
+      enabled: true

@@ -62,9 +62,25 @@ func severityOf(level string) (plog.SeverityNumber, string) {
 // resKey groups records by the ARM resource they describe.
 func resKey(rec *record) string { return strings.ToLower(rec.resourceID) }
 
-// resource builds the ARM resource's OTLP resource.
-func (r *Reader) resource(rec *record) pcommon.Resource {
-	res := pcommon.NewResource()
+// resKeyMemo is resKey for a batch walk: Azure emits a resource's records
+// together, so consecutive records usually carry the SAME (uppercased) ARM id,
+// and lowering it again for each is an allocation per record that buys
+// nothing. It re-lowers only when the id changes, so the key is exactly
+// resKey's whatever the order.
+type resKeyMemo struct{ id, key string }
+
+func (m *resKeyMemo) of(rec *record) string {
+	if rec.resourceID != m.id { // the zero memo is right for an empty id
+		m.id, m.key = rec.resourceID, resKey(rec)
+	}
+	return m.key
+}
+
+// fillResource builds the ARM resource's OTLP resource into res, which must
+// be freshly created (both callers hand it an AppendEmpty'd one). It writes in
+// place rather than returning a resource to CopyTo: that was a throwaway
+// Resource plus a full attribute copy per ARM-resource group per poll.
+func (r *Reader) fillResource(rec *record, res pcommon.Resource) {
 	a := res.Attributes()
 	a.PutStr("cloud.provider", "azure")
 	if rec.resourceID != "" {
@@ -100,7 +116,6 @@ func (r *Reader) resource(rec *record) pcommon.Resource {
 	// the resource an Azure record describes has no relation to wherever
 	// this singleton happens to be scheduled.
 	r.cfg.Attrs.Build(res, attrs.Context{})
-	return res
 }
 
 // convertLogs turns the batch's log records into one plog.Logs, grouped per
@@ -113,14 +128,9 @@ func (r *Reader) convertLogs(recs []record) plog.Logs {
 	ld := plog.NewLogs()
 	groups := logchain.NewGroups(ld, ScopeName, 8)
 	observed := pcommon.NewTimestampFromTime(time.Now())
-	sink := &recordSink{r: r, observed: observed, scrub: r.cfg.Scrub}
-	chain := logchain.NewChain[string](logchain.Config{
-		Scrub:      r.cfg.Scrub,
-		LogAttrs:   r.cfg.LogAttrs,
-		Enrich:     r.cfg.Enrich,
-		LogMetrics: r.cfg.LogMetrics,
-		Rules:      r.cfg.Rules,
-	}, false)
+	sink := &recordSink{r: r, observed: observed}
+	chain := logchain.NewChain[string](r.cfg.Chain, false)
+	var keys resKeyMemo
 
 	for i := range recs {
 		rec := &recs[i]
@@ -128,9 +138,9 @@ func (r *Reader) convertLogs(recs []record) plog.Logs {
 			continue
 		}
 		// Scrub runs first, before anything copies from the body.
-		body, extracted := chain.Line(string(rec.raw))
+		body, extracted := chain.Line(string(rec.raw), false)
 
-		key := chain.GroupKey(resKey(rec), extracted)
+		key := chain.GroupKey(keys.of(rec), extracted)
 		// The group is built BEFORE the record because metric and rule
 		// resolution reads the group's own resource; a group the rules empty is
 		// pruned below.
@@ -151,7 +161,7 @@ func (r *Reader) convertLogs(recs []record) plog.Logs {
 }
 
 // redundantOnAzureResource reports whether an enrich-derived record attribute
-// merely repeats what r.resource() already put on the OTLP resource.
+// merely repeats what r.fillResource() already put on the OTLP resource.
 //
 // The converter is authoritative for identity on this path: it parses the ARM
 // id out of the envelope's own resourceId field, while enrich re-derives one
@@ -217,14 +227,13 @@ type recordSink struct {
 	rec      *record
 	body     string
 	observed pcommon.Timestamp
-	scrub    *logscrub.Scrubber
 }
 
 func (s *recordSink) Dest() plog.LogRecordSlice { return s.sl.LogRecords() }
 
 // FillResource builds a fresh group's resource: the ARM resource the record
 // describes.
-func (s *recordSink) FillResource(res pcommon.Resource) { s.r.resource(s.rec).CopyTo(res) }
+func (s *recordSink) FillResource(res pcommon.Resource) { s.r.fillResource(s.rec, res) }
 
 func (s *recordSink) Stamp(lr plog.LogRecord) {
 	ts := s.rec.ts
@@ -237,7 +246,7 @@ func (s *recordSink) Stamp(lr plog.LogRecord) {
 	lr.SetSeverityNumber(sev)
 	lr.SetSeverityText(sevText)
 	lr.Body().SetStr(s.body)
-	putLogAttrs(lr.Attributes(), s.rec, s.scrub)
+	putLogAttrs(lr.Attributes(), s.rec, s.r.cfg.Chain.Scrub)
 }
 
 // putLogAttrs stamps the record-level attributes describing the diagnostic
@@ -272,49 +281,77 @@ func putLogAttrs(dst pcommon.Map, rec *record, scrub *logscrub.Scrubber) {
 // convertMetrics turns the batch's metric records into one pmetric.Metrics:
 // per ARM resource, per Azure metric, one gauge per present aggregation,
 // named <prefix><metricname>.<aggregation>.
+//
+// The lookups are keyed so a record builds no string it does not keep: a
+// group is found by the lowered metric name alone, and the full
+// <prefix><name>.<aggregation> name is built only when that gauge is first
+// created — it used to be rebuilt per RECORD (a base concat plus one per
+// aggregation, six allocations) just to probe the map. The lowered name is
+// memoized per raw spelling, and the group per consecutive ARM id, so a batch
+// of one resource's records lowers each of those once.
 func (r *Reader) convertMetrics(recs []record) pmetric.Metrics {
 	md := pmetric.NewMetrics()
+	// gauges holds one Azure metric's per-aggregation gauges; made[agg] says
+	// whether dps[agg] exists yet (created on the first record carrying it).
+	type gauges struct {
+		dps  [nAggs]pmetric.NumberDataPointSlice
+		made [nAggs]bool
+	}
 	type group struct {
 		sm     pmetric.ScopeMetrics
-		byName map[string]pmetric.NumberDataPointSlice
+		byName map[string]*gauges // keyed by the LOWERED metric name
 	}
 	groups := make(map[string]*group, 8)
+	lowered := make(map[string]string, 8) // raw metricName -> strings.ToLower
 	observed := pcommon.NewTimestampFromTime(time.Now())
+	var (
+		g      *group
+		lastID string
+	)
 
 	for i := range recs {
 		rec := &recs[i]
 		if !rec.metric {
 			continue
 		}
-		key := resKey(rec)
-		g, ok := groups[key]
-		if !ok {
-			rm := md.ResourceMetrics().AppendEmpty()
-			r.resource(rec).CopyTo(rm.Resource())
-			sm := rm.ScopeMetrics().AppendEmpty()
-			sm.Scope().SetName(ScopeName)
-			sm.Scope().SetVersion(obs.ScopeVersion)
-			g = &group{sm: sm, byName: make(map[string]pmetric.NumberDataPointSlice, 8)}
-			groups[key] = g
+		if g == nil || rec.resourceID != lastID {
+			key := resKey(rec)
+			var ok bool
+			if g, ok = groups[key]; !ok {
+				rm := md.ResourceMetrics().AppendEmpty()
+				r.fillResource(rec, rm.Resource())
+				sm := rm.ScopeMetrics().AppendEmpty()
+				sm.Scope().SetName(ScopeName)
+				sm.Scope().SetVersion(obs.ScopeVersion)
+				g = &group{sm: sm, byName: make(map[string]*gauges, 8)}
+				groups[key] = g
+			}
+			lastID = rec.resourceID
 		}
 		ts := pcommon.NewTimestampFromTime(rec.ts)
 		if rec.ts.IsZero() {
 			ts = observed
 		}
-		base := r.cfg.MetricPrefix + strings.ToLower(rec.metricName) + "."
-		for agg := 0; agg < nAggs; agg++ {
+		lower, ok := lowered[rec.metricName]
+		if !ok {
+			lower = strings.ToLower(rec.metricName)
+			lowered[rec.metricName] = lower
+		}
+		gs := g.byName[lower]
+		if gs == nil {
+			gs = &gauges{}
+			g.byName[lower] = gs
+		}
+		for agg := range nAggs {
 			if !rec.has[agg] {
 				continue
 			}
-			name := base + aggNames[agg]
-			dps, ok := g.byName[name]
-			if !ok {
+			if !gs.made[agg] {
 				m := g.sm.Metrics().AppendEmpty()
-				m.SetName(name)
-				dps = m.SetEmptyGauge().DataPoints()
-				g.byName[name] = dps
+				m.SetName(r.cfg.MetricPrefix + lower + "." + aggNames[agg])
+				gs.dps[agg], gs.made[agg] = m.SetEmptyGauge().DataPoints(), true
 			}
-			dp := dps.AppendEmpty()
+			dp := gs.dps[agg].AppendEmpty()
 			dp.SetTimestamp(ts)
 			dp.SetDoubleValue(rec.aggs[agg])
 			if rec.timeGrain != "" {

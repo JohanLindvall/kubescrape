@@ -239,8 +239,8 @@ func TestScriptOutputDoesNotOverwriteTheRecordMessage(t *testing.T) {
 	old := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
 	t.Cleanup(func() { slog.SetDefault(old) })
-	scriptLogGates.Delete("logs")
-	t.Cleanup(func() { scriptLogGates.Delete("logs") })
+	scriptLogGates.logs = logdedupe.Throttle{}
+	t.Cleanup(func() { scriptLogGates.logs = logdedupe.Throttle{} })
 
 	scriptLog("logs", "level=ERROR everything is on fire")
 

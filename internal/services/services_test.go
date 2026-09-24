@@ -27,26 +27,40 @@ func makeService(uid, name string, selector map[string]string) *corev1.Service {
 	}
 }
 
-func TestMatching(t *testing.T) {
+// matching is the production read path for "which Services select this pod":
+// one InNamespaces snapshot filtered by Service.Selects, which is what the
+// server's node-targets derivation does — so these tests exercise the memoised
+// snapshot rather than a locked per-pod scan no production caller uses.
+func matching(ix *Index, namespace string, podLabels map[string]string) []*Service {
+	var out []*Service
+	for _, svc := range ix.InNamespaces([]string{namespace})[namespace] {
+		if svc.Selects(podLabels) {
+			out = append(out, svc)
+		}
+	}
+	return out
+}
+
+func TestSelectorMatching(t *testing.T) {
 	ix := NewIndex()
 	ix.Upsert(makeService("uid1", "web-svc", map[string]string{"app": "web"}))
 	ix.Upsert(makeService("uid2", "strict-svc", map[string]string{"app": "web", "tier": "gold"}))
 	ix.Upsert(makeService("uid3", "no-selector", nil))
 
-	got := ix.Matching("default", map[string]string{"app": "web", "extra": "x"})
+	got := matching(ix, "default", map[string]string{"app": "web", "extra": "x"})
 	if len(got) != 1 || got[0].Name != "web-svc" {
 		t.Fatalf("got %+v", got)
 	}
 
-	got = ix.Matching("default", map[string]string{"app": "web", "tier": "gold"})
+	got = matching(ix, "default", map[string]string{"app": "web", "tier": "gold"})
 	if len(got) != 2 {
 		t.Fatalf("expected both selecting services, got %+v", got)
 	}
 
-	if got := ix.Matching("other-ns", map[string]string{"app": "web"}); len(got) != 0 {
+	if got := matching(ix, "other-ns", map[string]string{"app": "web"}); len(got) != 0 {
 		t.Fatalf("wrong namespace matched: %+v", got)
 	}
-	if got := ix.Matching("default", map[string]string{"app": "api"}); len(got) != 0 {
+	if got := matching(ix, "default", map[string]string{"app": "api"}); len(got) != 0 {
 		t.Fatalf("non-matching labels matched: %+v", got)
 	}
 }
@@ -55,7 +69,7 @@ func TestPortConversion(t *testing.T) {
 	ix := NewIndex()
 	ix.Upsert(makeService("uid1", "web-svc", map[string]string{"app": "web"}))
 
-	got := ix.Matching("default", map[string]string{"app": "web"})
+	got := matching(ix, "default", map[string]string{"app": "web"})
 	if len(got) != 1 || len(got[0].Ports) != 2 {
 		t.Fatalf("got %+v", got)
 	}
@@ -73,15 +87,15 @@ func TestUpsertReplacesAndDeleteRemoves(t *testing.T) {
 	// Selector change must stop matching old pods.
 	ix.Upsert(makeService("uid1", "svc", map[string]string{"app": "api"}))
 
-	if got := ix.Matching("default", map[string]string{"app": "web"}); len(got) != 0 {
+	if got := matching(ix, "default", map[string]string{"app": "web"}); len(got) != 0 {
 		t.Fatalf("stale selector still matches: %+v", got)
 	}
-	if got := ix.Matching("default", map[string]string{"app": "api"}); len(got) != 1 {
+	if got := matching(ix, "default", map[string]string{"app": "api"}); len(got) != 1 {
 		t.Fatalf("new selector does not match: %+v", got)
 	}
 
 	ix.Delete("default", "uid1")
-	if got := ix.Matching("default", map[string]string{"app": "api"}); len(got) != 0 {
+	if got := matching(ix, "default", map[string]string{"app": "api"}); len(got) != 0 {
 		t.Fatalf("deleted service still matches: %+v", got)
 	}
 }

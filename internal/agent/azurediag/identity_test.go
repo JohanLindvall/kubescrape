@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/plog"
+
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 )
 
 // The enricher re-derives an ARM identity from the record BODY, while the
@@ -21,7 +23,7 @@ import (
 func TestIdentityIsNotDuplicatedOntoEveryRecord(t *testing.T) {
 	exp := &captureExporter{}
 	src := newFakeSource([][]byte{[]byte(logEnvelope)})
-	r := newTestReader(Config{Exporter: exp, Enrich: true}, src)
+	r := newTestReader(Config{Exporter: exp, Chain: logchain.Config{Enrich: true}}, src)
 	runUntilCommit(t, r, src)
 
 	exp.mu.Lock()
@@ -137,7 +139,7 @@ func TestEnvelopeCategoryAndBodyEventCategoryStayDistinct(t *testing.T) {
 ]}`
 	exp := &captureExporter{}
 	src := newFakeSource([][]byte{[]byte(envelope)})
-	r := newTestReader(Config{Exporter: exp, Enrich: true}, src)
+	r := newTestReader(Config{Exporter: exp, Chain: logchain.Config{Enrich: true}}, src)
 	runUntilCommit(t, r, src)
 
 	recs := exp.records()

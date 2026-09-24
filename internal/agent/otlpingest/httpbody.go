@@ -3,7 +3,7 @@ package otlpingest
 // The OTLP/HTTP request seam, shared by every receiver in this repo.
 //
 // There were two copies of this: the ingest server's and the trace tier's
-// internal receiver (cmd/kubescrape-agent/servicegraph.go), and the bug fix
+// internal receiver (cmd/kubescrape-agent/sgreceiver.go), and the bug fix
 // landed in only one. The ingest reader wraps the COMPRESSED body in a
 // cappedReader specifically so an over-cap gzip reports 413 — its truncation at
 // the cap otherwise surfaces as a gzip parse error and answers 400 "malformed"
@@ -21,7 +21,7 @@ package otlpingest
 //   - the byte BUDGET (admit.go), which the tier's receiver deliberately does
 //     not have — it is authenticated, its senders are siblings, and its gRPC
 //     message cap bounds one push. A nil budget charges nothing;
-//   - the OBSERVATION (NewBodyReader vs newBodyReader): the counter says
+//   - the OBSERVATION (NewBodyReader vs newIngestBodyReader): the counter says
 //     "an application push was refused at a listener nothing authenticates",
 //     and the trace tier serves BOTH kinds of listener in one process.
 //
@@ -44,11 +44,12 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/gzip"
+	"google.golang.org/grpc/encoding"
 
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/internal/peerip"
 
-	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/clip"
 )
 
@@ -99,7 +100,7 @@ type BodyReader struct {
 
 // NewBodyReader returns a reader capping bodies at max bytes with no byte
 // budget and NO observation — the shape the trace tier's AUTHENTICATED
-// internal hop wants (cmd/kubescrape-agent/servicegraph.go).
+// internal hop wants (cmd/kubescrape-agent/sgreceiver.go).
 //
 // The counter it stays out of is deliberate, not an oversight.
 // kubescrape_ingest_body_rejected_total means one thing: an APPLICATION push
@@ -121,7 +122,12 @@ type BodyReader struct {
 // exactly the aggregation that erases the distinction.
 func NewBodyReader(limit int64) *BodyReader { return &BodyReader{max: limit} }
 
-func newBodyReader(limit int64, budget *byteBudget, log *slog.Logger) *BodyReader {
+// newIngestBodyReader returns the APPLICATION-facing reader — charged to the
+// ingest byte budget and OBSERVED (counted into kubescrape_ingest_body_rejected_total
+// and warned about) — which is everything NewBodyReader, above, deliberately is
+// not. The names differ by more than case so the one letter cannot be what
+// picks which series a refusal lands on.
+func newIngestBodyReader(limit int64, budget *byteBudget, log *slog.Logger) *BodyReader {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -217,7 +223,7 @@ func (br *BodyReader) noteRejected(r *http.Request, err error) {
 	br.log.Warn("ingest: refused an OTLP/HTTP push at the door; the sender's request is wrong and retrying it will not help",
 		"reason", reason,
 		"status", BodyErrorStatus(err),
-		"peer", r.RemoteAddr,
+		"peer", peerip.ForLog(r.RemoteAddr),
 		"path", clipForLog(r.URL.Path),
 		"contentType", clipForLog(r.Header.Get("Content-Type")),
 		"contentEncoding", clipForLog(r.Header.Get("Content-Encoding")),
@@ -228,13 +234,13 @@ func (br *BodyReader) noteRejected(r *http.Request, err error) {
 // maxLoggedValueBytes bounds one SENDER-supplied value on a log line.
 //
 // This listener is unauthenticated by design, and net/http admits a request
-// line and header block up to Server.MaxHeaderBytes (1 MiB by default) — so the
-// request path and the two Content-* headers are each up to about a megabyte
-// that whoever can reach the port chose. The throttle above bounds how OFTEN
-// this line is emitted; only a clip bounds how BIG it is, and a megabyte per
-// window per reason per node is a log bill and a collector stall, not a
-// diagnostic. peer is exempt: net/http fills RemoteAddr from the connection,
-// not from anything the sender wrote.
+// line and header block up to Server.MaxHeaderBytes (maxHeaderListBytes, 64
+// KiB, on every NewPushHTTPServer) — so the request path and the two Content-*
+// headers are each up to tens of kilobytes that whoever can reach the port
+// chose. The throttle above bounds how OFTEN this line is emitted; only a clip
+// bounds how BIG it is, and 64 KiB per window per reason per node is a log
+// bill, not a diagnostic. peer is exempt: net/http fills RemoteAddr from the
+// connection, not from anything the sender wrote.
 //
 // The value still has to REACH the operator — a wrong Content-Type IS the
 // diagnosis — so it is clipped rather than dropped, and clipped on a rune
@@ -312,8 +318,8 @@ func (br *BodyReader) Read(r *http.Request) ([]byte, int64, error) {
 		if mt, _, err := mime.ParseMediaType(ct); err != nil || mt != "application/x-protobuf" {
 			// The value is CLIPPED into the error, not just onto the log line
 			// that carries it: this listener is unauthenticated and net/http
-			// admits a header block up to Server.MaxHeaderBytes (1 MiB by
-			// default), so an unclipped value renders at full size in the log's
+			// admits a header block up to Server.MaxHeaderBytes (64 KiB here),
+			// so an unclipped value renders at full size in the log's
 			// error= field and in the 415 body — which is the exact bound
 			// maxLoggedValueBytes exists to hold, walked around by the one
 			// attribute nobody thought to clip.
@@ -336,7 +342,7 @@ func (br *BodyReader) Read(r *http.Request) ([]byte, int64, error) {
 		// Allow one byte over the cap so an exactly-at-cap compressed body is
 		// not misreported as oversized; the decompressed cap below still holds.
 		capped = &cappedReader{r: body, remain: br.max + 1}
-		zr, err := gzip.NewReader(capped)
+		zr, err := openGzip(capped)
 		if err != nil {
 			if capped.remain <= 0 {
 				// See below: our own truncation, not the sender's payload.
@@ -344,6 +350,9 @@ func (br *BodyReader) Read(r *http.Request) ([]byte, int64, error) {
 			}
 			return fail(body.classify(r, fmt.Errorf("gzip body: %w", err)))
 		}
+		// Close is required, not tidy: it is what returns a pooled reader, and
+		// an over-cap read stops short of EOF — the one case a terminal Read
+		// never releases it (see openGzip).
 		defer func() { _ = zr.Close() }()
 		src = zr
 	default:
@@ -388,6 +397,41 @@ func (br *BodyReader) Read(r *http.Request) ([]byte, int64, error) {
 		return fail(err)
 	}
 	return buf, bd.held, nil
+}
+
+// openGzip opens a gzip reader over r through the process's registered gRPC
+// "gzip" compressor rather than gzip.NewReader. That is otlpexport's
+// klauspost-backed codec (registered by its init; this package imports it, and
+// otlpexport refuses to build a client if anything displaced it), whose readers
+// are POOLED behind a warm slot the GC cannot drain and scrubbed of the message
+// they read before they go back. The gRPC arm of every receiver already
+// decompresses through it; the HTTP arm built a fresh reader per push — a
+// 32 KiB window plus huffman tables, ~37 kB of garbage per gzipped request on
+// an unauthenticated listener, and on the trace tier's internal hop.
+//
+// The reader goes back on the first of a terminal Read or Close, exactly once,
+// so the caller MUST Close it: a body the caps cut short never reaches EOF. A
+// header error returns the reader to the pool inside the codec. The fallbacks
+// cover a registry without a gzip compressor, or one whose reader has no Close
+// (grpc-go's own codec, which pools at EOF itself) — both still correct, one
+// merely unpooled.
+func openGzip(r io.Reader) (io.ReadCloser, error) {
+	c := encoding.GetCompressor("gzip")
+	if c == nil {
+		zr, err := gzip.NewReader(r)
+		if err != nil {
+			return nil, err
+		}
+		return zr, nil
+	}
+	zr, err := c.Decompress(r)
+	if err != nil {
+		return nil, err
+	}
+	if rc, ok := zr.(io.ReadCloser); ok {
+		return rc, nil
+	}
+	return io.NopCloser(zr), nil
 }
 
 // requestBody is r.Body with the first transport-level failure remembered.
@@ -534,7 +578,8 @@ func BodyErrorStatus(err error) int {
 // absent.
 func WriteBodyError(w http.ResponseWriter, err error) {
 	if errors.Is(err, errBufferBudget) {
-		w.Header().Set("Retry-After", "1")
+		writeShed(w, err) // BodyErrorStatus' 429, plus the Retry-After
+		return
 	}
 	http.Error(w, err.Error(), BodyErrorStatus(err))
 }
@@ -553,27 +598,83 @@ func WriteProto(w http.ResponseWriter, m ProtoMarshaler) {
 	_, _ = w.Write(b)
 }
 
-// GRPCForwardStatus maps a forwarding failure onto a gRPC status the sender's
-// SDK retries correctly. A bare error would surface as codes.Unknown —
-// NON-retryable per the OTLP spec — making senders permanently drop batches on
-// transient conditions (a full disk buffer, an upstream 5xx). A status error
-// from a gRPC upstream passes through unchanged.
-//
-// Permanence is classified by otlpexport.IsPermanent (the single source of
-// truth): only definitive upstream rejections become InvalidArgument (do not
-// retry). Everything else — diskqueue.ErrFull back-pressure, upstream 5xx,
-// 401/403/404 windows, timeouts, unclassified failures — is Unavailable: the
-// receiver is a proxy, and the sender retrying is the safe default.
-func GRPCForwardStatus(err error) error { return grpcForwardStatus(err) }
+// maxPresizeBytes bounds what an UNVERIFIED size hint may allocate before the
+// sender has produced a single byte. Content-Length is the sender's claim, not
+// a fact: sizing the destination from it let four idle sockets declaring 16 MiB
+// each add 64 MiB of heap while sending nothing. Below this, one allocation
+// still covers the overwhelming majority of real OTLP pushes; above it, the
+// buffer grows only as the sender proves it is good for the bytes.
+const maxPresizeBytes = 64 << 10
 
-// HTTPForwardStatus maps a forwarding failure onto the HTTP status the sender
-// retries correctly (the HTTP counterpart of GRPCForwardStatus): a permanent
-// upstream rejection is 400 (the sender must not retry the batch), everything
-// else — diskqueue.ErrFull back-pressure, upstream 5xx, timeouts — is 503
-// (retryable).
-func HTTPForwardStatus(err error) int {
-	if otlpexport.IsPermanent(err) {
-		return http.StatusBadRequest
+// readAllCapped is io.ReadAll with a bounded pre-sized destination. A body that
+// fits the pre-sized head lands in ONE allocation instead of the log2(n)
+// doublings io.ReadAll performs; past it the buffer doubles, and only the LAST
+// step is trimmed to the declared length so a full-size body finishes on an
+// exact fit rather than an overshoot. Growth therefore stays proportional to the
+// bytes the sender has actually produced — the reason it may not simply jump to
+// the declaration is that a peer would then buy the whole allocation with one
+// pre-sized head's worth of real bytes, which is the same trade that made
+// crediting Content-Length a denial of service. Sizes are grown by one byte
+// because the loop needs a final short read to see EOF, and an exactly-sized
+// buffer would double for it.
+//
+// limit is the reader's own cap (16 MiB for application pushes, 4 MiB on the
+// trace tier's internal hop) rather than a constant: the two receivers offer
+// different limits deliberately.
+func readAllCapped(r io.Reader, hint, limit int64) ([]byte, error) {
+	if hint > limit {
+		// An over-cap declaration is rejected once the read confirms it, but
+		// the read still happens: never size past what the LimitReader will
+		// hand over.
+		hint = limit
 	}
-	return http.StatusServiceUnavailable
+	start := min(hint, maxPresizeBytes)
+	if start <= 0 {
+		start = 511 // unknown length: start where io.ReadAll does
+	}
+	buf := make([]byte, 0, start+1)
+	for {
+		if len(buf) == cap(buf) {
+			// Already past the cap: the caller rejects this body (413), so
+			// every further byte is bought and thrown away. Stop here rather
+			// than doubling into it.
+			//
+			// The growth loop cannot see that on its own. The trim below lands
+			// the last step exactly on a declared length, so an identity-encoded
+			// body declaring the cap fills a buffer of exactly limit+1 — the
+			// LimitReader's one byte of over-cap evidence — and the next
+			// iteration found len==cap with the hint no longer ahead of it and
+			// doubled to ~2x the cap, copying the ~16 MiB predecessor into it
+			// while both were live. That is ~3x the body's byte-budget charge
+			// for a request that is refused two lines later, and maxBufferBytes
+			// admits four of them at once (measured: cap 33,554,435 for a
+			// 16 MiB limit).
+			//
+			// Returning a nil error is right: the buffer already carries the
+			// over-cap evidence (limit+1 bytes), and BodyReader.Read tests
+			// len(buf) > max unconditionally, so the answer is the same 413 by
+			// the same route — the compressed-cap arm above it is reached only
+			// on an error, and it would have answered 413 as well.
+			if int64(len(buf)) > limit {
+				return buf, nil
+			}
+			// Double, except for the step that would overshoot a declared
+			// length still ahead of us — that one lands exactly on it.
+			next := int64(cap(buf)) * 2
+			if hint > int64(cap(buf)) && hint < next {
+				next = hint
+			}
+			grown := make([]byte, len(buf), next+1)
+			copy(grown, buf)
+			buf = grown
+		}
+		n, err := r.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				err = nil
+			}
+			return buf, err
+		}
+	}
 }

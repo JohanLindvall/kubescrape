@@ -7,6 +7,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -44,11 +45,24 @@ func TestPodAnnotationCannotSetReservedPlumbing(t *testing.T) {
 		Exporter:      exp,
 	})
 	tl.retryBackoff = time.Millisecond
+	// The refusal is COUNTED per refused key, plumbing markers included —
+	// kubescrape_log_pod_attrs_refused_total's help names both reserved sets,
+	// and a counter that moved only for identity keys would hide the direct
+	// form of the routing attack.
+	routeBefore := obs.LogPodAttrsRefused.WithLabelValues(route.ScriptMarker).Value()
+	dropBefore := obs.LogPodAttrsRefused.WithLabelValues(transform.DropMarker).Value()
 	tl.scanDir(nil, true)
 	writeLog(t, dir, timeNowCRI()+" stdout F hello")
 	tl.scanDir(nil, false)
 	ctx := context.Background()
 	driveUntil(t, ctx, tl, func() bool { return len(exp.get()) > 0 }, "a record to be exported")
+
+	if got := obs.LogPodAttrsRefused.WithLabelValues(route.ScriptMarker).Value() - routeBefore; got != 1 {
+		t.Errorf("refused %q counted %v times, want 1", route.ScriptMarker, got)
+	}
+	if got := obs.LogPodAttrsRefused.WithLabelValues(transform.DropMarker).Value() - dropBefore; got != 1 {
+		t.Errorf("refused %q counted %v times, want 1", transform.DropMarker, got)
+	}
 
 	exp.mu.Lock()
 	ra := exp.resAttrs

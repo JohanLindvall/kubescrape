@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -180,5 +181,32 @@ func TestShutdownDeadlineDoesNotCloseConnections(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the handler's response never reached the client")
+	}
+}
+
+// The deferred backstop join must be a TRUE no-op once run()'s inline join has
+// run. It used to call stepBudget() regardless, and on a shutdown whose inline
+// steps spent the shared deadline exactly (a hanging collector: the join spends
+// Registry.Run's export timeout, FinalExport the rest) that call emitted the
+// one-time "shutdown deadline exceeded ... final exports are lost" WARN after
+// "shutdown complete ... deadlineExceeded=false" — contradicting it, from a join
+// with nothing left to join. On an early return it is the only join and must
+// still stop and wait.
+func TestTheBackstopJoinIsANoOpAfterTheInlineJoin(t *testing.T) {
+	var wg sync.WaitGroup
+	stops, budgets := 0, 0
+	stop := func() { stops++ }
+	budget := func() time.Duration { budgets++; return 0 }
+
+	joinOnEarlyReturn(true, stop, &wg, budget)
+	if stops != 0 || budgets != 0 {
+		t.Fatalf("after the inline join the backstop called stop %d times and asked for a budget %d times, want 0: "+
+			"asking stepBudget for a budget past a spent deadline logs the deadline WARN after 'shutdown complete'", stops, budgets)
+	}
+
+	joinOnEarlyReturn(false, stop, &wg, budget)
+	if stops != 1 || budgets != 1 {
+		t.Fatalf("on an early return the backstop called stop %d times and asked for a budget %d times, want 1 each: "+
+			"it is the only join before the deferred exporter.Close", stops, budgets)
 	}
 }

@@ -23,10 +23,9 @@ import (
 // halves have not arrived, i.e. exactly what the store holds between two
 // requests, and returns it with the clock parked so nothing expires under the
 // measurement.
-func steadyStore(b *testing.B, live int, dims []string) *Processor {
+func steadyStore(b *testing.B, live int, dims []string, sink EdgeSink) *Processor {
 	b.Helper()
-	p := NewProcessor(Config{MaxItems: live * 4, Wait: "10s", Dimensions: dims}, discardLog())
-	p.SetSink(&countSink{})
+	p := NewProcessor(Config{MaxItems: live * 4, Wait: "10s", Dimensions: dims}, sink, discardLog())
 	now := t0
 	p.now = func() time.Time { return now }
 	const chunk = 500
@@ -88,7 +87,7 @@ func pairingBatchAttrs(base, traces int, attrs map[string]string) ptrace.Traces 
 // the peer and database scans actually walk.
 func BenchmarkConsumeSteadyState(b *testing.B) {
 	for _, live := range []int{100, 10000} {
-		p := steadyStore(b, live, nil)
+		p := steadyStore(b, live, nil, &countSink{})
 		td := pairingBatch(live+1, 100) // 200 spans: 100 inserts, 100 completions
 		b.Run(strconv.Itoa(live)+"-live", func(b *testing.B) {
 			b.ReportAllocs()
@@ -102,7 +101,7 @@ func BenchmarkConsumeSteadyState(b *testing.B) {
 
 // The same store, with the attribute set a real instrumented span carries.
 func BenchmarkConsumeSteadyStateRealisticAttrs(b *testing.B) {
-	p := steadyStore(b, 10000, nil)
+	p := steadyStore(b, 10000, nil, &countSink{})
 	td := pairingBatchAttrs(10001, 100, realisticSpanAttrs)
 	b.ReportAllocs()
 	for b.Loop() {
@@ -114,8 +113,7 @@ func BenchmarkConsumeSteadyStateRealisticAttrs(b *testing.B) {
 // The same, with the metric Registry as the sink rather than a counter, so the
 // completed edge pays for its series key and fold as it does in production.
 func BenchmarkConsumeSteadyStateIntoRegistry(b *testing.B) {
-	p := steadyStore(b, 10000, []string{"http.request.method", "peer.service"})
-	p.SetSink(NewRegistry(Config{}, nil))
+	p := steadyStore(b, 10000, []string{"http.request.method", "peer.service"}, NewRegistry(Config{}, nil))
 	td := pairingBatch(10001, 100)
 	b.ReportAllocs()
 	for b.Loop() {
@@ -131,8 +129,7 @@ func TestConsumeSteadyStateIsAllocationFree(t *testing.T) {
 	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
-	p := NewProcessor(Config{MaxItems: 40000, Wait: "10s"}, discardLog())
-	p.SetSink(&countSink{})
+	p := NewProcessor(Config{MaxItems: 40000, Wait: "10s"}, &countSink{}, discardLog())
 	now := t0
 	p.now = func() time.Time { return now }
 	for i := 0; i < 10000; i += 500 {

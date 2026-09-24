@@ -1,6 +1,7 @@
 package promparse
 
 import (
+	"fmt"
 	"io"
 	"math"
 	"strings"
@@ -121,14 +122,16 @@ func TestHelpIsPerExposition(t *testing.T) {
 			t.Fatalf("second parse = %+v, want no help", got)
 		}
 	})
+	// On ONE parser, through the pool's own round trip: a Put followed by a Get
+	// need not hand the same parser back.
 	t.Run("Pooled", func(t *testing.T) {
 		p := Get(Options{})
+		defer Put(p)
 		if _, err := p.Parse(strings.NewReader(first), func(Sample) error { return nil }); err != nil {
 			t.Fatal(err)
 		}
-		Put(p)
-		p = Get(Options{})
-		defer Put(p)
+		p.release()
+		p.reset(Options{})
 		var got []Sample
 		if _, err := p.Parse(strings.NewReader(second), func(s Sample) error { got = append(got, s); return nil }); err != nil {
 			t.Fatal(err)
@@ -189,6 +192,28 @@ rpc_latency_count 2000
 			t.Errorf("sample %d (%s): role=%v family=%q, want role=%v family=%q",
 				i, samples[i].Name, samples[i].Role, samples[i].Family, w.role, w.family)
 		}
+	}
+}
+
+// A sample carrying a histogram family's BARE name — defined by neither
+// exposition format — is the family's own, never a gauge that happens to be
+// named like it: a consumer building metrics by name would otherwise let that
+// gauge claim the family's name and lose every histogram point to a collision.
+// It is classified RoleHistogramBucket with Name == Family, the one shape a
+// real bucket series (always `<family>_bucket`) never has, so a consumer can
+// refuse it.
+func TestBareHistogramFamilyNameIsClassifiedAsTheFamilys(t *testing.T) {
+	samples := parseAll(t, "# TYPE lat histogram\nlat_bucket{le=\"+Inf\"} 2\nlat 42\nlat_count 2\n")
+	if len(samples) != 3 {
+		t.Fatalf("got %d samples, want 3", len(samples))
+	}
+	bare := samples[1]
+	if bare.Role != RoleHistogramBucket || bare.Name != "lat" || bare.Family != "lat" {
+		t.Fatalf("bare sample: role=%v name=%q family=%q, want RoleHistogramBucket with Name == Family == %q",
+			bare.Role, bare.Name, bare.Family, "lat")
+	}
+	if b := samples[0]; b.Name == b.Family {
+		t.Fatalf("a real bucket series has Name == Family (%q); the distinction a consumer relies on is gone", b.Name)
 	}
 }
 
@@ -384,7 +409,7 @@ func TestParseClassicRejectsExemplarSyntax(t *testing.T) {
 func BenchmarkParseLargeScrape(b *testing.B) {
 	var sb strings.Builder
 	sb.WriteString("# TYPE bench_metric counter\n")
-	for i := 0; i < 10_000; i++ {
+	for i := range 10_000 {
 		sb.WriteString("bench_metric_total{pod=\"pod-")
 		sb.WriteString(strings.Repeat("x", 20))
 		sb.WriteString("\",idx=\"")
@@ -692,8 +717,8 @@ func TestExemplarsFlagDoesNotDecideLineValidity(t *testing.T) {
 // syntactically broken exemplars reads exactly like one emitting none unless
 // the failures are counted somewhere, and the malformed count is the wrong
 // somewhere — it means a DROPPED sample. With the flag off nothing is parsed,
-// so there is nothing to count, which is what keeps parseExemplar's trace-id
-// interning off targets that never asked for exemplars.
+// so there is nothing to count, which is what keeps parseExemplar's
+// per-exemplar allocations off targets that never asked for exemplars.
 func TestMalformedExemplarsAreCountedNotDropped(t *testing.T) {
 	const body = "a 1 # junk\n" +
 		"b 2 # {t=\"x\"} 2 3 4\n" +
@@ -744,6 +769,40 @@ func TestMalformedExemplarsAreCountedNotDropped(t *testing.T) {
 	}
 	if pp.MalformedExemplars() != 0 {
 		t.Fatalf("pooled, after a clean parse: MalformedExemplars = %d, want 0", pp.MalformedExemplars())
+	}
+}
+
+// exemplarRuneSet returns an exemplar label set of exactly `runes` code points:
+// one 1-rune name and a value of two-byte runes, so its BYTE length is nearly
+// twice its rune count and a byte bound would refuse what the spec allows.
+func exemplarRuneSet(runes int) string {
+	return `{t="` + strings.Repeat("é", runes-1) + `"}`
+}
+
+// OpenMetrics bounds an exemplar's label set at 128 code points of names plus
+// values (Prometheus's exemplar.ExemplarMaxLabelSetLength). Past it the
+// exemplar is one no Prometheus-compatible backend keeps, so it is refused and
+// counted — its sample still ships — and the bound is inclusive and counted in
+// RUNES, not bytes. The protobuf front applies the identical rule
+// (TestProtoExemplarLabelSetIsBoundedInRunes).
+func TestExemplarLabelSetIsBoundedInRunes(t *testing.T) {
+	body := "a_total 1 # " + exemplarRuneSet(MaxExemplarLabelSetRunes) + " 1\n" +
+		"b_total 2 # " + exemplarRuneSet(MaxExemplarLabelSetRunes+1) + " 1\n" +
+		"# EOF\n"
+	p := New(Options{OpenMetrics: true, Exemplars: true})
+	got, malformed, err := collect(t, p, body)
+	if err != nil || malformed != 0 || len(got) != 2 {
+		t.Fatalf("samples=%d malformed=%d err=%v, want both samples and no malformed line", len(got), malformed, err)
+	}
+	if got[0].Exemplar == nil {
+		t.Errorf("an exemplar of exactly %d runes (%d bytes) was refused; the bound is inclusive and in runes",
+			MaxExemplarLabelSetRunes, len(exemplarRuneSet(MaxExemplarLabelSetRunes)))
+	}
+	if got[1].Exemplar != nil {
+		t.Errorf("an exemplar of %d runes was attached; it must be refused", MaxExemplarLabelSetRunes+1)
+	}
+	if p.MalformedExemplars() != 1 {
+		t.Errorf("MalformedExemplars = %d, want 1 (the refusal is a bad exemplar, never a dropped sample)", p.MalformedExemplars())
 	}
 }
 
@@ -855,36 +914,106 @@ func TestParseAllocationBudget(t *testing.T) {
 		t.Skip("-race perturbs allocation counts")
 	}
 	const samples = 10_000
-	var sb strings.Builder
-	sb.WriteString("# TYPE bench_metric counter\n")
-	sb.WriteString("# HELP bench_metric a counter\n")
-	for i := 0; i < samples; i++ {
-		sb.WriteString("bench_metric_total{pod=\"pod-")
-		sb.WriteString(strings.Repeat("x", 20))
-		sb.WriteString("\",idx=\"")
-		sb.WriteByte(byte('0' + i%10))
-		sb.WriteString("\"} 12345.678\n")
+	// "repeated declarations" is the exporter that re-declares its family's
+	// HELP and TYPE before EVERY sample: an unchanged redeclaration must cost no
+	// copy of the name or the text, or it is three allocations per sample.
+	for _, tc := range []struct {
+		name   string
+		repeat bool
+	}{{"classic", false}, {"repeated declarations", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sb strings.Builder
+			sb.WriteString("# TYPE bench_metric counter\n")
+			sb.WriteString("# HELP bench_metric a counter\n")
+			for i := range samples {
+				if tc.repeat {
+					sb.WriteString("# TYPE bench_metric counter\n")
+					sb.WriteString("# HELP bench_metric a counter\n")
+				}
+				sb.WriteString("bench_metric_total{pod=\"pod-")
+				sb.WriteString(strings.Repeat("x", 20))
+				sb.WriteString("\",idx=\"")
+				sb.WriteByte(byte('0' + i%10))
+				sb.WriteString("\"} 12345.678\n")
+			}
+			input := sb.String()
+
+			n := 0
+			parse := func() {
+				p := Get(Options{MaxLineBytes: 1 << 20}) // the production path: pooled parser + reader
+				n = 0
+				if _, err := p.Parse(strings.NewReader(input), func(Sample) error { n++; return nil }); err != nil {
+					t.Fatal(err)
+				}
+				Put(p)
+			}
+			parse() // warm the pool and the intern tables
+			if n != samples {
+				t.Fatalf("parsed %d samples, want %d", n, samples)
+			}
+			// Whole-scrape ceiling, so a per-sample regression is 10_000x over it and
+			// cannot hide in the noise of the pooled reader's growth.
+			const ceiling = 32
+			if allocs := testing.AllocsPerRun(20, parse); allocs > ceiling {
+				t.Fatalf("parsing %d samples allocates %v times, want <= %d (a per-sample "+
+					"allocation would put this at ~%d)", samples, allocs, ceiling, samples)
+			}
+		})
 	}
+}
+
+// Exemplar label VALUES are trace and span IDs, which never repeat, and they
+// must not share the intern table sample label values warm up in: one scrape
+// carrying more IDs than the table holds used to fill it mid-parse, after which
+// every later sample value allocated on every occurrence (and a pooled parser
+// clearing the full table at Get evicted the next borrower's warm values too).
+// The body is exemplars with unique IDs followed by an exemplar-free family
+// whose two values alternate, so the positional cache misses on every line and
+// only the intern table can spare them the allocation.
+func TestParseExemplarAllocationBudget(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	const exemplars, gauges = MaxInternedValues + 1000, 2000
+	var sb strings.Builder
+	sb.WriteString("# TYPE c counter\n")
+	for i := range exemplars {
+		fmt.Fprintf(&sb, "c_total 1 # {trace_id=\"%032x\"} 1\n", i)
+	}
+	sb.WriteString("# TYPE g gauge\n")
+	for i := range gauges {
+		// Two bytes at least: the runtime converts a one-byte string without
+		// allocating, which would hide the regression.
+		fmt.Fprintf(&sb, "g{v=\"value-%c\"} 1\n", 'a'+i%2)
+	}
+	sb.WriteString("# EOF\n")
 	input := sb.String()
 
-	n := 0
+	var n, withExemplar int
 	parse := func() {
-		p := Get(Options{MaxLineBytes: 1 << 20}) // the production path: pooled parser + reader
-		n = 0
-		if _, err := p.Parse(strings.NewReader(input), func(Sample) error { n++; return nil }); err != nil {
+		p := Get(Options{MaxLineBytes: 1 << 20, OpenMetrics: true, Exemplars: true})
+		n, withExemplar = 0, 0
+		if _, err := p.Parse(strings.NewReader(input), func(s Sample) error {
+			n++
+			if s.Exemplar != nil {
+				withExemplar++
+			}
+			return nil
+		}); err != nil {
 			t.Fatal(err)
 		}
 		Put(p)
 	}
 	parse() // warm the pool and the intern tables
-	if n != samples {
-		t.Fatalf("parsed %d samples, want %d", n, samples)
+	if n != exemplars+gauges || withExemplar != exemplars {
+		t.Fatalf("parsed %d samples (%d with exemplars), want %d (%d)", n, withExemplar, exemplars+gauges, exemplars)
 	}
-	// Whole-scrape ceiling, so a per-sample regression is 10_000x over it and
-	// cannot hide in the noise of the pooled reader's growth.
-	const ceiling = 32
-	if allocs := testing.AllocsPerRun(20, parse); allocs > ceiling {
-		t.Fatalf("parsing %d samples allocates %v times, want <= %d (a per-sample "+
-			"allocation would put this at ~%d)", samples, allocs, ceiling, samples)
+	// One allocation per unique ID is inherent: the exemplar carries its own
+	// copy. The gauges must cost nothing past their first two values.
+	const ceiling = exemplars + 64
+	if allocs := testing.AllocsPerRun(10, parse); allocs > ceiling {
+		t.Fatalf("parsing %d exemplars and %d gauges allocates %v times, want <= %d "+
+			"(an exemplar value filling the shared intern table puts this near %d)",
+			exemplars, gauges, allocs, ceiling, exemplars+gauges)
 	}
 }

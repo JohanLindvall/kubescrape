@@ -1,27 +1,41 @@
-// Package docscheck keeps the flag documentation and the flag sets from
-// drifting apart, in both directions:
+// Package docscheck keeps the configuration documentation and the code it
+// documents from drifting apart. Two of its guards are about FLAGS, in both
+// directions; the third is about the agent's -config file:
 //
 //   - docs/FLAGS.md is GENERATED from each binary's registered flags
 //     (FlagTable + ReplaceSection, driven by flagsdoc_test.go in each cmd
 //     package with an -update-flags-doc flag — the METRICS.md pattern).
 //   - Every flag named in a markdown TABLE ROW of the hand-written docs must
-//     exist in one of the binaries (TableFlags vs SourceFlags, asserted by
-//     this package's own test). That is how a renamed or deleted flag stops
-//     being quietly documented — the prose sibling of internal/manifestcheck,
-//     which does the same for the shipped manifests.
+//     exist in one of the binaries (TableFlags over the docs vs TableFlags over
+//     the generated docs/FLAGS.md, asserted by this package's own test). That
+//     is how a renamed or deleted flag stops being quietly documented — the
+//     prose sibling of internal/manifestcheck, which does the same for the
+//     shipped manifests.
+//   - docs/agent-config.schema.json is GENERATED from the agent's config
+//     structs (ConfigSchema, jsonschema.go, driven by cmd/kubescrape-agent's
+//     configschema_test.go with an -update-config-schema flag). It lives here
+//     rather than in a package of its own for FlagTable's reason: both render
+//     a documentation artefact from the code it describes, so neither can
+//     drift from it.
 //
-// The hand-written docs are read as TEXT and the registrations are parsed from
-// SOURCE (both cmd trees, tagged files included), so the test needs neither
-// build tags nor a running binary and covers both binaries from one package.
+// Everything is read as TEXT, so the test needs neither build tags nor a
+// running binary and covers both binaries from one package. The registered set
+// is docs/FLAGS.md itself: it is generated from the flag sets the binaries
+// actually parse, TestFlagsDocIsCurrent holds it current in every build variant
+// CI runs, and the optional-pipeline flags are registered on every variant, so
+// it lists exactly what is registered. (It used to be re-derived by a regular
+// expression over the cmd SOURCE, comments included — a second derivation of
+// the same set that had already missed the flag.XxxVar spellings once, and
+// could fail OPEN: a comment quoting a removed registration kept its stale doc
+// row green.)
 package docscheck
 
 import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -33,31 +47,6 @@ import (
 // cross-references, not inventory, and prose mentions are deliberately out of
 // scope (bounded-word matching over prose is what FlagMentioned is for).
 var tableFlagPattern = regexp.MustCompile("(?m)^\\|\\s*\\(?`--?([A-Za-z0-9][A-Za-z0-9-]*)")
-
-// registerPattern matches a flag registration in source — on the package-level
-// flag.CommandLine (`flag.String(...)`) or on the FlagSet parameter of
-// internal/cli's shared registrations (`fs.String(...)`). The name is always a
-// string literal in this repo (a computed name could not be matched — nothing
-// registers one, and the FLAGS.md generator would catch the omission anyway).
-//
-// The `Var` SUFFIX is part of the alternation rather than a separate
-// alternative, which it has to be: the alternation is followed immediately by
-// `(`, so an earlier spelling that listed `Duration` and `TextVar` side by side
-// matched neither `flag.DurationVar` nor `flag.TextVar` — every `flag.XxxVar`
-// form, which is the idiomatic package-level registration, was invisible. That
-// is a FAIL-LOUD miss rather than a silent one (docs/FLAGS.md is generated from
-// the live flag set and is one of the scanned docs, so the new row would be
-// accused of naming a flag nothing registers) and the obvious remedy for the
-// red build is to delete a true row. registerpattern_test.go pins every
-// spelling.
-//
-// Up to two leading arguments may precede the name literal: one for the
-// `flag.XxxVar(&v, "name", ...)` and `flag.Var(&v, "name", ...)` forms, two for
-// `flag.TextVar(&v, defaultValue, "name", ...)`. They are matched as "anything
-// that is not a string literal, a bracket or a comma", so a default value
-// spelled as a call — `net.ParseIP("::1")` — is out of reach; nothing in this
-// repo writes one, and a missed registration fails loudly rather than passing.
-var registerPattern = regexp.MustCompile(`(?:flag|fs)\.(?:BoolFunc|Func|Var|(?:String|Bool|Int64|Int|Uint64|Uint|Float64|Duration|Text)(?:Var)?)\(\s*(?:[^"(),]+,\s*){0,2}"([A-Za-z0-9][A-Za-z0-9-]*)"`)
 
 // TableFlags returns the flag names documented in markdown table rows of the
 // given files, deduplicated, with the file and line of the first occurrence.
@@ -84,36 +73,6 @@ func TableFlags(paths ...string) (map[string]string, error) {
 	return out, nil
 }
 
-// SourceFlags returns the union of flag names registered by the .go files
-// (tests excluded) under the given directories.
-func SourceFlags(dirs ...string) (map[string]bool, error) {
-	out := map[string]bool{}
-	for _, dir := range dirs {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			return nil, err
-		}
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
-				continue
-			}
-			b, err := os.ReadFile(filepath.Join(dir, e.Name()))
-			if err != nil {
-				return nil, err
-			}
-			for _, m := range registerPattern.FindAllSubmatch(b, -1) {
-				out[string(m[1])] = true
-			}
-		}
-	}
-	return out, nil
-}
-
-// CmdDirs are the directories whose sources register flags, relative to this
-// package: the two binaries' mains plus internal/cli, where the flag blocks
-// both binaries share are registered once.
-var CmdDirs = []string{"../../cmd/kubescrape", "../../cmd/kubescrape-agent", "../../internal/cli"}
-
 // FlagMentioned reports whether doc names the flag anywhere, as a whole word
 // preceded by a dash — `-scrape-interval` matches, `-scrape-interval-x` and
 // `-logs-scrape-interval` do not. This is the "every registered flag appears
@@ -124,19 +83,29 @@ func FlagMentioned(doc, name string) bool {
 	return re.MatchString(doc)
 }
 
-// FlagTable renders the markdown table for every flag in fs, sorted by name.
-// Flags named in skip (test harness flags like -update-flags-doc) are omitted,
-// as is everything under the "test." prefix that `go test` registers.
-func FlagTable(fs *flag.FlagSet, skip ...string) string {
-	skipSet := map[string]bool{}
-	for _, s := range skip {
-		skipSet[s] = true
-	}
-	var rows []string
+// DocumentedFlags returns the flags of fs that the documentation covers, in
+// lexical order: every flag except those named in skip (the test binary's own
+// harness flags, like -update-flags-doc) and everything under the "test."
+// prefix that `go test` registers. It is the ONE statement of that rule, read
+// by FlagTable and by each binary's every-flag-is-mentioned test alike, so the
+// generated inventory and the mention check cannot disagree about which flags
+// exist.
+func DocumentedFlags(fs *flag.FlagSet, skip ...string) []*flag.Flag {
+	var out []*flag.Flag
 	fs.VisitAll(func(f *flag.Flag) {
-		if skipSet[f.Name] || strings.HasPrefix(f.Name, "test.") {
+		if slices.Contains(skip, f.Name) || strings.HasPrefix(f.Name, "test.") {
 			return
 		}
+		out = append(out, f)
+	})
+	return out
+}
+
+// FlagTable renders the markdown table for every flag DocumentedFlags returns,
+// sorted by row. ParseFlagRow reads a row back.
+func FlagTable(fs *flag.FlagSet, skip ...string) string {
+	var rows []string
+	for _, f := range DocumentedFlags(fs, skip...) {
 		def := "—"
 		// "map[]" is what a flag.Var over a map renders as its zero value —
 		// an implementation artifact, not a default worth documenting.
@@ -144,8 +113,8 @@ func FlagTable(fs *flag.FlagSet, skip ...string) string {
 			def = "`" + escapeCell(f.DefValue) + "`"
 		}
 		rows = append(rows, fmt.Sprintf("| `-%s` | %s | %s |", f.Name, def, escapeCell(f.Usage)))
-	})
-	sort.Strings(rows)
+	}
+	slices.Sort(rows)
 	return "| Flag | Default | Description |\n|---|---|---|\n" + strings.Join(rows, "\n") + "\n"
 }
 
@@ -153,6 +122,43 @@ func FlagTable(fs *flag.FlagSet, skip ...string) string {
 func escapeCell(s string) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	return strings.ReplaceAll(s, "|", "\\|")
+}
+
+// FlagRow is the part of one FlagTable row a consumer reads back: the flag's
+// name and its documented default.
+type FlagRow struct {
+	Name string
+	// Default is the default cell unescaped, or "" for the `—` placeholder
+	// (no default, or a map's `map[]` zero value).
+	Default string
+}
+
+// flagRowPattern matches one row as FlagTable renders it.
+var flagRowPattern = regexp.MustCompile("^\\|\\s*`-([A-Za-z0-9][A-Za-z0-9-]*)`\\s*\\|\\s*(?:`([^`]*)`|—)\\s*\\|")
+
+// ParseFlagRow reads one line of docs/FLAGS.md back as the row FlagTable
+// rendered, and reports whether it is one. It is FlagTable's inverse for the
+// name and default cells, so a reader of the generated inventory (the chart
+// guards in internal/chartcheck take their defaults from it) follows the
+// format from the one package that writes it rather than from a copy.
+func ParseFlagRow(line string) (FlagRow, bool) {
+	m := flagRowPattern.FindStringSubmatch(line)
+	if m == nil {
+		return FlagRow{}, false
+	}
+	return FlagRow{Name: m[1], Default: strings.ReplaceAll(m[2], "\\|", "|")}, true
+}
+
+// ParseFlagTable returns every FlagTable row in doc, in document order. A flag
+// both binaries register has a row in each binary's section.
+func ParseFlagTable(doc string) []FlagRow {
+	var out []FlagRow
+	for line := range strings.SplitSeq(doc, "\n") {
+		if r, ok := ParseFlagRow(line); ok {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // ReplaceSection substitutes the region between the begin and end marker lines

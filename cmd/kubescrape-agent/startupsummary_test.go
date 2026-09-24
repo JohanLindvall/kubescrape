@@ -11,6 +11,7 @@ import (
 
 	"github.com/JohanLindvall/logfmt"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
 	"github.com/JohanLindvall/kubescrape/internal/cli"
 )
 
@@ -23,7 +24,7 @@ func summaryLines(t *testing.T, cfg agentConfig) map[string]map[string]string {
 	var buf bytes.Buffer
 	printConfigSummary(cfg, slog.New(cli.NewLogfmtHandler(&buf, slog.LevelInfo)))
 	out := map[string]map[string]string{}
-	for _, line := range bytes.Split(bytes.TrimSuffix(buf.Bytes(), []byte("\n")), []byte("\n")) {
+	for line := range bytes.SplitSeq(bytes.TrimSuffix(buf.Bytes(), []byte("\n")), []byte("\n")) {
 		if err := logfmt.Validate(line); err != nil {
 			t.Fatalf("summary line is not logfmt: %v\n%s", err, line)
 		}
@@ -49,10 +50,12 @@ func restoreSummaryFlags(t *testing.T) {
 	t.Helper()
 	logs, metrics, ingest, sg, events, azure, journald, node, summary, cgroup :=
 		*logsOn, *metricsOn, *ingestOn, *serviceGraphOn, *eventsOn, *azureOn, *journaldOn, *nodeOn, *summaryOn, *cgroupStatsOn
+	cadvisor := *cadvisorOn
 	nn, ep, kubelet, meta := *nodeName, *otlpEndpoint, *kubeletEndpoint, *metadataURL
 	t.Cleanup(func() {
 		*logsOn, *metricsOn, *ingestOn, *serviceGraphOn, *eventsOn = logs, metrics, ingest, sg, events
 		*azureOn, *journaldOn, *nodeOn, *summaryOn, *cgroupStatsOn = azure, journald, node, summary, cgroup
+		*cadvisorOn = cadvisor
 		*nodeName, *otlpEndpoint, *kubeletEndpoint, *metadataURL = nn, ep, kubelet, meta
 	})
 }
@@ -128,6 +131,57 @@ func TestEffectiveIdentityFollowsTheDeploymentRole(t *testing.T) {
 	}
 }
 
+// The identity line is the resource the self-metrics carry, READ BACK — not a
+// second derivation of the role rule and of attrs.Identity's node fallback kept
+// beside agentSelfResource, which is what it was: the two agreed only because
+// nothing had changed one without the other yet. Pinned per role against
+// agentSelfResource itself, including the hostNetwork singleton with no
+// $POD_NAME, whose resource leaves the instance to Identity's node fallback.
+func TestEffectiveIdentityIsTheStampedResource(t *testing.T) {
+	restoreSummaryFlags(t)
+	old := selfInstanceName
+	t.Cleanup(func() { selfInstanceName = old })
+	*nodeName = "node-1"
+	perNodeOff := func() {
+		*logsOn, *metricsOn, *cadvisorOn, *nodeOn, *summaryOn = false, false, false, false, false
+		*journaldOn, *ingestOn, *cgroupStatsOn = false, false, false
+	}
+	for _, tc := range []struct {
+		name     string
+		set      func()
+		pod      string
+		wantInst string
+	}{
+		{"node agent", func() { *logsOn = true; *eventsOn, *azureOn, *serviceGraphOn = false, false, false }, "kubescrape-agent-x7k2p", "node-1"},
+		{"events singleton", func() { perNodeOff(); *eventsOn, *azureOn, *serviceGraphOn = true, false, false }, "kubescrape-events-5d9f", "kubescrape-events-5d9f"},
+		{"trace tier shard", func() { perNodeOff(); *eventsOn, *azureOn, *serviceGraphOn = false, false, true }, "kubescrape-traces-0", "kubescrape-traces-0"},
+		{"singleton with no pod name", func() { perNodeOff(); *eventsOn, *azureOn, *serviceGraphOn = true, false, false }, "", "node-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.set()
+			selfInstanceName = func() string { return tc.pod }
+			res := agentSelfResource(*nodeName).Attributes()
+			got := summaryLines(t, agentConfig{})["effective identity"]
+			for key, attr := range map[string]string{
+				"serviceName": "service.name",
+				"instance":    "service.instance.id",
+				"namespace":   "k8s.namespace.name",
+			} {
+				want := ""
+				if v, ok := res.Get(attr); ok {
+					want = v.AsString()
+				}
+				if got[key] != want {
+					t.Errorf("summary %s = %q, but the stamped resource's %s is %q", key, got[key], attr, want)
+				}
+			}
+			if got["instance"] != tc.wantInst || got["serviceName"] != agentServiceName {
+				t.Errorf("serviceName/instance = %q/%q, want %s/%s", got["serviceName"], got["instance"], agentServiceName, tc.wantInst)
+			}
+		})
+	}
+}
+
 // The summary reports credential FILES, never credentials: it is emitted at
 // Info on every start, and a token in a log aggregator is there forever.
 func TestEffectiveConfigDumpCarriesPathsNotCredentials(t *testing.T) {
@@ -146,6 +200,87 @@ func TestEffectiveConfigDumpCarriesPathsNotCredentials(t *testing.T) {
 		if strings.Contains(strings.ToLower(k), "token") && !strings.HasSuffix(k, "File") {
 			t.Errorf("destination key %q=%q looks like a credential rather than a path to one", k, v)
 		}
+	}
+}
+
+// The ingest admission bounds are printed RESOLVED — the value in force, not
+// the value typed. Both flags' stock value is 0 ("the built-in default"), so
+// the raw flag put ingestMaxInFlight=0 on every default deployment beside a
+// shed running at 32, reading as "unbounded"; and the per-message gRPC cap was
+// not printed at all. They govern the trace tier's application ports too, so
+// the tier reports them — it used to print neither, being -ingest=false.
+func TestEffectiveLimitsReportTheIngestBoundsInForce(t *testing.T) {
+	restoreSummaryFlags(t)
+	inflight, recv := *ingestMaxInFlight, *ingestGRPCMaxRecv
+	sgIngest, sgGRPC, sgHTTP := *serviceGraphIngest, *serviceGraphIngestGRPC, *serviceGraphIngestHTTP
+	t.Cleanup(func() {
+		*ingestMaxInFlight, *ingestGRPCMaxRecv = inflight, recv
+		*serviceGraphIngest, *serviceGraphIngestGRPC, *serviceGraphIngestHTTP = sgIngest, sgGRPC, sgHTTP
+	})
+	check := func(what, wantInFlight, wantRecv string) {
+		t.Helper()
+		limits := summaryLines(t, agentConfig{})["effective limits"]
+		if got := limits["ingestMaxInFlight"]; got != wantInFlight {
+			t.Errorf("%s: ingestMaxInFlight = %q, want %q (the bound in force)", what, got, wantInFlight)
+		}
+		if got := limits["ingestGRPCMaxRecvBytes"]; got != wantRecv {
+			t.Errorf("%s: ingestGRPCMaxRecvBytes = %q, want %q (the cap in force)", what, got, wantRecv)
+		}
+	}
+
+	// The DaemonSet receiver at the stock values: the built-in defaults.
+	*ingestOn, *serviceGraphOn = true, false
+	*ingestMaxInFlight, *ingestGRPCMaxRecv = 0, 0
+	check("default -ingest", "32", "4194304")
+
+	// An explicit value is what is in force, so it is what is printed.
+	*ingestMaxInFlight, *ingestGRPCMaxRecv = 8, 16<<20
+	check("explicit -ingest", "8", "16777216")
+
+	// The trace tier: -ingest off, application ports on — the same knobs
+	// govern them (startServiceGraphIngest), so the same line reports them.
+	*ingestOn, *serviceGraphOn = false, true
+	*ingestMaxInFlight, *ingestGRPCMaxRecv = 0, 0
+	*serviceGraphIngest, *serviceGraphIngestGRPC, *serviceGraphIngestHTTP = true, ":4317", ":4318"
+	check("trace tier", "32", "4194304")
+
+	// A tier serving no application port, and no -ingest: nothing these bounds
+	// govern is running, so they are not reported.
+	*serviceGraphIngest = false
+	if limits := summaryLines(t, agentConfig{})["effective limits"]; limits["ingestMaxInFlight"] != "" || limits["ingestGRPCMaxRecvBytes"] != "" {
+		t.Errorf("no ingest listener runs, yet the ingest bounds were reported: %v", limits)
+	}
+}
+
+// The forwarding line names the ring THIS process re-shards onto, so it is
+// printed on the tier only. Off it, a serviceGraphShards section in the shared
+// ConfigMap is inert — nothing but the tier forwards traces, applications push
+// to it — and the same dry run's tier-only-sections line says so; printing
+// "service-graph forwarding shards=3" beside that contradicted it.
+func TestServiceGraphForwardingIsReportedOnlyOnTheTier(t *testing.T) {
+	restoreSummaryFlags(t)
+	cfg := agentConfig{ServiceGraphShards: &servicegraph.ReshardConfig{
+		StatefulSet: "kubescrape-traces", Namespace: "monitoring", Replicas: 3,
+	}}
+
+	*serviceGraphOn = false
+	lines := summaryLines(t, cfg)
+	if fwd, ok := lines["service-graph forwarding"]; ok {
+		t.Errorf("a node agent reported forwarding traces it never receives: %v", fwd)
+	}
+	var inert string
+	for msg, pairs := range lines {
+		if strings.HasPrefix(msg, "tier-only config sections present") {
+			inert = pairs["sections"]
+		}
+	}
+	if !strings.Contains(inert, "serviceGraphShards") {
+		t.Errorf("off the tier the section must be reported inert, got sections=%q", inert)
+	}
+
+	*serviceGraphOn = true
+	if got := summaryLines(t, cfg)["service-graph forwarding"]["shards"]; got != "3" {
+		t.Errorf("on the tier the forwarding line must name the ring: shards=%q, want 3", got)
 	}
 }
 
@@ -251,17 +386,41 @@ func TestReadinessStatesReportEveryGate(t *testing.T) {
 
 // -listen empty takes /readyz with it, so a rolling update has nothing to gate
 // on and marches across the fleet whatever each agent's state. Legal, but it
-// must not be silent — this is the flag that turns the readiness work off.
+// must not be silent — this is the flag that turns the readiness work off. And
+// it is a configWarnings entry, not a start-path Warn, so -check-config says it
+// too: the start-only line meant a dry run described a different agent.
 func TestEmptyListenIsWarnedAboutRatherThanSilent(t *testing.T) {
 	addr := *listen
 	t.Cleanup(func() { *listen = addr })
 	*listen = ""
 
-	var buf bytes.Buffer
-	p := &pipelines{log: slog.New(cli.NewLogfmtHandler(&buf, slog.LevelInfo)), ready: newReadiness()}
-	_ = p.startDebugServer(context.Background(), nil, nil)
-	out := buf.String()
-	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "/readyz") {
-		t.Errorf("an agent with no -listen did not say that readiness is unprobeable:\n%s", out)
+	if got := warnText(agentConfig{}); !strings.Contains(got, "-listen is empty") || !strings.Contains(got, "/readyz") {
+		t.Errorf("configWarnings did not say that readiness is unprobeable with no -listen:\n%s", got)
+	}
+	*listen = ":8080"
+	if got := warnText(agentConfig{}); strings.Contains(got, "-listen is empty") {
+		t.Errorf("a set -listen was reported empty:\n%s", got)
+	}
+}
+
+// Same for the trace tier with no application port: a start used to warn and
+// -check-config did not.
+func TestTierWithoutApplicationPortsIsWarnedByTheDryRun(t *testing.T) {
+	withServiceGraph(t)
+	on, g, h := *serviceGraphIngest, *serviceGraphIngestGRPC, *serviceGraphIngestHTTP
+	t.Cleanup(func() { *serviceGraphIngest, *serviceGraphIngestGRPC, *serviceGraphIngestHTTP = on, g, h })
+
+	const want = "the trace tier accepts no application pushes"
+	*serviceGraphIngest, *serviceGraphIngestGRPC, *serviceGraphIngestHTTP = true, ":4317", ""
+	if got := warnText(agentConfig{}); strings.Contains(got, want) {
+		t.Fatalf("a tier serving gRPC was reported as accepting nothing:\n%s", got)
+	}
+	*serviceGraphIngestGRPC = ""
+	if got := warnText(agentConfig{}); !strings.Contains(got, want) {
+		t.Errorf("both application listeners empty, and -check-config said nothing:\n%s", got)
+	}
+	*serviceGraphIngest, *serviceGraphIngestGRPC = false, ":4317"
+	if got := warnText(agentConfig{}); !strings.Contains(got, want) {
+		t.Errorf("-service-graph-ingest=false, and -check-config said nothing:\n%s", got)
 	}
 }

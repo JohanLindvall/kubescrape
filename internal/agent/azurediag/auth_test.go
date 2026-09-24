@@ -98,7 +98,7 @@ func TestTokenSourceCachesAndRefreshes(t *testing.T) {
 			return "tok", time.Hour, nil
 		},
 	}
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if tok, err := ts.get(context.Background()); err != nil || tok != "tok" {
 			t.Fatalf("get: %q, %v", tok, err)
 		}

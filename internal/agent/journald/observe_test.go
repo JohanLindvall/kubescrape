@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
@@ -130,7 +131,7 @@ func TestJournaldObservesOncePerDeliveryAcrossACollectorOutage(t *testing.T) {
 	exp := &captureExporter{}
 	r := New(Config{
 		Exporter: exp, FlushInterval: 20 * time.Millisecond, RestartBackoff: 5 * time.Millisecond,
-		LogMetrics: set, Rules: rules, Positions: pos,
+		Chain: logchain.Config{LogMetrics: set, Rules: rules}, Positions: pos,
 	})
 	r.open = fd.open
 	ctx, cancel := context.WithCancel(context.Background())
@@ -354,7 +355,7 @@ func TestJournaldFlushCadenceHonoursTheInterval(t *testing.T) {
 		budget = interval + exportFor + (interval-exportFor)/2
 	)
 	all := make([]rawEntry, 0, 256)
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		all = append(all, mkEntry(cursorAt(i), "kubelet.service", "line", "6"))
 	}
 	fd := &feeder{all: all}

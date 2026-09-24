@@ -2,10 +2,12 @@ package positions
 
 import (
 	"bytes"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -42,6 +44,69 @@ func TestLogsAndCursorPersistTogether(t *testing.T) {
 	}
 	if _, ok := s3.Logs()["/var/log/b.log"]; !ok {
 		t.Errorf("logs not updated: %+v", s3.Logs())
+	}
+}
+
+// TestConcurrentSectionsDoNotClobber drives the package's stated contract: the
+// tailer and journald save their own sections from different goroutines while
+// readers take copies, and neither producer's last write is lost. What ENFORCES
+// the contract is the -race pass, which catches save's state — the document,
+// the cached log section, the written-identity skip — being touched outside the
+// mutex; the end-state check is best-effort (a lost update can still land in an
+// order that reads back correctly).
+func TestConcurrentSectionsDoNotClobber(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "positions.json")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 50 // every save fsyncs twice
+	var producers, reader sync.WaitGroup
+	done := make(chan struct{})
+	producers.Add(2)
+	go func() {
+		defer producers.Done()
+		for i := 1; i <= n; i++ {
+			if err := s.SetLogsOwned(map[string]LogPos{"/a.log": {Offset: int64(i)}}); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer producers.Done()
+		for i := 1; i <= n; i++ {
+			if err := s.SetJournalCursor(fmt.Sprint(i)); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	reader.Go(func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_ = s.Logs()["/a.log"].Offset
+			_ = s.JournalCursor()
+			_ = s.Corrupt()
+		}
+	})
+	producers.Wait()
+	close(done)
+	reader.Wait()
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s2.Logs()["/a.log"].Offset; got != n {
+		t.Errorf("stored log offset = %d, want %d (the cursor producer's save clobbered it)", got, n)
+	}
+	if got := s2.JournalCursor(); got != fmt.Sprint(n) {
+		t.Errorf("stored cursor = %q, want %q (the log producer's save clobbered it)", got, fmt.Sprint(n))
 	}
 }
 

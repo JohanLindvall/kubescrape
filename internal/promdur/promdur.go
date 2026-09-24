@@ -14,10 +14,13 @@
 // to be copies (byte-identical regexes held equal by nothing) because the
 // agent's lived in the OTLP scraper, which the metadata service must not
 // link; a dependency-free leaf package removes the copy without adding the
-// link. What deliberately stays at the CALL SITES is each consumer's edge
-// rule — promscrape's caller gates non-positive values with its own warning,
-// and the merge reads "0" as "not a usable interval" — because those are
-// different READINGS of the same parse, not different parses.
+// link. The two must also agree on which values are USABLE at all — if the
+// merge read "0" as a usable and therefore "finer" interval, it would displace
+// a real one that the agent then discards as invalid, dropping the target to
+// the default cadence — so that rule lives here too, as Interval. What stays at
+// the CALL SITES is only each consumer's REACTION to an unusable value: the
+// merge keeps the holder's interval, the scraper warns once and falls back to
+// its default.
 //
 // This is the sibling of internal/config's Duration, not a competitor: that
 // is the one reader for Go-duration config STRINGS and explicitly scopes this
@@ -31,6 +34,15 @@ import (
 	"strconv"
 	"time"
 )
+
+// Interval parses a monitor's interval or scrapeTimeout and reports whether it
+// is USABLE: it parsed, and it is positive. "0", a negative Go duration, an
+// overflow and garbage are all unusable, and ok is the one rule every consumer
+// of these values applies — see the package doc for why they must agree.
+func Interval(s string) (time.Duration, bool) {
+	d, err := Parse(s)
+	return d, err == nil && d > 0
+}
 
 // Parse parses one prometheus-operator duration value. An explicit "0" (and
 // an empty string, which the CRD pattern matches) parses to (0, nil): whether
@@ -74,7 +86,7 @@ func Parse(s string) (time.Duration, error) {
 		// admits any magnitude, so scrapeTimeout "18446744073710ms" wrapped to
 		// +448µs — a deadline every scrape exceeds (total metric loss), with no
 		// invalid-duration warning. Refuse the overflow at EACH accumulation
-		// step (compound forms like "290y290y" overflow the sum, not one term)
+		// step (compound forms like "292y52w" overflow the sum, not one term)
 		// so callers warn and fall back like any other bad value.
 		if n > math.MaxInt64/int64(u) {
 			return 0, fmt.Errorf("duration %q: overflows time.Duration", s)

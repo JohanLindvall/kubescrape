@@ -3,11 +3,14 @@ package main
 import (
 	"flag"
 	"os"
-	"strings"
 	"testing"
 
 	"github.com/JohanLindvall/kubescrape/internal/docscheck"
 )
+
+// harnessFlags are this test binary's own flags, which the binary does not
+// register and the docs therefore do not cover (docscheck.DocumentedFlags).
+var harnessFlags = []string{"update-flags-doc", "update-config-schema"}
 
 var updateFlagsDoc = flag.Bool("update-flags-doc", false, "rewrite this binary's generated section of docs/FLAGS.md")
 
@@ -26,7 +29,7 @@ func TestFlagsDocIsCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table := docscheck.FlagTable(flag.CommandLine, "update-flags-doc", "update-config-schema")
+	table := docscheck.FlagTable(flag.CommandLine, harnessFlags...)
 	want, err := docscheck.ReplaceSection(string(doc), flagsBeginMark, flagsEndMark, table)
 	if err != nil {
 		t.Fatal(err)
@@ -51,12 +54,9 @@ func TestFlagsAreMentionedInConfigurationDoc(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	flag.CommandLine.VisitAll(func(f *flag.Flag) {
-		if f.Name == "update-flags-doc" || f.Name == "update-config-schema" || strings.HasPrefix(f.Name, "test.") {
-			return
-		}
+	for _, f := range docscheck.DocumentedFlags(flag.CommandLine, harnessFlags...) {
 		if !docscheck.FlagMentioned(string(doc), f.Name) {
 			t.Errorf("-%s is not mentioned anywhere in docs/CONFIGURATION.md", f.Name)
 		}
-	})
+	}
 }

@@ -149,6 +149,27 @@ spec:
     - ports:
         - port: 9090
 ---
+# Source: kubescrape/templates/priorityquota.yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: kubescrape-priority-classes
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+spec:
+  hard:
+    pods: "100000"
+  scopeSelector:
+    matchExpressions:
+      - scopeName: PriorityClass
+        operator: In
+        values:
+          - system-cluster-critical
+          - system-node-critical
+---
 # Source: kubescrape/templates/agent.yaml
 apiVersion: v1
 kind: ServiceAccount
@@ -319,9 +340,11 @@ spec:
     spec:
       serviceAccountName: kubescrape-agent
       # The shutdown sequence is bounded but not instant: producers stop
-      # under a budget, then the final log-metrics, span-metrics and
-      # self-metrics exports run, then the disk buffer drains. The kubelet
-      # default of 30s cuts that short during a collector outage.
+      # under a budget, then the final log-metrics, cgroup-stats and
+      # self-metrics exports run, then (with agent.bufferDir) the disk buffer
+      # drains. The kubelet default of 30s cuts that short during a collector
+      # outage; values.yaml's terminationGracePeriodSeconds covers all three
+      # agent-binary workloads.
       terminationGracePeriodSeconds: 60
       priorityClassName: system-node-critical
       tolerations:
@@ -461,10 +484,12 @@ spec:
         prometheus.io/path: /metrics
     spec:
       serviceAccountName: kubescrape-events
-      # The shutdown sequence is bounded but not instant: producers stop
-      # under a budget, then the final log-metrics, span-metrics and
-      # self-metrics exports run, then the disk buffer drains. The kubelet
-      # default of 30s cuts that short during a collector outage.
+      # The shutdown sequence is bounded but not instant: the readers stop
+      # under a budget (the events reader's final flush and position write;
+      # the Azure reader just stops, its uncommitted records redelivered on
+      # the next start), then the final log-metrics and self-metrics exports
+      # run. There is no disk buffer to drain here (see the header). The
+      # kubelet default of 30s cuts that short during a collector outage.
       terminationGracePeriodSeconds: 60
       securityContext:
         seccompProfile:

@@ -16,7 +16,9 @@ package obs_test
 //                  was 3.4x worse concurrent than serial: a per-call cost that
 //                  looks small serially can be a contended cache line, and only
 //                  the parallel arm shows it. The agent's concurrent bumpers are
-//                  the ingest handlers and the scrape goroutines.
+//                  the ingest handlers and the scrape goroutines. Beside it, a
+//                  vec's distinct label values (one shared series lock) and
+//                  distinct registered metrics (one lock each).
 //   WithLabelValues the per-call label resolution, for the sites that legitimately
 //                  cannot pre-bind (a label value known only at the call).
 //   Export/Dump    the two whole-registry renders. Export is the OTLP push
@@ -28,6 +30,7 @@ package obs_test
 import (
 	"context"
 	"strconv"
+	"sync/atomic"
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -86,17 +89,36 @@ func BenchmarkCounterIncParallel(b *testing.B) {
 	})
 }
 
-// Distinct series bumped concurrently — the shape a labelled counter has when
-// each goroutine owns a different label value. Same registry, different series,
-// so this isolates per-series contention from per-registry contention.
+// Distinct label values of ONE vec bumped concurrently — the shape a labelled
+// counter has when each goroutine owns a different label value. This is NOT
+// per-series isolation: every label tuple of a vec is a sample in the vec's one
+// series (Registry.CounterVec registers a single series and every
+// WithLabelValues binds into it), behind that series' one mutex. So it measures
+// the same lock as BenchmarkCounterIncParallel with a different sample behind
+// it; BenchmarkCounterDistinctMetricsParallel is the isolated shape.
 func BenchmarkCounterVecDistinctSeriesParallel(b *testing.B) {
 	r := metrics.NewRegistry()
 	v := r.CounterVec("kubescrape_bench_distinct_total", "bench", "outcome")
-	var n int
+	var n atomic.Int64
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
-		n++
-		c := v.WithLabelValues("outcome" + strconv.Itoa(n))
+		c := v.WithLabelValues("outcome" + strconv.FormatInt(n.Add(1), 10))
+		for pb.Next() {
+			c.Inc()
+		}
+	})
+}
+
+// One registered counter per goroutine: distinct METRICS, hence distinct
+// series and distinct mutexes, in one registry. Beside the vec benchmark above
+// this separates per-series lock contention (absent here) from what a shared
+// series costs.
+func BenchmarkCounterDistinctMetricsParallel(b *testing.B) {
+	r := metrics.NewRegistry()
+	var n atomic.Int64
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		c := r.Counter("kubescrape_bench_own_"+strconv.FormatInt(n.Add(1), 10)+"_total", "bench")
 		for pb.Next() {
 			c.Inc()
 		}
@@ -104,7 +126,8 @@ func BenchmarkCounterVecDistinctSeriesParallel(b *testing.B) {
 }
 
 // Per-call label resolution: one cached-wrapper lookup under the vec's mutex.
-// Single-label vecs take vecKey's alloc-free arm; two labels build a key.
+// A single-label vec keys on the value itself; two labels build a
+// length-prefixed key in a stack buffer. Both are allocation-free on a hit.
 func BenchmarkCounterWithLabelValues(b *testing.B) {
 	r := metrics.NewRegistry()
 	one := r.CounterVec("kubescrape_bench_wlv1_total", "bench", "outcome")
@@ -126,7 +149,7 @@ func BenchmarkCounterWithLabelValues(b *testing.B) {
 }
 
 // The OTLP push render, at the registry sizes both binaries actually reach.
-// obs.go registers 137 metric families; the agent's labelled ones fan out to a
+// This package registers 137 metric families; the agent's labelled ones fan out to a
 // few hundred series in total.
 func BenchmarkRegistryExport(b *testing.B) {
 	for _, sz := range []struct {

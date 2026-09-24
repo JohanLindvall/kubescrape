@@ -5,12 +5,14 @@
 //
 // # Why this is not part of agent/spanmetrics
 //
-// spanmetrics aggregates every span INDEPENDENTLY, which is why its RED
-// metrics are already correct cluster-wide: the spans partition across agents
-// and cumulative counters sum. An edge is the opposite shape — it needs BOTH
-// halves of one request, and the two halves are produced by two pods that
-// usually run on different nodes, so the two agents that receive them never
-// see each other's half. No amount of per-agent aggregation fixes that.
+// spanmetrics aggregates every span INDEPENDENTLY, so its RED metrics are
+// correct wherever a span is counted: the spans partition across processes and
+// cumulative counters sum. An edge is the opposite shape — it needs BOTH halves
+// of one request, and the two halves are produced by two pods that usually run
+// on different nodes, so a per-node receiver holds half of every edge by
+// construction. No amount of per-process aggregation fixes that; routing every
+// span of a trace to one process (below) does. (spanmetrics now runs in that
+// same owner chain, on the shard owning each trace, but it would not need to.)
 //
 // # The Tempo model
 //
@@ -69,9 +71,6 @@ const (
 	defaultBucketStart    = 0.1
 	defaultBucketFactor   = 2
 	defaultBucketCount    = 8
-	// maxDimensionValueBytes bounds one retained label value; see
-	// cumagg.MaxLabelBytes for what it is protecting against.
-	maxDimensionValueBytes = cumagg.MaxLabelBytes
 )
 
 // Config is the `serviceGraph` section of the agent config file.
@@ -102,7 +101,9 @@ type Config struct {
 	// reason.
 	Wait string `json:"wait,omitempty"`
 	// MaxItems bounds the pairing store (half-edges awaiting a partner). Over
-	// it, spans are dropped and counted — never silently.
+	// it, spans are refused by the pairing store and counted — never silently.
+	// A refused span is still forwarded (the pairing tap forwards first); what
+	// it loses is its request's edge.
 	MaxItems int `json:"maxItems,omitempty"`
 	// MaxCardinality bounds the number of distinct EDGE series. A new edge
 	// over the cap is dropped and counted; existing edges keep reporting,
@@ -127,7 +128,8 @@ type Config struct {
 	//
 	// On by default because an edge's exemplar is the only link from "this
 	// call between two services is slow" to a trace showing WHY, and it costs
-	// one data point per occupied bucket per edge per export.
+	// one data point per occupied bucket per edge per export. Only a trace the
+	// head sampler keeps anchors one (Registry.SetExemplarKeep).
 	Exemplars *bool `json:"exemplars,omitempty"`
 	// Dimensions are extra span/resource attribute keys lifted onto the edge
 	// series. Tempo's rule applies: a dimension resolves from whichever side
@@ -138,11 +140,14 @@ type Config struct {
 	// here starts resolving on the next export with no second list to keep in
 	// step.
 	Dimensions []string `json:"dimensions,omitempty"`
-	// VirtualNodePeerAttributes name the far side of an UNPAIRED client span,
-	// in precedence order, so calls to uninstrumented dependencies (managed
-	// databases, third-party APIs) still appear on the graph. Tempo's default
-	// is peer.service, db.name, db.system. An empty list disables virtual
-	// nodes; nil takes the default.
+	// VirtualNodePeerAttributes name the far side of an UNPAIRED half — a
+	// client half's callee or a server half's caller (see Wait) — in
+	// precedence order, so calls to uninstrumented dependencies (managed
+	// databases, third-party APIs) and from uninstrumented callers still
+	// appear on the graph. A db.* key never names a caller from a server half
+	// (a server span carrying db.* is a service that talks TO a database).
+	// Tempo's default is peer.service, db.name, db.system. An empty list
+	// disables virtual nodes; nil takes the default.
 	VirtualNodePeerAttributes []string `json:"virtualNodePeerAttributes,omitempty"`
 }
 
@@ -170,8 +175,34 @@ func (c Config) wait() (time.Duration, error) {
 // that one used to clamp a negative to zero, which silently DISABLED eviction
 // instead of refusing the config.
 func (c Config) staleAfter() (time.Duration, error) {
-	return cumagg.ParseStaleAfter("serviceGraph.staleAfter", c.StaleAfter, DefaultStaleAfter)
+	return cumagg.ParseStaleAfter(staleAfterField, c.StaleAfter, DefaultStaleAfter)
 }
+
+// staleAfterField is StaleAfter's config path, for the refusal and the fallback
+// warning alike.
+const staleAfterField = "serviceGraph.staleAfter"
+
+// dimensionsField is Dimensions' config path, for the warning and
+// NewProcessor's trace.
+const dimensionsField = "serviceGraph.dimensions"
+
+// DimensionWarnings is one sentence per configured dimension NewProcessor will
+// drop (an empty entry, a repeat), and nothing for a clean list. It is the SAME
+// rule NewProcessor applies (cumagg.Builtins.Configure, with no built-ins: every
+// configured name is prefixed client_ / server_ before it becomes a label, so
+// none can collide with one) and it is pure, so cmd/kubescrape-agent's
+// configWarnings says it from -check-config and a real start alike.
+// NewProcessor only logs the drops at Debug, or a start would print each twice.
+func (c *Config) DimensionWarnings() []string {
+	if c == nil {
+		return nil
+	}
+	return noBuiltins.DimensionWarnings(dimensionsField, c.Dimensions)
+}
+
+// noBuiltins is the configured-dimension rule without a built-in set; see
+// DimensionWarnings.
+var noBuiltins cumagg.Builtins
 
 // Validate checks the section without acquiring anything, so -check-config can
 // run it. It is shape-only by design (see cmd/kubescrape-agent/config.go).
@@ -289,7 +320,12 @@ type Edge struct {
 	// Failed is true when either side reported an error status.
 	Failed bool
 	// Dimensions are the configured extra labels, already prefixed client_ /
-	// server_ and truncated.
+	// server_. Their VALUES are not necessarily cut to cumagg.MaxLabelBytes:
+	// the half a pairing store HELD was cut when it was stored, but the half
+	// that completes a pair reaches the sink as the sender wrote it — cutting
+	// it with a copy first would allocate per span for a value that may never
+	// be kept. A sink cuts what it keys (cumagg.Trunc) and what it keeps
+	// (cumagg.Retain), as Registry.RecordAt does.
 	//
 	// An ORDERED slice rather than a map, for two reasons that pull the same
 	// way. The metric layer keys a series on this sequence, and a map has no
@@ -303,8 +339,8 @@ type Edge struct {
 	// The slice is BORROWED: it aliases a buffer the pairing store recycles the
 	// instant the sink returns (see edgeStore.retire and joinDims), so a sink
 	// that keeps the Edge past its Record call must copy the pairs out. Every
-	// production sink already does — Registry.Record copies what it needs into
-	// the series' own label set the one time the series is admitted.
+	// production sink already does — Registry.RecordAt copies what it needs
+	// into the series' own label set the one time the series is admitted.
 	Dimensions []EdgeDimension
 	// VirtualNode is "client" or "server" when one side was synthesized, else
 	// empty. Tempo exposes this as the `virtual_node` dimension.
@@ -318,8 +354,14 @@ type Edge struct {
 	// they cannot pair otherwise. Whichever half arrived first therefore sets
 	// it, which is also the only half a promoted virtual-node edge has. Trace
 	// sampling cannot split them either: it is consistent per trace id, so both
-	// halves are sampled or neither is, and an exemplar either resolves in
-	// Tempo or the trace was never stored to begin with.
+	// halves are sampled or neither is.
+	//
+	// It does not follow that the exemplar resolves. The graph counts EVERY
+	// request — the tier's samplers sit below it — so a trace the head sampler
+	// drops still completes an edge here, and an exemplar naming it would be a
+	// dead link; Registry.SetExemplarKeep is how the tier skips those. What no
+	// predicate can see is the TAIL sampler's later whole-trace verdict, so
+	// under tailSampling an exemplar can still name a trace it dropped.
 	//
 	// Zero when the edge came from spans with no trace id — impossible today
 	// (the processor refuses to key those), but an exemplar is skipped rather

@@ -401,7 +401,7 @@ func TestGzipReaderCloseIsSafeAgainstAnInFlightRead(t *testing.T) {
 	c := &gzipCodec{}
 	gz := gzipTestBytes(t, bytes.Repeat([]byte("concurrent close. "), 200000), nil)
 
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		p, _ := decompressTest(t, c, gz)
 		var wg sync.WaitGroup
 		wg.Add(2)
@@ -484,12 +484,12 @@ func TestGRPCGzipConcurrentRoundTripIsIntact(t *testing.T) {
 
 	const senders, rounds = 8, 25
 	var wg sync.WaitGroup
-	for s := 0; s < senders; s++ {
+	for s := range senders {
 		wg.Add(1)
 		go func(s int) {
 			defer wg.Done()
 			ld := verifiableLogs(fmt.Sprintf("sender-%d", s))
-			for r := 0; r < rounds; r++ {
+			for range rounds {
 				if err := c.ExportLogs(context.Background(), ld); err != nil {
 					t.Errorf("export: %v", err)
 					return
@@ -511,7 +511,7 @@ const verifiableRecords = 200
 func verifiableLogs(tag string) plog.Logs {
 	ld := plog.NewLogs()
 	lrs := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords()
-	for i := 0; i < verifiableRecords; i++ {
+	for i := range verifiableRecords {
 		lrs.AppendEmpty().Body().SetStr(fmt.Sprintf("%s/%04d/%s", tag, i, "padding to make the payload worth compressing "))
 	}
 	return ld

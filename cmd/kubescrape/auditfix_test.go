@@ -1,10 +1,10 @@
 package main
 
 import (
-	"sync"
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/selfmeta"
 )
 
@@ -68,9 +68,10 @@ func TestServiceSelfResourceWithoutANamespace(t *testing.T) {
 // literals put the worst case at 40s and the kubelet SIGKILLed the process
 // mid-sequence, losing exactly the exports the budgets exist to fit in.
 func TestShutdownBudgetFitsTheDefaultTerminationGrace(t *testing.T) {
-	// internal/obs/runtime.go gives each of ServeMetrics/ServePprof's stoppers
-	// its own 5s Shutdown, and they run deferred, after the sequence above.
-	const listenerStoppers = 2 * 5 * time.Second
+	// Each of ServeMetrics/ServePprof's stoppers gets its own Shutdown bound,
+	// and they run deferred, after the sequence above. The real constant, not a
+	// copy of it: a copy let the stopper's timeout grow without failing this.
+	const listenerStoppers = 2 * obs.ListenerShutdownTimeout
 	const defaultGrace = 30 * time.Second
 	if shutdownTotal+listenerStoppers >= defaultGrace {
 		t.Fatalf("shutdownTotal %v + %v of listener stoppers leaves nothing of the kubelet's default %v grace",
@@ -78,21 +79,5 @@ func TestShutdownBudgetFitsTheDefaultTerminationGrace(t *testing.T) {
 	}
 	if shutdownStep > shutdownTotal {
 		t.Fatalf("a single step (%v) may spend more than the whole sequence's budget (%v)", shutdownStep, shutdownTotal)
-	}
-}
-
-func TestWaitForRespectsItsBudget(t *testing.T) {
-	var wg sync.WaitGroup
-	if !waitFor(&wg, time.Second) {
-		t.Fatal("an already-done WaitGroup was reported as overrunning its budget")
-	}
-	wg.Add(1)
-	t.Cleanup(wg.Done)
-	start := time.Now()
-	if waitFor(&wg, 20*time.Millisecond) {
-		t.Fatal("a WaitGroup that never finished was reported as done")
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("waitFor blocked for %v past a 20ms budget", elapsed)
 	}
 }

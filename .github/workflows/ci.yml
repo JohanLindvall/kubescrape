@@ -74,16 +74,20 @@ jobs:
       - name: build and test with no optional pipelines
         run: make build test TAGS=
 
-      # docs/METRICS.md is generated from the registrations; this fails if a
-      # metric was added or renamed without regenerating it.
-      - name: metrics doc is current
-        run: go test ./internal/obs/ -run 'TestMetricsDocIsCurrent|TestDocumentedMetricsExist'
+      # No separate "generated docs are current" step: TestMetricsDocIsCurrent,
+      # TestDocumentedMetricsExist, TestFlagsDocIsCurrent and the chart goldens
+      # all run in both `make test` steps above.
 
-      # Concurrency-touching code (store, metaclient cache, otlpingest) has
-      # targeted race exercises; AGENTS.md asks for this pass, so run it here
-      # rather than relying on it being remembered locally.
+      # The race detector over the WHOLE tree, with the shipped tags (`make
+      # race`). This used to name six packages and pass no tags, which skipped
+      # every package whose locking was most recently reworked — cumagg,
+      # servicegraph, spanmetrics and tailbuffer (chunked lock-releasing
+      # passes, whose stall tests only catch a race under -race), bearer
+      # (lock-dropped reads), otlpexport, the tailer and the server — and the
+      # tagged journald/azure/events code entirely. The allocation budgets skip
+      # themselves under -race, so nothing needs excluding.
       - name: go test -race
-        run: CGO_ENABLED=1 go test -race ./internal/store/ ./pkg/metaclient/ ./internal/agent/otlpingest/ ./internal/metrics/ ./internal/logline/ ./pkg/logattrs/
+        run: make race
 
   lint:
     runs-on: ubuntu-latest
@@ -101,6 +105,31 @@ jobs:
       # run, and it would have drifted from the Makefile regardless.
       - run: make lint
 
+  # Both images, built exactly as `make image` and `make image-static` build
+  # them, and then each binary STARTED inside its own runtime base. Nothing else
+  # in CI builds either Dockerfile — `make e2e` (never run here) builds only the
+  # one its TAGS select, and before this job nothing at all built
+  # Dockerfile.static — so a Dockerfile or .dockerignore break reached main
+  # unseen. -check-config acquires nothing (no listeners, no
+  # API server, no kubeconfig), so it runs anywhere; the exec itself is the
+  # point: it resolves the agent's shared libraries against distroless/base's
+  # glibc and the .so files the Dockerfile stages from a HAND-KEPT list, which a
+  # base-image bump can outgrow without failing the build.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: build both images
+        run: make image image-static IMAGE=kubescrape-ci TAG=ci
+      - name: start every binary in its runtime base
+        run: |
+          set -eu
+          for img in kubescrape-ci:ci kubescrape-ci:ci-static; do
+            echo "== $img"
+            docker run --rm --entrypoint /kubescrape "$img" -check-config
+            docker run --rm --entrypoint /kubescrape-agent "$img" -check-config -node-name=ci
+          done
+
   vulncheck:
     runs-on: ubuntu-latest
     steps:
@@ -112,40 +141,24 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libsystemd-dev
       # go.mod's `go` directive is a SECURITY floor (AGENTS.md: the advisories
       # it was raised for), and the floor only holds while nothing reachable
-      # is newly advisable. Run against the shipped tag set, so the journald,
-      # Azure and events pipelines' dependencies are in the reachability
-      # analysis rather than the stubs.
+      # is newly advisable. `make vulncheck` runs against the Makefile's TAGS —
+      # the shipped set, so the journald, Azure and events pipelines'
+      # dependencies are in the reachability analysis rather than the stubs —
+      # and is what a developer runs locally, so the tag list is not a second
+      # copy here that can drift from the one the images are built with.
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest -tags journald,azure,events ./...
+        run: make vulncheck
 
+  # `make helm-lint`, the same target `make check` runs, with the same pinned
+  # helm (hack/helm-version, bootstrapped by hack/ensure-helm.sh): a lint that
+  # passes under a different major than the one main is pinned to proves
+  # nothing about what `helm install` will do. What renders is asserted by
+  # internal/chartcheck in `make test` — including the -config flag/mount
+  # parity this job used to check with a bash loop over whole-render COUNTS
+  # (TestEveryConfigFlagHasItsMount, now per workload, with the events
+  # singleton and the trace tier enabled, which the loop never rendered).
   helm:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # The same pinned helm the golden test renders under (hack/helm-version).
-      # A lint and a template that pass under a different major than the one
-      # main is pinned to prove nothing about what `helm install` will do.
-      - name: install pinned helm
-        run: echo "HELM=$(hack/ensure-helm.sh)" >> "$GITHUB_ENV"
-      - run: "$HELM lint charts/kubescrape"
-      # Render the value combinations that have broken before: staticAttrs
-      # alone once rendered -config plus its ConfigMap but neither the volume
-      # nor the mount, CrashLoopBackOff-ing every node.
-      - name: helm template (value matrix)
-        run: |
-          set -eu
-          for args in \
-            "" \
-            "--set agent.staticAttrs.foo=bar" \
-            "--set networkPolicy.enabled=true" \
-            "--set agent.ingest.enabled=true --set networkPolicy.enabled=true" \
-            "--set service.scrapeAuthSecrets=true --set service.scrapeAuthToken.existingSecret=tok" \
-            "--set service.scrapeAuthSecrets=true --set service.scrapeAuthToken.value=tok"; do
-            echo "== helm template $args"
-            out=$($HELM template t charts/kubescrape $args)
-            flag=$(printf '%s' "$out" | grep -c 'config=/etc/kubescrape/config/config.yaml' || true)
-            mount=$(printf '%s' "$out" | grep -c 'mountPath: /etc/kubescrape/config' || true)
-            if [ "$flag" != "$mount" ]; then
-              echo "-config flag ($flag) and its volumeMount ($mount) disagree"; exit 1
-            fi
-          done
+      - run: make helm-lint

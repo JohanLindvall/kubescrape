@@ -10,6 +10,11 @@
         "tag": {
           "type": "string"
         },
+        "digest": {
+          "type": "string",
+          "pattern": "^(sha256:[a-f0-9]{64})?$",
+          "description": "image digest (sha256:<64 hex>); renders repository@digest and defaults the pull policy to IfNotPresent"
+        },
         "pullPolicy": {
           "type": "string"
         }
@@ -49,6 +54,20 @@
         },
         "localhostProfile": {
           "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "priorityClassQuota": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "pods": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*$",
+          "description": "hard.pods of the ResourceQuota covering the system-* priority classes the workloads use"
         }
       },
       "additionalProperties": false
@@ -304,7 +323,7 @@
             },
             "root": {
               "type": "string",
-              "description": "-cgroup-stats-root, and the mountPath the host's cgroup hierarchy is bind-mounted at (empty means /sys/fs/cgroup)"
+              "description": "-cgroup-stats-root, and the mountPath the host's cgroup hierarchy is bind-mounted at (empty means /host/sys/fs/cgroup; never /sys/fs/cgroup, which would shadow the container's own cgroup and hide its memory limit)"
             }
           },
           "additionalProperties": false
@@ -321,9 +340,19 @@
             "httpEndpoint": {
               "type": "string"
             },
+            "service": {
+              "type": "object",
+              "description": "a Service (<release>-agent-ingest, internalTrafficPolicy: Local) an SDK addresses to reach the agent on its OWN node; keeps the source address, so peerIpFallback still works",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false
+            },
             "hostPort": {
               "type": "boolean",
-              "description": "bind the ingest ports on the node so an SDK can reach its own node's agent via status.hostIP; off by default (a hostPort claims the port on every node and is not covered by allowFrom)"
+              "description": "bind the ingest ports on the node so an SDK can reach its own node's agent via status.hostIP; off by default (a hostPort claims the port on every node and is not covered by allowFrom, and on portmap CNIs masquerades same-node senders, defeating peerIpFallback)"
             },
             "metricsMode": {
               "type": "string"
@@ -588,6 +617,18 @@
             "type": "string"
           }
         },
+        "extraVolumes": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "extraVolumeMounts": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
         "resources": {
           "type": "object"
         }
@@ -726,7 +767,9 @@
               }
             },
             "group": {
-              "type": "string"
+              "type": "string",
+              "minLength": 1,
+              "description": "-azure-eventhub-group; empty is refused here and by the agent (azurediag.ValidateGroup)"
             },
             "connectionStringSecret": {
               "type": "object",

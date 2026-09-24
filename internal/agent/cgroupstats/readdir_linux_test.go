@@ -47,7 +47,7 @@ func TestDiscoveryDoesNotAllocatePerControlFile(t *testing.T) {
 		}
 	}
 
-	var found []containerDir
+	var found []cgroupRef
 	got := testing.AllocsPerRun(20, func() {
 		f, _, err := discoverContainers(root)
 		if err != nil {

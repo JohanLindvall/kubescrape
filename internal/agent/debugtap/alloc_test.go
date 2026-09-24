@@ -34,7 +34,7 @@ func TestZeroSubscriberExportIsAllocationFree(t *testing.T) {
 	}
 
 	md := pmetric.NewMetrics()
-	for r := 0; r < 512; r++ {
+	for range 512 {
 		rm := md.ResourceMetrics().AppendEmpty()
 		rm.Resource().Attributes().PutStr("k8s.namespace.name", "team-1")
 		rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetEmptyGauge().DataPoints().AppendEmpty().SetIntValue(1)

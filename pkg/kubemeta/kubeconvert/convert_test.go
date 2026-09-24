@@ -1,6 +1,7 @@
 package kubeconvert
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -400,5 +401,87 @@ func TestPreviousIncarnationRestartCountIsNeverNegative(t *testing.T) {
 	_, byID := FromPod(pod)
 	if got := byID["old"].RestartCount; got != 0 {
 		t.Errorf("previous RestartCount = %d, want 0", got)
+	}
+}
+
+// previousIncarnation BUILDS the history record rather than copying the live
+// container and clearing it, so a field added to kubemeta.Container defaults to
+// absent on a record presented as history instead of silently inheriting the
+// LIVE container's value — which is how Image, ImageID and RestartCount leaked
+// for as long as the record was a copy-and-clear.
+//
+// Every field of the live container is filled with a non-zero sentinel that
+// lastState does not share, so the result may equal the live value only on the
+// SPEC-derived fields that are meant to carry over. A new field fails here
+// until it is either answered from lastState or added to carried below with a
+// reason; a field of a kind sentinel cannot fill fails loudly rather than being
+// skipped.
+func TestPreviousIncarnationCarriesOnlyTheSpecFields(t *testing.T) {
+	carried := map[string]bool{"Name": true, "Type": true, "Ports": true}
+	var live kubemeta.Container
+	lv := reflect.ValueOf(&live).Elem()
+	for i := range lv.NumField() {
+		fillSentinel(t, lv.Field(i), lv.Type().Field(i).Name)
+	}
+	live.ID = "liveid" // previousIncarnation refuses a lastState naming the live ID
+	now := time.Unix(1_600_000_000, 0)
+	st := &corev1.ContainerStatus{
+		Name: live.Name, RestartCount: 3,
+		LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ContainerID: "containerd://previd", ExitCode: 137,
+			StartedAt:  metav1.Time{Time: now.Add(-time.Hour)},
+			FinishedAt: metav1.Time{Time: now},
+		}},
+	}
+	prev, ok := previousIncarnation(live, st)
+	if !ok {
+		t.Fatal("a distinct lastState was not modelled as a previous incarnation")
+	}
+	pv := reflect.ValueOf(prev)
+	for i := range lv.NumField() {
+		name := lv.Type().Field(i).Name
+		same := reflect.DeepEqual(lv.Field(i).Interface(), pv.Field(i).Interface())
+		switch {
+		case carried[name] && !same:
+			t.Errorf("%s is spec-derived and must carry over: live %v, previous %v",
+				name, lv.Field(i).Interface(), pv.Field(i).Interface())
+		case !carried[name] && same:
+			t.Errorf("%s on the previous incarnation is the LIVE container's value %v: answer it from lastState or leave it absent",
+				name, pv.Field(i).Interface())
+		}
+	}
+	if len(prev.Ports) > 0 && &prev.Ports[0] == &live.Ports[0] {
+		t.Error("the previous incarnation shares the live container's Ports array")
+	}
+}
+
+// fillSentinel sets v to a non-zero value derived from name.
+func fillSentinel(t *testing.T, v reflect.Value, name string) {
+	t.Helper()
+	switch v.Kind() {
+	case reflect.String:
+		v.SetString("live-" + name)
+	case reflect.Bool:
+		v.SetBool(true)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		v.SetInt(41)
+	case reflect.Slice:
+		s := reflect.MakeSlice(v.Type(), 1, 1)
+		fillSentinel(t, s.Index(0), name)
+		v.Set(s)
+	case reflect.Pointer:
+		p := reflect.New(v.Type().Elem())
+		fillSentinel(t, p.Elem(), name)
+		v.Set(p)
+	case reflect.Struct:
+		if v.Type() == reflect.TypeFor[time.Time]() {
+			v.Set(reflect.ValueOf(time.Unix(1_000_000_000, 0)))
+			return
+		}
+		for i := range v.NumField() {
+			fillSentinel(t, v.Field(i), name+"."+v.Type().Field(i).Name)
+		}
+	default:
+		t.Fatalf("%s: no sentinel for kind %s; teach fillSentinel", name, v.Kind())
 	}
 }

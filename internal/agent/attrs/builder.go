@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"regexp"
 	"regexp/syntax"
 	"slices"
-	"sort"
 	"strings"
 	"text/template"
 	"time"
@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
+	"github.com/JohanLindvall/kubescrape/internal/regexcost"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -55,6 +56,12 @@ type Context struct {
 // resources join only while they are byte-identical. A separate attribute
 // surface over them would be a supported way to break that (the coupling
 // internal/agent/cgroupstats documents for the same reason).
+//
+// "ingest" governs more than the OTLP receiver: the Kubernetes events reader
+// (-events) and the Azure diagnostics readers (-azure-diagnostics) build their
+// resources with it too (cmd/kubescrape-agent wires Builders.Ingest into
+// both), so a "logs" override — of service.name, say — reaches a pod's logs
+// but not the events about that pod.
 var pipelineNames = []string{"logs", "targets", "cadvisor", "node", "summary", "journal", "ingest", "self"}
 
 // Config declares how resource attributes are built. It is the
@@ -84,9 +91,11 @@ type Config struct {
 	// Attributes maps attribute keys to Go templates over Context.
 	Attributes map[string]string `json:"attributes,omitempty"`
 	// InstancePrefix is prepended to the derived service.instance.id (see
-	// PrefixInstance). It defaults per pipeline (cadvisor -> "cadvisor") so
-	// describing exporters do not collide with self-scraped metrics; set it to
-	// "" to disable, or to any string to override.
+	// PrefixInstance). It defaults per pipeline (cadvisor -> "cadvisor",
+	// summary -> "summary"; defaultInstancePrefix) so describing exporters do
+	// not collide with self-scraped metrics — and the kubelet's /stats/summary
+	// node resource does not collide with the -node-metrics scrape's; set it
+	// to "" to disable, or to any string to override.
 	InstancePrefix *string `json:"instancePrefix,omitempty"`
 	// Enable keeps only resource attributes whose key matches one of these
 	// anchored regexes (empty keeps all); Disable drops matching keys. Both are
@@ -233,12 +242,8 @@ func mergeMaps(base, over map[string]string) map[string]string {
 		return nil
 	}
 	out := make(map[string]string, len(base)+len(over))
-	for k, v := range base {
-		out[k] = v
-	}
-	for k, v := range over {
-		out[k] = v
-	}
+	maps.Copy(out, base)
+	maps.Copy(out, over)
 	return out
 }
 
@@ -273,33 +278,80 @@ type dynamicAttr struct {
 // a template ARGUMENT, so a template may compose one from per-object data
 // (`regexMatch .Pod.Name ...`, a label value, an annotation). Every distinct
 // value then pins a compiled *regexp.Regexp for the agent's life, on a path
-// that runs per resource built. The cap bounds that — by EVICTING, never by
-// refusing to cache: a working set larger than the cap has to keep its hot
-// patterns or every call past the cap is a fresh compile, which is three orders
-// of magnitude dearer than the lookup and lands on precisely the data-derived
-// input this bound exists for (see genCache).
-const maxRegexKeys = 1024
+// that runs per resource built. Three bounds hold that, and the COUNT is the
+// least of them:
+//
+//   - maxRegexKeys bounds how many patterns are held — by EVICTING, never by
+//     refusing to cache: a working set larger than the cap has to keep its hot
+//     patterns or every call past the cap is a fresh compile, which is three
+//     orders of magnitude dearer than the lookup and lands on precisely the
+//     data-derived input this bound exists for (see genCache).
+//   - maxRegexInsts bounds ONE program. A count says nothing about size: a
+//     repeat expands at compile time, so 5.6 KB of `x{999}|...` (well inside
+//     an 8 KiB annotation) is an 800k-instruction program that took ~0.27 s
+//     and 187 MB of allocation to compile and retained ~35 MB — per distinct
+//     pattern, 2048 of them live. Such a pattern is refused BEFORE it is
+//     compiled (regexcost.Insts reads the parsed tree, expanding nothing), as
+//     the *syntax.Error regexp/syntax itself returns for a program over its own
+//     128 MB ceiling — so a LITERAL oversized pattern is a config error at
+//     startup (templateConfigError), and a data-derived one omits the
+//     attribute like any other failed render.
+//   - maxRegexWeight bounds the TOTAL: a generation rotates once the programs
+//     admitted into it reach that many instructions, so ~2x it is live at
+//     most however large each accepted pattern is.
+const (
+	maxRegexKeys = 1024
+	// maxRegexInsts is far above any pattern a template plausibly needs (a DNS
+	// label `[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?` is ~125) and ~400 KB retained.
+	maxRegexInsts = 1 << 13
+	// maxRegexWeight is ~6 MB of compiled programs per generation; ordinary
+	// patterns (tens of instructions) reach maxRegexKeys long before it.
+	maxRegexWeight = 1 << 17
+	// regexInstBytes is what one instruction costs (regexp/syntax's own
+	// instSize), used to charge the pattern STRING a cache entry also holds.
+	regexInstBytes = 40
+)
 
-var regexCache = newGenCache[any](maxRegexKeys) // pattern -> *regexp.Regexp | error
-
-func cachedRegexp(pattern string) (*regexp.Regexp, error) {
-	if v, ok := regexCache.load(pattern); ok {
-		if re, ok := v.(*regexp.Regexp); ok {
-			return re, nil
-		}
-		return nil, v.(error)
-	}
-	re, err := regexp.Compile(pattern)
-	regexCache.store(pattern, cacheValue(re, err))
-	return re, err
+// regexEntry is one cached pattern: the compiled program or the error, and its
+// weight against maxRegexWeight.
+type regexEntry struct {
+	re     *regexp.Regexp
+	err    error
+	weight int
 }
 
-// cacheValue is what gets stored: the compiled regex, or the compile error.
-func cacheValue(re *regexp.Regexp, err error) any {
-	if err != nil {
-		return err
+var regexCache = newWeightedGenCache(maxRegexKeys, maxRegexWeight, func(e regexEntry) int { return e.weight })
+
+func cachedRegexp(pattern string) (*regexp.Regexp, error) {
+	if e, ok := regexCache.load(pattern); ok {
+		return e.re, e.err
 	}
-	return re
+	e := compileBounded(pattern)
+	regexCache.store(pattern, e)
+	return e.re, e.err
+}
+
+// compileBounded compiles pattern unless its program would exceed
+// maxRegexInsts, which is refused as syntax.ErrLarge without compiling. The
+// weight charges the program's instructions plus the pattern string the entry
+// keeps as its key (a refusal or a syntax error holds only the latter).
+func compileBounded(pattern string) regexEntry {
+	e := regexEntry{weight: 1 + len(pattern)/regexInstBytes}
+	parsed, err := syntax.Parse(pattern, syntax.Perl) // the flags regexp.Compile parses with
+	if err != nil {
+		e.err = err
+		return e
+	}
+	insts := regexcost.Insts(parsed, maxRegexInsts)
+	if insts > maxRegexInsts {
+		e.err = &syntax.Error{Code: syntax.ErrLarge, Expr: pattern}
+		return e
+	}
+	e.re, e.err = regexp.Compile(pattern)
+	if e.err == nil {
+		e.weight += insts
+	}
+	return e
 }
 
 // templateFuncs are available in attribute templates.
@@ -357,7 +409,7 @@ func NewBuilder(cfg *Config, filter *Filter) (*Builder, error) {
 	for key := range cfg.Attributes {
 		keys = append(keys, key)
 	}
-	sort.Strings(keys) // deterministic evaluation order
+	slices.Sort(keys) // deterministic evaluation order
 	for _, key := range keys {
 		tmpl, err := template.New(key).Funcs(templateFuncs).Option("missingkey=zero").Parse(cfg.Attributes[key])
 		if err != nil {
@@ -420,8 +472,7 @@ func validateTemplate(tmpl *template.Template) error {
 // {{ slice .Pod.Name 0 5 }} fails on the empty name. Refusing any error would
 // reject configs that work in production.
 func templateConfigError(err error) bool {
-	var syn *syntax.Error
-	if errors.As(err, &syn) {
+	if _, ok := errors.AsType[*syntax.Error](err); ok {
 		return true
 	}
 	return strings.Contains(err.Error(), "can't evaluate field")

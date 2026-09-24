@@ -61,7 +61,7 @@ func nestedAnyValue(levels int, inner []byte) []byte {
 	// the innermost AnyValue{string_value: ""}.
 	size := make([]int, levels+1)
 	size[0] = len(inner)
-	for i := 0; i < levels; i++ {
+	for i := range levels {
 		arr := 1 + uvarintLen(size[i]) + size[i] // ArrayValue{values: [v]}
 		size[i+1] = 1 + uvarintLen(arr) + arr    // AnyValue{array_value: arr}
 	}
@@ -239,7 +239,9 @@ func TestGRPCDeepPayloadIsRefusedInTheCodec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := grpc.NewServer(NestingGuardOption(s.noteTooDeep)) // exactly what Run wires
+	// The nesting half of what Run wires (codecOption adds the decoded charge,
+	// whose claims only an interceptor collects — decodedsize_test.go drives that).
+	srv := grpc.NewServer(NestingGuardOption(s.noteTooDeep))
 	plogotlp.RegisterGRPCServer(srv, &logsGRPC{s: s})
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
@@ -306,7 +308,7 @@ func wireTag(num, wire uint64) []byte { return binary.AppendUvarint(nil, num<<3|
 // byte's excess bits out, so the value is unchanged). v must fit in 63 bits.
 func tenByteVarint(v uint64) []byte {
 	out := make([]byte, 0, 10)
-	for i := 0; i < 9; i++ {
+	for range 9 {
 		out = append(out, byte(v&0x7f)|0x80)
 		v >>= 7
 	}
@@ -569,6 +571,43 @@ func TestWrappersCannotHideAChainThatFailsAtItsDeepestPoint(t *testing.T) {
 	}
 }
 
+// FuzzNestingWalkHasNoBypass is the property above over ARBITRARY bytes around
+// the chain rather than the fixed hostileWrappers corpus. The walk parses
+// untrusted bytes on an unauthenticated door and has had two full bypasses, both
+// of the same shape — bytes pdata reads past that ended the walk — and a corpus
+// only proves the shapes someone thought of. decodedDepth is the oracle: whatever
+// surrounds a deep chain, if pdata recursed into it past what an admitted body
+// can reach, the walk must have refused it. The chain's blind twin (it fails at
+// its deepest point, so no destination measures it) rides along on the same
+// evidence, as in TestWrappersCannotHideAChainThatFailsAtItsDeepestPoint.
+//
+// Deliberately NOT a varint oracle against protowire: consumeVarint mirrors
+// pdata's LENGTH-only rule, which protowire's overflow check rejects by design
+// (depth.go), and TestConsumeVarintFastPathMatchesTheLoop covers it exhaustively.
+func FuzzNestingWalkHasNoBypass(f *testing.F) {
+	for _, w := range hostileWrappers() {
+		f.Add(w, []byte(nil))
+		f.Add([]byte(nil), w)
+		f.Add(w, w)
+	}
+	deep, blind := deepLogsRequest(200), deepLogsRequestFailingDeep(200)
+	f.Fuzz(func(t *testing.T, prefix, suffix []byte) {
+		b := concatBytes(prefix, deep, suffix)
+		d := decodedDepth(b)
+		if d <= maxDecodedDepthUnderTheBound {
+			return // the decoder never got into the chain; the walk owes nothing
+		}
+		if err := checkNesting(b); err == nil {
+			t.Fatalf("pdata recurses %d levels into this %d-byte payload (prefix %x, suffix %x) and the walk "+
+				"admitted it", d, len(b), prefix, suffix)
+		}
+		if err := checkNesting(concatBytes(prefix, blind, suffix)); err == nil {
+			t.Fatalf("the walk admitted the fail-at-the-bottom twin of a chain pdata recurses %d levels into "+
+				"(prefix %x, suffix %x)", d, prefix, suffix)
+		}
+	})
+}
+
 // The other direction, and the reason a blanket refusal of groups was rejected:
 // the walk is schema-free and descends into strings, and `{` is field 15
 // START_GROUP. Refusing the shape would answer 400 to every JSON log body past
@@ -658,7 +697,7 @@ func wrapped(levels int, payload []byte) []byte {
 	uvarintLen := func(n int) int { return len(binary.AppendUvarint(nil, uint64(n))) }
 	size := make([]int, levels+1)
 	size[0] = len(payload)
-	for i := 0; i < levels; i++ {
+	for i := range levels {
 		size[i+1] = 1 + uvarintLen(size[i]) + size[i]
 	}
 	out := make([]byte, 0, size[levels])
@@ -700,9 +739,9 @@ func TestConsumeVarintFastPathMatchesTheLoop(t *testing.T) {
 		}
 	}
 	check(nil)
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		check([]byte{byte(i)})
-		for j := 0; j < 256; j++ {
+		for j := range 256 {
 			check([]byte{byte(i), byte(j)})
 		}
 	}

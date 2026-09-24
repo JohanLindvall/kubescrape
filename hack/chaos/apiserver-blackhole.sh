@@ -83,6 +83,13 @@ FAILS_BEFORE=$(counter_total "$PROBE_METRIC") || \
   fail "could not read the collector's metrics capture before the outage — without a baseline the watchdog assertion below would be vacuous"
 info "$PROBE_METRIC before the outage: $FAILS_BEFORE"
 
+# The restart BASELINE, for the same reason: kubectl is unusable once paused,
+# and "nothing restarted" is a statement about this run, so it needs a before.
+# The agents are included — they talk to the metadata service, not the API
+# server, and an outage that crashed them is exactly what this must catch.
+SVC_RESTARTS=$(restart_snapshot app=kubescrape) || fail "could not take the metadata service's restart baseline"
+AGENT_RESTARTS=$(restart_snapshot app=kubescrape-agent) || fail "could not take the agents' restart baseline"
+
 # The pause MUST be checked. This script has no `set -e`, so a failed pause
 # (a CLUSTER_NAME override, a podman cluster, a multi-control-plane node named
 # ...-control-plane2, an already-stopped container) previously let it sleep with
@@ -110,7 +117,9 @@ OKS=$("$CRI" exec "$SVCNODE" sh -c \
   "awk '/OK/{n++} END{print n+0}' /var/log/kubescrape-chaos/readyz.log" 2>/dev/null | tr -d '[:space:]')
 
 say "the compensating signal"
-counters apiserver || fail "could not read the collector's metrics capture after the outage"
+# ONE capture for both questions below: they ask about the same moment.
+AFTER_CAP=$(metrics_capture) || fail "could not read the collector's metrics capture after the outage"
+counters apiserver "$AFTER_CAP" || fail "could not read the metrics capture after the outage"
 info "service log transitions:"
 "${KCTL[@]}" -n "$NS" logs -l app=kubescrape --tail=-1 --since=10m 2>/dev/null \
   | grep -iE 'API server (unreachable|reachable)' | tail -4 | sed 's/^/    /'
@@ -121,12 +130,13 @@ info "service log transitions:"
 # freezing. So this counter moving is the invariant, not a printout — a
 # regression that disabled the probe used to leave `counters apiserver` empty
 # and still print CHAOS PASS.
-FAILS_AFTER=$(counter_total "$PROBE_METRIC") || \
-  fail "could not read the collector's metrics capture after the outage"
+FAILS_AFTER=$(counter_total "$PROBE_METRIC" "$AFTER_CAP") || \
+  fail "could not total $PROBE_METRIC from the metrics capture after the outage"
 info "$PROBE_METRIC after the outage: $FAILS_AFTER (was $FAILS_BEFORE)"
 
-say "restarts (must be zero)"
-assert_no_restarts app=kubescrape
+say "restarts (must be none since the baseline)"
+assert_no_restarts app=kubescrape "$SVC_RESTARTS"
+assert_no_restarts app=kubescrape-agent "$AGENT_RESTARTS"
 
 say "verdict"
 # OKS>0 only proves the prober ran ONCE. It samples every 2s across

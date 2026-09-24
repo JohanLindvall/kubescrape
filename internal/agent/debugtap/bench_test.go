@@ -16,14 +16,14 @@ import (
 
 func benchLogs(resources, records int) plog.Logs {
 	ld := plog.NewLogs()
-	for r := 0; r < resources; r++ {
+	for r := range resources {
 		rl := ld.ResourceLogs().AppendEmpty()
 		a := rl.Resource().Attributes()
 		a.PutStr("k8s.namespace.name", fmt.Sprintf("team-%d", r%16))
 		a.PutStr("k8s.pod.name", fmt.Sprintf("checkout-%d", r))
 		a.PutStr("service.name", "checkout")
 		sl := rl.ScopeLogs().AppendEmpty()
-		for i := 0; i < records; i++ {
+		for i := range records {
 			lr := sl.LogRecords().AppendEmpty()
 			lr.Body().SetStr(`level=info msg="request completed" method=GET path=/api/v2/cart status=200`)
 			lr.SetTimestamp(pcommon.Timestamp(1755500000000000000 + int64(i)))
@@ -53,7 +53,7 @@ func BenchmarkTapNoSubscribers(b *testing.B) {
 func BenchmarkTapNoSubscribersMetrics(b *testing.B) {
 	ctx := context.Background()
 	md := pmetric.NewMetrics()
-	for r := 0; r < 512; r++ {
+	for range 512 {
 		rm := md.ResourceMetrics().AppendEmpty()
 		rm.Resource().Attributes().PutStr("k8s.namespace.name", "team-1")
 		rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetEmptyGauge().DataPoints().AppendEmpty().SetIntValue(1)

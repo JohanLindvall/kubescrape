@@ -156,7 +156,8 @@ func previousIncarnation(c kubemeta.Container, st *corev1.ContainerStatus) (kube
 	if st == nil || st.LastTerminationState.Terminated == nil || st.LastTerminationState.Terminated.ContainerID == "" {
 		return kubemeta.Container{}, false
 	}
-	prevID := kubemeta.NormalizeContainerID(st.LastTerminationState.Terminated.ContainerID)
+	term := st.LastTerminationState.Terminated
+	prevID := kubemeta.NormalizeContainerID(term.ContainerID)
 	// The "new runtime ID" premise above FAILS during CrashLoopBackOff: between
 	// restarts the kubelet leaves status.containerID equal to
 	// lastState.terminated.containerID (observed live), so there is no distinct
@@ -192,57 +193,56 @@ func previousIncarnation(c kubemeta.Container, st *corev1.ContainerStatus) (kube
 	if prevID == c.ID {
 		return kubemeta.Container{}, false
 	}
-	// A distinct incarnation: it shares nothing with the current one, so every
-	// field the struct copy carried is either refilled from lastState or
-	// cleared below. Only the Ports slice is cloned, not the whole container —
-	// the three time/exit pointers cloneContainer copies are cleared on the next
-	// lines and refilled from lastState, so cloning them allocates up to three
-	// values per restarted container per upsert, on the informer callback path,
-	// to discard them. The copy is a convenience for the SPEC-derived fields
-	// (name, type, ports); anything it carries from the STATUS is the live
-	// container's and has to be answered here or dropped.
-	prev := c
-	prev.Ports = clonePorts(c.Ports)
-	prev.RuntimeID = st.LastTerminationState.Terminated.ContainerID
-	prev.ID = prevID
-	prev.Ready = false
-	prev.State = "terminated"
-	prev.WaitingReason = ""
-	prev.StartedAt = nil
-	prev.FinishedAt = nil
-	prev.ExitCode = nil
-	// The three remaining fields the struct copy carried describe the LIVE
-	// container, on a record presented as HISTORY — the harm the same-ID guard
-	// above already names in passing, applied in that branch and not in this
-	// one. corev1.ContainerStateTerminated carries no image at all, so two of
-	// them cannot be answered and are OMITTED rather than guessed:
+	// A distinct incarnation: it shares nothing with the current one, so the
+	// record is BUILT from a literal rather than copied from the live container
+	// and cleared. Only the SPEC-derived fields carry over (name, type, ports —
+	// the Ports slice cloned so the two views share no array); everything else
+	// is answered from lastState or left absent. It used to be the copy-and-
+	// clear, which made every STATUS field added to kubemeta.Container inherit
+	// the LIVE container's value onto a record presented as HISTORY until
+	// somebody remembered to clear it here — which is exactly how Image, ImageID
+	// and RestartCount leaked. TestPreviousIncarnationCarriesOnlyTheSpecFields
+	// pins the literal's shape.
+	//
+	// Two of the live container's fields are deliberately ABSENT because
+	// corev1.ContainerStateTerminated carries no image at all, so they cannot be
+	// answered and are omitted rather than guessed:
 	//
 	//   - Image is the SPEC's image, and spec.containers[].image is one of the
 	//     few mutable pod-spec fields. `kubectl set image` (or any controller
 	//     patching it) restarts the container, leaves the crashed incarnation's
-	//     ID in lastState, and every lookup of that ID then answered with the
-	//     NEW image — the most misleading possible answer to the one question
-	//     the field is read for ("which image version crashed?"), stamped by
-	//     the tailer onto every record of that incarnation's log file.
+	//     ID in lastState, and serving the live image would answer every lookup
+	//     of that ID with the NEW image — the most misleading possible answer to
+	//     the one question the field is read for ("which image version
+	//     crashed?"), stamped by the tailer onto every record of that
+	//     incarnation's log file.
 	//   - ImageID is the digest the runtime resolved for the CURRENT container,
 	//     which is not even a value the operator wrote.
 	//
-	// RestartCount, by contrast, IS derivable and was always wrong by exactly
-	// one: the kubelet increments it when the NEW container starts, so the
-	// incarnation that just terminated ran as N-1. Clamped, because a status
-	// can carry a lastState with restartCount 0 (a container replaced without
-	// the counter moving — an image change on a never-restarted container), and
-	// a negative count is not a thing.
+	// Both are `omitempty` in the model and are read behind a non-empty check by
+	// the agent's resource builder, so absence reads as absence rather than as
+	// an empty attribute on every record of a restarted container's logs.
 	//
-	// The two cleared fields are `omitempty` in the model and are read behind
-	// a non-empty check by the agent's resource builder, so absence reads as
-	// absence rather than as an empty attribute on every record of a restarted
-	// container's logs; RestartCount always renders, and now renders the count
-	// the terminated run actually had.
-	prev.Image = ""
-	prev.ImageID = ""
-	prev.RestartCount = max(st.RestartCount-1, 0)
-	fillTerminated(&prev, st.LastTerminationState.Terminated)
+	// RestartCount, by contrast, IS derivable: the kubelet increments it when the
+	// NEW container starts, so the incarnation that just terminated ran as N-1.
+	// Clamped, because a status can carry a lastState with restartCount 0 (a
+	// container replaced without the counter moving — an image change on a
+	// never-restarted container), and a negative count is not a thing.
+	//
+	// Only the Ports slice is cloned, never the whole container: the three
+	// time/exit pointers cloneContainer would copy are fillTerminated's to set,
+	// and cloning them allocated up to three values per restarted container per
+	// upsert, on the informer callback path, to discard them.
+	prev := kubemeta.Container{
+		Name:         c.Name,
+		Type:         c.Type,
+		Ports:        clonePorts(c.Ports),
+		ID:           prevID,
+		RuntimeID:    term.ContainerID,
+		State:        "terminated",
+		RestartCount: max(st.RestartCount-1, 0),
+	}
+	fillTerminated(&prev, term)
 	return prev, true
 }
 

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -76,7 +77,7 @@ func TestPodAnnotationExclude(t *testing.T) {
 	tl.scanDir(tl.loadCheckpoints(), true)
 	writeLog(t, dir, "2026-07-05T10:00:00Z stdout F should never export")
 	tl.scanDir(nil, false)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
 	}
@@ -202,6 +203,62 @@ func TestPodAnnotationCannotForgeResolvedIdentity(t *testing.T) {
 	if got := attr("container.id"); got == "deadbeef" {
 		t.Error("pod annotation forged container.id")
 	}
+}
+
+// The pod annotation's serviceName/attributes are TENANT-authored and land
+// after the builder, so they must still go through the operator's
+// resourceAttributes enable/disable filter — or anyone who can annotate a pod
+// exports keys the operator's `disable` list drops, or that an `enable`
+// allowlist excludes. Both renders are covered: the resolve-time one and the
+// re-render a node relabel triggers (buildResource).
+func TestPodAnnotationAttributesHonourTheGlobalFilter(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	filter, err := attrs.NewFilterFromLists(nil, []string{`team`, `service\.name`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder, err := attrs.NewBuilder(nil, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl.cfg.Attrs = builder
+	tl.cfg.Metadata = annotatedMeta{annotation: `{
+		"serviceName": "checkout",
+		"attributes": {"team": "payments", "tier": "gold"}
+	}`}
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir, "2026-07-05T10:00:00Z stdout F hello")
+	tl.scanDir(nil, false)
+	driveUntil(t, ctx, tl, func() bool { return len(exp.get()) == 1 }, "one record")
+
+	check := func(when string, res map[string]any) {
+		t.Helper()
+		for _, k := range []string{"team", "service.name"} {
+			if v, ok := res[k]; ok {
+				t.Errorf("%s: the operator disabled %q, but the pod annotation exported %v", when, k, v)
+			}
+		}
+		// The filter is a filter, not a refusal of the annotation: what the
+		// operator did not disable still lands.
+		if res["tier"] != "gold" {
+			t.Errorf("%s: undisabled annotation attribute lost: %v", when, res)
+		}
+	}
+	exp.mu.Lock()
+	exported := exp.resAttrs
+	exp.mu.Unlock()
+	check("exported at resolve", exported)
+
+	var f *file
+	for _, ff := range tl.files {
+		f = ff
+	}
+	tl.buildResource(f, &attrs.NodeInfo{Name: "node1"})
+	check("after a node-metadata re-render", f.resource.Attributes().AsRaw())
 }
 
 // A restart restores checkpointed Pending segments (initFile) before metadata

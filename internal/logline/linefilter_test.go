@@ -1,6 +1,9 @@
 package logline
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestLineFilter(t *testing.T) {
 	t.Parallel()
@@ -52,7 +55,7 @@ func TestLineFilterSample(t *testing.T) {
 		t.Fatal(err)
 	}
 	kept := 0
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		if f.Keep(nil, "noisy line") {
 			kept++
 		}
@@ -63,6 +66,63 @@ func TestLineFilterSample(t *testing.T) {
 	// Non-matching lines are untouched by the sampling rule.
 	if !f.Keep(nil, "quiet line") {
 		t.Error("non-matching line must keep")
+	}
+}
+
+// sample is a FRACTION, and it is kept exactly. It used to be "every
+// round(1/sample)-th line", so every non-reciprocal was silently rounded: over
+// 10k lines 0.7, 0.75 and 0.9 kept 100%, 0.6 and 0.66 kept 50% and 0.4 kept
+// 33%, while the documentation said "keep this fraction". A reciprocal keeps
+// the very lines it always did — the first, then every Nth — so an existing
+// config does not churn.
+func TestLineFilterSampleKeepsExactlyTheFraction(t *testing.T) {
+	t.Parallel()
+	const lines = 10_000
+	run := func(t *testing.T, sample float64) []bool {
+		t.Helper()
+		f, err := NewLineFilter([]LineRule{{Action: "keep", MatchRegexp: []string{"__line__=noisy"}, Sample: sample}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		kept := make([]bool, lines)
+		for i := range kept {
+			kept[i] = f.Keep(nil, "noisy line")
+		}
+		return kept
+	}
+	for _, sample := range []float64{0.1, 0.25, 0.4, 0.5, 0.6, 0.66, 0.7, 0.75, 0.9, 0.999, 1} {
+		kept := run(t, sample)
+		n := 0
+		for _, k := range kept {
+			if k {
+				n++
+			}
+		}
+		if want := int(math.Round(sample * lines)); n != want {
+			t.Errorf("sample %v kept %d of %d lines, want %d", sample, n, lines, want)
+		}
+		// Spread evenly, not bunched: every window of 100 lines holds the
+		// fraction to within one line.
+		for start := 0; start+100 <= lines; start += 100 {
+			w := 0
+			for _, k := range kept[start : start+100] {
+				if k {
+					w++
+				}
+			}
+			if d := float64(w) - sample*100; d < -1 || d > 1 {
+				t.Fatalf("sample %v kept %d of lines [%d, %d)", sample, w, start, start+100)
+			}
+		}
+	}
+	// The reciprocals keep exactly what the old rule kept.
+	for _, every := range []int{2, 4, 5, 10, 100} {
+		kept := run(t, 1/float64(every))
+		for i, k := range kept {
+			if k != (i%every == 0) {
+				t.Fatalf("sample 1/%d: line %d kept=%v, the old rule kept=%v", every, i, k, i%every == 0)
+			}
+		}
 	}
 }
 

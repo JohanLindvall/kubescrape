@@ -45,11 +45,14 @@ type RegistryPoint struct {
 // Dump reads every registered series and evaluated func metric. It is safe to
 // call concurrently with observations and with Export, and mutates nothing:
 // calling it any number of times leaves the next OTLP export byte-identical.
+// (It does start a new func evaluation PASS, like Export — see PerPass — which
+// is bookkeeping for the funcs' sources, not state any export reads.)
 func (r *Registry) Dump() []RegistrySeries {
 	r.mu.Lock()
 	sers := append([]*series(nil), r.series...)
 	funcs := append([]*gaugeFunc(nil), r.funcs...)
 	r.mu.Unlock()
+	r.passes.Add(1)
 
 	// Func-backed series report the LIVE fn() value below and skip their db:
 	// a counter func's db accumulates Export's deltas, so reading both would
@@ -177,7 +180,7 @@ func (r *Registry) dumpSeries(s *series) (RegistrySeries, bool) {
 	}
 	d := RegistrySeries{Name: s.name, Desc: s.desc, Kind: kind}
 	if s.kind == kindHistogram {
-		d.Bounds = append([]float64(nil), s.buckets[:len(s.buckets)-1]...)
+		d.Bounds = slices.Clone(s.bounds)
 	}
 
 	s.mu.Lock()
@@ -235,9 +238,9 @@ const dumpLabelWarnEvery = 10 * time.Minute
 //
 // It cannot be a metric registered here: obs (where every kubescrape_* metric
 // is declared) imports this package, so the counter is exported through
-// DumpLabelErrors and published there as a CounterFunc.
+// SkippedPoints and published there as a CounterFunc.
 func (r *Registry) noteLabelParseError(metric, labels string, err error) {
-	r.dumpLabelErrors.Add(1)
+	r.skippedPoints.Add(1)
 	if !r.dumpWarn.Allow(dumpLabelWarnEvery) {
 		return
 	}
@@ -248,10 +251,10 @@ func (r *Registry) noteLabelParseError(metric, labels string, err error) {
 	slog.Default().Warn("a self-metric data point was skipped: its stored label set could not be parsed back, "+
 		"so it is missing from the Prometheus /metrics response this process serves for itself",
 		"metric", metric, "labels", truncLabelString(labels), "error", err,
-		"skipped", r.dumpLabelErrors.Load(),
-		"note", "the OTLP push path reads the same stored string and degrades differently — it emits the point "+
-			"with whatever labels parsed rather than dropping it — so the pushed copy of this series is "+
-			"mislabelled, not missing. Further reports are suppressed for "+dumpLabelWarnEvery.String())
+		"skipped", r.skippedPoints.Load(),
+		"note", "this response is where kubescrape_* metrics are delivered only while the OTLP self-metrics push "+
+			"is off (-self-metrics-interval=0), so there is no pushed copy: the point is not delivered anywhere "+
+			"until the corruption is fixed. Further reports are suppressed for "+dumpLabelWarnEvery.String())
 }
 
 // NoteSkippedPoint counts a data point a CONSUMER of Dump could not render,
@@ -262,7 +265,10 @@ func (r *Registry) noteLabelParseError(metric, labels string, err error) {
 // internal/obs (which imports this package, so it cannot declare the counter
 // there): Dump hands out points, and the const-metric construction that turns
 // them into an exposition can refuse one for reasons this package cannot see —
-// an invalid metric or label NAME, a label-count mismatch. That refusal used
+// an invalid metric or label NAME, a label-count mismatch, or a label VALUE that
+// is not valid UTF-8 (client_golang validates values; this package does not,
+// and truncLabelCut deliberately keeps an already-invalid value's bytes rather
+// than dropping the label). That refusal used
 // to be discarded with no counter and no log, which is the identical invisible
 // shrinkage of the operator's own telemetry that noteLabelParseError exists to
 // close one layer down.
@@ -275,16 +281,19 @@ func (r *Registry) noteLabelParseError(metric, labels string, err error) {
 // layer refused. A sibling metric would split one signal in two, and one half
 // would be a series nothing in this repo can currently move.
 func (r *Registry) NoteSkippedPoint(metric string, err error) {
-	r.dumpLabelErrors.Add(1)
+	r.skippedPoints.Add(1)
 	if !r.dumpWarn.Allow(dumpLabelWarnEvery) {
 		return
 	}
 	slog.Default().Warn("a self-metric data point was skipped: the Prometheus exposition could not be built for it, "+
 		"so it is missing from the /metrics response this process serves for itself",
-		"metric", metric, "error", err, "skipped", r.dumpLabelErrors.Load(),
-		"note", "every self-metric name and label NAME comes from code in kubescrape, so this is a bug here and not "+
-			"anything a caller supplied. The OTLP push path renders the same point without this step, so the pushed "+
-			"copy of this series is unaffected. Further reports are suppressed for "+dumpLabelWarnEvery.String())
+		"metric", metric, "error", err, "skipped", r.skippedPoints.Load(),
+		"note", "every self-metric name and label NAME comes from code in kubescrape, so a refused name is a bug here; "+
+			"a refused label VALUE (not valid UTF-8) is an operator-supplied string, such as a readiness gate named "+
+			"after a flag value, and the error quotes it. This response carries kubescrape_* metrics only while "+
+			"the OTLP self-metrics push is off (-self-metrics-interval=0), so there is no pushed copy: the point "+
+			"is not delivered anywhere until the cause is fixed. Further reports are suppressed for "+
+			dumpLabelWarnEvery.String())
 }
 
 // truncLabelString bounds what a log line carries from a corrupt label string.
@@ -310,7 +319,7 @@ func pairs(l labels) [][2]string {
 func sortPoints(ps []RegistryPoint) {
 	slices.SortFunc(ps, func(a, b RegistryPoint) int {
 		n := min(len(a.Labels), len(b.Labels))
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if c := strings.Compare(a.Labels[i][0], b.Labels[i][0]); c != 0 {
 				return c
 			}

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math/rand/v2"
+	"slices"
 	"testing"
 )
 
@@ -16,7 +17,7 @@ func randTraceIDs(n int) [][]byte {
 	for i := range out {
 		id := make([]byte, 16)
 		hi, lo := rng.Uint64(), rng.Uint64()
-		for b := 0; b < 8; b++ {
+		for b := range 8 {
 			id[b] = byte(hi >> (8 * b))
 			id[8+b] = byte(lo >> (8 * b))
 		}
@@ -39,7 +40,7 @@ func shardNames(n int) []string {
 // distribute fine and would never be noticed without this.
 func TestTokenForMatchesStdlib(t *testing.T) {
 	rng := rand.New(rand.NewPCG(1, 2))
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		id := make([]byte, 16)
 		for j := range id {
 			id[j] = byte(rng.Uint32())
@@ -59,6 +60,35 @@ func TestTokenForMatchesStdlib(t *testing.T) {
 	// constants cannot pass by breaking both sides identically.
 	if got := TokenFor("", nil); got != fnvOffset32 {
 		t.Fatalf("TokenFor(\"\", nil) = %d, want the FNV offset basis %d", got, uint32(fnvOffset32))
+	}
+}
+
+// The ring's token DERIVATION is a cross-VERSION contract, not only a
+// cross-process one: during a rolling update of the tier, old and new binaries
+// route the same trace ids at once, and if they place the shards' tokens
+// differently the two halves of one request land on two owners — no edge pairs,
+// and the tail sampler judges fragments — for as long as the rollout lasts.
+// Every other ring test compares rings built by ONE binary, and the distribution
+// tests pass for any decent mixer, so a changed constant would sail through
+// them. These literals are what the shipped binaries compute; changing them is a
+// wire change to be made on purpose, with the rollout hazard above in mind (the
+// sampling hash carries the same warning in tracehash's package doc).
+func TestRingDerivationKnownAnswers(t *testing.T) {
+	want := []uint32{0x06921e15, 0xfbe3b7df, 0x51aaec8e, 0xf70df6b0}
+	if got := shardTokens("kubescrape-servicegraph-0", 4); !slices.Equal(got, want) {
+		t.Fatalf("shardTokens(kubescrape-servicegraph-0, 4) = %#x, want %#x: the token derivation changed, which re-routes traces across a rollout", got, want)
+	}
+
+	owners := []int{1, 1, 2, 0, 1, 0, 0, 0, 2, 1, 0, 1, 0, 0, 2, 2}
+	r := NewRing(shardNames(3), 0) // DefaultTokensPerShard is part of what is pinned
+	for i, w := range owners {
+		id := make([]byte, 16)
+		for j := range id {
+			id[j] = byte(i*31 + j*7)
+		}
+		if got, want := r.Owner(id), fmt.Sprintf("kubescrape-servicegraph-%d", w); got != want {
+			t.Errorf("trace id %x is owned by %s, want %s: the ring derivation changed, which re-routes traces across a rollout", id, got, want)
+		}
 	}
 }
 

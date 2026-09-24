@@ -25,24 +25,52 @@ AGENT=$("${KCTL[@]}" -n "$NS" get pods -l app=kubescrape-agent \
 RESTARTS_BEFORE=$("${KCTL[@]}" -n "$NS" get pod "$AGENT" \
   -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null)
 info "SIGKILLing $AGENT on $NODE (restartCount=$RESTARTS_BEFORE)"
-# pkill inside the node beats deleting the pod: it is a genuine crash, with no
+# A kill inside the node beats deleting the pod: it is a genuine crash, with no
 # graceful shutdown and so no final flush — which is the case the checkpoint
 # exists for, and the kubelet restarts the container IN PLACE (same pod, same
 # sandbox, restartCount+1) rather than scheduling a replacement.
 #
-# `pkill -x` and not `pkill -f`. kind's node image is Debian-based, so /bin/sh
-# is dash, and dash does NOT exec-optimize `sh -c`: the forked shell is a
-# distinct process whose own command line is `sh -c pkill -9 -f
-# kubescrape-agent`, which `-f` matches. pkill exempts only ITSELF, so it killed
-# the agent and then its own parent, `$CRI exec` returned 137, the `||` fallback
-# force-deleted the pod, and every run of this scenario took the REPLACEMENT-POD
-# path — never the in-place restart the comment above claims to exercise (both
-# re-read the hostPath positions file, so the no-gap invariant passed either
-# way and hid it). `-x` matches the executable NAME exactly, which the wrapper
-# shell — named `sh` — cannot be.
-"$CRI" exec "$NODE" pkill -9 -x kubescrape-agent
+# The PID is resolved through the node's CRI, from THIS pod's `agent` container,
+# and killed by number. Two name-based spellings got this wrong, in opposite
+# directions, and both are worth remembering:
+#
+#   - `sh -c "pkill -9 -f kubescrape-agent"`: kind's node image is Debian-based,
+#     so /bin/sh is dash, and dash does NOT exec-optimize `sh -c` — the forked
+#     shell's own command line matched `-f`, pkill (which exempts only ITSELF)
+#     killed the agent and then its own parent, `$CRI exec` returned 137, the
+#     `||` fallback force-deleted the pod, and every run took the REPLACEMENT-POD
+#     path instead of the in-place restart claimed above (both re-read the
+#     hostPath positions file, so the no-gap verdict passed either way and hid
+#     it).
+#   - `pkill -9 -x kubescrape-agent`: `-x` matches the kernel's `comm`, which is
+#     cut to 15 bytes (TASK_COMM_LEN) — the agent's reads `kubescrape-agen` —
+#     so a 16-byte name can never match (procps-ng says so and exits 1), and the
+#     scenario failed on every run before it killed anything.
+#
+# A name cannot say WHICH agent either: an events singleton or a trace-tier
+# shard scheduled on this node runs the same binary, and a kill that also took
+# one of those would crash a pod this scenario never looks at. The container
+# PID names exactly one process, and `$CRI exec` runs `kill` directly, with no
+# wrapper shell to match or to die.
+crictl_node() { "$CRI" exec "$NODE" crictl "$@" 2>/dev/null; }
+POD_ID=$(crictl_node pods -q --name "^${AGENT}\$" --namespace "^${NS}\$" --state ready)
+[ "$(printf '%s' "$POD_ID" | grep -c .)" = 1 ] || \
+  fail "crictl on $NODE found $(printf '%s' "$POD_ID" | grep -c .) ready sandboxes for $NS/$AGENT (want exactly 1) — cannot resolve the process to kill"
+CTR_ID=$(crictl_node ps -q --pod "$POD_ID" --name '^agent$' --state running)
+[ "$(printf '%s' "$CTR_ID" | grep -c .)" = 1 ] || \
+  fail "crictl on $NODE found no single running 'agent' container in $AGENT's sandbox — cannot resolve the process to kill"
+AGENT_PID=$(crictl_node inspect --output go-template --template '{{.info.pid}}' "$CTR_ID")
+[[ "$AGENT_PID" =~ ^[1-9][0-9]*$ ]] || \
+  fail "crictl inspect on $NODE returned no PID for $AGENT's agent container (got '$AGENT_PID')"
+# Belt and braces: the PID must BE the agent binary, not a wrapper or a shim.
+AGENT_CMD=$("$CRI" exec "$NODE" cat "/proc/$AGENT_PID/cmdline" 2>/dev/null | tr '\0' ' ')
+case "$AGENT_CMD" in
+  /kubescrape-agent\ *) ;;
+  *) fail "PID $AGENT_PID on $NODE is not the agent (cmdline '${AGENT_CMD:0:80}') — refusing to kill it" ;;
+esac
+"$CRI" exec "$NODE" kill -9 "$AGENT_PID"
 KILL_RC=$?
-[ "$KILL_RC" = 0 ] || fail "pkill -9 -x kubescrape-agent on $NODE exited $KILL_RC — nothing was killed, so this run would prove nothing (1 = no process matched, 137 = pkill killed its own wrapper, which is the bug -x exists to avoid)"
+[ "$KILL_RC" = 0 ] || fail "kill -9 $AGENT_PID ($AGENT's agent container) on $NODE exited $KILL_RC — nothing was killed, so this run would prove nothing"
 info "killed at $(date -Iseconds)"
 
 say "waiting for the kubelet to restart the container in place"

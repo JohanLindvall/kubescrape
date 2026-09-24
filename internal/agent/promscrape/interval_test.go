@@ -20,7 +20,6 @@ func TestPerTargetIntervalRespected(t *testing.T) {
 
 	slow := testTarget(srv.URL)
 	slow.Interval = "1h" // must be scraped once, then skipped
-	fast := testTarget(srv.URL + "/fast")
 
 	s := New(Config{
 		Node: "n1", Interval: time.Minute, Timeout: 5 * time.Second,
@@ -46,7 +45,6 @@ func TestPerTargetIntervalRespected(t *testing.T) {
 	if got := exp2.points(); got != 1 {
 		t.Fatalf("points = %d, want 1: a target with no interval follows -scrape-interval, not the tick rate", got)
 	}
-	_ = fast
 }
 
 // An unparseable interval falls back to the default rather than dropping the
@@ -117,11 +115,11 @@ func (h *countingHandler) WithGroup(string) slog.Handler             { return h 
 // warning AND leak another map entry for the process' whole life.
 func TestWarnOnceSurvivesPodRestarts(t *testing.T) {
 	h := &countingHandler{}
-	s := &Scraper{cfg: Config{Interval: time.Minute, Timeout: 5 * time.Second}, log: slog.New(h)}
+	s := New(Config{Interval: time.Minute, Timeout: 5 * time.Second, Logger: slog.New(h)})
 
 	// The same monitor endpoint, re-resolved across 500 pod incarnations: a new
 	// pod IP (hence URL) and a new pod name each time, same broken CR field.
-	for i := 0; i < 500; i++ {
+	for i := range 500 {
 		tgt := testTarget(fmt.Sprintf("http://10.4.%d.%d:9090/metrics", i/256, i%256))
 		tgt.Pod.Name = fmt.Sprintf("dep1-7f9c4b6d5-%05x", i)
 		tgt.Pod.UID = fmt.Sprintf("uid-%d", i)
@@ -184,8 +182,8 @@ func TestWarnTargetIsStableAcrossRollouts(t *testing.T) {
 // The dedupe table is bounded, so a pathological generator cannot turn a
 // diagnostic into an unbounded leak.
 func TestWarnOnceTableIsBounded(t *testing.T) {
-	s := &Scraper{cfg: Config{Interval: time.Minute}, log: slog.New(&countingHandler{})}
-	for i := 0; i < maxWarnKeys*3; i++ {
+	s := New(Config{Interval: time.Minute, Logger: slog.New(&countingHandler{})})
+	for i := range maxWarnKeys * 3 {
 		s.warnOnce(fmt.Sprintf("k%d", i), "msg")
 	}
 	if s.warned.Len() > maxWarnKeys {
@@ -203,11 +201,11 @@ func TestWarnOnceTableIsBounded(t *testing.T) {
 // the cap suppresses instead, and says so once.
 func TestWarnOnceDoesNotStormAtTheCap(t *testing.T) {
 	h := &countingHandler{}
-	s := &Scraper{cfg: Config{Interval: time.Minute}, log: slog.New(h)}
+	s := New(Config{Interval: time.Minute, Logger: slog.New(h)})
 
 	// Fill past the cap, then replay the same key set over several "cycles".
-	for cycle := 0; cycle < 4; cycle++ {
-		for i := 0; i < maxWarnKeys+1; i++ {
+	for range 4 {
+		for i := range maxWarnKeys + 1 {
 			s.warnOnce(fmt.Sprintf("k%d", i), "msg")
 		}
 	}
@@ -284,7 +282,11 @@ func TestSameURLTargetsScheduleIndependently(t *testing.T) {
 
 	fast := testTarget(srv.URL)
 	fast.Pod.Name, fast.Pod.UID = "pod-a", "uid-a"
-	fast.Interval = "10ms"
+	// 1s, not something shorter: targetTimeout clamps a target's WHOLE scrape
+	// (round trip, parse, export) to its own interval, so a 10ms target failed
+	// its scrape on a loaded machine and the test flaked. The second cycle is
+	// made due by seeding the schedule below, not by sleeping past it.
+	fast.Interval = "1s"
 	slow := testTarget(srv.URL)
 	slow.Pod.Name, slow.Pod.UID = "pod-b", "uid-b"
 	slow.Source, slow.Monitor, slow.Interval = "servicemonitor", "monitoring/b", "2h"
@@ -301,10 +303,14 @@ func TestSameURLTargetsScheduleIndependently(t *testing.T) {
 		t.Fatal("two targets of different pods share one schedule key")
 	}
 
-	time.Sleep(15 * time.Millisecond) // past the fast target's own interval
+	// The fast target is due again; the slow one's slot is left as the first
+	// cycle committed it.
+	s.dueMu.Lock()
+	s.due[scheduleKey(fast)] = time.Now().Add(-time.Millisecond)
+	s.dueMu.Unlock()
 	s.cycle(context.Background())
 	if got := exp.points(); got != 3 {
-		t.Fatalf("points = %d, want 3: the 10ms target must not inherit the 2h one's schedule", got)
+		t.Fatalf("points = %d, want 3: the 1s target must not inherit the 2h one's schedule", got)
 	}
 	when, ok := s.dueAt(scheduleKey(slow))
 	if !ok {
@@ -338,5 +344,88 @@ func TestNonPositiveTimeoutIsDefaulted(t *testing.T) {
 		if got := exp.points(); got != 1 {
 			t.Fatalf("points = %d with Timeout %v, want 1", got, tmo)
 		}
+	}
+}
+
+// dueNow encodes three scheduling rules, each written after a bug, and only the
+// shortened-interval clamp was pinned: reverting the advance-from-the-due-time
+// rule to `now + iv`, or dropping the early-tick slack, left the whole package
+// green. The clock is explicit, so each rule is asserted exactly rather than by
+// sleeping on the wall clock.
+func TestDueNowAbsorbsAnEarlyTickAndAdvancesFromTheDueTime(t *testing.T) {
+	const key = "k"
+	iv := time.Hour
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name      string
+		seeded    time.Time // zero = never scheduled
+		wantDue   bool
+		wantNext  time.Time
+		violation string
+	}{
+		{
+			name: "early tick inside the slack", seeded: now.Add(iv / 20),
+			wantDue: true, wantNext: now.Add(iv/20 + iv),
+			violation: "a tick landing inside the iv/10 slack must scrape, and advance from the DUE time — folding the slack in drifted long-interval targets ~10% faster, permanently",
+		},
+		{
+			name: "late tick", seeded: now.Add(-iv / 3),
+			wantDue: true, wantNext: now.Add(-iv/3 + iv),
+			violation: "a late tick must advance from the due time, not from now, or the target's phase drifts every round",
+		},
+		{
+			name: "fell far behind", seeded: now.Add(-3 * iv),
+			wantDue: true, wantNext: now.Add(iv),
+			violation: "a due time a whole interval in the past must resynchronise to now+iv, not schedule a burst of catch-up scrapes",
+		},
+		{
+			name: "not due", seeded: now.Add(iv / 2),
+			wantDue: false, wantNext: now.Add(iv / 2),
+			violation: "a due time outside the slack must be carried unchanged",
+		},
+		{
+			name: "shortened interval", seeded: now.Add(2 * iv),
+			wantDue: false, wantNext: now.Add(iv),
+			violation: "a stored due time beyond now+iv must be pulled in to the current interval",
+		},
+		{
+			name: "never scheduled", wantDue: true, wantNext: now.Add(iv),
+			violation: "an unscheduled key is due now and next due one interval later",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(Config{Node: "n1", Interval: time.Minute, Timeout: time.Second})
+			if !tc.seeded.IsZero() {
+				s.setSchedule(map[string]time.Time{key: tc.seeded}, nil)
+			}
+			due := map[string]time.Time{}
+			if got := s.dueNow(due, now, key, iv); got != tc.wantDue {
+				t.Fatalf("due = %v, want %v: %s", got, tc.wantDue, tc.violation)
+			}
+			if got := due[key]; !got.Equal(tc.wantNext) {
+				t.Fatalf("next due at %v, want %v (seeded %v, now %v): %s", got, tc.wantNext, tc.seeded, now, tc.violation)
+			}
+		})
+	}
+
+	// And cycle() really schedules through it: a 1h target whose slot is 3m
+	// out (inside the 6m slack) is scraped now and next due one interval after
+	// its SEEDED time, not after the tick.
+	srv := serveBody(t, "m 1\n")
+	exp := &captureExporter{}
+	tgt := testTarget(srv.URL)
+	tgt.Interval = "1h"
+	s := New(Config{
+		Node: "n1", Interval: time.Minute, Timeout: 5 * time.Second,
+		Targets: staticTargets{tgt}, Exporter: exp, StartTime: time.Now(),
+	})
+	seeded := time.Now().Add(3 * time.Minute)
+	s.setSchedule(map[string]time.Time{scheduleKey(tgt): seeded}, nil)
+	s.cycle(context.Background())
+	if got := exp.points(); got != 1 {
+		t.Fatalf("points = %d, want 1: a tick inside the slack must scrape", got)
+	}
+	if when, _ := s.dueAt(scheduleKey(tgt)); !when.Equal(seeded.Add(time.Hour)) {
+		t.Fatalf("next due at %v, want exactly %v: cycle must advance from the due time", when, seeded.Add(time.Hour))
 	}
 }

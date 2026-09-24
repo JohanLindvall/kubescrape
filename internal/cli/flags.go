@@ -16,8 +16,8 @@ import (
 
 // OTLPFlags holds the values behind the shared -otlp-* exporter flag block.
 // The fields are the flag pointers, valid to read after the set is parsed;
-// each main maps them onto its own otlpexport.Config (the agent adds its
-// retry fields, the service its headers).
+// otlpexport.ConfigFromFlags maps them onto a Config (the agent adds its retry
+// fields, the service its headers) and SummaryAttrs reports them.
 type OTLPFlags struct {
 	Endpoint           *string
 	Protocol           *string
@@ -48,9 +48,29 @@ func RegisterOTLPFlags(fs *flag.FlagSet, endpointHelp string) *OTLPFlags {
 	}
 }
 
+// SummaryAttrs is the block as the "effective destinations" startup line
+// reports it: every one of the nine flags, under fixed keys, credentials only
+// as the PATH they are read from. One list for both binaries, because each
+// main hand-picked its own and the service's had dropped the two that change
+// what goes on the wire (compression, and TLS verification switched off).
+func (f *OTLPFlags) SummaryAttrs() []any {
+	return []any{
+		"otlpEndpoint", *f.Endpoint,
+		"otlpProtocol", *f.Protocol,
+		"otlpCompression", *f.Compression,
+		"otlpCompressionLevel", *f.CompressionLevel,
+		"otlpInsecure", *f.Insecure,
+		"otlpTLSSkipVerify", *f.InsecureSkipVerify,
+		"otlpCAFile", *f.CAFile,
+		"otlpBearerTokenFile", *f.BearerTokenFile,
+		"otlpTimeout", *f.Timeout,
+	}
+}
+
 // ObsFlags holds the values behind the shared process-observability flag
 // block: the metrics and pprof listeners of the three-listener story, the
-// self-metrics cadence, and the process logger's level (NewLogger consumes it).
+// self-metrics cadence, and the process logger's level (SetupLogging consumes
+// it).
 type ObsFlags struct {
 	MetricsListen       *string
 	PprofListen         *string

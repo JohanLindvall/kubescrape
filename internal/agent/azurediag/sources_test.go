@@ -200,6 +200,94 @@ func TestResolveSourcesMixedScopesGetDistinctGroups(t *testing.T) {
 	}
 }
 
+// The regex default's group suffix is spelled "insights", which is also a legal
+// hub name — and the IDENTITY used to be built from that suffix, so a
+// namespace-scoped string (the ^insights-.* regex) beside an entity-scoped one
+// for a hub literally named `insights` was refused as a duplicate, although
+// they are different subscriptions and the regex does not even match that hub.
+// Past the refusal both would have got group "g.insights". They must resolve,
+// into two groups; the explicit hub keeps the plain derivation.
+func TestResolveSourcesDefaultBesideAHubNamedInsightsIsNotADuplicate(t *testing.T) {
+	const ns = "ns.servicebus.windows.net"
+	got, err := ResolveSources(SourceSpec{
+		Group: "g",
+		ConnectionStringFiles: []string{
+			writeCS(t, namespaceCS(ns)),
+			writeCS(t, entityCS(ns, "insights")),
+		},
+	}, discardLog())
+	if err != nil {
+		t.Fatalf("a regex-default consumer and a hub named `insights` were refused: %v", err)
+	}
+	want := []string{
+		ns + ":9093  g." + regexGroupSuffix, // no topics: the ^insights-.* default
+		ns + ":9093 insights g.insights",
+	}
+	if !slices.Equal(brokersOf(got), want) {
+		t.Fatalf("resolved:\n  %v\nwant:\n  %v", brokersOf(got), want)
+	}
+}
+
+// sourceKey is an identity, so it must be injective over every shape a consumer
+// can take — while topicKey, the readable wire-visible group suffix, keeps its
+// historical spelling and is allowed to alias.
+func TestSourceKeyIsInjective(t *testing.T) {
+	b := []string{"ns.servicebus.windows.net:9093"}
+	for _, tc := range []struct{ a, c []string }{
+		{nil, []string{"insights"}},           // the regex default vs a hub named `insights`
+		{[]string{"a_b"}, []string{"a", "b"}}, // a hub with an underscore vs two hubs
+		{nil, []string{defaultTopicPattern}},  // the default vs a hub spelled like the pattern
+		{[]string{"ab"}, []string{"a", "b"}},  // concatenation
+	} {
+		ka, kc := KafkaConfig{Brokers: b, Topics: tc.a}, KafkaConfig{Brokers: b, Topics: tc.c}
+		if sourceKey(ka) == sourceKey(kc) {
+			t.Errorf("sourceKey(%q) == sourceKey(%q): two different subscriptions share an identity", tc.a, tc.c)
+		}
+	}
+	if sourceKey(KafkaConfig{Brokers: b, Topics: []string{"x", "y"}}) != sourceKey(KafkaConfig{Brokers: b, Topics: []string{"y", "x"}}) {
+		t.Error("sourceKey depends on topic order; the same set is the same subscription")
+	}
+}
+
+// Two consumers whose readable suffixes still collide after the regex default
+// is moved aside must be REFUSED, never handed one group: a shared group with
+// different subscriptions is the leader starvation disambiguateGroups exists to
+// prevent. (Not reachable through ResolveSources today — an explicit topic list
+// applies to every consumer — so it is driven directly.)
+func TestDisambiguateGroupsRefusesASharedSuffix(t *testing.T) {
+	b := []string{"ns.servicebus.windows.net:9093"}
+	ks := []KafkaConfig{
+		{Brokers: b, Topics: []string{"a_b"}, Group: "g"},
+		{Brokers: b, Topics: []string{"a", "b"}, Group: "g"},
+	}
+	if err := disambiguateGroups(ks, discardLog()); err == nil || !strings.Contains(err.Error(), "would share the consumer group") {
+		t.Fatalf("err = %v, want a refusal naming the shared group", err)
+	}
+}
+
+// A namespace-scoped string's ^insights-.* regex already reads every insights-*
+// hub in that namespace, so an entity-scoped string for one of them beside it
+// is a second consumer, in a second group, of the same hub: every record
+// exported twice, forever, with no counter and no line. That is refused,
+// naming both files; a mixed pair whose entity the regex does NOT match stays
+// legitimate (TestResolveSourcesMixedScopesGetDistinctGroups).
+func TestResolveSourcesRefusesAHubTheRegexAlreadyReads(t *testing.T) {
+	const ns = "ns.servicebus.windows.net"
+	nsFile, entityFile := writeCS(t, namespaceCS(ns)), writeCS(t, entityCS(ns, "insights-logs-audit"))
+	_, err := ResolveSources(SourceSpec{
+		Group:                 "g",
+		ConnectionStringFiles: []string{nsFile, entityFile},
+	}, discardLog())
+	if err == nil {
+		t.Fatal("a hub consumed by both the regex default and an entity-scoped string was accepted")
+	}
+	for _, want := range []string{"insights-logs-audit", nsFile, entityFile, "exported twice"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not name %q", err, want)
+		}
+	}
+}
+
 // More than one namespace alongside connection strings cannot be matched to a
 // file without inventing a positional rule, so it is refused rather than
 // guessed at.
@@ -207,6 +295,7 @@ func TestResolveSourcesRefusesManyNamespacesWithConnectionStrings(t *testing.T) 
 	spec := SourceSpec{
 		Namespaces:            []string{"a.servicebus.windows.net", "b.servicebus.windows.net"},
 		ConnectionStringFiles: []string{writeCS(t, entityCS("c.servicebus.windows.net", "h"))},
+		Group:                 "g",
 	}
 	_, err := ResolveSources(spec, discardLog())
 	if err == nil || !strings.Contains(err.Error(), "at most one namespace") {
@@ -248,7 +337,7 @@ func TestResolveSourcesIgnoresBlankEntries(t *testing.T) {
 		t.Fatalf("resolved %v, want the one real namespace", brokersOf(got))
 	}
 
-	if _, err := ResolveSources(SourceSpec{Namespaces: []string{"", " "}}, discardLog()); err == nil {
+	if _, err := ResolveSources(SourceSpec{Namespaces: []string{"", " "}, Group: "g"}, discardLog()); err == nil {
 		t.Fatal("an all-blank namespace list resolved to something")
 	}
 }
@@ -285,8 +374,58 @@ func TestResolveSourcesUnreadableFileFails(t *testing.T) {
 func TestResolveSourcesRejectsUnusableNamespace(t *testing.T) {
 	// A namespace-less spec is the only way Resolve fails on that arm; the
 	// blank-entry test covers the list form, this the empty-after-trim one.
-	if _, err := ResolveSources(SourceSpec{Namespaces: []string{"\t"}}, discardLog()); err == nil {
+	if _, err := ResolveSources(SourceSpec{Namespaces: []string{"\t"}, Group: "g"}, discardLog()); err == nil {
 		t.Fatal("a whitespace-only namespace resolved to a consumer")
+	}
+}
+
+// Two flag shapes that are decidable from the flags alone used to pass
+// -check-config and then never connect. An EMPTY consumer group (the chart
+// renders the flag unconditionally, and its schema allows "") is refused by kgo
+// only when the consumer is opened — a Warn per backoff and a readiness gate
+// that never clears. A namespace given as the portal's Endpoint value
+// (sb://myns.servicebus.windows.net/) was normalised on the connection-string
+// door only: on the flag its ':' suppressed the :9093 append, the raw URL became
+// the seed broker, and the managed-identity audience host came out as "sb".
+func TestResolveSourcesRefusesAnEmptyGroupAndTakesThePortalEndpoint(t *testing.T) {
+	for _, group := range []string{"", "  "} {
+		_, err := ResolveSources(SourceSpec{Namespaces: []string{"ns.servicebus.windows.net"}, Group: group}, discardLog())
+		if err == nil || !strings.Contains(err.Error(), "-azure-eventhub-group") {
+			t.Errorf("group %q: err = %v, want a refusal naming -azure-eventhub-group", group, err)
+		}
+		if ValidateGroup(group) == nil {
+			t.Errorf("ValidateGroup(%q) accepted an empty group; -check-config calls it", group)
+		}
+	}
+	if err := ValidateGroup("$Default"); err != nil {
+		t.Errorf("ValidateGroup($Default) = %v", err)
+	}
+
+	for _, ns := range []string{
+		"sb://myns.servicebus.windows.net/",
+		"amqps://myns.servicebus.windows.net",
+		" myns.servicebus.windows.net/ ",
+	} {
+		got, err := ResolveSources(SourceSpec{Namespaces: []string{ns}, Group: "g"}, discardLog())
+		if err != nil {
+			t.Fatalf("%q: %v", ns, err)
+		}
+		if len(got) != 1 || !slices.Equal(got[0].Brokers, []string{"myns.servicebus.windows.net:9093"}) {
+			t.Errorf("%q resolved to %v, want brokers [myns.servicebus.windows.net:9093]", ns, brokersOf(got))
+		}
+	}
+	// And as the OVERRIDE beside a connection string, the other door the flag
+	// reaches.
+	got, err := ResolveSources(SourceSpec{
+		Namespaces:            []string{"sb://myns.servicebus.windows.net/"},
+		ConnectionStringFiles: []string{writeCS(t, namespaceCS("other.servicebus.windows.net"))},
+		Group:                 "g",
+	}, discardLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !slices.Equal(got[0].Brokers, []string{"myns.servicebus.windows.net:9093"}) {
+		t.Errorf("override resolved to %v, want brokers [myns.servicebus.windows.net:9093]", brokersOf(got))
 	}
 }
 

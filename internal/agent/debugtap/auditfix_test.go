@@ -33,7 +33,7 @@ func TestAttrFilterWildcardsCrossSlashes(t *testing.T) {
 		{"k8s.pod.label.*", "api", false},
 		{"k8s.node.*", "*", false},
 	} {
-		f := attrFilter{Key: tc.key, Value: tc.value}
+		f := newAttrFilter(tc.key, tc.value)
 		if got := f.matches(attrs); got != tc.want {
 			t.Errorf("attr=%s=%s matched %v, want %v", tc.key, tc.value, got, tc.want)
 		}
@@ -54,8 +54,8 @@ func TestGlobMatchKeepsPatternSyntax(t *testing.T) {
 		{"", "", true},
 		{"*", "", true},
 	} {
-		if got := globMatch(tc.pat, tc.s); got != tc.want {
-			t.Errorf("globMatch(%q, %q) = %v, want %v", tc.pat, tc.s, got, tc.want)
+		if got := compileGlob(tc.pat).match(tc.s); got != tc.want {
+			t.Errorf("glob %q matching %q = %v, want %v", tc.pat, tc.s, got, tc.want)
 		}
 	}
 }
@@ -96,7 +96,7 @@ func TestFilterValueRefusesUnboundedAttributeKinds(t *testing.T) {
 		{"sender.bytes", "*", false},
 		{"sender.b*", "*nginx*", false},
 	} {
-		f := attrFilter{Key: tc.key, Value: tc.value}
+		f := newAttrFilter(tc.key, tc.value)
 		if got := f.matches(attrs); got != tc.want {
 			t.Errorf("attr=%s=%s matched %v, want %v", tc.key, tc.value, got, tc.want)
 		}
@@ -115,14 +115,14 @@ func TestWideFilterDoesNotRenderStructuredValues(t *testing.T) {
 	// The map FIRST: Range stops at the first match, so a scalar in front of it
 	// would make this pass without the skip ever being reached.
 	blob := attrs.PutEmptyMap("sender.blob")
-	for i := 0; i < 4096; i++ {
+	for i := range 4096 {
 		blob.PutStr(fmt.Sprintf("k%d", i), strings.Repeat("v", 64))
 	}
 	attrs.PutStr("k8s.namespace.name", "team-a")
 	// A key glob that matches everything and a value glob that matches
 	// everything: the shape maxAttrFilters was written against, reached through
 	// the value side. It must not walk into the map at all.
-	f := attrFilter{Key: "*", Value: "*"}
+	f := newAttrFilter("*", "*")
 	if got := testing.AllocsPerRun(20, func() {
 		if !f.matches(attrs) {
 			t.Fatal("a match-everything filter must match the scalar attribute")

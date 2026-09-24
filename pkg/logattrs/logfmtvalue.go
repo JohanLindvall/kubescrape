@@ -2,6 +2,7 @@ package logattrs
 
 import (
 	"bytes"
+	"unsafe"
 
 	"github.com/JohanLindvall/logfmt"
 )
@@ -25,12 +26,38 @@ import (
 // verbatim — the conservative direction, since leaving an escape undecoded
 // preserves the writer's bytes while decoding a non-escape destroys them.
 func DecodeLogfmtValue(line, val []byte) string {
-	// The common path: nothing to decode, so quoted-ness does not matter and
-	// the position work never runs.
-	if !logfmt.NeedsUnescape(val) || !quotedValue(line, val) {
+	if !needsDecode(line, val) {
 		return string(val)
 	}
 	return string(logfmt.AppendUnescape(nil, val))
+}
+
+// LogfmtValueView is DecodeLogfmtValue without the copy where there is nothing
+// to decode: a value DecodeLogfmtValue would return verbatim comes back as a
+// read-only VIEW into line, and only a quoted value carrying an escape is
+// decoded into new memory. The result may therefore alias line, so line must
+// stay unchanged for as long as the result is used.
+//
+// It is the one decision both line-field scanners in this module make —
+// Extractor.Extract here and internal/logline's KeyIndex.Parse, each of which
+// iterates an unsafe view of an immutable Go string, so aliasing it is safe —
+// and it exists because the two had spelled it separately and drifted (one
+// aliased, one copied every lifted value). DecodeLogfmtValue keeps its
+// always-copy contract: an external caller that reuses its buffer must never
+// be handed an alias into it.
+func LogfmtValueView(line, val []byte) string {
+	if !needsDecode(line, val) {
+		return unsafe.String(unsafe.SliceData(val), len(val))
+	}
+	return string(logfmt.AppendUnescape(nil, val))
+}
+
+// needsDecode reports whether val holds an escape to decode: it must carry
+// one and have been QUOTED. The escape test runs first — the common path has
+// nothing to decode, so quoted-ness does not matter and the position work
+// never runs.
+func needsDecode(line, val []byte) bool {
+	return logfmt.NeedsUnescape(val) && quotedValue(line, val)
 }
 
 // quotedValue reports whether val (a subslice of line handed out by

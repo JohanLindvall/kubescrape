@@ -155,8 +155,9 @@ func TestWrongCachedTypeIsCountedAndWarned(t *testing.T) {
 }
 
 // An unparseable apiVersion can never match a watched kind. It must be counted
-// exactly ONCE per reference: Resolve reaches ownerKind twice (kindGVR and
-// followable), and a report in the shared helper would double every occurrence.
+// exactly ONCE per reference: ownerKind is the silent shared helper and ownerRow
+// its one reporting caller, so a report moved into the helper — or a second
+// lookup of the same reference — would double every occurrence.
 func TestBadAPIVersionIsCountedOnce(t *testing.T) {
 	before := counter("ReplicaSet", reasonBadAPIVersion)
 	r, buf := withLister(t, ReplicaSetGVR, errLister{errors.New("unused")})

@@ -16,8 +16,10 @@
 //     other product needs expiry from.
 //
 // What they share is series (series.go, labels.go, resource.go): the expiring,
-// hash-keyed sample store. Both export over OTLP; there is no Prometheus
-// exposition from this package (obs bridges Registry onto a scrape separately).
+// hash-keyed sample store — and the OTLP render built over it (render.go: the
+// Exporter, the scopes, renderSeries), which both export loops call, so a change
+// there changes both products' wire format. There is no Prometheus exposition
+// from this package (obs bridges Registry onto a scrape separately).
 package metrics
 
 import (

@@ -51,7 +51,7 @@ func TestUnresolvedCadvisorRowsAreCountedAndNamed(t *testing.T) {
 		t.Errorf("the object level must not collide with slog's level key; log %q", got)
 	}
 	// The invariant is per LINE: exactly one ` level=` pair (slog's own).
-	for _, line := range strings.Split(strings.TrimSpace(got), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(got), "\n") {
 		if n := strings.Count(line, " level="); n != 1 {
 			t.Errorf("line has %d ` level=` pairs, want exactly 1 (slog's own): %q", n, line)
 		}
@@ -94,5 +94,62 @@ func TestKubeletRefusalNamesTheRBACRule(t *testing.T) {
 	}
 	if now := obs.ScrapeFailures.WithLabelValues(pipelineCadvisor, reasonUnauthorized).Value(); now <= before {
 		t.Errorf("the counter stopped moving with the log line (%v -> %v)", before, now)
+	}
+}
+
+// kubescrape_cadvisor_unresolved_total is read as "the metadata service is not
+// answering" (its help, CONFIGURATION.md, FIRST-RUN.md). A row cadvisor itself
+// could not attribute — CRI-O's crio-conmon-<id>.scope, kata's kata_<id> — names
+// no namespace, pod or container, so it is never looked up; counting it put two
+// increments per pod per scrape on every HEALTHY CRI-O or kata node.
+func TestUnresolvedCounterIgnoresRowsCadvisorCouldNotAttribute(t *testing.T) {
+	podSlice := systemdPodSlice(uid1)
+	const head = "# TYPE container_cpu_usage_seconds_total counter\n"
+	kataHelper := cadvisorRow("container_cpu_usage_seconds_total", []Label{
+		{Name: "id", Value: podSlice + "/kata_" + pauseCID},
+		{Name: "name", Value: "kata_" + pauseCID},
+	}, 7)
+	for _, tc := range []struct{ name, body string }{
+		{"crio-conmon", crioCadvisorBody(podSlice)},
+		{"kata-helper", head + strings.TrimPrefix(containerdCadvisorBody(podSlice), head) + kataHelper},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := serveBody(t, tc.body)
+			var buf strings.Builder
+			exp := &captureExporter{}
+			meta := &fakeMetaSource{}
+			s := newKubeletScraper(t, srv.URL, meta, exp, false)
+			s.log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+			beforeCtr := obs.CadvisorUnresolved.WithLabelValues("container").Value()
+			beforePod := obs.CadvisorUnresolved.WithLabelValues("pod").Value()
+			for range 3 {
+				if _, err := s.scrapeCadvisor(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctr := obs.CadvisorUnresolved.WithLabelValues("container").Value() - beforeCtr
+			pod := obs.CadvisorUnresolved.WithLabelValues("pod").Value() - beforePod
+			if ctr != 0 || pod != 0 {
+				t.Errorf("unresolved moved container=%v pod=%v against a healthy metadata service, want 0: the rows nobody asked about were counted", ctr, pod)
+			}
+			// The app container still resolves through the service.
+			var resolved bool
+			for _, md := range exp.batches {
+				rms := md.ResourceMetrics()
+				for i := 0; i < rms.Len(); i++ {
+					res := rms.At(i).Resource()
+					if attrStr(res, "container.id") == appCID && attrStr(res, "k8s.deployment.name") == "dep1" {
+						resolved = true
+					}
+				}
+			}
+			if !resolved {
+				t.Error("the app container did not resolve")
+			}
+			if !strings.Contains(buf.String(), "was not looked up") {
+				t.Errorf("the unattributable row was not named at Debug:\n%s", buf.String())
+			}
+		})
 	}
 }

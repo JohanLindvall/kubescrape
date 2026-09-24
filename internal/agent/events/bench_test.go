@@ -1,8 +1,8 @@
 package events
 
-// Benchmarks for the events pipeline's per-event cost: ingest (eventAttrs +
+// Benchmarks for the events pipeline's per-event cost: ingest (newEventMeta +
 // resource resolution + append), convert (batch -> OTLP grouping, bare and
-// with the rules+enrich chain), and eventAttrs alone.
+// with the rules+enrich chain), and newEventMeta alone.
 //
 // Context for the budgets: this pipeline is LOW-RATE — tens of events/second
 // cluster-wide, bursting on incidents — and a cluster-singleton, so it does
@@ -20,12 +20,13 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 // benchSink defeats dead-code elimination of pure-function results.
-var benchSink map[string]any
+var benchSink eventMeta
 
 // benchPod is the involved pod every benchmark event resolves to, shaped like
 // a real resolved pod (owner chain, node, IP, labels).
@@ -61,7 +62,7 @@ func benchFill(b *testing.B, r *Reader, n, pods int) {
 		{"Unhealthy", "Readiness probe failed: HTTP probe failed with statuscode: 503", "Warning"},
 		{"Started", "Started container app", "Normal"},
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		k := kinds[i%len(kinds)]
 		e := event(fmt.Sprintf("ev-%03d", i), k.reason, k.msg, k.typ, strconv.Itoa(10000+i), int32(i%5+1), now)
 		e.InvolvedObject.Name = fmt.Sprintf("web-%02d", i%pods)
@@ -72,7 +73,7 @@ func benchFill(b *testing.B, r *Reader, n, pods int) {
 	}
 }
 
-// BenchmarkIngest is the per-event ingest cost: eventAttrs, the metadata
+// BenchmarkIngest is the per-event ingest cost: newEventMeta, the metadata
 // resolution (fakeMeta, so the metaclient's own cost is excluded) and the
 // resource build, plus the batch append.
 func BenchmarkIngest(b *testing.B) {
@@ -142,15 +143,16 @@ func BenchmarkConvert(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		run(b, Config{Rules: rules, Enrich: true})
+		run(b, Config{Chain: logchain.Config{Rules: rules, Enrich: true}})
 	})
 }
 
-// BenchmarkEventAttrs isolates the record-attribute map build.
-func BenchmarkEventAttrs(b *testing.B) {
+// BenchmarkEventMeta isolates capturing the record attributes an entry
+// retains (it was a boxed map[string]any: 16 allocs, ~1.1 KB per event).
+func BenchmarkEventMeta(b *testing.B) {
 	e := benchEvent()
 	b.ReportAllocs()
 	for b.Loop() {
-		benchSink = eventAttrs(e)
+		benchSink = newEventMeta(e)
 	}
 }

@@ -122,6 +122,10 @@ func writeLog(t *testing.T, dir string, lines ...string) {
 	writeLines(t, filepath.Join(dir, logName), lines...)
 }
 
+// testDirScanEvery is the discovery cadence startTailer gives a Run-driven
+// tailer (see defaultDirScanEvery).
+const testDirScanEvery = 20 * time.Millisecond
+
 func newTestTailer(dir, checkpoint string, exp *fakeExporter) *Tailer {
 	var pos *positions.Store
 	if checkpoint != "" {
@@ -144,12 +148,35 @@ func newTestTailer(dir, checkpoint string, exp *fakeExporter) *Tailer {
 // startTailer runs the tailer and returns after its initial directory scan
 // has certainly happened, so files created afterwards are treated as new
 // (read from the beginning) rather than pre-existing (skipped to the end).
+// "Certainly" is the initialScanned hook Run closes after that scan; a fixed
+// sleep here used to be the only thing ordering the two, so a Run goroutine
+// scheduled late on a loaded CI machine discovered the test's file at startup,
+// -logs-unknown-files=auto resolved it to "end", and the test timed out
+// waiting for records.
+//
+// It also shortens the discovery cadence (testDirScanEvery) unless the test set
+// its own: every Run in this package goes through here, almost none with a
+// watcher, so the production 2s dirTicker was the whole wait for every file a
+// test creates after start — and most of this package's wall clock.
 func startTailer(t *testing.T, tl *Tailer) (stop func()) {
 	t.Helper()
+	if tl.dirScanEvery == defaultDirScanEvery {
+		tl.dirScanEvery = testDirScanEvery
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	scanned := make(chan struct{})
+	tl.initialScanned = scanned
 	go func() { tl.Run(ctx); close(done) }()
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-scanned:
+	case <-done:
+		cancel()
+		t.Fatal("the tailer's Run returned before its initial directory scan")
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for the tailer's initial directory scan")
+	}
 	return func() {
 		cancel()
 		<-done
@@ -426,7 +453,7 @@ func appendGzip(t *testing.T, path string, lines ...string) {
 func rateLines(t *testing.T, dir string, from, n int) {
 	t.Helper()
 	lines := make([]string, 0, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		lines = append(lines, fmt.Sprintf("%s stdout F line-%03d", timeNowCRI(), from+i))
 	}
 	writeLog(t, dir, lines...)

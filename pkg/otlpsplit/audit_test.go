@@ -21,7 +21,7 @@ import (
 func fatAttrs(m pcommon.Map, seed, depth int) {
 	m.PutStr(fmt.Sprintf("very.long.attribute.key.number.%d.with.dots.and.more", seed), strings.Repeat("V", 137))
 	sl := m.PutEmptySlice(fmt.Sprintf("slice.key.%d", seed))
-	for i := 0; i < 12; i++ {
+	for i := range 12 {
 		sl.AppendEmpty().SetStr(strings.Repeat("s", 40+i))
 	}
 	if depth > 0 {
@@ -31,17 +31,17 @@ func fatAttrs(m pcommon.Map, seed, depth int) {
 
 func buildAdversarialLogs(resources, scopesPer, recordsPer, bodyLen int) plog.Logs {
 	ld := plog.NewLogs()
-	for r := 0; r < resources; r++ {
+	for r := range resources {
 		rl := ld.ResourceLogs().AppendEmpty()
 		rl.SetSchemaUrl(fmt.Sprintf("https://schemas.example.com/resource/v%d", r))
 		fatAttrs(rl.Resource().Attributes(), r, 4)
-		for sc := 0; sc < scopesPer; sc++ {
+		for sc := range scopesPer {
 			sl := rl.ScopeLogs().AppendEmpty()
 			sl.SetSchemaUrl(fmt.Sprintf("https://schemas.example.com/scope/v%d", sc))
 			sl.Scope().SetName(fmt.Sprintf("scope-with-a-longish-instrumentation-name-%d", sc))
 			sl.Scope().SetVersion("v1.2.3-adversarial")
 			fatAttrs(sl.Scope().Attributes(), sc*7, 3)
-			for i := 0; i < recordsPer; i++ {
+			for i := range recordsPer {
 				lr := sl.LogRecords().AppendEmpty()
 				lr.Body().SetStr(strings.Repeat("x", bodyLen))
 				fatAttrs(lr.Attributes(), i, 3)
@@ -65,8 +65,12 @@ func TestAuditLogsUpperBoundStress(t *testing.T) {
 		for _, sh := range shapes {
 			ld := buildAdversarialLogs(sh.res, sh.sc, sh.rec, sh.body)
 			parts, rep := LogsWithReport(ld, cp)
+			over := 0
 			for i, p := range parts {
 				sz := m.LogsSize(p)
+				if sz > cp {
+					over++
+				}
 				single := p.ResourceLogs().Len() == 1 &&
 					p.ResourceLogs().At(0).ScopeLogs().Len() == 1 &&
 					p.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().Len() == 1
@@ -78,18 +82,25 @@ func TestAuditLogsUpperBoundStress(t *testing.T) {
 					t.Errorf("cap=%d shape=%v part %d = %d bytes, OVER cap and unaccounted (framing undercounted)", cp, sh, i, sz)
 				}
 			}
+			// And every over-cap part is COUNTED, whichever of the two it is:
+			// the report is what kubescrape_export_oversize_parts_total and its
+			// "the collector will reject that part" warning are made of.
+			if got := rep.Oversize + rep.Abandoned; got != over {
+				t.Errorf("cap=%d shape=%v: %d parts over the cap, report counts %d (%+v)", cp, sh, over, got, rep)
+			}
 			// The amplification bound: the parts together may not cost more
-			// than minChunkRoomDiv times the input, whatever the shape. This is
-			// the invariant an attacker tests — a framing just under the cap
-			// used to turn one push into a part per record, each re-carrying
-			// that framing.
+			// than the logs bound times the input, whatever the shape (see
+			// minChunkRoomDiv for why that is 2d-1 and not d). This is the
+			// invariant an attacker tests — a framing just under the cap used
+			// to turn one push into a part per record, each re-carrying that
+			// framing.
 			var total int
 			for _, p := range parts {
 				total += m.LogsSize(p)
 			}
-			if in := m.LogsSize(ld); total > minChunkRoomDiv*in {
+			if in := m.LogsSize(ld); total > logsAmplificationBound*in {
 				t.Errorf("cap=%d shape=%v: parts total %d bytes for a %d-byte input (%.1fx, bound %dx)",
-					cp, sh, total, in, float64(total)/float64(in), minChunkRoomDiv)
+					cp, sh, total, in, float64(total)/float64(in), logsAmplificationBound)
 			}
 		}
 	}
@@ -103,7 +114,7 @@ func TestAuditLogsUpperBoundStress(t *testing.T) {
 
 func buildAllTypeMetrics(resources, perType int) pmetric.Metrics {
 	md := pmetric.NewMetrics()
-	for r := 0; r < resources; r++ {
+	for r := range resources {
 		rm := md.ResourceMetrics().AppendEmpty()
 		rm.SetSchemaUrl("https://schema/res")
 		rm.Resource().Attributes().PutStr("service.name", fmt.Sprintf("svc-%d", r))
@@ -112,7 +123,7 @@ func buildAllTypeMetrics(resources, perType int) pmetric.Metrics {
 		sm.SetSchemaUrl("https://schema/scope")
 		sm.Scope().SetName("scope-x")
 		sm.Scope().Attributes().PutStr("scope.attr", "keepme")
-		for i := 0; i < perType; i++ {
+		for i := range perType {
 			g := sm.Metrics().AppendEmpty()
 			g.SetName(fmt.Sprintf("gauge_%d_%d", r, i))
 			gp := g.SetEmptyGauge().DataPoints().AppendEmpty()
@@ -214,14 +225,14 @@ func TestAuditTracesPreservationEventsLinks(t *testing.T) {
 	td := ptrace.NewTraces()
 	total := 0
 	names := map[string]int{}
-	for r := 0; r < 3; r++ {
+	for r := range 3 {
 		rs := td.ResourceSpans().AppendEmpty()
 		rs.SetSchemaUrl("https://schema/rs")
 		rs.Resource().Attributes().PutStr("service.name", fmt.Sprintf("svc-%d", r))
 		ss := rs.ScopeSpans().AppendEmpty()
 		ss.SetSchemaUrl("https://schema/ss")
 		ss.Scope().Attributes().PutStr("scope.attr", "keepme")
-		for i := 0; i < 200; i++ {
+		for i := range 200 {
 			sp := ss.Spans().AppendEmpty()
 			nm := fmt.Sprintf("op-%d-%d", r, i)
 			sp.SetName(nm)
@@ -292,7 +303,7 @@ func TestAuditScopeAttrsPreservedOnBigSplit(t *testing.T) {
 	sl.SetSchemaUrl("https://scope/schema")
 	sl.Scope().SetName("logger")
 	sl.Scope().Attributes().PutStr("scope.identity", "critical")
-	for i := 0; i < 3000; i++ {
+	for range 3000 {
 		sl.LogRecords().AppendEmpty().Body().SetStr(strings.Repeat("x", 40))
 	}
 	parts := Logs(ld, 8<<10)
@@ -408,7 +419,7 @@ func TestBigSplitPreservesEmptyScope(t *testing.T) {
 	// scope B: enough records to push the resource over the cap.
 	sb := rl.ScopeLogs().AppendEmpty()
 	sb.Scope().SetName("scope-B")
-	for i := 0; i < 3000; i++ {
+	for range 3000 {
 		sb.LogRecords().AppendEmpty().Body().SetStr(strings.Repeat("x", 40))
 	}
 

@@ -256,11 +256,51 @@ func TestRotatingAcceptsATokenTheClientRotatedToFirst(t *testing.T) {
 	}
 }
 
-// The refresh cadence must not become a per-second retry of a BROKEN file: the
-// warn it logs is per receiver, so a projection that stays unreadable would
-// otherwise be one log line per second per process, fleet-wide, about a state
-// that is not changing. A failed read backs off to the periodic interval.
-func TestRotatingBacksOffToTheIntervalAfterAFailedRead(t *testing.T) {
+// The refresh cadence must not become a per-second retry of a BROKEN file: a
+// projection that stays unreadable would otherwise be a failed read, a counter
+// increment and a log line once a second per receiver, fleet-wide, about a
+// state that is not changing. A failure that PERSISTS backs off to the
+// periodic interval.
+func TestRotatingBacksOffToTheIntervalOnceAFailurePersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	write(t, path, "tok")
+	c := newClock()
+	r, err := NewRotating(path, discard(), WithClock(c.now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	// Two failures in a row: the first is retried at the refresh cadence (see
+	// the next test), the second is what makes the failure a persisting one.
+	for i := range 2 {
+		c.advance(DefaultRefreshInterval)
+		if got := r.Tokens(); len(got) != 1 || got[0] != "tok" {
+			t.Fatalf("after failed read %d: %v, want the last good [tok]", i+1, got)
+		}
+	}
+	// Restore the file. A read at the refresh cadence would pick it up
+	// immediately; the backoff means it does not.
+	write(t, path, "new")
+	c.advance(2 * DefaultRefreshInterval)
+	if got := r.Tokens(); len(got) != 1 || got[0] != "tok" {
+		t.Fatalf("%v: a PERSISTING failure must consume the periodic interval, not the refresh cadence — "+
+			"otherwise an unreadable token file is re-read once a second", got)
+	}
+	c.advance(DefaultReadInterval)
+	if got := r.Tokens(); len(got) != 2 || got[0] != "new" || got[1] != "tok" {
+		t.Fatalf("past the interval: %v, want [new tok]", got)
+	}
+}
+
+// The FIRST failure of a run is not yet a broken projection: it may be the one
+// transient read a Secret swap can produce. Backing off a whole read interval
+// from it left the receiver blind to the swapped-in token for a minute — a
+// minute of hard 401s for every client that re-read first, the exact lag
+// DefaultRefreshInterval exists to remove. It is retried at the refresh
+// cadence instead.
+func TestRotatingRetriesTheFirstFailedReadAtTheRefreshCadence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "token")
 	write(t, path, "tok")
 	c := newClock()
@@ -275,17 +315,12 @@ func TestRotatingBacksOffToTheIntervalAfterAFailedRead(t *testing.T) {
 	if got := r.Tokens(); len(got) != 1 || got[0] != "tok" {
 		t.Fatalf("after a failed read: %v, want the last good [tok]", got)
 	}
-	// Restore the file. A read at the refresh cadence would pick it up
-	// immediately; the backoff means it does not.
+	// The swap completes: the new token is readable one refresh later.
 	write(t, path, "new")
-	c.advance(2 * DefaultRefreshInterval)
-	if got := r.Tokens(); len(got) != 1 || got[0] != "tok" {
-		t.Fatalf("%v: a FAILED read must consume the periodic interval, not the refresh cadence — "+
-			"otherwise an unreadable token file is re-read (and warned about) once a second", got)
-	}
-	c.advance(DefaultReadInterval)
+	c.advance(DefaultRefreshInterval)
 	if got := r.Tokens(); len(got) != 2 || got[0] != "new" || got[1] != "tok" {
-		t.Fatalf("past the interval: %v, want [new tok]", got)
+		t.Fatalf("one refresh after a single failed read: %v, want [new tok] — a transient failure "+
+			"must not blind the receiver to a rotated token for the whole read interval", got)
 	}
 }
 
@@ -307,7 +342,7 @@ func TestRotatingKeepsLastGoodTokenAcrossAFailedReread(t *testing.T) {
 	}
 }
 
-func TestParse(t *testing.T) {
+func TestParseHeader(t *testing.T) {
 	for _, tc := range []struct {
 		header string
 		want   string
@@ -321,9 +356,9 @@ func TestParse(t *testing.T) {
 		{"Bearer ", "", false},
 		{"", "", false},
 	} {
-		got, ok := Parse(tc.header)
+		got, ok := parseHeader(tc.header)
 		if got != tc.want || ok != tc.ok {
-			t.Errorf("Parse(%q) = %q, %v; want %q, %v", tc.header, got, ok, tc.want, tc.ok)
+			t.Errorf("parseHeader(%q) = %q, %v; want %q, %v", tc.header, got, ok, tc.want, tc.ok)
 		}
 	}
 }
@@ -378,8 +413,7 @@ func TestRotatingRunPicksUpRotationWithoutTraffic(t *testing.T) {
 		return r.cur, r.prev
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go r.Run(ctx)
 
 	if err := os.WriteFile(path, []byte("second"), 0o600); err != nil {

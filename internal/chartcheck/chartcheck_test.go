@@ -31,11 +31,14 @@ package chartcheck
 
 import (
 	"bytes"
+	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -43,17 +46,16 @@ var updateChartGolden = flag.Bool("update-chart-golden", false, "rewrite testdat
 
 // pinnedHelmVersion reads hack/helm-version, the one home for the version
 // hack/ensure-helm.sh downloads and this test compares under.
-func pinnedHelmVersion(t *testing.T) string {
-	t.Helper()
+func pinnedHelmVersion() (string, error) {
 	b, err := os.ReadFile(filepath.Join("..", "..", "hack", "helm-version"))
 	if err != nil {
-		t.Fatalf("reading the helm pin: %v", err)
+		return "", fmt.Errorf("reading the helm pin: %w", err)
 	}
 	v := strings.TrimSpace(string(b))
 	if v == "" {
-		t.Fatal("hack/helm-version is empty")
+		return "", errors.New("hack/helm-version is empty")
 	}
-	return v
+	return v, nil
 }
 
 // helmVersion returns the short version of a helm binary ("v3.19.0"), dropping
@@ -67,9 +69,23 @@ func helmVersion(bin string) (string, error) {
 	return v, nil
 }
 
-func helmBin(t *testing.T) string {
-	t.Helper()
-	want := pinnedHelmVersion(t)
+// helmResolution is where the pinned helm was found, or why it was not.
+type helmResolution struct {
+	path   string // the pinned binary; "" when none was found
+	want   string // the pinned version
+	detail string // what was found instead, for the skip or failure message
+	err    error  // the pin itself could not be read
+}
+
+// findHelm looks for the pinned helm ONCE per test binary. Every helm-driven
+// test asks for it, and each candidate costs a `helm version` exec; the answer
+// cannot change within one run. What each test DOES with the answer — skip, or
+// fail under CI — stays per test, in helmBin.
+var findHelm = sync.OnceValue(func() helmResolution {
+	want, err := pinnedHelmVersion()
+	if err != nil {
+		return helmResolution{err: err}
+	}
 	var candidates []string
 	if p, err := filepath.Abs("../../hack/bin/helm"); err == nil {
 		if _, statErr := os.Stat(p); statErr == nil {
@@ -90,9 +106,25 @@ func helmBin(t *testing.T) string {
 			continue
 		}
 		if got == want {
-			return p
+			return helmResolution{path: p, want: want}
 		}
 		found = append(found, p+" ("+got+")")
+	}
+	detail := "no helm binary found (hack/bin/helm or PATH)"
+	if len(found) > 0 {
+		detail = "found " + strings.Join(found, ", ") + " but the goldens are recorded under " + want
+	}
+	return helmResolution{want: want, detail: detail}
+})
+
+func helmBin(t *testing.T) string {
+	t.Helper()
+	r := findHelm()
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if r.path != "" {
+		return r.path
 	}
 	// A developer without the pinned helm gets a skip; CI does NOT. This whole
 	// guard is a no-op without a helm binary, and the CI job that runs the Go
@@ -102,17 +134,30 @@ func helmBin(t *testing.T) string {
 	// PR. A guard that quietly downgrades to "pass" in the one environment that
 	// gates merges is worse than no guard, because the green check is read as
 	// coverage. GitHub Actions sets CI=true.
-	detail := "no helm binary found (hack/bin/helm or PATH)"
-	if len(found) > 0 {
-		detail = "found " + strings.Join(found, ", ") + " but the goldens are recorded under " + want
-	}
 	if os.Getenv("CI") != "" {
-		t.Fatal("chart golden guard needs helm " + want + ": " + detail +
+		t.Fatal("chart golden guard needs helm " + r.want + ": " + r.detail +
 			" — bootstrap it with hack/ensure-helm.sh (see .github/workflows/ci.yml)")
 	}
-	t.Skip("chart golden guard needs helm " + want + ": " + detail +
+	t.Skip("chart golden guard needs helm " + r.want + ": " + r.detail +
 		"; run `make helm-lint` once to bootstrap it")
 	return ""
+}
+
+// chartDir is the chart under test, relative to this package.
+const chartDir = "../../charts/kubescrape"
+
+// releaseName is the release every render in this package is named.
+const releaseName = "kubescrape"
+
+// helmTemplate renders the chart as release releaseName into namespace ns
+// with the given helm, args appended (--set, -f, --show-only, ...). The output
+// is COMBINED, so a refusal's reason is in it; a caller asserting a refusal
+// checks err itself. The namespace is a parameter because some guards render
+// on purpose into one other than the default endpoint's (logsExcludeNamespaces
+// derives an exclusion from it).
+func helmTemplate(helm, ns string, args ...string) ([]byte, error) {
+	full := append([]string{"template", releaseName, chartDir, "--namespace", ns}, args...)
+	return exec.Command(helm, full...).CombinedOutput()
 }
 
 func TestChartGolden(t *testing.T) {
@@ -126,9 +171,7 @@ func TestChartGolden(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			// Release name and namespace are part of the rendered output, so
 			// they are pinned here exactly like the fixture's values.
-			cmd := exec.Command(helm, "template", "kubescrape", "../../charts/kubescrape",
-				"--namespace", "monitoring", "-f", fixture)
-			out, err := cmd.CombinedOutput()
+			out, err := helmTemplate(helm, "monitoring", "-f", fixture)
 			if err != nil {
 				t.Fatalf("helm template failed: %v\n%s", err, out)
 			}
@@ -190,8 +233,7 @@ func TestValuesSchemaRejectsUnknownKeys(t *testing.T) {
 		"agent.injest.enabled=true",
 		"servceGraph.enabled=true",
 	} {
-		out, err := exec.Command(helm, "template", "kubescrape", "../../charts/kubescrape",
-			"--namespace", "monitoring", "--set", set).CombinedOutput()
+		out, err := helmTemplate(helm, "monitoring", "--set", set)
 		if err == nil {
 			t.Errorf("--set %s rendered fine; the schema should have refused it", set)
 		} else if !strings.Contains(string(out), "Additional property") && !strings.Contains(string(out), "additional propert") {
@@ -207,16 +249,6 @@ func TestValuesSchemaRejectsUnknownKeys(t *testing.T) {
 // rendered into a flag.Duration, and a per-field test is exactly what let its
 // twin (agent.logsIdleClose) keep half a guard.
 
-// A human-format agent.logsMetrics.maxBytes ("3MiB") used to pass the
-// string-typed schema and render `-logs-metrics-max-bytes=0`: helm's int64
-// parses any non-number to 0, and the agent defines 0 as "no byte bound, one
-// payload per export" — the OPPOSITE of the requested bound, with no signal
-// anywhere. Two layers now refuse it and this exercises both: the schema's
-// digits-only pattern in the normal path, and the template's own fail()
-// (kubescrape.logsMetricsMaxBytes) under --skip-schema-validation, which is
-// what protects subchart use, where the parent's schema does not apply. Each
-// assertion is on the one thing both error texts name — the value's key —
-// so a future reshuffle of which layer fires first stays green.
 // serviceGraph.enabled alone used to render a complete StatefulSet that the
 // binary then refused to start: the shard's internal span receiver is reachable
 // from every pod in the cluster, so the agent requires
@@ -229,31 +261,37 @@ func TestValuesSchemaRejectsUnknownKeys(t *testing.T) {
 func TestServiceGraphWithoutTokenIsRefusedAtRender(t *testing.T) {
 	helm := helmBin(t)
 
-	out, err := exec.Command(helm, "template", "kubescrape", "../../charts/kubescrape",
-		"--namespace", "monitoring", "--set", "serviceGraph.enabled=true").CombinedOutput()
+	out, err := helmTemplate(helm, "monitoring", "--set", "serviceGraph.enabled=true")
 	if err == nil {
 		t.Errorf("serviceGraph.enabled with no tokenSecret.name rendered fine; the binary refuses that flag list, so this is a CrashLoop shipped as a successful install:\n%s", out)
 	} else if !strings.Contains(string(out), "serviceGraph.tokenSecret.name") {
 		t.Errorf("the refusal does not name the value an operator has to set: %s", out)
 	}
 
-	if out, err := exec.Command(helm, "template", "kubescrape", "../../charts/kubescrape",
-		"--namespace", "monitoring",
+	if out, err := helmTemplate(helm, "monitoring",
 		"--set", "serviceGraph.enabled=true",
-		"--set", "serviceGraph.tokenSecret.name=kubescrape-service-graph").CombinedOutput(); err != nil {
+		"--set", "serviceGraph.tokenSecret.name=kubescrape-service-graph"); err != nil {
 		t.Errorf("naming a tokenSecret must render: %v\n%s", err, out)
 	}
 }
 
+// A human-format agent.logsMetrics.maxBytes ("3MiB") used to pass the
+// string-typed schema and render `-logs-metrics-max-bytes=0`: helm's int64
+// parses any non-number to 0, and the agent defines 0 as "no byte bound, one
+// payload per export" — the OPPOSITE of the requested bound, with no signal
+// anywhere. Two layers now refuse it and this exercises both: the schema's
+// digits-only pattern in the normal path, and the template's own fail()
+// (kubescrape.logsMetricsMaxBytes) under --skip-schema-validation, which is
+// what protects subchart use, where the parent's schema does not apply. Each
+// assertion is on the one thing both error texts name — the value's key —
+// so a future reshuffle of which layer fires first stays green.
 func TestLogsMetricsMaxBytesRejectsHumanSizes(t *testing.T) {
 	helm := helmBin(t)
 	for _, extra := range [][]string{
 		nil,                          // the schema pattern refuses it
 		{"--skip-schema-validation"}, // the template guard refuses it
 	} {
-		args := append([]string{"template", "kubescrape", "../../charts/kubescrape",
-			"--namespace", "monitoring", "--set", "agent.logsMetrics.maxBytes=3MiB"}, extra...)
-		out, err := exec.Command(helm, args...).CombinedOutput()
+		out, err := helmTemplate(helm, "monitoring", append([]string{"--set", "agent.logsMetrics.maxBytes=3MiB"}, extra...)...)
 		if err == nil {
 			t.Errorf("maxBytes=3MiB rendered fine (extra flags %v); it must be refused, not parsed to 0:\n%s", extra, out)
 		} else if !strings.Contains(string(out), "maxBytes") {

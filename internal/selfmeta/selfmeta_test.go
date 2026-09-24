@@ -226,12 +226,28 @@ func TestPollRetriesUntilResolved(t *testing.T) {
 
 // A resolve that returns (nil, nil) is a failure, not a success: stamping a
 // zero pod would put empty attributes on every metric.
+//
+// The provider staying nil cannot prove it on its own — without the guard a
+// (nil, nil) first resolve stores nil and the provider reads nil either way. What
+// the guard adds is that the attempt is COUNTED as a failure: it warns, and the
+// resolver never treats it as its first value (OnFirst is not reached).
 func TestPollTreatsNilValueAsFailure(t *testing.T) {
-	pod := startPoll(t, func(context.Context) (*kubemeta.Pod, error) { return nil, nil },
-		podPollConfig(time.Minute, discardLog()))
-	time.Sleep(50 * time.Millisecond)
+	var out syncBuffer
+	log := slog.New(slog.NewTextHandler(&out, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	var firsts atomic.Int32
+	cfg := podPollConfig(time.Minute, log)
+	onFirst := cfg.OnFirst
+	cfg.OnFirst = func(p *kubemeta.Pod) { firsts.Add(1); onFirst(p) }
+	pod := startPoll(t, func(context.Context) (*kubemeta.Pod, error) { return nil, nil }, cfg)
+
+	waitFor(t, &out, "the failure warning", func(s string) bool {
+		return strings.Contains(s, `level=WARN msg="resolving this pod's own metadata failed`)
+	})
 	if p := pod(); p != nil {
 		t.Fatalf("provider returned %+v for a nil resolve", p)
+	}
+	if n := firsts.Load(); n != 0 {
+		t.Fatalf("OnFirst ran %d times for a resolve that yielded nothing", n)
 	}
 }
 
@@ -279,9 +295,9 @@ func TestPollKeepsLastGoodValue(t *testing.T) {
 // onFirst runs exactly once, after the first success (the agent hangs its
 // readiness gate on it).
 func TestPollOnFirstRunsOnceWithTheValue(t *testing.T) {
-	var fired atomic.Int32
+	var fired, resolves atomic.Int32
 	var got atomic.Pointer[kubemeta.Pod]
-	startPoll(t, func(context.Context) (*kubemeta.Pod, error) { return testPod(), nil },
+	startPoll(t, func(context.Context) (*kubemeta.Pod, error) { resolves.Add(1); return testPod(), nil },
 		PollConfig[kubemeta.Pod]{
 			Refresh: 5 * time.Millisecond,
 			OnFirst: func(p *kubemeta.Pod) { fired.Add(1); got.Store(p) },
@@ -292,7 +308,16 @@ func TestPollOnFirstRunsOnceWithTheValue(t *testing.T) {
 	for fired.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	time.Sleep(30 * time.Millisecond) // several refreshes
+	// Several SUCCESSFUL refreshes after the first, counted rather than slept
+	// through: a sleep that saw no refresh would pass a repeating OnFirst too.
+	// Waiting for the resolve AFTER them means each of those has run to the end
+	// (the resolver is one goroutine), OnFirst decision included.
+	for want := resolves.Load() + 4; resolves.Load() < want; {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d resolves ran; the refreshes this test needs never came", resolves.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if n := fired.Load(); n != 1 {
 		t.Fatalf("onFirst fired %d times; want 1", n)
 	}
@@ -551,5 +576,55 @@ func TestStartPodLogsTheResolutionReport(t *testing.T) {
 	}
 	if p := get(); p == nil || p.Name != host {
 		t.Fatalf("provider = %+v", p)
+	}
+}
+
+// A lookup whose answer cannot exist yet must not be made. The metadata service
+// started its self-pod poll BEFORE its informers, so its first lookup missed an
+// empty store on every clean start: a Warn ("resolving this pod's own metadata
+// failed"), an error-outcome lookup and a recovery line five seconds later, all
+// describing nothing but startup order. PollConfig.After holds the first lookup
+// until the source can answer, and a context that ends first never looks up.
+func TestPollWaitsForAfterBeforeItsFirstLookup(t *testing.T) {
+	var calls atomic.Int32
+	resolve := func(context.Context) (*kubemeta.Pod, error) {
+		calls.Add(1)
+		return testPod(), nil
+	}
+	after := make(chan struct{})
+	cfg := podPollConfig(time.Minute, discardLog())
+	cfg.After = after
+	pod := startPoll(t, resolve, cfg)
+
+	time.Sleep(50 * time.Millisecond)
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("resolve ran %d times before After closed: the first lookup of a source that cannot answer yet "+
+			"is a guaranteed miss, and a Warn on every clean start", n)
+	}
+	close(after)
+	deadline := time.Now().Add(30 * time.Second)
+	for pod() == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if pod() == nil || calls.Load() != 1 {
+		t.Fatalf("after After closed: pod=%v calls=%d, want the first lookup to run and succeed once", pod(), calls.Load())
+	}
+
+	// A context that ends while waiting stops the resolver without a lookup.
+	var never atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	cfg = podPollConfig(time.Minute, discardLog())
+	cfg.After = make(chan struct{}) // never closed
+	cfg.stopped = stopped
+	Poll(ctx, func(context.Context) (*kubemeta.Pod, error) { never.Add(1); return testPod(), nil }, cfg)
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(30 * time.Second):
+		t.Fatal("a resolver waiting on After did not stop when its context ended")
+	}
+	if n := never.Load(); n != 0 {
+		t.Fatalf("resolve ran %d times after the context ended while waiting", n)
 	}
 }

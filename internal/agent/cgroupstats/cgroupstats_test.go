@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"os"
@@ -63,7 +64,7 @@ func newHarness(t *testing.T) *harness {
 }
 
 // discover runs one full discovery pass (walk, reconcile, resolve) at the
-// harness clock. It shadows Sampler.discover so the tests read as the sampler
+// harness clock. It shadows Sampler.discover so the tests read as the discovery
 // goroutine's loop does.
 func (h *harness) discover() { h.Sampler.discover(context.Background(), h.t) }
 
@@ -121,18 +122,6 @@ func setMem(t *testing.T, dir string, current, inactive uint64) {
 	t.Helper()
 	writeFile(t, filepath.Join(dir, fileMemCurrent), fmtUint(current))
 	writeFile(t, filepath.Join(dir, fileMemStat), memStat(inactive))
-}
-
-func fmtUint(v uint64) string {
-	var b []byte
-	if v == 0 {
-		return "0\n"
-	}
-	for v > 0 {
-		b = append([]byte{byte('0' + v%10)}, b...)
-		v /= 10
-	}
-	return string(b) + "\n"
 }
 
 // --- version / startup -------------------------------------------------
@@ -199,6 +188,39 @@ func TestUnmountedRootIsRefused(t *testing.T) {
 	_, err := New(Config{Root: filepath.Join(t.TempDir(), "nope"), Resolver: &fakeResolver{}})
 	if err == nil {
 		t.Fatal("expected a refusal for a root that is not mounted")
+	}
+}
+
+// Being cgroup v2 is necessary and not sufficient: memory.current and
+// memory.stat exist only where the memory controller is enabled. A systemd
+// hybrid node's unified mount is v2 with an EMPTY cgroup.controllers and
+// container scopes carrying only the core files, and accepting it started a
+// sampler that resolved every container, opened none and exported nothing,
+// under a warning that blamed the metadata service.
+func TestAV2HierarchyWithoutTheMemoryControllerIsRefused(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, controllersFile), "\n")
+	// What such a node's kubepods scopes carry: cpu.stat is a core file.
+	writeFile(t, filepath.Join(systemdContainerDir(root, 1, hexID(1)), fileCPUStat), cpuStat(1000))
+	quiet := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	_, err := New(Config{Root: root, Resolver: &fakeResolver{}, Logger: quiet})
+	if err == nil {
+		t.Fatal("an explicit root without the memory controller was accepted; the sampler would open nothing and export nothing")
+	}
+	if errors.Is(err, ErrUnsupportedNode) {
+		t.Errorf("an explicit root reported ErrUnsupportedNode: %v", err)
+	}
+	if !strings.Contains(err.Error(), "memory") {
+		t.Errorf("the refusal does not name the missing controller: %v", err)
+	}
+
+	// The same verdict on the DEFAULT root is the node's property: this
+	// pipeline off, the rest running (see ErrUnsupportedNode).
+	_, err = New(Config{Resolver: &fakeResolver{}, Logger: quiet,
+		check: func(string) error { return checkCgroup2(root) }})
+	if !errors.Is(err, ErrUnsupportedNode) {
+		t.Errorf("err = %v on the default root, want ErrUnsupportedNode", err)
 	}
 }
 
@@ -270,6 +292,88 @@ func TestUnresolvableCgroupsWarnAboutMetadataNotTheMount(t *testing.T) {
 	if strings.Contains(out, "no container cgroups") {
 		t.Errorf("the warning blames the mount for a metadata failure:\n%s", out)
 	}
+}
+
+// And the THIRD way, which must not borrow the second's words: every container
+// RESOLVES and its files then will not open. Those containers sit in the
+// pending set too, so the line used to say "resolved none" and send the
+// operator to the metadata service — while the counter actually moving,
+// kubescrape_cgroup_open_errors_total, was named nowhere and the error saying
+// which file was missing had been dropped.
+func TestResolvedButUnopenableCgroupsDoNotBlameTheMetadataService(t *testing.T) {
+	h := newHarness(t)
+	dir := systemdContainerDir(h.root, 1, hexID(1))
+	// cpu.stat and memory.current, but no memory.stat.
+	writeFile(t, filepath.Join(dir, fileCPUStat), cpuStat(1000))
+	writeFile(t, filepath.Join(dir, fileMemCurrent), "1048576\n")
+	h.log.Reset()
+	h.discover()
+
+	if got := len(h.res.asked()); got != 1 {
+		t.Fatalf("fixture: %d lookups, want the container resolved once", got)
+	}
+	if got := h.Containers(); got != 0 {
+		t.Fatalf("fixture: Containers() = %d, want 0 (the open must fail)", got)
+	}
+	out := h.log.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Fatalf("a sampler that can open nothing said nothing:\n%s", out)
+	}
+	if strings.Contains(out, "resolved none") {
+		t.Errorf("the warning says nothing resolved, about a container that resolved perfectly well:\n%s", out)
+	}
+	for _, want := range []string{"could not read their files", "kubescrape_cgroup_open_errors_total", fileMemStat} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the warning does not name %q:\n%s", want, out)
+		}
+	}
+}
+
+// The two pending-set diagnoses above name different causes, so neither may
+// silence the other: they used to share one throttle slot, claimed BEFORE the
+// arm was chosen, so a metadata outage healing onto cgroups whose files will
+// not open kept the operator on the "resolved none" line (and its metadata
+// hint) for the whole ten-minute window — and the reverse, an outage starting
+// after the unreadable line had fired, said nothing at all. Both orders, each
+// on one sampler inside one window.
+func TestNothingSampledDiagnosesDoNotSilenceEachOther(t *testing.T) {
+	const (
+		unresolved = "resolved none"
+		unreadable = "could not read their files"
+	)
+	// A container whose identity resolves and whose memory.stat is missing:
+	// with the resolver down it is unresolved, with it up it is unreadable.
+	setup := func(t *testing.T) *harness {
+		h := newHarness(t)
+		dir := systemdContainerDir(h.root, 1, hexID(1))
+		writeFile(t, filepath.Join(dir, fileCPUStat), cpuStat(1000))
+		writeFile(t, filepath.Join(dir, fileMemCurrent), "1048576\n")
+		return h
+	}
+	pass := func(t *testing.T, h *harness, down bool, want, notWant string) {
+		t.Helper()
+		h.res.setDown(down)
+		h.log.Reset()
+		h.discover()
+		out := h.log.String()
+		if !strings.Contains(out, want) {
+			t.Errorf("down=%v: the %q diagnosis was suppressed by the other one's throttle:\n%s", down, want, out)
+		}
+		if strings.Contains(out, notWant) {
+			t.Errorf("down=%v: logged %q for a pass whose cause is %q:\n%s", down, notWant, want, out)
+		}
+	}
+
+	t.Run("outage then unreadable", func(t *testing.T) {
+		h := setup(t)
+		pass(t, h, true, unresolved, unreadable)
+		pass(t, h, false, unreadable, unresolved)
+	})
+	t.Run("unreadable then outage", func(t *testing.T) {
+		h := setup(t)
+		pass(t, h, false, unreadable, unresolved)
+		pass(t, h, true, unresolved, unreadable)
+	})
 }
 
 func TestNonEmptyRootDoesNotWarn(t *testing.T) {
@@ -829,6 +933,72 @@ func TestAFailedExportCountsTheWindowsItLost(t *testing.T) {
 	}
 }
 
+// A collector outage is a persisting STATE, and the export loop narrates it as
+// one: a Warn when it starts (saying the windows are lost, and where they are
+// counted), Debug while it lasts, one Info when an export gets through. It was
+// an unthrottled Warn per failed tick — two identical lines a minute per node
+// at the default -scrape-interval — with nothing marking the recovery, so a
+// sampler that stopped exporting and one whose collector came back looked the
+// same in the log.
+func TestAFailingExportWarnsOnceAndSaysWhenItRecovered(t *testing.T) {
+	h := newHarness(t)
+	dir := systemdContainerDir(h.root, 1, hexID(1))
+	makeContainer(t, dir, 0, 10<<20, 0)
+	h.discover()
+	window := func(i int) {
+		h.advance(time.Second)
+		setMem(t, dir, uint64(20+i)<<20, 0)
+		h.advance(time.Second)
+	}
+	ctx := context.Background()
+	var narr exportNarration
+	down := &fakeExporter{err: errors.New("collector unavailable")}
+	up := &fakeExporter{}
+	count := func(prefix string) int { return strings.Count(h.log.String(), prefix) }
+	const (
+		warned    = `level=WARN msg="cgroup-stats export failed`
+		debugged  = `level=DEBUG msg="cgroup-stats export failed"`
+		recovered = `level=INFO msg="cgroup-stats export recovered"`
+	)
+
+	h.log.Reset()
+	const outage = 6
+	for i := range outage {
+		window(i)
+		h.exportTick(ctx, down, &narr)
+	}
+	if len(down.sent) != 0 || count(warned) != 1 || count(debugged) != outage-1 {
+		t.Fatalf("%d failed ticks logged %d Warn and %d Debug lines, want 1 and %d: a persisting outage is throttled, not restated per tick\n%s",
+			outage, count(warned), count(debugged), outage-1, h.log.String())
+	}
+	if !strings.Contains(h.log.String(), "kubescrape_cgroup_windows_dropped_total") {
+		t.Errorf("the Warn does not name the counter carrying the lost windows:\n%s", h.log.String())
+	}
+
+	// Nothing to send says nothing about the collector: not a recovery.
+	narr.note(h.Sampler.log, false, nil)
+	if count(recovered) != 0 {
+		t.Fatalf("an export that sent nothing announced a recovery:\n%s", h.log.String())
+	}
+
+	window(outage)
+	h.exportTick(ctx, up, &narr)
+	window(outage + 1)
+	h.exportTick(ctx, up, &narr)
+	if len(up.sent) != 2 {
+		t.Fatalf("the healthy exporter received %d payloads, want 2", len(up.sent))
+	}
+	var line string
+	for l := range strings.SplitSeq(h.log.String(), "\n") {
+		if strings.Contains(l, recovered) {
+			line = l
+		}
+	}
+	if count(recovered) != 1 || !strings.Contains(line, fmt.Sprintf("failures=%d ", outage)) {
+		t.Errorf("the recovery logged %d lines, want exactly 1 carrying failures=%d:\n%s", count(recovered), outage, h.log.String())
+	}
+}
+
 // A container the metadata service cannot place is NOT EXPORTED. Its resource
 // would carry no service.name, hence no Prometheus job, hence a series
 // attributed to nothing that joins none of the cadvisor series these gauges
@@ -981,10 +1151,43 @@ func TestResolutionBudgetBoundsOnePass(t *testing.T) {
 	}
 }
 
+// emittedNames returns the metric names build renders for ONE container whose
+// window measured both signals, in the order it renders them. It reads what
+// goes on the WIRE: a list of the name constants kept beside build would be
+// held equal to it by nothing, and an eleventh gauge written straight into
+// build would pass every check that read the list.
+func emittedNames(t *testing.T) []string {
+	t.Helper()
+	h := newHarness(t)
+	md := h.build(context.Background(), []windowPair{{
+		id: hexID(1), podUID: podUID(1),
+		cpu: signalOut{emit: true, stats: stats{stddev: 0.25, max: 4, min: 0.01, mean: 0.4}, samples: 29},
+		mem: signalOut{emit: true, stats: stats{stddev: 1 << 20, max: 512 << 20, min: 16 << 20, mean: 64 << 20}, samples: 30},
+	}}, h.t)
+	if md.ResourceMetrics().Len() != 1 {
+		t.Fatalf("built %d resources for one resolvable container, want 1", md.ResourceMetrics().Len())
+	}
+	var names []string
+	sms := md.ResourceMetrics().At(0).ScopeMetrics()
+	for i := range sms.Len() {
+		ms := sms.At(i).Metrics()
+		for j := range ms.Len() {
+			names = append(names, ms.At(j).Name())
+		}
+	}
+	return names
+}
+
 // The ten names are the contract with every dashboard that will join them
 // against cadvisor's. A rename is a wire break, so it costs a deliberate test
 // edit. (An ADDITION is not a break, which is what made _mean and _samples
-// affordable; see the argument above the name block.)
+// affordable; see the argument above the name block — but it is still a
+// change to the wire set, so it too costs an edit here.)
+//
+// The set is read off build's OUTPUT. It used to be read off a metricNames
+// slice that no production code consulted, so a renamed constant was caught
+// and an extra gauge rendered directly in build was not: the whole package
+// stayed green with an eleventh metric on the wire.
 func TestMetricNamesAreExactlyTheDocumentedTen(t *testing.T) {
 	want := []string{
 		"container_cpu_usage_stddev",
@@ -998,20 +1201,15 @@ func TestMetricNamesAreExactlyTheDocumentedTen(t *testing.T) {
 		"container_memory_working_set_bytes_mean",
 		"container_memory_working_set_bytes_samples",
 	}
-	if len(metricNames) != len(want) {
-		t.Fatalf("metricNames has %d entries, want %d", len(metricNames), len(want))
-	}
-	for i, n := range want {
-		if metricNames[i] != n {
-			t.Errorf("metricNames[%d] = %q, want %q", i, metricNames[i], n)
-		}
+	if got := emittedNames(t); !slices.Equal(got, want) {
+		t.Errorf("build emits %q, want %q", got, want)
 	}
 }
 
 // The unit field can rewrite the NAME under the OTLP→Prometheus translation
 // (it appends the unit as a suffix), so the memory gauges deliberately leave it
 // empty and the CPU ones use a brace-annotated unit, which is never appended.
-// See the block comment in cgroupstats.go.
+// See the block comment above the name constants in names.go.
 func TestUnitsCannotRewriteTheNames(t *testing.T) {
 	if !strings.HasPrefix(unitCores, "{") || !strings.HasSuffix(unitCores, "}") {
 		t.Errorf("unitCores = %q; a non-annotated unit would be appended to container_cpu_usage_* as a name suffix", unitCores)
@@ -1360,9 +1558,7 @@ func TestConcurrentExportsAreSerialised(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 4 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 50 {
 				// Each goroutine its own exporter: sharing one would be the
 				// test's race rather than the sampler's.
@@ -1372,7 +1568,7 @@ func TestConcurrentExportsAreSerialised(t *testing.T) {
 				}
 				s.sample()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }
@@ -1748,6 +1944,135 @@ func TestAListedButUnreadableContainerIsRetired(t *testing.T) {
 	}
 }
 
+// retireForTest drives a tracked container through maxDeadWindows windows of
+// failing reads, which is what retires it into the quarantine (the pending set,
+// on the slow clock). The directory stays listed throughout.
+func retireForTest(t *testing.T, h *harness, dir, id string) {
+	t.Helper()
+	breakContainer(t, dir)
+	for range maxDeadWindows {
+		h.advance(time.Second)
+		h.advance(time.Second)
+		h.exportOnce(t)
+	}
+	h.mu.Lock()
+	_, tracked := h.tracked[id]
+	p := h.pending[id]
+	h.mu.Unlock()
+	if tracked || p == nil || !p.gaveUp {
+		t.Fatalf("fixture: the container was not retired into the quarantine (tracked=%v pending=%v)", tracked, p)
+	}
+}
+
+// lookupsOf counts the identity lookups made for one container id.
+func lookupsOf(h *harness, id string) int {
+	n := 0
+	for _, c := range h.res.asked() {
+		if c.containerID == id {
+			n++
+		}
+	}
+	return n
+}
+
+// The quarantine's retry is ONE retry per abandonRetryEvery, including when the
+// files still will not OPEN on it.
+//
+// track()'s open-failure arm returned without re-arming the entry's slow clock,
+// so after the first allowed retry nextTry stayed in the past and dueLocked
+// held true on every later pass: a metadata lookup and a failed open per
+// container per discovery cycle, for the life of a leaked scope — the "three
+// failing reads out of every ten minutes instead of forever" the quarantine
+// promises, undone by its own retry.
+func TestAQuarantinedContainerWhoseFilesWillNotOpenStaysOnItsSlowClock(t *testing.T) {
+	h := newHarness(t)
+	id := hexID(1)
+	dir := systemdContainerDir(h.root, 1, id)
+	makeContainer(t, dir, 0, 100<<20, 0)
+	h.discover()
+	retireForTest(t, h, dir, id)
+
+	// The files are now GONE rather than empty, with the directory still
+	// listed: the leaked-scope shape. An open fails.
+	if err := os.Remove(filepath.Join(dir, fileCPUStat)); err != nil {
+		t.Fatal(err)
+	}
+	h.t = h.t.Add(abandonRetryEvery)
+	lookups, opens := lookupsOf(h, id), obs.CgroupOpenErrors.Value()
+	h.discover() // the one retry the slow clock allows
+	if got := lookupsOf(h, id) - lookups; got != 1 {
+		t.Fatalf("the allowed retry made %d lookups, want 1", got)
+	}
+	if got := obs.CgroupOpenErrors.Value() - opens; got != 1 {
+		t.Fatalf("the allowed retry counted %v open errors, want 1 (the fixture must reach the open)", got)
+	}
+
+	lookups, opens = lookupsOf(h, id), obs.CgroupOpenErrors.Value()
+	const passes = 8 // two minutes at the default cadence, well inside abandonRetryEvery
+	for range passes {
+		h.t = h.t.Add(DefaultDiscoverInterval)
+		h.discover()
+	}
+	if got := lookupsOf(h, id) - lookups; got != 0 {
+		t.Errorf("%d lookups in %d discovery passes after the allowed retry, want 0: the retry did not re-arm the slow clock, so the quarantined container is asked about every pass", got, passes)
+	}
+	if got := obs.CgroupOpenErrors.Value() - opens; got != 0 {
+		t.Errorf("%v failed opens in %d discovery passes after the allowed retry, want 0", got, passes)
+	}
+
+	// And the NEXT retry still comes, on schedule.
+	h.t = h.t.Add(abandonRetryEvery)
+	h.discover()
+	if got := lookupsOf(h, id) - lookups; got != 1 {
+		t.Errorf("%d lookups once the slow clock came round again, want 1: a give-up is not a deletion", got)
+	}
+}
+
+// Same clock, the other early return in track(): a given-up container whose
+// retry resolves and is then refused by the DESCRIPTOR cap must not be asked
+// about on every pass either. It goes back on reconsiderEvery rather than the
+// ten-minute clock, because the refusal says nothing about the cgroup and a
+// slot can free up sooner.
+func TestACapRefusedRetryOfAGivenUpContainerIsNotAskedEveryPass(t *testing.T) {
+	h := newHarness(t)
+	id := hexID(1)
+	dir := systemdContainerDir(h.root, 1, id)
+	makeContainer(t, dir, 0, 100<<20, 0)
+	makeContainer(t, systemdContainerDir(h.root, 1, hexID(2)), 0, 200<<20, 0)
+	h.discover()
+	retireForTest(t, h, dir, id)
+
+	// The healthy container now fills the only slot, and the retired one's
+	// files read again — so its retry resolves and the CAP is what refuses it.
+	h.maxTracked = 1
+	makeContainer(t, dir, 0, 100<<20, 0)
+	h.t = h.t.Add(abandonRetryEvery)
+	lookups := lookupsOf(h, id)
+	capped := obs.CgroupContainersCapped.WithLabelValues("tracked").Value()
+	h.discover()
+	if got := lookupsOf(h, id) - lookups; got != 1 {
+		t.Fatalf("the allowed retry made %d lookups, want 1", got)
+	}
+	if got := obs.CgroupContainersCapped.WithLabelValues("tracked").Value() - capped; got != 1 {
+		t.Fatalf("capped{tracked} moved by %v, want 1 (the fixture must reach the cap)", got)
+	}
+
+	lookups = lookupsOf(h, id)
+	const passes = 3 // 45s at the default cadence, inside reconsiderEvery
+	for range passes {
+		h.t = h.t.Add(DefaultDiscoverInterval)
+		h.discover()
+	}
+	if got := lookupsOf(h, id) - lookups; got != 0 {
+		t.Errorf("%d lookups in %d passes after a cap-refused retry, want 0: a given-up entry's clock was left in the past", got, passes)
+	}
+	h.t = h.t.Add(reconsiderEvery)
+	h.discover()
+	if got := lookupsOf(h, id) - lookups; got != 1 {
+		t.Errorf("%d lookups once reconsiderEvery had passed, want 1", got)
+	}
+}
+
 // The retirement must not fire on a container that merely went quiet, or a
 // perfectly healthy container is dropped every time its cgroup files are slow
 // to change. Only a window in which a sample was ATTEMPTED and NOTHING was read
@@ -1886,8 +2211,8 @@ func TestDescriptionsAreAffordablePerContainer(t *testing.T) {
 	for i := range containers {
 		snap = append(snap, windowPair{
 			id: hexID(i + 1), podUID: podUID(i + 1),
-			cpu: signalOut{emit: true, stddev: 0.25, max: 4, min: 0.01, mean: 0.4, samples: 29},
-			mem: signalOut{emit: true, stddev: 1 << 20, max: 512 << 20, min: 16 << 20, mean: 64 << 20, samples: 30},
+			cpu: signalOut{emit: true, stats: stats{stddev: 0.25, max: 4, min: 0.01, mean: 0.4}, samples: 29},
+			mem: signalOut{emit: true, stats: stats{stddev: 1 << 20, max: 512 << 20, min: 16 << 20, mean: 64 << 20}, samples: 30},
 		})
 	}
 	md := h.build(context.Background(), snap, h.t)
@@ -1926,16 +2251,17 @@ func TestDescriptionsAreAffordablePerContainer(t *testing.T) {
 	// SET growing. 850 is the measured 790 plus headroom deliberately smaller
 	// than one more gauge (+79), so an eleventh gauge has to arrive together
 	// with a new number here rather than instead of one.
+	metricsPerContainer := len(emittedNames(t))
 	const perMetricBudget = 90
-	if per := desc / containers / len(metricNames); per > perMetricBudget {
+	if per := desc / containers / metricsPerContainer; per > perMetricBudget {
 		t.Errorf("descriptions cost %d bytes per metric per container per export (%d bytes for %d metrics on %d containers), over the %d-byte budget",
-			per, desc, len(metricNames), containers, perMetricBudget)
+			per, desc, metricsPerContainer, containers, perMetricBudget)
 	}
 	const perContainerBudget = 850
 	if per := desc / containers; per > perContainerBudget {
 		t.Errorf("descriptions cost %d bytes per container per export (%d metrics), over the %d-byte budget: "+
 			"this is the number repeated once per container on every scrape interval, and widening the metric SET spends it just as surely as lengthening a description does",
-			per, len(metricNames), perContainerBudget)
+			per, metricsPerContainer, perContainerBudget)
 	}
 	if share > 0.40 {
 		t.Errorf("descriptions are %.0f%% of the payload (%d of %d bytes) for %d containers. "+

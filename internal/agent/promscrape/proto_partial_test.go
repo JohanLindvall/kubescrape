@@ -20,12 +20,12 @@ import (
 // parsed before the abort was thrown away.
 func TestProtoPartialScrapeExportedOnSampleLimit(t *testing.T) {
 	var fams []*dto.MetricFamily
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		fams = append(fams, &dto.MetricFamily{
-			Name: ptr(fmt.Sprintf("g%d", i)),
+			Name: new(fmt.Sprintf("g%d", i)),
 			Type: dto.MetricType_GAUGE.Enum(),
 			Metric: []*dto.Metric{
-				{Gauge: &dto.Gauge{Value: ptr(float64(i))}},
+				{Gauge: &dto.Gauge{Value: new(float64(i))}},
 			},
 		})
 	}
@@ -56,12 +56,12 @@ func TestProtoPartialScrapeExportedOnSampleLimit(t *testing.T) {
 // must still be exported.
 func TestProtoPartialScrapeExportedOnTruncatedBody(t *testing.T) {
 	var fams []*dto.MetricFamily
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		fams = append(fams, &dto.MetricFamily{
-			Name: ptr(fmt.Sprintf("g%d", i)),
+			Name: new(fmt.Sprintf("g%d", i)),
 			Type: dto.MetricType_GAUGE.Enum(),
 			Metric: []*dto.Metric{
-				{Gauge: &dto.Gauge{Value: ptr(float64(i))}},
+				{Gauge: &dto.Gauge{Value: new(float64(i))}},
 			},
 		})
 	}

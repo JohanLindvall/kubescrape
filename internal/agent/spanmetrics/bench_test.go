@@ -3,12 +3,15 @@ package spanmetrics
 import (
 	"context"
 	"strconv"
+	"strings"
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/cumagg"
+	"github.com/JohanLindvall/kubescrape/internal/agent/tracehash"
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
@@ -74,6 +77,46 @@ func TestConsumeAllocationBudget(t *testing.T) {
 		{"dimensions", Config{Dimensions: []string{"http.route", "http.method"}}, benchTraces("checkout", map[string]string{
 			"http.route": "/api/v1/orders", "http.method": "GET",
 		})},
+		// An INT dimension — the status code every HTTP span carries. Rendering
+		// it to a string first (pdata's AsString, strconv.FormatInt) allocated
+		// for every value outside 0-99; the key now appends the value itself,
+		// so neither the common code nor a port-sized one may cost anything.
+		{"int-dimension", Config{Dimensions: []string{"http.response.status_code", "server.port"}}, func() ptrace.Traces {
+			td := benchTraces("checkout", nil)
+			a := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes()
+			a.PutInt("http.response.status_code", 200)
+			a.PutInt("server.port", 8080)
+			return td
+		}()},
+		// The tier's exemplar predicate (the head sampler's per-span decision)
+		// runs once per span: a bound method value, called, allocates nothing.
+		{"exemplar-keep", Config{ExemplarKeep: func(sp ptrace.Span) bool {
+			return tracehash.Keep(sp.TraceID(), tracehash.Threshold(0.5))
+		}}, benchTraces("checkout", nil)},
+		// Names AT the truncation limit, and past it: the series key is built
+		// on a per-call stack buffer, so a key that outgrew it allocated on
+		// EVERY span — one 256-byte span name was enough while the buffer was
+		// 256 bytes, and some database instrumentations name a span after its
+		// statement text. Both built-in strings at the cut are the largest key
+		// the built-ins can make (keyScratchBytes).
+		{"names-at-the-cut", Config{}, traces(strings.Repeat("s", cumagg.MaxLabelBytes), spanSpec{
+			name: strings.Repeat("n", cumagg.MaxLabelBytes), kind: ptrace.SpanKindServer, status: ptrace.StatusCodeOk,
+			dur: 0.012, traceID: tid1, spanID: sid1,
+		})},
+		{"names-past-the-cut", Config{}, traces(strings.Repeat("s", 4096), spanSpec{
+			name: strings.Repeat("n", 4096), kind: ptrace.SpanKindUnspecified, status: ptrace.StatusCodeUnset,
+			dur: 0.012, traceID: tid1, spanID: sid1,
+		})},
+		{"batch-of-names-at-the-cut", Config{}, func() ptrace.Traces {
+			specs := make([]spanSpec, 100)
+			for i := range specs {
+				specs[i] = spanSpec{
+					name: strings.Repeat("n", cumagg.MaxLabelBytes), kind: ptrace.SpanKindServer, status: ptrace.StatusCodeOk,
+					dur: 0.012, traceID: tid1, spanID: sid1,
+				}
+			}
+			return traces("checkout", specs...)
+		}()},
 		// A realistic batch: the staleness clock is read once per Consume, not
 		// per span, so 100 spans must still cost nothing.
 		{"batch", Config{}, func() ptrace.Traces {

@@ -32,13 +32,18 @@ func (d *Dynamic) kind() (seriesKind, error) {
 	}
 }
 
-// maxAge parses and clamps the expiration duration. A zero or negative
-// expiration would mark every sample idle on every export, silently turning
-// counters into per-interval deltas — so this is one of the fields where zero
-// is NOT a legal value, which config.Positive says in the error itself.
+// maxAge parses and clamps the expiration duration. Zero is NOT a legal value
+// here, which config.Positive says in the error itself: every sample would go
+// idle at the first export after its observation, so a running gauge
+// (inc/dec/add/sub) would be zeroed every interval — a per-interval delta —
+// and a counter, histogram or summary would be exported only in the intervals
+// it was observed and, once idle past the 4-minute grace, deleted and
+// restarted from zero by its next observation (see series.snapshot).
 func (d *Dynamic) maxAge() (time.Duration, error) {
 	age, err := config.Duration("maxAge", d.MaxAge, defaultMaxAge,
-		config.Positive("every sample would be idle on every export, turning counters into per-interval deltas"))
+		config.Positive("every sample would go idle at the next export: a running gauge would be zeroed every interval, "+
+			"turning it into a per-interval delta, and a counter, histogram or summary would be exported only when observed "+
+			"and restart from zero after 4 idle minutes"))
 	if err != nil {
 		return 0, err
 	}
@@ -80,7 +85,7 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 		return nil, err
 	}
 
-	rule := &metricRule{value: d.Value}
+	rule := &metricRule{value: d.Value, declared: d.Name}
 	if d.ValueRegexp != "" {
 		if d.Value != "" {
 			return nil, errors.New("value and valueRegexp are mutually exclusive")
@@ -120,11 +125,8 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 		// scales with the PRODUCT: every live sample carries a counts slot per
 		// bucket, and every export renders all of them. Refuse a combination
 		// that could outgrow that budget. The effective bucket count is what
-		// matters: an empty Buckets is replaced by defaultBuckets in newSeries.
-		streams := len(d.Buckets) + 1
-		if len(d.Buckets) == 0 {
-			streams = len(defaultBuckets) + 1
-		}
+		// matters (effectiveBuckets), plus the +Inf bucket every export renders.
+		streams := len(effectiveBuckets(d.Buckets)) + 1
 		if series := cardinalityCap(d.MaxCardinality); series*streams > maxStreamCap {
 			return nil, fmt.Errorf("metric %q: maxCardinality %d x %d buckets = %d bucket slots, above the %d-slot budget — lower maxCardinality or use fewer buckets",
 				d.Name, series, streams, series*streams, maxStreamCap)
@@ -142,7 +144,7 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 		// memory blow-up the field was set to prevent. Refuse a DIFFERING
 		// declaration; leaving a field unset still means "whatever the name
 		// already has".
-		if kind == kindHistogram && len(d.Buckets) > 0 && !slices.Equal(existing.buckets[:len(existing.buckets)-1], d.Buckets) {
+		if kind == kindHistogram && len(d.Buckets) > 0 && !slices.Equal(existing.bounds, d.Buckets) {
 			return nil, fmt.Errorf("metric %q declared with conflicting buckets", d.Name)
 		}
 		if series := cardinalityCap(d.MaxCardinality); d.MaxCardinality != 0 && series != existing.maxSize {
@@ -203,10 +205,8 @@ func rejectUnresolvableKeys(d *Dynamic, rule *metricRule) error {
 		return fmt.Errorf("metric %q: %s reads %s, which only logs.rules resolves — a log-metric sees record/resource attributes and line fields, so it would match nothing; select on the line's own level field instead",
 			d.Name, where, logline.SeverityKey)
 	}
-	for _, key := range rule.match.LabelKeys() {
-		if key == logline.SeverityKey {
-			return reject("match")
-		}
+	if slices.Contains(rule.match.LabelKeys(), logline.SeverityKey) {
+		return reject("match")
 	}
 	for _, lt := range rule.labels {
 		if lt.getKey == logline.SeverityKey {

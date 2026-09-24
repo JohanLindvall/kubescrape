@@ -28,13 +28,10 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/backoff"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
-	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
-	"github.com/JohanLindvall/kubescrape/internal/logline"
-	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
 // Start modes for a consumer group with no committed offsets, mirroring the
@@ -57,20 +54,17 @@ func ValidateStartMode(mode string) error {
 
 // Config configures the consumer.
 type Config struct {
-	// Kafka connectivity — filled by ApplyKafka in production, directly by
-	// tests (plaintext, no SASL).
+	// Kafka connectivity — resolved by ResolveSources in production (one
+	// KafkaConfig per consumer), filled directly by tests (plaintext, no SASL).
 	Kafka KafkaConfig
 
 	// MetricPrefix prefixes converted Azure metric names (default "azure.").
 	MetricPrefix string
 
-	// Enrich, Scrub, LogAttrs, Rules and LogMetrics are the same levers the
-	// tailer, journald and events apply, in the same order.
-	Enrich     bool
-	Scrub      *logscrub.Scrubber
-	LogAttrs   *logattrs.Extractor
-	Rules      *logline.LineFilter
-	LogMetrics *metrics.DynamicMetricSet
+	// Chain is the per-record log chain the tailer, journald and events run
+	// too — the same levers, in the same order (logchain.Config). Unlike those
+	// two, the chain itself scrubs here: the record body is the raw envelope.
+	Chain logchain.Config
 
 	Attrs *attrs.Builder
 
@@ -108,6 +102,11 @@ type Reader struct {
 	// commitWarn the offset-commit failure (once per poll otherwise).
 	decodeWarn logdedupe.Throttle
 	commitWarn logdedupe.Throttle
+	// logsExport and metricsExport size each signal's export outage, so the
+	// attempt that lands can say how long the collector refused and how often
+	// (see export). Every failure is loud (an interval of 0): deliver's
+	// back-off already spaces the attempts.
+	logsExport, metricsExport logdedupe.Outage
 
 	scratch [][]byte // GetPaths output, reused across records
 }
@@ -148,12 +147,15 @@ func (r *Reader) Run(ctx context.Context) {
 		}
 		bo.ResetIfHealthy(started)
 		// The consumer is rebuilt for exactly one class of error — one no
-		// further fetch can clear, which fatalFetchErr admits as a cluster-wide
-		// authorization or SASL failure — and both that line and this one say
-		// the rebuild reads credentials afresh. Make it so: the connection
-		// string is re-read by the SASL session itself, while a cached Entra
-		// token would otherwise be re-presented for up to ~55 minutes, so an
-		// operator who FIXES the role assignment would see no recovery.
+		// further fetch can clear, which fatalFetchErr admits as a group or
+		// cluster authorization refusal (or a closed client) — and both that
+		// line and this one say the rebuild reads credentials afresh. Make it
+		// so: the connection string is re-read by the SASL session itself,
+		// while a cached Entra token would otherwise be re-presented for up to
+		// ~55 minutes, so an operator who FIXES the role assignment would see
+		// no recovery. A credential rejected at the SASL handshake does NOT
+		// come through here: kgo retries that inside the connection and no
+		// fetch reports it (see credentialRefusal).
 		r.cfg.Kafka.invalidateCredentials()
 		r.log.Warn("event hubs consumer stopped; reopening", "error", err, "backoff", bo.Delay())
 		bo.Sleep(ctx)
@@ -268,7 +270,14 @@ func (r *Reader) reportDecodeError(what string, size int, err error) {
 // deliver converts and exports both signals, retrying transient failures in
 // place. Returns false only when ctx ended. A permanent rejection drops that
 // signal's payload (counted) so the offsets can advance past the poison.
+//
+// Both exports are marked route.Reoffer: each signal is retried in place until
+// it settles and the offsets commit only after both, so a router splitting a
+// payload (only a transform script's route() does — ARM resources carry no
+// namespace) may hold its default share back while a tenant route fails
+// instead of spooling one copy per attempt (route/reoffer.go).
 func (r *Reader) deliver(ctx context.Context, recs []record) bool {
+	ctx = route.Reoffer(ctx)
 	ld := r.convertLogs(recs)
 	md := r.convertMetrics(recs)
 	logsDone := ld.LogRecordCount() == 0
@@ -279,10 +288,10 @@ func (r *Reader) deliver(ctx context.Context, recs []record) bool {
 			return false
 		}
 		if !logsDone {
-			logsDone = r.export(ctx, "logs", ld.LogRecordCount(), func() error { return r.cfg.Exporter.ExportLogs(ctx, ld) })
+			logsDone = r.export(ctx, "logs", ld.LogRecordCount(), &r.logsExport, func() error { return r.cfg.Exporter.ExportLogs(ctx, ld) })
 		}
 		if !metricsDone {
-			metricsDone = r.export(ctx, "metrics", md.DataPointCount(), func() error { return r.cfg.Exporter.ExportMetrics(ctx, md) })
+			metricsDone = r.export(ctx, "metrics", md.DataPointCount(), &r.metricsExport, func() error { return r.cfg.Exporter.ExportMetrics(ctx, md) })
 		}
 		if !logsDone || !metricsDone {
 			bo.Sleep(ctx)
@@ -295,18 +304,29 @@ func (r *Reader) deliver(ctx context.Context, recs []record) bool {
 // (delivered, or permanently rejected and dropped — a payload the collector
 // definitively refuses would wedge the partition, as everywhere else;
 // logchain.SettlePermanent owns that arm).
-func (r *Reader) export(ctx context.Context, signal string, count int, send func() error) bool {
+//
+// The per-attempt Warn is not throttled: deliver's backoff already spaces the
+// attempts (the journald shape). What it needs besides is the END of an outage:
+// without a recovery line a collector outage is a run of warnings and then
+// silence, and the only way to learn that delivery resumed is to watch a counter
+// stop moving — journald, events and the tailer each say so, and this reader
+// did not.
+func (r *Reader) export(ctx context.Context, signal string, count int, outage *logdedupe.Outage, send func() error) bool {
 	err := send()
 	if err == nil {
 		obs.AzureExported.WithLabelValues(signal).Add(float64(count))
+		r.exportSettled(signal, outage)
 		return true
 	}
 	if logchain.SettlePermanent(err, r.log, "azure payload", count,
 		logchain.SettleCounters{Batches: obs.AzureDropped, Records: obs.AzureDroppedRecords.WithLabelValues(signal)},
 		"signal", signal) {
+		r.exportSettled(signal, outage)
 		return true
 	}
 	if ctx.Err() == nil {
+		now := time.Now()
+		outage.Fail(now, 0)
 		// This pipeline's OWN transient-failure counter, per signal.
 		// kubescrape_log_export_failures_total documents itself as the tailer's
 		// "files rewound"; this reader owns no file and runs in the singleton
@@ -316,7 +336,17 @@ func (r *Reader) export(ctx context.Context, signal string, count int, send func
 		// obs.Exports{metrics,error}, which cannot say WHICH pipeline retried),
 		// so a hub carrying platform metrics retried invisibly.
 		obs.AzureExportFailures.WithLabelValues(signal).Inc()
-		r.log.Warn("exporting azure diagnostics", "signal", signal, "error", err)
+		r.log.Warn("exporting azure diagnostics", "signal", signal, "error", err,
+			"failures", outage.Failures(), "outage", outage.Lasted(now))
 	}
 	return false
+}
+
+// exportSettled ends a signal's outage, if one was running, with the one line
+// that says delivery resumed.
+func (r *Reader) exportSettled(signal string, outage *logdedupe.Outage) {
+	if failures, lasted, ok := outage.Recover(time.Now()); ok {
+		r.log.Info("azure diagnostics export recovered", "signal", signal,
+			"failures", failures, "outage", lasted)
+	}
 }

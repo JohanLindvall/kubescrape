@@ -58,7 +58,7 @@ tests:
       body: 'level=error msg="x" auth="Bearer [REDACTED]"'
       metrics: [errors_total]
 `)
-	if err := runConfigTests(*cfg, "", pass, slog.Default()); err != nil {
+	if err := runConfigTestsFor(t, *cfg, "", pass); err != nil {
 		t.Fatalf("passing cases failed: %v", err)
 	}
 
@@ -69,7 +69,7 @@ tests:
     expect:
       kept: true
 `)
-	err = runConfigTests(*cfg, "", fail, slog.Default())
+	err = runConfigTestsFor(t, *cfg, "", fail)
 	if err == nil || !strings.Contains(err.Error(), "1 of 1") {
 		t.Fatalf("want a 1-of-1 failure, got %v", err)
 	}
@@ -104,7 +104,7 @@ tests:
       severity: error
       body: 'level=error msg="boom"'
 `)
-	if err := runConfigTests(*cfg, "", tests, slog.Default()); err != nil {
+	if err := runConfigTestsFor(t, *cfg, "", tests); err != nil {
 		t.Fatalf("severity/body assertions must hold for a dropped record: %v", err)
 	}
 }
@@ -143,7 +143,19 @@ tests:
       kept: true
       metrics: [script_lines_total]
 `)
-	if err := runConfigTests(*cfg, transforms, tests, slog.Default()); err != nil {
+	if err := runConfigTestsFor(t, *cfg, transforms, tests); err != nil {
 		t.Fatalf("emit_metric must be evaluated by -test-config, and its series assertable: %v", err)
 	}
+}
+
+// runConfigTestsFor compiles cfg the way run() does before it reaches
+// -test-config (compileConfig), then runs the cases through what that
+// compiled — the harness never compiles a section of its own.
+func runConfigTestsFor(t *testing.T, cfg agentConfig, transformsFile, testsFile string) error {
+	t.Helper()
+	cc, err := compileConfig(cfg, transformsFile)
+	if err != nil {
+		t.Fatalf("compileConfig: %v", err)
+	}
+	return runConfigTests(cfg, cc, testsFile, slog.Default())
 }

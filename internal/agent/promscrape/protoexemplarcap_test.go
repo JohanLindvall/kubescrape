@@ -9,57 +9,67 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 	"go.opentelemetry.io/collector/pdata/pcommon"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // exemplarWith builds a protobuf exemplar carrying n labels, named by nameOf.
 func exemplarWith(n int, nameOf func(int) string) *dto.Exemplar {
-	e := &dto.Exemplar{Value: ptr(1.0), Label: make([]*dto.LabelPair, 0, n)}
+	e := &dto.Exemplar{Value: new(1.0), Label: make([]*dto.LabelPair, 0, n)}
 	for i := range n {
-		e.Label = append(e.Label, &dto.LabelPair{Name: proto.String(nameOf(i)), Value: proto.String("v")})
+		e.Label = append(e.Label, &dto.LabelPair{Name: new(nameOf(i)), Value: new("v")})
 	}
 	return e
 }
 
-// An exemplar's label block gets protoLabels' two guards, and it needs them
-// MORE than a metric's does: the labels end up in pmetric.Exemplar's
+// runeExemplar builds a protobuf exemplar whose label set is exactly `runes`
+// code points: a 1-rune name and a value of two-byte runes, so a BYTE bound
+// would refuse what the spec allows.
+func runeExemplar(runes int) *dto.Exemplar {
+	return &dto.Exemplar{Value: new(1.0), Label: []*dto.LabelPair{
+		{Name: new("t"), Value: new(strings.Repeat("é", runes-1))},
+	}}
+}
+
+// An exemplar's label block is bounded by the OpenMetrics rule — 128 code
+// points of names plus values, Prometheus's exemplar.ExemplarMaxLabelSetLength —
+// exactly as the text front bounds it (promparse's
+// TestExemplarLabelSetIsBoundedInRunes), and it needs the bound MORE than a
+// metric needs protoLabels' cap: the labels end up in pmetric.Exemplar's
 // FilteredAttributes through PutStr, which probes the map linearly before every
 // insert, so the WRITE is quadratic on top of the duplicate scan — measured
-// 10.5s at 80k labels, with ~420k fitting inside maxProtoMessageBytes, i.e.
-// minutes of frozen scrape loop from one target answering the protobuf Accept
-// it was offered. cycle() waits for every scrape it starts, so that is the
-// whole node's cadence.
-func TestProtoExemplarLabelsAreCapped(t *testing.T) {
+// 10.5s at 80k labels. The per-sample label cap this used to take was not
+// enough: 4096 labels still cost ~50 ms per exemplar, one exemplar per bucket
+// row, so one metric of 85 exemplar-bearing buckets ran 4 s past its deadline.
+func TestProtoExemplarLabelSetIsBoundedInRunes(t *testing.T) {
 	ss := protoExemplarSession(t)
 	var scratch Exemplar
 
-	if e := ss.protoExemplar(exemplarWith(maxLabelsPerSample, seqName), &scratch); e == nil {
-		t.Errorf("an exemplar with exactly %d labels was refused; the cap must be inclusive", maxLabelsPerSample)
-	} else if len(e.Labels) != maxLabelsPerSample {
-		t.Errorf("kept %d labels, want %d", len(e.Labels), maxLabelsPerSample)
+	if e := ss.protoExemplar(runeExemplar(maxExemplarLabelSetRunes), &scratch); e == nil {
+		t.Errorf("an exemplar of exactly %d runes was refused; the bound is inclusive and counted in runes, not bytes", maxExemplarLabelSetRunes)
 	}
 	if got := ss.badExemplars; got != 0 {
 		t.Errorf("an accepted exemplar counted %d bad; want 0", got)
 	}
-
-	if e := ss.protoExemplar(exemplarWith(maxLabelsPerSample+1, seqName), &scratch); e != nil {
-		t.Errorf("an exemplar with %d labels was accepted; it must be refused past the cap", maxLabelsPerSample+1)
+	if e := ss.protoExemplar(runeExemplar(maxExemplarLabelSetRunes+1), &scratch); e != nil {
+		t.Errorf("an exemplar of %d runes was accepted; it must be refused past the bound", maxExemplarLabelSetRunes+1)
 	}
 	if got := ss.badExemplars; got != 1 {
 		t.Errorf("the refusal counted %d bad exemplars, want 1 — it is a bad exemplar, not a malformed sample", got)
 	}
 
-	// And the refusal must be CHEAP: the whole point is that neither the
+	// A label COUNT past the bound is refused before a single label is read
+	// (every accepted name costs at least one rune), and cheaply: neither the
 	// duplicate scan nor setExemplar's quadratic write ever runs. 200k labels
 	// is half the count that fits inside one 4 MiB message.
-	start := time.Now()
-	if e := ss.protoExemplar(exemplarWith(200_000, seqName), &scratch); e != nil {
-		t.Fatal("a 200k-label exemplar was accepted")
-	}
-	if d := time.Since(start); d > 2*time.Second {
-		t.Errorf("refusing a 200k-label exemplar took %v; the cap is not short-circuiting the copy", d)
+	for _, n := range []int{maxExemplarLabelSetRunes + 1, maxLabelsPerSample, 200_000} {
+		start := time.Now()
+		if e := ss.protoExemplar(exemplarWith(n, seqName), &scratch); e != nil {
+			t.Fatalf("a %d-label exemplar was accepted", n)
+		}
+		if d := time.Since(start); d > time.Second {
+			t.Errorf("refusing a %d-label exemplar took %v; the bound is not short-circuiting the copy", n, d)
+		}
 	}
 }
 
@@ -107,9 +117,9 @@ func TestProtoExemplarWithARepeatedLabelNameIsRefused(t *testing.T) {
 // the text front uses — which it did not report at all before.
 func TestProtoRefusedExemplarStillExportsItsSampleAndCounts(t *testing.T) {
 	fam := &dto.MetricFamily{
-		Name: ptr("http_requests_total"), Type: dto.MetricType_COUNTER.Enum(),
+		Name: new("http_requests_total"), Type: dto.MetricType_COUNTER.Enum(),
 		Metric: []*dto.Metric{{
-			Counter: &dto.Counter{Value: ptr(7.0), Exemplar: exemplarWith(maxLabelsPerSample+1, seqName)},
+			Counter: &dto.Counter{Value: new(7.0), Exemplar: exemplarWith(maxLabelsPerSample+1, seqName)},
 		}},
 	}
 	body := protoBody(t, fam)

@@ -34,11 +34,11 @@ func benchResource(a pcommon.Map, i int) {
 // log line.
 func benchLogs(resources, records int) plog.Logs {
 	ld := plog.NewLogs()
-	for r := 0; r < resources; r++ {
+	for r := range resources {
 		rl := ld.ResourceLogs().AppendEmpty()
 		benchResource(rl.Resource().Attributes(), r)
 		sl := rl.ScopeLogs().AppendEmpty()
-		for i := 0; i < records; i++ {
+		for i := range records {
 			lr := sl.LogRecords().AppendEmpty()
 			lr.Body().SetStr(`level=info ts=2026-08-18T09:31:07.442Z caller=handler.go:214 msg="request completed" method=GET path=/api/v2/cart status=200 duration_ms=17.4`)
 			lr.SetTimestamp(pcommon.Timestamp(1755500000000000000 + int64(i)))
@@ -52,16 +52,16 @@ func benchLogs(resources, records int) plog.Logs {
 // split (many resources, few points each).
 func benchMetrics(resources, metricsN, points int) pmetric.Metrics {
 	md := pmetric.NewMetrics()
-	for r := 0; r < resources; r++ {
+	for r := range resources {
 		rm := md.ResourceMetrics().AppendEmpty()
 		benchResource(rm.Resource().Attributes(), r)
 		sm := rm.ScopeMetrics().AppendEmpty()
-		for m := 0; m < metricsN; m++ {
+		for m := range metricsN {
 			me := sm.Metrics().AppendEmpty()
 			me.SetName(fmt.Sprintf("http_server_request_duration_seconds_%d", m))
 			me.SetUnit("s")
 			dps := me.SetEmptySum().DataPoints()
-			for p := 0; p < points; p++ {
+			for p := range points {
 				dp := dps.AppendEmpty()
 				dp.SetDoubleValue(float64(p))
 				dp.SetTimestamp(pcommon.Timestamp(1755500000000000000))

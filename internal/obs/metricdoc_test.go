@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-var updateMetricsDoc = flag.Bool("update-metrics-doc", false, "rewrite docs/METRICS.md from the registrations in obs.go")
+var updateMetricsDoc = flag.Bool("update-metrics-doc", false, "rewrite docs/METRICS.md from the registrations in internal/obs")
 
 const metricsDocPath = "../../docs/METRICS.md"
 
@@ -21,7 +21,7 @@ const metricsDocPath = "../../docs/METRICS.md"
 //
 //	go test ./internal/obs/ -run TestMetricsDocIsCurrent -update-metrics-doc
 func TestMetricsDocIsCurrent(t *testing.T) {
-	docs, err := ParseMetricDocs("obs.go")
+	docs, err := ParseMetricDocs(".")
 	if err != nil {
 		t.Fatalf("ParseMetricDocs: %v", err)
 	}
@@ -77,7 +77,7 @@ func renderMetricsDoc(docs []MetricDoc) string {
 	b.WriteString("consumers (Datadog, Dynatrace, AWS EMF) report the whole running total as\n")
 	b.WriteString("each interval's delta, while Google Cloud rejected the points outright.\n")
 	b.WriteString("Prometheus/Mimir ignore the field by default and are unaffected.\n\n")
-	b.WriteString("This file is generated from `internal/obs/obs.go`. Regenerate with\n")
+	b.WriteString("This file is generated from the registrations in `internal/obs`. Regenerate with\n")
 	b.WriteString("`go test ./internal/obs/ -run TestMetricsDocIsCurrent -update-metrics-doc`;\n")
 	b.WriteString("`TestDocumentedMetricsExist` additionally fails if prose in `README.md`,\n")
 	b.WriteString("`AGENTS.md` or any `docs/*.md` names a metric or a label that is not\n")
@@ -123,7 +123,7 @@ func renderMetricsDoc(docs []MetricDoc) string {
 // a blank cell, invisible to TestMetricsDocIsCurrent (which compares the
 // generated doc against the same generator).
 func TestEveryMetricHasHelp(t *testing.T) {
-	docs, err := ParseMetricDocs("obs.go")
+	docs, err := ParseMetricDocs(".")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -25,7 +25,7 @@ func summaryLines(t *testing.T, apiServer string) map[string]map[string]string {
 	var buf bytes.Buffer
 	logStartupSummary(slog.New(cli.NewLogfmtHandler(&buf, slog.LevelInfo)), apiServer)
 	out := map[string]map[string]string{}
-	for _, line := range bytes.Split(bytes.TrimSuffix(buf.Bytes(), []byte("\n")), []byte("\n")) {
+	for line := range bytes.SplitSeq(bytes.TrimSuffix(buf.Bytes(), []byte("\n")), []byte("\n")) {
 		if err := logfmt.Validate(line); err != nil {
 			t.Fatalf("summary line is not logfmt: %v\n%s", err, line)
 		}
@@ -52,10 +52,11 @@ func TestStartupSummaryNamesTheAPIServerListenersAndLimits(t *testing.T) {
 	lines := summaryLines(t, "https://10.96.0.1:443")
 	want := map[string][]string{
 		"effective configuration": {"servicemonitors", "monitorNamespaces", "scrapeAuthSecrets", "selfAttributes", "logLevel"},
-		"effective destinations":  {"apiServer", "kubeconfig"},
-		"effective listeners":     {"listen", "metricsListen", "pprofListen"},
-		"effective identity":      {"namespace", "serviceName", "instance", "selfMetricsInterval"},
-		"effective limits":        {"waitTimeout", "maxBlockedLookups", "cacheTTL", "metadataCacheTTL", "resync", "apiserverProbeInterval"},
+		"effective destinations": {"apiServer", "kubeconfig", "otlpEndpoint", "otlpProtocol", "otlpCompression",
+			"otlpCompressionLevel", "otlpInsecure", "otlpTLSSkipVerify", "otlpCAFile", "otlpBearerTokenFile", "otlpTimeout"},
+		"effective listeners": {"listen", "metricsListen", "pprofListen"},
+		"effective identity":  {"namespace", "serviceName", "instance", "selfMetricsInterval"},
+		"effective limits":    {"waitTimeout", "maxBlockedLookups", "cacheTTL", "metadataCacheTTL", "resync", "apiserverProbeInterval"},
 	}
 	for msg, keys := range want {
 		pairs, ok := lines[msg]
@@ -133,8 +134,7 @@ func TestWaitForCachesNamesTheCacheThatWillNotSync(t *testing.T) {
 	gates := []syncGate{{"pods", pods.Load}, {"replicasets", replicasets.Load}}
 	var buf syncBuffer
 	ready := make(chan struct{})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go waitForCaches(ctx, gates, store.New(time.Minute), slog.New(cli.NewLogfmtHandler(&buf, slog.LevelInfo)), ready)
 
 	deadline := time.After(2 * time.Second)
@@ -145,7 +145,7 @@ func TestWaitForCachesNamesTheCacheThatWillNotSync(t *testing.T) {
 		case <-time.After(time.Millisecond):
 		}
 	}
-	if strings.Contains(buf.String(), "caches=pods") {
+	if strings.Contains(buf.String(), "gates=pods") {
 		t.Errorf("a cache that HAS synced was reported as pending:\n%s", buf.String())
 	}
 	select {
@@ -204,5 +204,40 @@ func TestUntrimmableInformerObjectIsReportedOnce(t *testing.T) {
 	}
 	if !strings.Contains(out, "type=string") {
 		t.Errorf("the line does not name the type it could not read:\n%s", out)
+	}
+}
+
+// The self-pod lookup waits on the POD gate by name, and only on it: its first
+// lookup ran before the informers were even started, so it missed an empty
+// store — Warn, error-outcome lookup, recovery line — on every clean start. A
+// different gate still pending (a monitor informer 403-looping on RBAC) must
+// not hold it, and a context that ends first must not leave it waiting.
+func TestSelfLookupWaitsOnlyForThePodGate(t *testing.T) {
+	var pods, monitors atomic.Bool
+	gates := []syncGate{
+		{podGate, pods.Load},
+		{"servicemonitors", monitors.Load},
+	}
+	ctx := t.Context()
+	ch := gatesSynced(ctx, gates, podGate)
+	select {
+	case <-ch:
+		t.Fatal("released before the pod gate synced: the first lookup would miss an empty store")
+	case <-time.After(250 * time.Millisecond):
+	}
+	pods.Store(true) // monitors stay pending
+	select {
+	case <-ch:
+	case <-time.After(30 * time.Second):
+		t.Fatal("not released after the pod gate synced: an unrelated pending gate is holding the self lookup")
+	}
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	never := gatesSynced(ctx2, []syncGate{{podGate, func() bool { return false }}}, podGate)
+	cancel2()
+	select {
+	case <-never:
+		t.Fatal("a cancelled wait reported the gate synced")
+	case <-time.After(250 * time.Millisecond):
 	}
 }

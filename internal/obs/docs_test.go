@@ -20,7 +20,7 @@ import (
 // actually exist. The reverse (an undocumented metric) is not an error — a
 // name is added before its prose.
 func TestDocumentedMetricsExist(t *testing.T) {
-	docs, err := ParseMetricDocs("obs.go")
+	docs, err := ParseMetricDocs(".")
 	if err != nil {
 		t.Fatalf("ParseMetricDocs: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestDocumentedMetricsExist(t *testing.T) {
 			// Gauge families rendered with a _bytes/_total suffix in prose are
 			// matched as written; only exact registrations count.
 			if !registered[name] {
-				t.Errorf("%s documents metric %q, which is not registered in obs.go", doc, name)
+				t.Errorf("%s documents metric %q, which is not registered in internal/obs", doc, name)
 			}
 		}
 
@@ -77,7 +77,7 @@ func TestDocumentedMetricsExist(t *testing.T) {
 			if !registered[name] {
 				continue // already reported above
 			}
-			for _, part := range strings.Split(inner, ",") {
+			for part := range strings.SplitSeq(inner, ",") {
 				part = strings.TrimSpace(part)
 				if part == "" {
 					continue

@@ -13,31 +13,19 @@ import (
 )
 
 func genMonitorObj(kind, name, rv, port string) *unstructured.Unstructured {
-	u := &unstructured.Unstructured{Object: map[string]any{
-		"metadata": map[string]any{
-			"namespace": "default", "name": name, "resourceVersion": rv,
-		},
-		"spec": map[string]any{
-			"selector": map[string]any{"matchLabels": map[string]any{"app": "web"}},
-		},
-	}}
-	spec := u.Object["spec"].(map[string]any)
-	endpoints := []any{map[string]any{"port": port}}
-	if kind == "podmonitor" {
-		spec["podMetricsEndpoints"] = endpoints
-	} else {
-		spec["endpoints"] = endpoints
-	}
-	return u
+	return crObject(kind, "default", name, rv, map[string]any{
+		"selector":         map[string]any{"matchLabels": map[string]any{"app": "web"}},
+		endpointsKey(kind): []any{map[string]any{"port": port}},
+	})
 }
 
 func TestGenerationIgnoresMonitorReDeliveries(t *testing.T) {
-	for _, kind := range []string{"servicemonitor", "podmonitor"} {
+	for _, kind := range []string{"ServiceMonitor", "PodMonitor"} {
 		t.Run(kind, func(t *testing.T) {
 			ix := NewIndex()
 			upsert := func(u *unstructured.Unstructured) error { return ix.Upsert(u) }
 			del := func() { ix.Delete("default", "m") }
-			if kind == "podmonitor" {
+			if kind == "PodMonitor" {
 				upsert = func(u *unstructured.Unstructured) error { return ix.UpsertPodMonitor(u) }
 				del = func() { ix.DeletePodMonitor("default", "m") }
 			}
@@ -63,7 +51,7 @@ func TestGenerationIgnoresMonitorReDeliveries(t *testing.T) {
 				t.Fatal("the change token did not move for a genuine monitor update")
 			}
 			var port string
-			if kind == "podmonitor" {
+			if kind == "PodMonitor" {
 				port = ix.PodMonitors()[0].Endpoints[0].Port
 			} else {
 				port = ix.All()[0].Endpoints[0].Port

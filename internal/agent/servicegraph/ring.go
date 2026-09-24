@@ -9,6 +9,8 @@ package servicegraph
 // any coordination between them.
 
 import (
+	"cmp"
+	"slices"
 	"sort"
 )
 
@@ -88,7 +90,11 @@ func TokenFor(tenant string, traceID []byte) uint32 {
 //     shards, no RBAC, and no window where two agents hold different rings and
 //     send the two halves of one request to two different shards. With derived
 //     tokens every agent computes the identical ring from the identical config
-//     — disagreement is impossible unless the CONFIG disagrees.
+//     — disagreement is impossible unless the CONFIG disagrees, or the BINARIES
+//     do: a release that changes the derivation (shardTokens, mix32, fnv1a32,
+//     DefaultTokensPerShard) makes old and new shards route one trace to
+//     different owners for the length of a rolling update, which is why
+//     TestRingDerivationKnownAnswers pins it with literals.
 //   - It is testable and reviewable: the ring is a pure function of (names,
 //     tokens), so a distribution regression is a unit test rather than a
 //     production observation.
@@ -104,12 +110,18 @@ func TokenFor(tenant string, traceID []byte) uint32 {
 //     (which re-derives EVERY shard's positions, moving a large fraction of
 //     the keys once) and the replica count.
 //   - The membership is whatever the config says, not what is alive. A dead
-//     shard keeps its arc of the circle and its traces are simply not paired
+//     shard keeps its arc of the circle, and its traces are not DELIVERED
 //     until it returns — where gossip would hand its range to a neighbour.
-//     That is the intended trade for a best-effort, opt-in graph: a resharding
-//     stampede on every rolling restart would corrupt more edges (every
-//     in-flight half-edge on both the losing and gaining shard) than a brief
-//     gap loses.
+//     Every push carrying one of them fails and its sender retries, and the
+//     traces the same push carries for HEALTHY shards fail with it (the entry
+//     shard holds the only copy, so it cannot ack part of a push). Reshard
+//     sends a shard whose last hop failed its share first, so those retries do
+//     not also re-deliver and re-count the healthy owners' shares. That is the
+//     intended trade: a resharding stampede on every rolling restart would
+//     corrupt more edges (every in-flight half-edge on both the losing and
+//     gaining shard, and every trace the tail sampler is assembling) than a
+//     brief outage of one arc costs, and the senders' retries — not a queue
+//     here — are what carry the arc's traces across it.
 //   - Scaling the StatefulSet is a config change agents must see. Until they
 //     do, they address the old shard set — correctly, just at the old width.
 //     A shard added or removed moves ~1/N of the keys and nothing else, which
@@ -131,7 +143,7 @@ func NewRing(shards []string, tokensPerShard int) *Ring {
 		tokensPerShard = DefaultTokensPerShard
 	}
 	names := append([]string(nil), shards...)
-	sort.Strings(names)
+	slices.Sort(names)
 	names = dedupeStrings(names)
 	r := &Ring{shards: names}
 	if len(names) == 0 {
@@ -152,11 +164,8 @@ func NewRing(shards []string, tokensPerShard int) *Ring {
 	// somewhere across a fleet's lifetime — still yield one deterministic ring
 	// everywhere. The duplicate is then dropped: a token that appears twice
 	// would make the binary search's answer depend on which copy it landed on.
-	sort.Slice(all, func(i, j int) bool {
-		if all[i].token != all[j].token {
-			return all[i].token < all[j].token
-		}
-		return all[i].owner < all[j].owner
+	slices.SortFunc(all, func(a, b entry) int {
+		return cmp.Or(cmp.Compare(a.token, b.token), cmp.Compare(a.owner, b.owner))
 	})
 	r.tokens = make([]uint32, 0, len(all))
 	r.owner = make([]int32, 0, len(all))
@@ -211,9 +220,10 @@ func (r *Ring) Shards() []string {
 
 // Ownership reports the EXACT fraction of the key space each shard owns,
 // summing to 1. It is computed from the token arcs rather than by sampling, so
-// a test (or a startup log line) sees the ring's real balance rather than one
-// draw from it — the sampled distribution converges to this, and any gap
-// between them is the sample's noise, not the ring's.
+// a caller sees the ring's real balance rather than one draw from it — the
+// sampled distribution converges to this, and any gap between them is the
+// sample's noise, not the ring's. Only the ring's tests call it today (nothing
+// logs it); it is the balance a diagnostic would report.
 func (r *Ring) Ownership() map[string]float64 {
 	out := make(map[string]float64, len(r.shards))
 	for _, s := range r.shards {
@@ -228,7 +238,7 @@ func (r *Ring) Ownership() map[string]float64 {
 		out[r.shards[r.owner[0]]] = 1
 		return out
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		prev := r.tokens[(i-1+n)%n]
 		// Token i owns (tokens[i-1], tokens[i]]; the subtraction wraps for i=0,
 		// which is exactly the arc crossing zero.

@@ -132,9 +132,12 @@ lat{quantile="0.5",zone="b"} 7
 lat_sum{zone="b"} 70
 lat_count{zone="b"} 10
 `
+	// ONE parser through the pool's own round trip (release, then reset): a
+	// Put followed by a Get may hand back a fresh parser, and under -race the
+	// pool drops one Put in four on purpose, so the test would pass vacuously.
+	pp := Get(Options{})
+	defer Put(pp)
 	run := func(body string) []Sample {
-		pp := Get(Options{})
-		defer Put(pp)
 		var out []Sample
 		_, err := pp.Parse(strings.NewReader(body), func(s Sample) error {
 			cp := s
@@ -148,9 +151,11 @@ lat_count{zone="b"} 10
 		return out
 	}
 
-	// Warm the pooled parser with the first exposition, return it, then take it
-	// back for the second — same *Pooled with high probability.
+	// Warm the pooled parser with the first exposition, recycle it, and parse
+	// the second on the same parser.
 	_ = run(first)
+	pp.release()
+	pp.reset(Options{})
 	got := run(second)
 
 	want := []struct {
@@ -187,24 +192,53 @@ lat_count{zone="b"} 10
 
 // TestAudit_PooledEOFNotSticky: a parser that saw "# EOF" must not refuse to
 // parse the next (classic) exposition.
+// The recycling runs on ONE parser (release, then reset — the pool's own round
+// trip), since a Put followed by a Get need not hand the same parser back.
 func TestAudit_PooledEOFNotSticky(t *testing.T) {
 	pp := Get(Options{OpenMetrics: true})
+	defer Put(pp)
 	var n int
 	if _, err := pp.Parse(strings.NewReader("a 1\n# EOF\n"), func(Sample) error { n++; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	Put(pp)
 	if n != 1 {
 		t.Fatalf("first parse emitted %d", n)
 	}
-	pp2 := Get(Options{})
-	defer Put(pp2)
+	pp.release()
+	pp.reset(Options{})
 	n = 0
-	if _, err := pp2.Parse(strings.NewReader("b 2\nc 3\n"), func(Sample) error { n++; return nil }); err != nil {
+	if _, err := pp.Parse(strings.NewReader("b 2\nc 3\n"), func(Sample) error { n++; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if n != 2 {
 		t.Fatalf("BUG: sticky eof — second parse emitted %d samples, want 2", n)
+	}
+}
+
+// Pooled.Parse is one exposition per CALL, like Parser.Parse: the
+// per-exposition reset used to live in Parse and in Get, so a second
+// Pooled.Parse on one parser (no Get in between) skipped it — a previous
+// OpenMetrics "# EOF" silently ended the new exposition after one sample, and
+// the previous exposition's TYPE and HELP classified the new one's samples.
+func TestPooledParseIsOneExpositionPerCall(t *testing.T) {
+	pp := Get(Options{OpenMetrics: true})
+	defer Put(pp)
+	if _, err := pp.Parse(strings.NewReader("# TYPE x counter\n# HELP x Old.\nx_total 1\n# EOF\n"), func(Sample) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	var got []Sample
+	if _, err := pp.Parse(strings.NewReader("b 2\nx_total 3\nd 4\n"), func(s Sample) error {
+		got = append(got, s)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("second Pooled.Parse emitted %d of 3 samples (a stale # EOF ended it)", len(got))
+	}
+	if x := got[1]; x.Role != RoleGauge || x.Family != "x_total" || x.Help != "" {
+		t.Fatalf("x_total on the second exposition = role %v family %q help %q, want an untyped family of its own with no help (the first exposition's TYPE/HELP leaked)",
+			x.Role, x.Family, x.Help)
 	}
 }
 
@@ -335,7 +369,7 @@ func TestAudit_ExemplarsDisabledStillValid(t *testing.T) {
 func TestAudit_AbortedParseKeepsEmitted(t *testing.T) {
 	var body strings.Builder
 	body.WriteString("# TYPE a counter\n")
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		fmt.Fprintf(&body, "a_total{i=\"%d\"} %d\n", i, i)
 	}
 	p := New(Options{})

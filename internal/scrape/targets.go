@@ -1,12 +1,32 @@
-// Package scrape derives Prometheus scrape targets from pod and service
-// metadata using the conventional prometheus.io/* annotations.
+// Package scrape derives Prometheus scrape targets from pod and Service
+// metadata. It is pure functions over kubemeta, services and servicemonitors
+// values — no store, no locks, no logging — which is what lets /v1/explain
+// replay the derivation exactly. It covers:
+//
+//   - the conventional prometheus.io/* annotations on pods and Services
+//     (PodTargets, ServiceTargets, ServiceDoor), port names resolved one way
+//     on every path;
+//   - ServiceMonitor and PodMonitor endpoint resolution (MonitorTargets,
+//     PodMonitorTargets and their URL-only pre-checks), stamping each
+//     endpoint's auth/TLS refs, cadence and metricRelabelings on the target;
+//   - the fold that serves two monitors resolving to one URL as ONE target
+//     (MergeMonitorEndpoint, merge.go), with its merged-chain and contributor
+//     ceilings;
+//   - per-pod byte accounting against MaxTargetBytesPerPod (docsize.go);
+//   - the exported-identity collision scan (InstanceScan, instance.go);
+//   - the /v1/explain mirrors and the notes shared with the derivation
+//     (explain.go), kept beside the parsers they mirror so explanation and
+//     derivation cannot drift.
+//
+// The per-pod ceilings are defined and measured here but ENFORCED where
+// targets are accumulated, in internal/server's targetDedup.
 package scrape
 
 import (
+	"iter"
 	"strconv"
 	"strings"
 
-	"github.com/JohanLindvall/kubescrape/internal/cli"
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -22,6 +42,27 @@ const (
 	AnnotationPort   = "prometheus.io/port"
 	AnnotationScheme = "prometheus.io/scheme"
 )
+
+// OptedIn reports whether a pod's or a Service's annotations opt it into
+// scraping: prometheus.io/scrape="true", exactly. The ONE spelling of the
+// opt-in — the doors here, nodeTargets' pre-check and /v1/explain's head all
+// ask it — so no reader can come to accept a value another refuses.
+func OptedIn(annotations map[string]string) bool {
+	return annotations[AnnotationScrape] == "true"
+}
+
+// portAnnotation reads a door's prometheus.io/port annotation and whether it is
+// EXPLICIT: present and not all-blank. An absent or all-blank annotation falls
+// back (every declared container port on the pod door, every service port on
+// the Service door); an explicit one never does, even one whose entries all
+// split away (","), which selects nothing. The ONE fallback predicate: the
+// derivation (podPorts, selectServicePorts) and its explain mirrors
+// (ExplainPodPorts, ExplainServicePorts) all ask it, so the two cannot disagree
+// about which shape a door is in.
+func portAnnotation(annotations map[string]string) (raw string, explicit bool) {
+	raw, ok := annotations[AnnotationPort]
+	return raw, ok && strings.TrimSpace(raw) != ""
+}
 
 // MaxPortsPerPod bounds how many scrape targets ONE POD may produce, across
 // every door that produces them. Every ScrapeTarget embeds the WHOLE pod
@@ -63,7 +104,7 @@ const MaxPortsPerPod = 16
 // annotation, every declared container port becomes a target. The pod
 // (including any owners the caller resolved) is embedded in each target.
 func PodTargets(pod kubemeta.Pod) []kubemeta.ScrapeTarget {
-	if pod.Annotations[AnnotationScrape] != "true" || !Scrapeable(pod) {
+	if !OptedIn(pod.Annotations) || !Scrapeable(pod) {
 		return nil
 	}
 	scheme, path, ok := schemeAndPath(pod.Annotations)
@@ -90,31 +131,84 @@ func PodTargets(pod kubemeta.Pod) []kubemeta.ScrapeTarget {
 // as the endpoints controller and a ServiceMonitor endpoint resolve it —
 // explicit number, or the port itself).
 func ServiceTargets(pod kubemeta.Pod, svc *services.Service) []kubemeta.ScrapeTarget {
-	if svc == nil || svc.Annotations[AnnotationScrape] != "true" || !Scrapeable(pod) {
+	if svc == nil || !Scrapeable(pod) {
 		return nil
+	}
+	door := NewServiceDoor(svc)
+	return door.Targets(pod)
+}
+
+// ServiceDoor is ServiceTargets' POD-INDEPENDENT half, resolved once: whether
+// the Service opts in at all, its scheme and path, which of its ports the
+// port annotation selects, and the Service view every target carries.
+//
+// It exists because none of that depends on the pod, while nodeTargets asks
+// the question once per (pod, matched Service): a Service's prometheus.io/port
+// list is tenant-authored and up to kubemeta.MaxAnnotationValueBytes long
+// (~4,000 entries), and re-resolving it for every pod behind the Service turned
+// one annotation into a per-pod cost — measured at 110 pods, ~70-90 ms and
+// 75 MB per derivation for an `80,80,...` list that yields one target. The
+// server memoises one door per Service per derivation; ServiceTargets is the
+// composition, so every other caller is unchanged.
+//
+// A door is a value and treat-as-immutable once built: its Service view is
+// SHARED by every target it produces, on every pod, exactly as one call of
+// ServiceTargets always shared it across that call's targets.
+type ServiceDoor struct {
+	open   bool
+	scheme string
+	path   string
+	ports  []services.Port
+	info   *kubemeta.Service
+}
+
+// NewServiceDoor resolves a Service's annotation door. A Service that is not
+// annotated prometheus.io/scrape="true", or whose path annotation is over
+// MaxTargetPathBytes, yields a door that produces nothing — and costs nothing
+// to build.
+func NewServiceDoor(svc *services.Service) ServiceDoor {
+	if svc == nil || !OptedIn(svc.Annotations) {
+		return ServiceDoor{}
 	}
 	scheme, path, ok := schemeAndPath(svc.Annotations)
 	if !ok {
+		return ServiceDoor{}
+	}
+	return ServiceDoor{
+		open:   true,
+		scheme: scheme,
+		path:   path,
+		ports:  selectServicePorts(svc),
+		info:   serviceInfo(svc),
+	}
+}
+
+// Targets derives the door's targets on one pod: ServiceTargets(pod, svc)
+// exactly, without re-resolving anything that does not depend on the pod.
+func (d *ServiceDoor) Targets(pod kubemeta.Pod) []kubemeta.ScrapeTarget {
+	if !d.open || !Scrapeable(pod) {
 		return nil
 	}
-	info := serviceInfo(svc)
 	var targets []kubemeta.ScrapeTarget
-	seen := make(map[int32]struct{})
-	for _, sp := range selectServicePorts(svc) {
+	var seen map[int32]struct{}
+	for _, sp := range d.ports {
 		if len(targets) >= MaxPortsPerPod {
 			break // anti-abuse: every target embeds the whole pod (MaxPortsPerPod)
 		}
-		port, ok := TargetPodPort(pod, sp)
+		port, ok := targetPodPort(pod, sp)
 		if !ok {
 			continue
 		}
 		if _, dup := seen[port]; dup {
 			continue
 		}
+		if seen == nil {
+			seen = make(map[int32]struct{}, len(d.ports))
+		}
 		seen[port] = struct{}{}
-		t := makeTarget(pod, scheme, path, port)
+		t := makeTarget(pod, d.scheme, d.path, port)
 		t.Source = "service"
-		t.Service = info
+		t.Service = d.info
 		targets = append(targets, t)
 	}
 	return targets
@@ -174,28 +268,44 @@ func monitorEndpoint(pod kubemeta.Pod, svc *services.Service, ep servicemonitors
 	if !ok {
 		return "", "", 0, false
 	}
-	scheme, path, ok = defaultSchemePath(ep.Scheme, ep.Path)
+	scheme, path, ok = defaultSchemePath(monitorScheme(ep.Scheme), ep.Path)
 	if !ok {
 		return "", "", 0, false
 	}
 	return scheme, path, port, true
 }
 
+// monitorScheme folds a monitor endpoint's `scheme` to the spelling
+// defaultSchemePath tests for. prometheus-operator's CRD admits
+// `http`/`https`/`HTTP`/`HTTPS` (its own SchemeHTTPS constant is the upper-case
+// one, and its field doc says "Supported values are HTTP and HTTPS"), and
+// defaultSchemePath maps anything but the exact string "https" to plaintext —
+// so an upper-case `HTTPS` was served as http:// with up=0 and nothing pointing
+// at the scheme, tlsConfig silently unused, and any bearer, basicAuth or
+// authorization credential sent in cleartext on the pod network.
+//
+// ONLY the monitor doors fold: the annotation door's prometheus.io/scheme is
+// documented lower-case, matching Prometheus' classic relabel regex. And it
+// never copies the tenant's string — the length gate keeps EqualFold from
+// walking an arbitrarily long value, and the result is one of the two
+// constants defaultSchemePath emits anyway (which is why Scheme needs no field
+// ceiling of its own).
+func monitorScheme(scheme string) string {
+	if len(scheme) == len("https") && strings.EqualFold(scheme, "https") {
+		return "https"
+	}
+	return scheme
+}
+
 // stampEndpoint copies the endpoint's auth/TLS/relabeling declarations onto
 // a target.
 func stampEndpoint(t *kubemeta.ScrapeTarget, ep servicemonitors.Endpoint) {
-	t.InsecureSkipVerify = ep.InsecureSkipVerify
-	t.AuthSecret = ep.BearerSecret
+	// ONE assignment for the whole auth/TLS group: the endpoint carries the
+	// very kubemeta.ScrapeAuth the target does, so a new auth field cannot be
+	// parsed and then forgotten here.
+	t.ScrapeAuth = ep.ScrapeAuth
 	t.Interval = ep.Interval
 	t.ScrapeTimeout = ep.ScrapeTimeout
-	t.BasicAuthUser = ep.BasicAuthUser
-	t.BasicAuthPass = ep.BasicAuthPass
-	t.AuthType = ep.AuthType
-	t.AuthCredentials = ep.AuthCredentials
-	t.TLSCA = ep.TLSCA
-	t.TLSCert = ep.TLSCert
-	t.TLSKey = ep.TLSKey
-	t.TLSServerName = ep.TLSServerName
 	// servicemonitors.RelabelRule IS kubemeta.RelabelRule (a type alias — the
 	// wire contract owns the shape), so the old field-by-field copy here was a
 	// third place a new relabel field had to be remembered, and forgetting it
@@ -237,30 +347,55 @@ func podMonitorEndpoint(pod kubemeta.Pod, ep servicemonitors.Endpoint) (scheme, 
 	if ep.Refused != "" || !Scrapeable(pod) {
 		return "", "", 0, false
 	}
-	if ep.Port == "" && ep.TargetPort == nil {
-		return "", "", 0, false // same phantom-target guard as ServiceMonitors
+	port, ok = podMonitorPodPort(pod, ep)
+	if !ok {
+		return "", "", 0, false
 	}
-	switch {
-	case ep.Port != "":
-		p, found := containerPortByName(pod, ep.Port)
-		if !found {
-			return "", "", 0, false
-		}
-		port = p
-	default:
-		if n, numeric := MonitorPortNumber(*ep.TargetPort); numeric {
-			port = n
-		} else if p, found := containerPortByName(pod, ep.TargetPort.StrVal); found {
-			port = p
-		} else {
-			return "", "", 0, false
-		}
-	}
-	scheme, path, ok = defaultSchemePath(ep.Scheme, ep.Path)
+	scheme, path, ok = defaultSchemePath(monitorScheme(ep.Scheme), ep.Path)
 	if !ok {
 		return "", "", 0, false
 	}
 	return scheme, path, port, true
+}
+
+// podMonitorPodPort resolves the pod port a PodMonitor endpoint targets — the
+// port half of podMonitorEndpoint, split out (like monitorPodPort, its
+// ServiceMonitor sibling) so the explain note can ask the port question on a
+// pod the derivation short-circuits on before it ever reaches the port.
+func podMonitorPodPort(pod kubemeta.Pod, ep servicemonitors.Endpoint) (int32, bool) {
+	if ep.Port == "" && ep.TargetPort == nil {
+		return 0, false // same phantom-target guard as ServiceMonitors
+	}
+	if ep.Port != "" {
+		return containerPortByName(pod, ep.Port)
+	}
+	return targetPortOnPod(pod, *ep.TargetPort)
+}
+
+// targetPortOnPod resolves a monitor endpoint's targetPort against a pod: a
+// number (bounds-checked by monitorPortNumber, which also reads a numeric
+// STRING), else a container-port NAME through containerPortByName. It is the
+// ONE spelling of that question for both monitor kinds — the ServiceMonitor
+// fallback (monitorPodPort) and the PodMonitor one (podMonitorPodPort) — which
+// open-coded it twice and agreed only through a contract between two
+// functions: the PodMonitor copy had no Type check and leaned on
+// containerPortByName's empty-name guard alone.
+//
+// Only a String-typed targetPort may resolve by name: an Int-typed value
+// always has StrVal == "" (a rejected number like 0 or 70000 names nothing).
+// containerPortByName still carries the other half of the guard, for a
+// String-typed `targetPort: ""`.
+func targetPortOnPod(pod kubemeta.Pod, tp intstr.IntOrString) (int32, bool) {
+	// IntValue() on a string-typed value Atoi's it ignoring the error and
+	// returns a full int, so parse and bound explicitly: "4294967297" must be
+	// rejected, not truncated to port 1.
+	if n, ok := monitorPortNumber(tp); ok {
+		return n, true
+	}
+	if tp.Type != intstr.String {
+		return 0, false
+	}
+	return containerPortByName(pod, tp.StrVal)
 }
 
 // containerPortByName resolves a container-port NAME to a pod port: the first
@@ -269,9 +404,9 @@ func podMonitorEndpoint(pod kubemeta.Pod, ep servicemonitors.Endpoint) (scheme, 
 //
 // It is the ONE resolver for that question, and every path in this package
 // that asks it goes through here — the pod annotation's named entry
-// (podPorts), a Service port's named targetPort (TargetPodPort, hence
+// (podPorts), a Service port's named targetPort (targetPodPort, hence
 // ServiceTargets), a ServiceMonitor endpoint's targetPort and a PodMonitor
-// endpoint's port/targetPort (monitorPodPort/podMonitorEndpoint). One function
+// endpoint's port/targetPort (targetPortOnPod, podMonitorPodPort). One function
 // because one pod must get ONE answer: a pod may legally declare one name on
 // two containers (Kubernetes only WARNS about it at admission), and while the
 // paths each open-coded the walk they disagreed about exactly that pod — the
@@ -318,12 +453,11 @@ func podMonitorEndpoint(pod kubemeta.Pod, ep servicemonitors.Endpoint) (scheme, 
 // first: the fallback must never outrank a regular container's declaration.
 //
 // The empty-name check is NOT a redundant nil-guard, and must not be removed
-// as one: it is the phantom-target guard PodMonitorTargets depends on. That
-// path passes a degenerate string targetPort straight here, so without it an
-// endpoint with `targetPort: ""` would match the first UNNAMED container port
-// and mint a scrape target the user never declared. MonitorTargets states the
-// same precondition explicitly at its own call site; this is where the
-// PodMonitor half of it lives.
+// as one: it is the phantom-target guard for a degenerate String-typed
+// `targetPort: ""`, which targetPortOnPod (both monitor kinds) passes straight
+// here — its own Type check refuses only an Int-typed value. Without it such an
+// endpoint would match the first UNNAMED container port by "" == "" and mint a
+// scrape target the user never declared.
 func containerPortByName(pod kubemeta.Pod, name string) (int32, bool) {
 	if name == "" {
 		return 0, false
@@ -382,10 +516,10 @@ func containerPortDeclarations(pod kubemeta.Pod, name string) int {
 	return n
 }
 
-// MonitorPortNumber extracts a numeric targetPort, bounds-checked to the
+// monitorPortNumber extracts a numeric targetPort, bounds-checked to the
 // valid port range; string values that do not parse fall through to the
 // port-name path.
-func MonitorPortNumber(tp intstr.IntOrString) (int32, bool) {
+func monitorPortNumber(tp intstr.IntOrString) (int32, bool) {
 	if tp.Type != intstr.Int {
 		return parsePort(tp.StrVal)
 	}
@@ -402,12 +536,45 @@ func MonitorPortNumber(tp intstr.IntOrString) (int32, bool) {
 // range. A rejected entry falls back to whatever name matching its caller
 // does, which is safe because a Kubernetes port name must contain a letter —
 // an all-digit string can never name a declared port.
+//
+// It accepts EXACTLY what strconv.ParseInt(entry, 10, 32) followed by that
+// range check accepts — one optional sign, then ASCII digits, leading zeros
+// included ("+80", "000080") — and is hand-written rather than a call for one
+// reason: ParseInt's error path allocates a *NumError and a copy of the input,
+// and most entries it sees are REJECTED ones. Every named entry ("metrics") on
+// the ordinary path paid that per derivation, and a tenant-authored list of
+// ~4,000 non-numeric entries paid it ~4,000 times per (pod, Service).
+// TestParsePortAgreesWithStrconv and FuzzParsePortAgreesWithStrconv pin the
+// accepted set against ParseInt itself.
 func parsePort(entry string) (int32, bool) {
-	n, err := strconv.ParseInt(entry, 10, 32)
-	if err != nil || n < 1 || n > 65535 {
+	s := entry
+	if s != "" && (s[0] == '+' || s[0] == '-') {
+		if s[0] == '-' {
+			// Every value ParseInt reads after a minus is <= 0: out of range.
+			return 0, false
+		}
+		s = s[1:]
+	}
+	if s == "" {
 		return 0, false
 	}
-	return int32(n), true
+	var n int32
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		// Past 65535 the entry is rejected whatever follows — out of range if
+		// the rest are digits, a syntax error if not — so stop there, which
+		// also keeps n far from int32 overflow.
+		if n = n*10 + int32(c-'0'); n > 65535 {
+			return 0, false
+		}
+	}
+	if n < 1 {
+		return 0, false
+	}
+	return n, true
 }
 
 // monitorPodPort resolves the pod port a ServiceMonitor endpoint targets.
@@ -425,27 +592,14 @@ func monitorPodPort(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.
 	if ep.Port != "" {
 		for _, sp := range svc.Ports {
 			if sp.Name == ep.Port {
-				return TargetPodPort(pod, sp)
+				return targetPodPort(pod, sp)
 			}
 		}
 		return 0, false
 	}
 	// Port was empty, so TargetPort is non-nil (the guard above returned for
-	// the neither-set case). IntValue() on a string-typed value Atoi's it
-	// ignoring the error and returns a full int, so parse and bound explicitly:
-	// "4294967297" must be rejected, not truncated to port 1.
-	if n, ok := MonitorPortNumber(*ep.TargetPort); ok {
-		return n, true
-	}
-	// Only a String-typed targetPort may resolve by container port NAME: an
-	// Int-typed value always has StrVal == "" (a rejected number like 0 or
-	// 70000 names nothing). containerPortByName carries the other half of the
-	// guard — matching "" against an UNNAMED container port by "" == "" would
-	// fabricate a phantom target.
-	if ep.TargetPort.Type != intstr.String {
-		return 0, false
-	}
-	return containerPortByName(pod, ep.TargetPort.StrVal)
+	// the neither-set case).
+	return targetPortOnPod(pod, *ep.TargetPort)
 }
 
 // Scrapeable reports whether a pod can yield scrape targets at all: it must
@@ -460,10 +614,44 @@ func monitorPodPort(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.
 // endpoints discovery drops terminating endpoints for the same reason. They
 // remain resolvable by container ID / UID / name; only TARGETS are affected.
 func Scrapeable(pod kubemeta.Pod) bool {
-	if pod.PodIP == "" || pod.DeletedAt != nil || pod.DeletionTimestamp != nil {
-		return false
+	return unscrapeableReasons(&pod) == 0
+}
+
+// unscrapeable is the set of Scrapeable's conditions a pod fails. The
+// conditions are defined HERE and nowhere else: the derivation's yes/no
+// (Scrapeable) and /v1/explain's list of reasons (ScrapeableReasons) are two
+// readings of this one check, so explain's head cannot say a pod is scrapeable
+// while nodeTargets serves it nothing, or the reverse — which a second if-chain
+// shaped like this one could, the moment a condition was added to only one of
+// them. TestScrapeableAndItsReasonsAreOneCheck pins the two readings together
+// over every combination.
+type unscrapeable uint8
+
+const (
+	unscrapeableNoIP        unscrapeable = 1 << iota // no pod IP yet
+	unscrapeableDeleted                              // tombstoned
+	unscrapeableTerminating                          // deletionTimestamp set
+	unscrapeableFinished                             // Succeeded or Failed
+)
+
+// unscrapeableReasons evaluates every condition (no short circuit: the answer
+// is the whole set, and each is a field compare). Allocation-free, on the
+// per-pod path of every target derivation.
+func unscrapeableReasons(pod *kubemeta.Pod) unscrapeable {
+	var u unscrapeable
+	if pod.PodIP == "" {
+		u |= unscrapeableNoIP
 	}
-	return !kubemeta.FinishedPhase(pod.Phase)
+	if pod.DeletedAt != nil {
+		u |= unscrapeableDeleted
+	}
+	if pod.DeletionTimestamp != nil {
+		u |= unscrapeableTerminating
+	}
+	if kubemeta.FinishedPhase(pod.Phase) {
+		u |= unscrapeableFinished
+	}
+	return u
 }
 
 // MaxTargetPathBytes bounds the scrape PATH a target may carry, at every door
@@ -490,7 +678,7 @@ func Scrapeable(pod kubemeta.Pod) bool {
 // Over the ceiling the door yields NO targets rather than a truncated or
 // defaulted path: see enforceFieldBounds for why those two are the worse
 // outcomes. /v1/explain reports it through the same port-entry verdicts as
-// every other refusal (PathRefusedNote).
+// every other refusal (pathRefusedNote).
 const MaxTargetPathBytes = 2 << 10
 
 // schemeAndPath resolves a door's scheme/path annotations, reporting false when
@@ -618,8 +806,8 @@ func podPorts(pod kubemeta.Pod) []int32 {
 		ports = append(ports, p)
 	}
 
-	ann, ok := pod.Annotations[AnnotationPort]
-	if !ok || strings.TrimSpace(ann) == "" {
+	ann, explicit := portAnnotation(pod.Annotations)
+	if !explicit {
 		for _, c := range pod.Containers {
 			for _, p := range c.Ports {
 				add(p.Port)
@@ -627,7 +815,7 @@ func podPorts(pod kubemeta.Pod) []int32 {
 		}
 		return ports
 	}
-	for _, entry := range splitList(ann) {
+	for entry := range listEntries(ann) {
 		if len(ports) >= MaxPortsPerPod {
 			break // the cap is reached; stop parsing a hostile-length list
 		}
@@ -649,29 +837,148 @@ func podPorts(pod kubemeta.Pod) []int32 {
 // selectServicePorts resolves the service's port annotation (each entry a
 // service port number or name) against its declared ports; without an
 // annotation, all service ports.
+//
+// Each service port is selected AT MOST ONCE, in the order the entries first
+// name it (and, within one entry, in the Service's own port order). That is
+// not a change of answer: ServiceTargets dedupes by resolved pod port in
+// selection order, and a repeated service port always resolves to the pod port
+// its first selection already claimed, so a repeat never produced a target.
+// What it did produce was cost — the output was entries x matching ports long,
+// and the only bound on the loop consuming it counts TARGETS, which repeats
+// never add — so an 8 KiB `8,8,...,8` list cost ~3 MB and milliseconds per
+// (pod, Service) to yield one target. Now the output is bounded by the
+// Service's port count, the walk stops once every port is selected, and the
+// entry-to-port match goes through servicePortIndex, so a long list against a
+// many-ported Service is O(entries + ports) rather than their product.
+// TestServicePortSelectionMatchesTheNestedLoop pins the order against the
+// original nested loop over randomised inputs.
 func selectServicePorts(svc *services.Service) []services.Port {
-	ann, ok := svc.Annotations[AnnotationPort]
-	if !ok || strings.TrimSpace(ann) == "" {
+	ann, explicit := portAnnotation(svc.Annotations)
+	if !explicit {
 		return svc.Ports
 	}
+	ix := newServicePortIndex(svc.Ports)
+	var picked []bool
 	var out []services.Port
-	for _, entry := range splitList(ann) {
-		n, numeric := parsePort(entry)
-		for _, sp := range svc.Ports {
-			if sp.Name == entry || (numeric && sp.Port == n) {
-				out = append(out, sp)
+	var buf [8]int32
+	for entry := range listEntries(ann) {
+		for _, i := range ix.appendMatches(buf[:0], entry) {
+			if picked == nil {
+				picked = make([]bool, len(svc.Ports))
 			}
+			if !picked[i] {
+				picked[i] = true
+				out = append(out, svc.Ports[i])
+			}
+		}
+		if len(out) == len(svc.Ports) {
+			break // every port is selected; the rest of the list can add nothing
 		}
 	}
 	return out
 }
 
-// TargetPodPort translates a service port to the pod port it targets — the ONE
+// servicePortIndex answers "which of this Service's ports does annotation
+// entry E name?" — a port whose Name is E, or, when E is a port number, a port
+// whose Port equals it — in the Service's own port order. It is the ONE
+// predicate for that question: the derivation (selectServicePorts) and its
+// explain mirror (ExplainServicePorts) both ask it here, so the two cannot
+// disagree about what an entry selects.
+//
+// A small port list is scanned linearly, which allocates nothing. Past
+// indexServicePortsOver ports it is indexed — first index per name and per
+// number, with a chain to the next index carrying the same key — because the
+// entry list and the port list are BOTH tenant-authored, and an unindexed walk
+// is their product: measured at 4,001 entries, 0.83 ms per call at one port and
+// 31.8 ms at 1,000.
+type servicePortIndex struct {
+	ports    []services.Port
+	byName   map[string]int32 // first index carrying the name; nil when scanned linearly
+	byNum    map[int32]int32  // first index carrying the number
+	nextName []int32          // next index with the same name, or -1
+	nextNum  []int32          // next index with the same number, or -1
+}
+
+// indexServicePortsOver is the port count past which servicePortIndex builds
+// its maps: below it a linear scan per entry is cheaper than the index costs to
+// build, and it keeps the ordinary Service allocation-free.
+const indexServicePortsOver = 16
+
+func newServicePortIndex(ports []services.Port) servicePortIndex {
+	ix := servicePortIndex{ports: ports}
+	if len(ports) <= indexServicePortsOver {
+		return ix
+	}
+	ix.byName = make(map[string]int32, len(ports))
+	ix.byNum = make(map[int32]int32, len(ports))
+	next := make([]int32, 2*len(ports))
+	ix.nextName, ix.nextNum = next[:len(ports)], next[len(ports):]
+	// Built back to front, so each map holds the FIRST index for its key and
+	// every chain runs in ascending port order — the order the linear scan
+	// yields.
+	for i := len(ports) - 1; i >= 0; i-- {
+		sp := &ports[i]
+		ix.nextName[i] = -1
+		if j, ok := ix.byName[sp.Name]; ok {
+			ix.nextName[i] = j
+		}
+		ix.byName[sp.Name] = int32(i)
+		ix.nextNum[i] = -1
+		if j, ok := ix.byNum[sp.Port]; ok {
+			ix.nextNum[i] = j
+		}
+		ix.byNum[sp.Port] = int32(i)
+	}
+	return ix
+}
+
+// appendMatches appends to dst the indexes of the ports entry names, in
+// ascending order, each once. entry is never empty (listEntries and
+// cli.SplitList drop blank entries), so an unnamed port cannot match by
+// "" == "".
+func (ix *servicePortIndex) appendMatches(dst []int32, entry string) []int32 {
+	n, numeric := parsePort(entry)
+	if ix.byName == nil {
+		for i := range ix.ports {
+			if sp := &ix.ports[i]; sp.Name == entry || (numeric && sp.Port == n) {
+				dst = append(dst, int32(i))
+			}
+		}
+		return dst
+	}
+	a, b := int32(-1), int32(-1)
+	if j, ok := ix.byName[entry]; ok {
+		a = j
+	}
+	if numeric {
+		if j, ok := ix.byNum[n]; ok {
+			b = j
+		}
+	}
+	// Merge the two ascending chains: a port both a name and a number select
+	// is ONE match, exactly as the linear scan's `||` makes it.
+	for a >= 0 || b >= 0 {
+		switch {
+		case b < 0 || (a >= 0 && a < b):
+			dst = append(dst, a)
+			a = ix.nextName[a]
+		case a < 0 || b < a:
+			dst = append(dst, b)
+			b = ix.nextNum[b]
+		default:
+			dst = append(dst, a)
+			a, b = ix.nextName[a], ix.nextNum[b]
+		}
+	}
+	return dst
+}
+
+// targetPodPort translates a service port to the pod port it targets — the ONE
 // answer both callers of a Service port get: the service-annotation path
 // (ServiceTargets) and a ServiceMonitor endpoint naming that port
 // (monitorPodPort). A named targetPort goes through containerPortByName, whose
 // doc carries the first-declaration rule and why it is the whole stack's.
-func TargetPodPort(pod kubemeta.Pod, sp services.Port) (int32, bool) {
+func targetPodPort(pod kubemeta.Pod, sp services.Port) (int32, bool) {
 	if sp.TargetPortName != "" {
 		return containerPortByName(pod, sp.TargetPortName)
 	}
@@ -681,7 +988,19 @@ func TargetPodPort(pod kubemeta.Pod, sp services.Port) (int32, bool) {
 	return sp.Port, true
 }
 
-// splitList delegates to the one comma-list reader both binaries share.
-func splitList(s string) []string {
-	return cli.SplitList(s)
+// listEntries yields exactly cli.SplitList(s)'s entries — split on commas,
+// trimmed, blanks dropped — without materialising the list. The derivation
+// reads a tenant-authored port annotation of up to
+// kubemeta.MaxAnnotationValueBytes per (pod, Service) and usually stops early
+// (at the ceiling, or once every port is selected), so building a ~4,000
+// element slice first was the whole cost of the walk it then abandoned.
+// TestListEntriesMatchesSplitList holds the two readers equal.
+func listEntries(s string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		for part := range strings.SplitSeq(s, ",") {
+			if part = strings.TrimSpace(part); part != "" && !yield(part) {
+				return
+			}
+		}
+	}
 }

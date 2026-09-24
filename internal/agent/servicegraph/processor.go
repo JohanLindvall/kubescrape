@@ -1,7 +1,9 @@
 package servicegraph
 
 import (
+	"context"
 	"log/slog"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -15,11 +17,14 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
-// edgeSink receives every edge the store finishes with: completed pairs and
+// EdgeSink receives every edge the store finishes with: completed pairs and
 // expired halves promoted against a virtual node. It is the ONLY seam between
 // pairing and metrics — metrics.go implements it, and nothing about series,
 // buckets or cardinality is visible on this side of it.
-type edgeSink interface{ Record(Edge) }
+//
+// It is handed the pairing pass's clock with the edge (see Registry.RecordAt):
+// the sink runs under the pairing mutex, and the pass has already read the time.
+type EdgeSink interface{ RecordAt(Edge, time.Time) }
 
 const (
 	attrServiceName = "service.name"
@@ -42,30 +47,24 @@ const (
 	// It stays cheap because the expiry list is expiry-ordered: a batch with
 	// nothing due pays one time comparison whatever the budget says.
 	sweepFloorPerBatch = 32
-	// maxSweepPerBatch caps that pass. It holds the mutex every concurrent
-	// Consume needs, so one huge push must not stall the shard's ingest for the
-	// length of its own span count; the ticker below picks up any remainder.
-	maxSweepPerBatch = 1024
-	// maxSweepBudgetPerBatch bounds the TOTAL a single Consume may spend across
-	// those passes. Without any cap a pathological batch could sweep for as
-	// long as its span count; with the per-hold ceiling as the only bound the
-	// backlog never drains. This is the compromise: many short holds, bounded
-	// in aggregate.
+	// maxSweepBudgetPerBatch bounds the TOTAL a single Consume may spend. Without
+	// any cap a pathological batch could sweep for as long as its span count;
+	// with the per-hold ceiling as the only bound the backlog never drains. This
+	// is the compromise: many short holds, bounded in aggregate; the ticker's
+	// sweep picks up any remainder.
 	maxSweepBudgetPerBatch = 16384
 
-	// sweepBudget is the PER-LOCK-HOLD ceiling of the sweeps driven from outside
-	// Consume — the ticker's (cmd/kubescrape-agent's sweepServiceGraph, cadence
-	// wait/2 clamped to [1s, 30s], i.e. 5s at the default 10s wait) and the
-	// shutdown one. Bounded for the same mutex reason as maxSweepPerBatch, and
-	// bounded ONLY per hold: both spend it in as many passes as the backlog
-	// needs (see sweepDue).
-	//
-	// Those sweeps are NOT what keeps up with ingest; the per-batch pass above
-	// is. They exist for the shard that has gone QUIET, where nothing is
-	// arriving to drive expiry and a client half that could still become a
-	// virtual-node edge would otherwise sit until the next busy batch — or, on a
-	// tier that quiesces overnight, until morning.
-	sweepBudget = 1024
+	// expirePerHold is the PER-LOCK-HOLD ceiling of every expiry pass: Consume's
+	// incremental one, and the sweeps driven from outside it — the ticker's
+	// (cmd/kubescrape-agent's sweepServiceGraph, cadence wait/2 clamped to
+	// [1s, 30s], i.e. 5s at the default 10s wait) and the shutdown one. A pass
+	// holds the mutex every concurrent Consume needs, so neither one huge push
+	// nor a deep backlog may stall the shard's ingest for its whole length;
+	// expireInPasses spends a larger budget in passes of this size with the
+	// mutex released between them. It is a ceiling per HOLD and never a total:
+	// the total is the caller's (the batch's span count for Consume, everything
+	// due for a sweep).
+	expirePerHold = 1024
 )
 
 // databaseAttrs mark a client span as talking to a database. The first two are
@@ -85,12 +84,15 @@ const (
 // the default there is a product decision, not something to "fix" here.
 var databaseAttrs = []string{"db.system", "db.name", "db.system.name", "db.namespace"}
 
+// dbAttrPrefix is the prefix every databaseAttrs entry shares, and namesDatabase's
+// gate.
+const dbAttrPrefix = "db."
+
 // Processor pairs the spans of one shard into edges. It mirrors
-// spanmetrics.Generator's shape — construct, Consume from the concurrent ingest
-// goroutines, injectable clock — but keeps no series of its own: everything it
-// derives leaves through the sink.
+// spanmetrics.Generator's shape — construct, a forward-first Tap, Consume from
+// the concurrent ingest goroutines, injectable clock — but keeps no series of
+// its own: everything it derives leaves through the sink.
 type Processor struct {
-	cfg Config
 	// wait is the RESOLVED pairing window: Config.Wait is a string (it has to
 	// be, to decode from YAML — see Config.Wait), parsed once here.
 	wait time.Duration
@@ -100,7 +102,7 @@ type Processor struct {
 	unnamedWarn logdedupe.Throttle
 
 	store *edgeStore
-	sink  edgeSink
+	sink  EdgeSink
 
 	// dims are the configured dimension keys; clientDims/serverDims are the
 	// same keys with the client_/server_ prefix applied ONCE at construction.
@@ -122,46 +124,39 @@ type Processor struct {
 }
 
 // NewProcessor builds a processor from cfg (the zero value is valid and takes
-// Tempo's defaults). A sink must be wired with SetSink before the first
-// Consume; a processor without one still pairs and counts, it just has nowhere
-// to put the edges.
-func NewProcessor(cfg Config, log *slog.Logger) *Processor {
+// Tempo's defaults) writing its edges to sink. The sink is fixed at
+// construction because it is read on the pairing path under the store's mutex,
+// so there is no ordering contract to keep; a nil sink is legal — the processor
+// still pairs and counts, it just has nowhere to put the edges.
+func NewProcessor(cfg Config, sink EdgeSink, log *slog.Logger) *Processor {
 	if log == nil {
 		log = slog.Default()
 	}
 	cfg = cfg.withDefaults()
-	// An unparseable wait falls back to the default rather than refusing to
-	// pair; Config.Validate is what reports it, and -check-config runs that on
-	// every start (spanmetrics' New makes the same trade for staleAfter).
+	// An invalid wait falls back to the default rather than refusing to pair;
+	// Config.Validate is what reports it, and -check-config runs that on every
+	// start (cumagg.ResolveStaleAfter makes the same trade for staleAfter).
+	// "Invalid", not "unparseable": wait() refuses a zero and a negative too,
+	// both of which parse.
 	wait, err := cfg.wait()
 	if err != nil {
-		log.Warn("service-graph wait is unparseable; using the default", "error", err, "wait", wait)
+		log.Warn("serviceGraph.wait is invalid; using the default pairing window", "error", err, "wait", wait)
 	}
-	p := &Processor{cfg: cfg, wait: wait, log: log, now: time.Now}
+	p := &Processor{wait: wait, log: log, now: time.Now, sink: sink}
 
-	// Deduplicate the configured dimensions. A repeat would resolve twice and
-	// write the same map key twice — harmless but pure waste on the hot path
-	// (spanmetrics learned a sharper version of this lesson: there a duplicate
-	// silently blanked a built-in label).
+	// Drop an empty or repeated configured dimension. A repeat would resolve
+	// twice and write the same map key twice — harmless but pure waste on the
+	// hot path (spanmetrics learned a sharper version of this lesson: there a
+	// duplicate silently blanked a built-in label) — and an empty one would mint
+	// a client_/server_ label pair with no name. The rule is cumagg's, shared
+	// with spanmetrics, which is where the empty-name half had drifted: this
+	// loop refused it while spanmetrics rendered an empty-KEY attribute.
 	//
-	// Dropping is right; doing it SILENTLY is not, which is the other half of
-	// that lesson and the half this loop was missing. Config.Validate does not
-	// look at Dimensions at all, so nothing upstream reports it either: the
-	// operator asked for a label, got no error, and the only trace was the
-	// resolved COUNT on a Debug line — so a list quietly one entry shorter than
-	// it reads is undetectable at Info. One line per rejection, at startup, with
-	// the key that was dropped.
-	seen := make(map[string]bool, len(cfg.Dimensions))
-	for _, d := range cfg.Dimensions {
-		if d == "" {
-			log.Warn("ignoring an empty serviceGraph dimension: there is no attribute to resolve, and it would mint a client_/server_ label pair with no name")
-			continue
-		}
-		if seen[d] {
-			log.Warn("ignoring a repeated serviceGraph dimension", "key", d)
-			continue
-		}
-		seen[d] = true
+	// Dropping is right; doing it SILENTLY is not — the operator asked for a
+	// label and got none. The Warn is configWarnings' (cmd/kubescrape-agent),
+	// from Config.DimensionWarnings, so -check-config says it too; Configure
+	// traces it at Debug only, or every start would print it twice.
+	for _, d := range noBuiltins.Configure(dimensionsField, cfg.Dimensions, log) {
 		p.dims = append(p.dims, d)
 		p.clientDims = append(p.clientDims, "client_"+d)
 		p.serverDims = append(p.serverDims, "server_"+d)
@@ -173,7 +168,7 @@ func NewProcessor(cfg Config, log *slog.Logger) *Processor {
 		p.peerAttrs = append(p.peerAttrs, a)
 		p.peerIsDB = append(p.peerIsDB, strings.HasPrefix(a, "db."))
 	}
-	p.store = newEdgeStore(cfg, wait, p.emit, log)
+	p.store = newEdgeStore(cfg.MaxItems, wait, p.emit, log)
 	log.Debug("service-graph pairing configured",
 		"wait", wait, "maxItems", cfg.MaxItems,
 		"dimensions", len(p.dims), "peerAttributes", len(p.peerAttrs))
@@ -185,20 +180,15 @@ func NewProcessor(cfg Config, log *slog.Logger) *Processor {
 // defaults, so a configured Wait and the sweep that enforces it cannot drift.
 func (p *Processor) Wait() time.Duration { return p.wait }
 
-// SetSink wires the metric writer. Call it before the first Consume: the sink
-// is read on the pairing path under the store's mutex, and swapping it under a
-// live ingest stream would be a data race for no gain (there is exactly one
-// writer per shard, built at startup).
-func (p *Processor) SetSink(s edgeSink) { p.sink = s }
-
-// Stats reports the pairing counters (see Stats). metrics.go publishes them.
+// Stats reports the pairing counters (see Stats, which says which of them
+// cmd/kubescrape-agent publishes through obs.RegisterServiceGraphStats).
 func (p *Processor) Stats() Stats { return p.store.stats() }
 
-func (p *Processor) emit(e Edge) {
+func (p *Processor) emit(e Edge, now time.Time) {
 	if p.sink == nil {
 		return
 	}
-	p.sink.Record(e)
+	p.sink.RecordAt(e, now)
 }
 
 // Consume feeds every span in td into the pairing store. It runs on the
@@ -212,27 +202,14 @@ func (p *Processor) Consume(td ptrace.Traces) {
 	// Incremental expiry on the way in, budgeted by THIS batch's span count —
 	// see sweepFloorPerBatch. SpanCount walks the scopes, not the spans, so it
 	// costs nothing next to the per-span work below.
-	// maxSweepPerBatch is a PER-LOCK-HOLD ceiling, not a total budget: it exists
-	// so one huge push cannot stall every concurrent Consume for the length of
-	// its own span count. Spending only that much of a larger budget made the
-	// batch scaling a lie — the budget IS the batch's span count, and a batch
-	// carrying more than 1024 unpairable half-edges then expired fewer than it
-	// added, so occupancy climbed past the honest rate x wait working set,
-	// pinned at MaxItems, and the store started refusing arriving spans.
-	// Spend it in ceiling-sized passes, releasing the mutex between them — and
-	// STOP at the first short pass: expire returns how many it took, and a
-	// short pass means nothing more is due at `now` (SweepAll's idiom).
-	// Ignoring the return spent the full budget in up-to-16 lock
-	// acquire/release cycles of the pairing mutex every Consume, even with
-	// nothing due — pure contention against every concurrent Consume and
-	// Record.
-	for budget := min(td.SpanCount()+sweepFloorPerBatch, maxSweepBudgetPerBatch); budget > 0; {
-		n := min(budget, maxSweepPerBatch)
-		if p.store.expire(now, n) < n {
-			break
-		}
-		budget -= n
-	}
+	//
+	// The whole budget is spent, in expirePerHold-sized passes. Spending only
+	// one pass's worth of it made the batch scaling a lie — the budget IS the
+	// batch's span count, and a batch carrying more than 1024 unpairable
+	// half-edges then expired fewer than it added, so occupancy climbed past the
+	// honest rate x wait working set, pinned at MaxItems, and the store started
+	// refusing arriving spans.
+	p.store.expireInPasses(now, min(td.SpanCount()+sweepFloorPerBatch, maxSweepBudgetPerBatch))
 
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
@@ -263,16 +240,7 @@ func (p *Processor) Consume(td ptrace.Traces) {
 			// computes against kubescrape_service_graph_completed_total came
 			// out inflated several-fold by a fraction that was never going to
 			// be an edge. ONE classifier for both arms, so they cannot drift.
-			n := 0
-			for j := 0; j < sss.Len(); j++ {
-				spans := sss.At(j).Spans()
-				for k := 0; k < spans.Len(); k++ {
-					if _, _, ok := spanSide(spans.At(k).Kind()); ok {
-						n++
-					}
-				}
-			}
-			if n > 0 {
+			if n := edgeCapableSpans(sss); n > 0 {
 				obs.ServiceGraphUnnamed.Add(float64(n))
 				p.reportUnnamed(rs.Resource().Attributes(), n)
 			}
@@ -285,6 +253,48 @@ func (p *Processor) Consume(td ptrace.Traces) {
 			}
 		}
 	}
+}
+
+// Tap returns a TracesExporter that forwards each batch to inner FIRST and feeds
+// it to Consume only once that succeeded — spanmetrics.Generator.Tap's shape,
+// and for the same reason: a failed export surfaces to the sender as retryable,
+// and the re-pushed batch would otherwise pair twice, so every outage or
+// back-pressure window would permanently inflate the cumulative edge counters.
+// (A retry after a lost ack still double-counts; that is the unavoidable
+// at-least-once residue.) It is the top of the trace tier's owner chain
+// (cmd/kubescrape-agent's buildOwnerChain), and Consume runs on the concurrent
+// receiver goroutines, which the pairing store's mutex is there for.
+func (p *Processor) Tap(inner TracesExporter) TracesExporter {
+	return &pairTap{proc: p, inner: inner}
+}
+
+type pairTap struct {
+	proc  *Processor
+	inner TracesExporter
+}
+
+func (t *pairTap) ExportTraces(ctx context.Context, td ptrace.Traces) error {
+	if err := t.inner.ExportTraces(ctx, td); err != nil {
+		return err
+	}
+	t.proc.Consume(td)
+	return nil
+}
+
+// edgeCapableSpans counts the spans pairing would have used — the kinds spanSide
+// accepts — which is the unit kubescrape_service_graph_unnamed_spans_total is
+// in (see Consume's unnamed-resource arm).
+func edgeCapableSpans(sss ptrace.ScopeSpansSlice) int {
+	n := 0
+	for j := 0; j < sss.Len(); j++ {
+		spans := sss.At(j).Spans()
+		for k := 0; k < spans.Len(); k++ {
+			if _, _, ok := spanSide(spans.At(k).Kind()); ok {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // unnamedHints are the attributes a throttled unnamed-resource warning quotes
@@ -342,17 +352,23 @@ func (p *Processor) reportUnnamed(attrs pcommon.Map, spans int) {
 // Everything due, not one budget's worth of it. The cadence its caller picks is
 // a PROMISE about promotion delay — sweepInterval takes wait/2 so a promotable
 // half-edge reaches the graph within 1.5x wait — and one bounded pass per tick
-// keeps that promise only while fewer than sweepBudget halves are pending. Past
-// that the sweep is a RATE (sweepBudget per tick), so the delay grows with the
+// keeps that promise only while fewer than expirePerHold halves are pending. Past
+// that the sweep is a RATE (expirePerHold per tick), so the delay grows with the
 // backlog instead of being bounded by it. The arithmetic at the defaults:
-// MaxItems 10,000 over sweepBudget 1,024 is ten ticks, and at DefaultWait 10s
+// MaxItems 10,000 over expirePerHold 1,024 is ten ticks, and at DefaultWait 10s
 // the cadence is 5s, so the LAST due half-edge waited 45s past its deadline
 // against the 15s the cadence promises — and an operator raising MaxItems made
 // that worse without touching anything named like a deadline. The quiet shard is
 // the ONLY case this entry point exists for, so nothing else corrects it.
 //
+// These sweeps are NOT what keeps up with ingest; Consume's per-batch pass is.
+// They exist for the shard that has gone QUIET, where nothing is arriving to
+// drive expiry and a client half that could still become a virtual-node edge
+// would otherwise sit until the next busy batch — or, on a tier that quiesces
+// overnight, until morning.
+//
 // What stays bounded is the LOCK HOLD: sweepDue spends the backlog in
-// sweepBudget-sized passes, releasing the pairing mutex between them, because
+// expirePerHold-sized passes, releasing the pairing mutex between them, because
 // that mutex is the one every concurrent Consume needs and the one the sink
 // runs under (see metrics.go's render strategy).
 func (p *Processor) Sweep() { p.sweepDue(p.now()) }
@@ -367,21 +383,13 @@ func (p *Processor) Sweep() { p.sweepDue(p.now()) }
 // tier, which the shutdown path claims to emit.
 func (p *Processor) SweepAll() { p.sweepDue(p.now()) }
 
-// sweepDue retires everything due at now, in passes of at most sweepBudget with
-// the pairing mutex released between them.
+// sweepDue retires everything due at now: expireInPasses with no total budget.
 //
-// The loop cannot spin: expire reports how many it retired, a short pass means
-// nothing more is due at THIS now, and nothing inserted while it runs can become
-// due at that same now (an entry is stamped its inserter's clock + wait, and
-// wait is always positive — Config.wait parses it under config.Positive and
-// falls back to DefaultWait).
-func (p *Processor) sweepDue(now time.Time) {
-	for {
-		if p.store.expire(now, sweepBudget) < sweepBudget {
-			return
-		}
-	}
-}
+// That cannot spin: a short pass means nothing more is due at THIS now, and
+// nothing inserted while it runs can become due at that same now (an entry is
+// stamped its inserter's clock + wait, and wait is always positive —
+// Config.wait parses it under config.Positive and falls back to DefaultWait).
+func (p *Processor) sweepDue(now time.Time) { p.store.expireInPasses(now, math.MaxInt) }
 
 // spanSide classifies a span kind into the half of an edge it can be, and
 // whether the kind ALONE already settles the connection type. ok is false for
@@ -398,7 +406,9 @@ func spanSide(k ptrace.SpanKind) (side edgeSide, conn ConnectionType, ok bool) {
 	case ptrace.SpanKindProducer:
 		// A producer is the client half of an asynchronous hop, and the pair
 		// being a messaging one is known from the KIND alone — the consumer
-		// says the same thing, so whichever arrives first classifies the edge.
+		// says the same thing, so either half classifies the edge. (A db.*
+		// attribute on the producer overrides it below, and pendingEdge.merge
+		// lets that database win whichever half arrives first.)
 		return sideClient, ConnectionMessagingSystem, true
 	case ptrace.SpanKindServer:
 		return sideServer, ConnectionUnknown, true
@@ -483,7 +493,10 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 		if v == "" {
 			continue
 		}
-		h.peer = cumagg.Retain(v)
+		// Not cut here: the pairing store cuts it WITH A COPY only if it keeps
+		// this half (edgeStore.insert) — the peer names a virtual node only
+		// once a half expires, so the half that completes a pair never needs it.
+		h.peer = v
 		if p.peerIsDB[i] {
 			h.connection = ConnectionDatabase
 		}
@@ -537,17 +550,20 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 		// Walked in the CONFIGURED order, which is what makes the edge's
 		// dimension sequence canonical without anyone sorting it: see joinDims.
 		for i, d := range p.dims {
-			v := cumagg.AttrStr(spanAttrs, d)
-			if v == "" {
-				v = cumagg.AttrStr(resAttrs, d) // fall back to the resource
-			}
+			// Span first, the resource as the fallback: cumagg.DimValue, the
+			// precedence spanmetrics resolves its dimensions by too.
+			v := cumagg.DimStr(spanAttrs, resAttrs, d)
 			if v == "" {
 				// Absent dimensions are simply not carried; the metric layer
 				// renders a missing key as the empty label value, so recording
 				// "" here would only cost a map entry per edge.
 				continue
 			}
-			ds = append(ds, EdgeDimension{Name: names[i], Value: cumagg.Retain(v)})
+			// Uncut, for the reason the peer is: the store cuts what it KEEPS
+			// (pendingEdge.setDims), and the sink cuts what reaches a series,
+			// so a clone here allocated per span for the completing half,
+			// whose values are dropped the moment the edge is emitted.
+			ds = append(ds, EdgeDimension{Name: names[i], Value: v})
 		}
 		dims = ds
 	}
@@ -562,7 +578,7 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 // Get calls. A pcommon.Map is a SLICE and Get is a linear scan of it, so the
 // four-Get shape walked a realistically instrumented span — otelhttp emits
 // fourteen attributes — four times over, and did it for every CLIENT and
-// PRODUCER span the tier receives. The prefix check is three byte compares
+// PRODUCER span the tier receives. The prefix check is a three-byte compare
 // against a key that, on a span that names no database, never matches, so the
 // full comparison against databaseAttrs is reached for essentially no key.
 //
@@ -570,19 +586,17 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 // agent/logscrub's prefilters must stay supersets of their regexes: a member
 // spelled without the prefix would be silently unreachable, and the failure —
 // a database edge classified as a plain service call — looks like a graph that
-// is merely uninformative. TestDatabaseAttrsAllCarryThePrefix is the alarm.
+// is merely uninformative. The gate is spelled with dbAttrPrefix itself, not
+// with its bytes unrolled, so TestDatabaseAttrsAllCarryThePrefix pins the gate
+// that runs; TestEveryDatabaseAttrClassifiesAlone pins it end to end.
 func namesDatabase(attrs pcommon.Map) bool {
 	for k := range attrs.All() {
-		if len(k) > len(dbAttrPrefix) && k[0] == 'd' && k[1] == 'b' && k[2] == '.' &&
-			slices.Contains(databaseAttrs, k) {
+		if strings.HasPrefix(k, dbAttrPrefix) && slices.Contains(databaseAttrs, k) {
 			return true
 		}
 	}
 	return false
 }
-
-// dbAttrPrefix is the prefix every databaseAttrs entry shares; see namesDatabase.
-const dbAttrPrefix = "db."
 
 // --- helpers ---
 //

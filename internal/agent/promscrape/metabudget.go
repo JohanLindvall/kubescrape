@@ -34,10 +34,12 @@ package promscrape
 // precisely the refused case, reached by the clock instead of by an RST. The
 // object keeps its label identity, the scrape exports, and
 // kubescrape_scrape_metadata_budget_exhausted_total says the allowance bound.
-// That counter is not redundant with the two that already exist: an object
-// never asked about cannot move kubescrape_metadata_requests_total, and
-// kubescrape_summary_unresolved_total covers only the summary pipeline, so
-// without it a cadvisor scrape shedding attribution moves nothing at all.
+// That counter is not redundant with the ones that already exist: an object
+// never asked about cannot move kubescrape_metadata_requests_total, and the
+// per-object unresolved counters (kubescrape_cadvisor_unresolved_total,
+// kubescrape_summary_unresolved_total) say THAT an object went unplaced, not
+// that the allowance is why — a refusing service and a spent allowance move
+// them identically, and a splitter's shed objects move neither.
 //
 // Why an allowance rather than giving the export a context of its own: cycle()
 // waits for every scrape it starts and Run only ticks after cycle returns, so a
@@ -48,6 +50,7 @@ package promscrape
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -70,8 +73,26 @@ const metaBudgetDivisor = 2
 // metaBudgetWarnEvery throttles the exhausted-allowance warning. Past the
 // allowance EVERY remaining object of the scrape takes that path, and the
 // diagnosis is per outage, not per object — otlpingest's lookupBudgetWarnEvery,
-// for the same reason.
+// for the same reason. The window is per PIPELINE (metaBudgetSlot).
 const metaBudgetWarnEvery = time.Minute
+
+// metaBudgetPipelines are the pipelines whose scrapes carry a metadata
+// allowance (every caller of scrapeContext); /metrics resolves nothing and has
+// none. Each owns one Scraper.metaBudgetWarn gate, and the extra last slot is
+// the fallback for a pipeline added to scrapeContext without being listed
+// here — shared, but never a panic.
+var metaBudgetPipelines = [...]string{pipelineTargets, pipelineCadvisor, pipelineSummary}
+
+// metaBudgetSlot is the index of pipeline's warning gate in
+// Scraper.metaBudgetWarn.
+func metaBudgetSlot(pipeline string) int {
+	for i, p := range metaBudgetPipelines {
+		if p == pipeline {
+			return i
+		}
+	}
+	return len(metaBudgetPipelines)
+}
 
 // metaBudget is one scrape's metadata allowance. It rides the CONTEXT rather
 // than the Scraper (which is shared by every concurrently running scrape) the
@@ -99,9 +120,33 @@ type metaBudget struct {
 	// spent" says a partition happened, "and 214 objects went out unjoinable"
 	// says how much of this node's cadvisor and summary data an operator should
 	// not trust to join. Nothing else can report it — a lookup that is never
-	// ISSUED moves no request counter, and only the summary pipeline tallies
-	// its unplaced objects.
+	// ISSUED moves no request counter, and the cadvisor and summary unresolved
+	// counters tally unplaced objects without saying which of them the
+	// allowance cost (a splitter's are tallied nowhere).
 	shed atomic.Int64
+	// shedKeys dedupes shed across the whole SCRAPE, not just one resolution:
+	// a batcher clears its per-chunk resource map on every flush and a refused
+	// lookup caches nothing, so an object present in several chunks reaches
+	// the shed path once per chunk. Allocated lazily on the first shed and
+	// touched only on that (cold) path; shedMu because a splitter-bearing
+	// scrape may resolve on more than one goroutine.
+	shedMu   sync.Mutex
+	shedKeys map[string]struct{}
+}
+
+// firstShed reports whether key names an object this scrape has not shed yet,
+// recording it.
+func (b *metaBudget) firstShed(key string) bool {
+	b.shedMu.Lock()
+	defer b.shedMu.Unlock()
+	if _, seen := b.shedKeys[key]; seen {
+		return false
+	}
+	if b.shedKeys == nil {
+		b.shedKeys = make(map[string]struct{})
+	}
+	b.shedKeys[key] = struct{}{}
+	return true
 }
 
 type metaBudgetKey struct{}
@@ -134,9 +179,10 @@ func (b *metaBudget) remaining() time.Duration {
 }
 
 // scrapeContext is the context one scrape runs in: the timeout bounding the
-// whole scrape, plus the metadata allowance carved out of it. Every scrape
-// entry point goes through here, so the three of them cannot drift on which
-// bound applies to what.
+// whole scrape, plus the metadata allowance carved out of it. The three
+// ENRICHED entry points (targets, cadvisor, summary) go through here, so they
+// cannot drift on which bound applies to what; scrapeNodeMetrics resolves
+// nothing and takes a plain timeout.
 // The returned cancel also REPORTS a spent allowance, so every scrape entry
 // point gets the line from its existing `defer cancel()` and none can forget
 // it.
@@ -188,12 +234,18 @@ func (s *Scraper) metaLookup(ctx context.Context, obj *objectShed) (context.Cont
 		// per LOOKUP reported `unattributed=400` for the 200 objects a 200-pod
 		// node actually shed — and the inflation factor is between 1x and 2x
 		// and not derivable from the line, since rows without a vouched
-		// container id and every summary object charge once.
-		if obj == nil || !obj.charged {
+		// container id and every summary object charge once. The flag covers
+		// the two lookups of ONE resolution for free; the scrape-wide key set
+		// covers the same object resolved again in a later chunk, which was
+		// the same inflation by the chunk count instead.
+		switch {
+		case obj == nil:
 			b.shed.Add(1)
-		}
-		if obj != nil {
+		case !obj.charged:
 			obj.charged = true
+			if b.firstShed(obj.key()) {
+				b.shed.Add(1)
+			}
 		}
 		return ctx, func() {}, false
 	}
@@ -212,8 +264,9 @@ func (s *Scraper) metaLookup(ctx context.Context, obj *objectShed) (context.Cont
 // final, and the count is most of what the line is for.
 //
 // The counters are the ongoing signal — kubescrape_scrape_metadata_budget_
-// exhausted_total counts the scrapes, and on the summary pipeline the objects
-// also land in kubescrape_summary_unresolved_total — so what this adds is WHICH
+// exhausted_total counts the scrapes, and on the cadvisor and summary
+// pipelines the objects also land in kubescrape_cadvisor_unresolved_total and
+// kubescrape_summary_unresolved_total — so what this adds is WHICH
 // pipeline is shedding, HOW MANY objects it shed, and the BUDGET the allowance
 // was cut from, which together are what an operator needs to decide whether to
 // raise the scrape timeout or go and fix the metadata service.
@@ -227,7 +280,7 @@ func (s *Scraper) metaLookup(ctx context.Context, obj *objectShed) (context.Cont
 // the timeout to 120s and moved the allowance not at all.
 func (s *Scraper) reportMetaBudget(ctx context.Context) {
 	b := metaBudgetFrom(ctx)
-	if b == nil || !b.exhausted.Load() || !s.metaBudgetWarn.Allow(metaBudgetWarnEvery) {
+	if b == nil || !b.exhausted.Load() || !s.metaBudgetWarn[metaBudgetSlot(b.pipeline)].Allow(metaBudgetWarnEvery) {
 		return
 	}
 	s.log.Warn("a scrape spent its whole metadata allowance; the objects it had left are exported with their label identity, and the scrape itself still ships",
@@ -238,6 +291,25 @@ func (s *Scraper) reportMetaBudget(ctx context.Context) {
 
 // objectShed makes the shed count per OBJECT rather than per LOOKUP: one
 // resolution may issue two (the container id, then the pod), and both are the
-// same object going out unjoinable. Declared on the caller's stack, so this
-// costs no allocation on the enriched path.
-type objectShed struct{ charged bool }
+// same object going out unjoinable. It carries the object's identity as the
+// resolution was asked it, so a later chunk resolving the same object again is
+// recognised too (metaBudget.shedKeys). Declared on the caller's stack and
+// holding only string headers, so this costs no allocation on the enriched
+// path; key() is built only on the shed path.
+//
+// The identity is the OBJECT's, not a lookup's cache key: keyed by lookup, a
+// pod-level row whose pod lookup a container row of that pod had already shed
+// would not be counted, although it is a different resource going out
+// unjoinable.
+type objectShed struct {
+	containerID, namespace, pod, uid, container string
+	charged                                     bool
+}
+
+func (o *objectShed) key() string {
+	var b []byte
+	for _, part := range [...]string{o.containerID, o.namespace, o.pod, o.uid, o.container} {
+		b = appendLP(b, part)
+	}
+	return string(b)
+}

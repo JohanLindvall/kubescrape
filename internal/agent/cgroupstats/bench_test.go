@@ -16,9 +16,9 @@ import (
 // own previous read, so a benchmark or a budget test has to be able to move it.
 func benchSampler(tb testing.TB, n int) (s *Sampler, clock *time.Time, done func()) {
 	tb.Helper()
-	root := newRootTB(tb)
+	root := newRoot(tb)
 	for i := range n {
-		makeContainerTB(tb, systemdContainerDir(root, i, hexID(i)), uint64(i)*1000, 1<<20, 1<<18)
+		makeContainer(tb, systemdContainerDir(root, i, hexID(i)), uint64(i)*1000, 1<<20, 1<<18)
 	}
 	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
 	s, err := New(Config{
@@ -35,33 +35,6 @@ func benchSampler(tb testing.TB, n int) (s *Sampler, clock *time.Time, done func
 		tb.Fatalf("tracked %d containers, want %d", got, n)
 	}
 	return s, &now, s.closeAll
-}
-
-// The testing.TB flavours of the tree helpers, so the benchmark can build one
-// too (the helpers in tree_test.go take *testing.T because every other caller
-// does).
-func newRootTB(tb testing.TB) string {
-	tb.Helper()
-	root := tb.TempDir()
-	if err := os.WriteFile(root+"/"+controllersFile, []byte("cpu memory pids\n"), 0o644); err != nil {
-		tb.Fatal(err)
-	}
-	return root
-}
-
-func makeContainerTB(tb testing.TB, dir string, usageUsec, memCurrent, inactiveFile uint64) {
-	tb.Helper()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		tb.Fatal(err)
-	}
-	write := func(name, content string) {
-		if err := os.WriteFile(dir+"/"+name, []byte(content), 0o644); err != nil {
-			tb.Fatal(err)
-		}
-	}
-	write(fileCPUStat, cpuStat(usageUsec))
-	write(fileMemCurrent, fmtUint(memCurrent))
-	write(fileMemStat, memStat(inactiveFile))
 }
 
 // TestSampleAllocationBudget is the ENFORCEMENT of the read path's zero-alloc
@@ -97,7 +70,7 @@ func TestReadIsAllocationFree(t *testing.T) {
 		t.Skip("the race detector changes escape analysis and adds bookkeeping allocations")
 	}
 	dir := t.TempDir()
-	makeContainerTB(t, dir, 123456, 1<<20, 1<<18)
+	makeContainer(t, dir, 123456, 1<<20, 1<<18)
 	fds, err := openCgroupFDs(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -146,7 +119,7 @@ func BenchmarkSample(b *testing.B) {
 // sample.
 func BenchmarkReadField(b *testing.B) {
 	dir := b.TempDir()
-	makeContainerTB(b, dir, 123456, 1<<20, 1<<18)
+	makeContainer(b, dir, 123456, 1<<20, 1<<18)
 	fds, err := openCgroupFDs(dir)
 	if err != nil {
 		b.Fatal(err)
@@ -161,9 +134,13 @@ func BenchmarkReadField(b *testing.B) {
 	}
 }
 
-// BenchmarkDiscover covers the periodic walk. It is not on the per-second path,
-// but it runs on the same goroutine, so a pathological cost there stalls
-// sampling.
+// BenchmarkDiscover covers the periodic walk. It is not on the per-second path:
+// it runs on the discovery goroutine (discoverLoop), never on the sampler's, so
+// its cost mostly delays picking up new containers, once per
+// -cgroup-stats-discover-interval. The exception is the phases that take the
+// mutex every sweep also takes — reconcile and track — so a pathological cost
+// THERE still delays a sweep, which minElapsed then keeps from being read as
+// a burst.
 func BenchmarkDiscover(b *testing.B) {
 	s, clock, done := benchSampler(b, 100)
 	defer done()

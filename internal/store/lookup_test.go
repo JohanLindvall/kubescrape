@@ -80,14 +80,14 @@ func TestGetPodByName(t *testing.T) {
 
 	// Expiry of the old tombstone must not evict the replacement.
 	clk.Advance(2 * time.Minute)
-	s.Sweep()
+	s.sweep()
 	if np, ok = s.GetPodByName("default", "pod1"); !ok || np.Pod.UID != "uid2" {
 		t.Fatalf("replacement gone after sweep: ok=%v", ok)
 	}
 
 	s.DeletePod("uid2")
 	clk.Advance(2 * time.Minute)
-	s.Sweep()
+	s.sweep()
 	if _, ok := s.GetPodByName("default", "pod1"); ok {
 		t.Fatal("expired tombstone still resolvable")
 	}
@@ -112,7 +112,7 @@ func TestGetPodByUID(t *testing.T) {
 		t.Fatal("deleted pod not resolvable within TTL")
 	}
 	clk.Advance(2 * time.Minute)
-	s.Sweep()
+	s.sweep()
 	if _, ok := s.GetPodByUID("uid1"); ok {
 		t.Fatal("expired pod still resolvable by uid")
 	}

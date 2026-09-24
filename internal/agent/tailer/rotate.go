@@ -1,18 +1,15 @@
 package tailer
 
-// Rotation, rewind and recovery: closing the tail into segments, replaying
-// incomplete segments (live and after a restart), draining vanished files,
-// and releasing settled ones.
+// Rotation and rewind: draining a rotated-away inode, closing the tail into a
+// segment (carrying a straddling multi-line group across the boundary), the
+// hop save, and rewinding a file to its committed offset after a failed
+// export. Replaying the recorded segments is replay.go's; draining and
+// releasing vanished files is gone.go's.
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
-	"os"
-	"path/filepath"
-	"slices"
-	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -178,11 +175,13 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed, drained bool) {
 			// `drained` — an UNFINISHED drain (a mid-drain flush failure, or
 			// the per-drain cap) does not abandon the old inode: the aborted
 			// arm below records it as an OPEN-ENDED segment whose owed range
-			// starts at committed, so this fragment is re-read and completed by
-			// the replay. Counting it here reported a loss for a line that is
-			// then delivered — a false positive on the tailer's own loss
-			// signal, which is worse than useless because it is
-			// indistinguishable from the real thing.
+			// starts at committed, so the replay re-reads this fragment. It
+			// completes it when the line continues in the file, and counts it
+			// (replaySegment's open-ended completion) when the file ends there.
+			// Counting it here too reported a loss for a line that may then be
+			// delivered — a false positive on the tailer's own loss signal,
+			// which is worse than useless because it is indistinguishable from
+			// the real thing.
 			//
 			// !f.discarding is the same gate drainGone's structurally
 			// identical block applies: while discarding, these bytes are the
@@ -240,7 +239,11 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed, drained bool) {
 	// live and feedSegments must replay them. Forcing wasFed false is what
 	// arms that replay.
 	aborted := renamed && !drained
-	wasFed := (f.segmentsFed || len(f.segments) == 0) && !aborted
+	// prevFed is the captured value BEFORE the abort overrides it, and nPrev
+	// how many segments it speaks for (this rotation only ever APPENDS, and
+	// neither stopPipeline nor newPipeline below touches the list).
+	prevFed, nPrev := f.segmentsFed || len(f.segments) == 0, len(f.segments)
+	wasFed := prevFed && !aborted
 	hopAdded := false
 	if aborted {
 		// Record the un-drained inode as an OPEN-ENDED segment (to = -1) and
@@ -268,7 +271,7 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed, drained bool) {
 		// committed, as it must. The CAP purged nothing: [committed, fedEnd)
 		// is in the unflushed batch, so resuming at committed would deliver
 		// every one of those records twice for no reason. A later rewind
-		// zeroes fedTo (ledger.reset) and the replay falls back to committed,
+		// zeroes fedTo (purgeSegmentFeeds) and the replay falls back to committed,
 		// which is exactly the contract fedTo already carries.
 		f.segments = append(f.segments, keep(&segment{
 			id: f.tail, inode: f.inode, fp: f.fp, committed: f.committed,
@@ -308,739 +311,112 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed, drained bool) {
 	_, buffered := f.watermark()
 	carry := renamed && buffered && wasFed
 	if !carry {
-		// ledger.reset zeroes every segment's fedTo because it is written for
-		// the PURGE case (rewind): the lines it names were discarded unemitted,
-		// so the replay must start over from `committed`. stopPipeline does the
-		// opposite — it DRAINS, emitting the buffered lines into the batch — so
-		// a budget-cut replay's already-fed prefix is still live and re-reading
-		// it delivers every one of those records twice, until the batch flushes.
-		// Carry the frontier across the rebuild — the discard frontier
-		// (skipTo/discarding) with it: it describes DISK content (an oversized
-		// line's already-dropped prefix), which the drain does not invalidate,
-		// and dropping it merely re-reads and re-discards the same bytes.
+		// DRAIN the stages into the batch, then rebuild them WITHOUT the purge
+		// newPipeline performs. That purge (purgeSegmentFeeds) is written for a
+		// REWIND, whose lines were discarded unemitted, so the replay must
+		// start over from `committed`: it zeroes every segment's fedTo and
+		// discard frontier and marks it unfed. stopPipeline does the opposite —
+		// it EMITS the buffered lines into the batch — so a budget-cut
+		// replay's already-fed prefix is still live, and re-reading it
+		// delivered every one of those records twice until the batch flushed;
+		// the discard frontier (skipTo/discarding) describes DISK content (an
+		// oversized line's already-dropped prefix), which the drain does not
+		// invalidate either. This used to call newPipeline and snapshot-and-
+		// restore the frontiers around it.
 		//
-		// Unconditionally, unlike the `fed` re-stamp below: the drain preserves
-		// the lines whatever wasFed says, and where wasFed is false because a
-		// rewind already purged, the value carried is the zero that purge left.
-		type frontier struct {
-			fedTo, skipTo int64
-			discarding    bool
-		}
-		frontiers := make([]frontier, len(f.segments))
-		for i, sg := range f.segments {
-			frontiers[i] = frontier{sg.fedTo, sg.skipTo, sg.discarding}
-		}
-		t.stopPipeline(ctx, f)
-		t.newPipeline(f)
 		// The segment list is NOT reset here: earlier segments' lines are
 		// still uncommitted, and a second rotation (or a truncation) during a
 		// collector outage does not make them recoverable any other way.
-		// Segments retire individually in commitBatch. Neither call above
-		// touches the list, so the indexes still line up.
-		for i, sg := range f.segments {
-			sg.fedTo, sg.skipTo, sg.discarding = frontiers[i].fedTo, frontiers[i].skipTo, frontiers[i].discarding
-		}
+		// Segments retire individually in commitBatch.
+		t.stopPipeline(ctx, f)
+		t.rebuildPipeline(f)
 	}
-	// newPipeline's reset cleared segmentsFed; that reset exists for REWINDS
-	// (where the batch was purged). A rotation purges nothing: entries built
-	// from fed segments are still in the unflushed batch, and re-feeding them
-	// would duplicate every one of those records on a plain truncation.
+	// A rotation purges nothing: entries built from fed segments are still in
+	// the unflushed batch, and re-feeding them would duplicate every one of
+	// those records on a plain truncation. So the fed state is the captured
+	// wasFed — for the file, and identically for EVERY segment, the one
+	// recorded above included (born `fed: true`, it ends unfed whenever wasFed
+	// is false). That per-segment answer is exactly what the purge-then-
+	// restore this replaced left behind, and the fed flags are load-bearing:
+	// proposeCandidates reads them for traversal claims.
 	f.segmentsFed = wasFed
-	if wasFed {
-		// Same restoration, per segment: a rotation purges nothing, so the
-		// lines that were live before it still are.
-		for _, sg := range f.segments {
+	for _, sg := range f.segments {
+		sg.fed = wasFed
+	}
+	if prevFed && aborted {
+		// The abort forced wasFed false so the NEW open-ended segment is
+		// replayed, but it says nothing about the OLDER segments: when the
+		// drain stopped at the per-drain CAP nothing was purged, and their
+		// lines are still live in the unflushed batch. (A flush failure
+		// rewinds first, which clears segmentsFed, so prevFed is false there
+		// and this arm does not run.) Restoring `fed` alone is not enough:
+		// feedSegments gates on the file-level flag, and replaySegment resumes
+		// from max(committed, fedTo, skipTo) — a rotation-recorded segment's
+		// fedTo is 0, so the replay re-fed every one of those lines and each
+		// was delivered twice. fedTo = to makes their replay a no-op; a later
+		// rewind still zeroes both through purgeSegmentFeeds, so the purge
+		// semantics are unchanged.
+		for _, sg := range f.segments[:nPrev] {
 			sg.fed = true
+			if sg.to >= 0 {
+				sg.fedTo = max(sg.fedTo, sg.to)
+			}
 		}
 	}
-	f.newTail()
-	// A new incarnation: any goneEnd from an earlier one no longer describes
-	// this file (see the resurrect path in sweep).
-	f.goneEnd = 0
-	f.goneDrained = false
-	f.inode = 0
-	f.fp = fingerprint{}
-	f.committed = 0
-	f.restartAt(0)
+	// A new incarnation (beginIncarnation: fresh tail id, offsets at zero, and
+	// any goneEnd from an earlier one no longer describes this file — see the
+	// resurrect path in sweep). The identity is cleared for the next
+	// ensureOpen to adopt; the withheld highs are KEPT, because they name the
+	// segment recorded above.
+	f.beginIncarnation(0)
+	f.inode, f.fp = 0, fingerprint{}
 	// The next ensureOpen's watchTarget re-derives the symlink target and
 	// switches watches acquire-before-release, so no eager unwatch here — an
 	// unwatched hole between reopen and that sweep would lose a second
 	// rotation happening inside one poll interval.
 	f.dirty = true
-	if hopAdded && t.checkpointing() {
-		// The hop must reach disk long before the 10s checkpoint cadence: a
-		// crash in that window leaves the on-disk checkpoint with no record of
-		// the rotated inode, and the tail is then lost outright rather than
-		// merely re-read.
-		//
-		// What actually has to hold is narrower than "persist every hop
-		// synchronously", and this is the whole reason a save per SWEEP still
-		// closes the window: initFile reconstructs the ONE hop a stale
-		// checkpoint implies — it sees the path naming a different incarnation
-		// than the stored identity and synthesizes an open-ended segment for it
-		// — so a single unpersisted hop is recoverable from the previous save.
-		// It is the SECOND hop of the same file that has no route back, because
-		// nothing on disk names the intermediate inode. So the invariant is "one
-		// file never carries two unsaved hops", enforced here, and the sweep's
-		// closing save (below, keyed on hopsUnsaved) bounds the exposure of the
-		// first one to the rest of that sweep.
-		//
-		// The cost this buys back is not marginal: a save marshals the WHOLE
-		// positions document and fsyncs it twice (file, then directory) —
-		// ~25ms and ~3.4MB of garbage at 5000 files — on the single sweep
-		// goroutine, and it ran once per hop. A storm in which 50 files rotate
-		// in one sweep paid 50 of them, precisely during the event the
-		// immediate save exists to survive.
-		if f.hopUnsaved {
-			t.saveCheckpoints()
-		}
-		f.hopUnsaved, t.hopsUnsaved = true, true
+	if hopAdded {
+		t.noteHop(f)
 	}
 }
 
-// feedSegments re-reads the incomplete segments' owed ranges and feeds them,
-// oldest first, into the fresh pipeline so a straddling group reconstructs
-// before the new inode's continuation is consumed. Each segment's lines are
-// fed UNDER ITS OWN id (l.feeding), so their items and entries carry the
-// segment-qualified positions that route their commits back to the segment's
-// record. A segment whose rotated file can no longer be found (already
-// deleted/compressed by the runtime) is skipped and counted — it is genuinely
-// gone from disk.
-func (t *Tailer) feedSegments(ctx context.Context, f *file) {
-	if len(f.segments) == 0 || f.segmentsFed {
-		return
-	}
-	// Iterate a SNAPSHOT: replaySegment retires the segment it is replaying
-	// when the source is unrecoverable (openSegmentSource's findRotated miss,
-	// or nothing recoverable was fed), and retire compacts f.segments with
-	// slices.DeleteFunc — which NILS the vacated tail of the backing array.
-	// Ranging over the live slice would hand a nil *segment to a later
-	// iteration and panic on sg.id, killing the tailer's single sweep
-	// goroutine and with it log collection for the whole node. Only the
-	// segment being replayed is ever retired, so the snapshot needs no
-	// membership re-check.
-	allDone := true
-	for _, sg := range slices.Clone(f.segments) {
-		f.feeding = sg.id
-		gen, progressBefore := f.rewindGen, max(sg.fedTo, sg.skipTo)
-		if t.replaySegment(ctx, f, sg) {
-			sg.stalledSince = time.Time{}
-			continue
-		}
-		allDone = false
-		t.chargeStall(f, sg, gen, progressBefore)
-		// Stop the pass at the FIRST unfinished segment: segments are
-		// oldest-first, so feeding a later one's lines now would put them
-		// into the pipeline AHEAD of this one's still-owed remainder —
-		// the same out-of-order feed the segmentsFed gate exists to
-		// prevent, one level down. (A rewind mid-replay purged the
-		// pipeline outright; continuing was equally wrong there.) A segment
-		// just given up on is gone from the list, so the next sweep starts at
-		// what is now the head.
-		break
-	}
-	f.feeding = 0
-	// Marked fed only AFTER the pass, and only when every segment finished.
-	// Setting it up front stranded a segment permanently on any transient
-	// failure — a non-ENOENT open error, a Seek failure, a read error —
-	// because nothing would replay it again, which is the opposite of
-	// replaySegment's own "left untouched for a retry": the fd stayed pinned,
-	// settledGone never fired, and the lines were never counted lost either.
-	// A replay that ran out of its per-sweep byte budget is unfinished for the
-	// same reason, and resumes next sweep from wherever its commits reached.
-	f.segmentsFed = allDone
-}
-
-// chargeStall bounds how long the LIVE TAIL may stay gated behind one segment
-// that is making no progress.
+// noteHop records that f just gained a rotation hop — a segment naming a
+// rotated-away inode — and enforces the one invariant its persistence needs.
 //
-// readFile refuses to read the tail while a replay is unfinished, and
-// openSegmentSource deliberately does not retire a segment whose file is still
-// there but will not open — EACCES on a rotated file, EMFILE at RLIMIT_NOFILE,
-// EIO on a failing disk. Those are transient by CLASS and frequently permanent
-// in fact, and while one persists this file collects nothing at all: it is the
-// tailer's only silent stop, since obs.LogPrefixLost covers the permanent
-// give-up and a Warn at sweep cadence (~2/s) is the sole other signal. Past the
-// bound the segment is given up on exactly as an unrecoverable one is —
-// counted, logged, retired — which is also what releases the gate.
+// The hop must reach disk long before the 10s checkpoint cadence: a crash in
+// that window leaves the on-disk checkpoint with no record of the rotated
+// inode, and the tail is then lost outright rather than merely re-read.
 //
-// A pass that FED anything, one that DISCARDED anything (an oversized line
-// advancing only the skipTo frontier is still advancing — stalling it out
-// would retire the segment and lose the readable remainder past the line),
-// and one whose pipeline a rewind purged under it, all count as progress: a
-// budget-cut replay is advancing, and a failed export re-owes the range
-// without the gate being the thing that is stuck.
-func (t *Tailer) chargeStall(f *file, sg *segment, gen int, progressBefore int64) {
-	if f.rewindGen != gen || max(sg.fedTo, sg.skipTo) > progressBefore {
-		sg.stalledSince = time.Time{}
-		return
-	}
-	now := time.Now()
-	if sg.stalledSince.IsZero() {
-		sg.stalledSince = now
-		return
-	}
-	stalled := now.Sub(sg.stalledSince)
-	if stalled < t.segmentStallLimit {
-		return
-	}
-	obs.LogPrefixLost.Inc()
-	t.log.Error("a rotated segment's source has been unreadable for too long; giving up on its lines so the file resumes collecting",
-		"path", f.path, "inode", sg.inode, "stalled", stalled,
-		"committed", sg.committed, "to", sg.to)
-	f.retire(sg)
-}
-
-// chargeGoneStall bounds how long a vanished file may stay pinned behind a
-// drain that can no longer reach goneEnd.
+// What actually has to hold is narrower than "persist every hop synchronously",
+// and this is the whole reason a save per SWEEP still closes the window:
+// initFile reconstructs the ONE hop a stale checkpoint implies — it sees the
+// path naming a different incarnation than the stored identity and synthesizes
+// an open-ended segment for it — so a single unpersisted hop is recoverable
+// from the previous save. It is the SECOND hop of the same file that has no
+// route back, because nothing on disk names the intermediate inode. So the
+// invariant is "one file never carries two unsaved hops", enforced here, and
+// the sweep's closing save (keyed on hopsUnsaved) bounds the exposure of the
+// first one to the rest of that sweep.
 //
-// drainGone's `max` keeps goneEnd rewind-proof on purpose — a transient short
-// read must not settle the file early and silently lose the [error, goneEnd)
-// bytes an earlier drain proved exist. But when the fd's readable boundary
-// REGRESSES for good (spreading bad sectors on the unlinked inode, a corrupt
-// committed prefix failing every re-decompression), commit can never reach
-// goneEnd again: settledGone stays false and the entry, the fd and the
-// checkpoint line are pinned forever, with obs.LogDrainErrors and an Error at
-// sweep cadence as the only signal. That is the segment replay's stall wedge
-// one path over, so the same budget applies: a cycle whose drain ENDED IN A
-// READ ERROR without commit progress charges the stall; progress, a rewind (a
-// failed export re-owes the range without the drain being what is stuck —
-// chargeStall's rule) or a cycle that ends at EOF resets it. Past the limit
-// the remainder is given up on exactly as a stalled segment is — counted
-// obs.LogPrefixLost, logged — and the caller releases the entry through the
-// normal gone cleanup (the next successful-listing save prunes its checkpoint
-// line). It reports whether the file was given up on.
-func (t *Tailer) chargeGoneStall(f *file, gen int, progressBefore int64) bool {
-	if f.rewindGen != gen || !f.drainErred || f.committed > progressBefore || (f.goneDrained && f.committed >= f.goneEnd) {
-		f.goneStalledSince = time.Time{}
-		return false
-	}
-	now := time.Now()
-	if f.goneStalledSince.IsZero() {
-		f.goneStalledSince = now
-		return false
-	}
-	stalled := now.Sub(f.goneStalledSince)
-	if stalled < t.segmentStallLimit {
-		return false
-	}
-	obs.LogPrefixLost.Inc()
-	t.log.Error("a vanished file's drain has been erring without progress for too long; giving up on its unread remainder",
-		"path", f.path, "committed", f.committed, "goneEnd", f.goneEnd, "stalled", stalled)
-	return true
-}
-
-// openSegmentSource resolves the readable handle for a segment's replay: the
-// retained fd first (it reaches the inode even after the runtime has deleted
-// or compressed the rotated file, which findRotated — resolving by NAME —
-// cannot; only a restart, where no fd survives, falls back to the path). A
-// segment whose source is genuinely gone is counted (obs.LogPrefixLost) AND
-// retired — an unrecoverable segment kept on the list can never reach its
-// `to` and would wedge retirement (fd budget, settledGone, the checkpoint)
-// forever.
+// The cost this buys back is not marginal: a save marshals the WHOLE positions
+// document and fsyncs it twice (file, then directory) — ~25ms and ~3.4MB of
+// garbage at 5000 files — on the single sweep goroutine, and it ran once per
+// hop. A storm in which 50 files rotate in one sweep paid 50 of them, precisely
+// during the event the immediate save exists to survive.
 //
-// retired reports whether the failure was PERMANENT (the segment was given up
-// on and removed); false means transient and the segment stays on the list for
-// another sweep.
-func (t *Tailer) openSegmentSource(f *file, p *segment) (fh *os.File, path string, closeFh func(), ok, retired bool) {
-	if p.fd != nil {
-		return p.fd, f.path, func() {}, true, false
-	}
-	path, found := t.findRotated(f, p)
-	if !found {
-		obs.LogPrefixLost.Inc()
-		// The owed range is the MAGNITUDE of the loss, which
-		// kubescrape_log_prefix_lost_total (one count per given-up segment)
-		// cannot carry: a segment owing 40 bytes and one owing 40 MiB are the
-		// same increment. `to` is -1 for an open-ended segment (a rotation the
-		// agent was down for), where the end is genuinely unknown — the line
-		// says -1 rather than inventing a number.
-		t.log.Warn("rotated segment source not found; its lines are lost",
-			"path", f.path, "inode", p.inode, "committed", p.committed, "to", p.to)
-		f.retire(p)
-		return nil, "", nil, false, true // retired: nothing to open, nothing owed
-	}
-	opened, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) { // pruned between findRotated and open
-			obs.LogPrefixLost.Inc()
-			f.retire(p)
-			t.log.Warn("opening rotated segment", "path", path, "error", err)
-			return nil, "", nil, false, true
-		}
-		// EACCES, EMFILE, EIO: the file is still there and may open next
-		// sweep. The segment stays on the list — and the caller must report
-		// the pass UNFINISHED, or segmentsFed strands it until an unrelated
-		// rewind or a restart re-arms the replay, pinning an fd and a
-		// checkpoint Pending entry that never clears.
-		t.log.Warn("opening rotated segment", "path", path, "error", err)
-		return nil, "", nil, false, false
-	}
-	return opened, path, func() { _ = opened.Close() }, true, false
-}
-
-// replaySegment re-reads one segment's owed [committed,to) range and feeds
-// its lines into the pipeline under the segment's own id. It reports whether
-// the range was finished this sweep; an unfinished one must be revisited.
-func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
-	fh, path, closeFh, ok, retired := t.openSegmentSource(f, p)
-	if !ok {
-		// Finished only when the segment was given up on for good; a
-		// transient open failure has to be retried.
-		return retired
-	}
-	defer closeFh()
-	// Resume at the FEED frontier, not the commit frontier: a budget-cut pass
-	// left its lines in the pipeline, and re-reading them feeds duplicates
-	// into groups that still buffer the originals. The DISCARD frontier
-	// (skipTo) counts too: an oversized line's already-discarded prefix can
-	// never produce a committing entry, and re-reading it re-discarded the
-	// same bytes every pass — for a line whose newline is out of one pass's
-	// reach, forever (see the segment field doc).
-	from := max(p.committed, p.fedTo, p.skipTo)
-	if _, err := fh.Seek(from, 0); err != nil {
-		t.log.Warn("seeking rotated segment", "path", path, "error", err)
-		return false // transient: retry next sweep
-	}
-
-	remaining := p.to - from
-	if p.to < 0 {
-		// Open-ended (a rotation that happened while the agent was DOWN: the
-		// checkpoint knows the identity and the committed offset but not
-		// where the rotated file ended). Read to EOF and pin `to` so the
-		// segment can retire.
-		remaining = 1 << 62
-	}
-	var carry []byte
-	cur := from
-	// fed is the last FED line boundary — the only offset commits can reach.
-	// Deliberately NOT `from`: from may sit at skipTo, mid-discard, and the
-	// open-ended completion below pins `to` from fed — a `to` inside a
-	// discarded run is an offset no entry commits, wedging the segment.
-	fed := max(p.committed, p.fedTo)
-	var lastErr error
-	// An over-cap line's remainder, dropped to its newline. Resumed from the
-	// segment: a pass that ends mid-discard persists the state, or the next
-	// pass would feed the oversized line's remainder as a fresh record.
-	discarding := p.discarding
-	buf := t.scratch()
-	// Bounded like every other read loop. The open-ended case (a rotation that
-	// happened while the agent was down) reads to EOF, so a large rotated
-	// remainder built one enormous batch — ~100k entries against a BatchSize of
-	// 1024 before the first size check — and starved the single sweep goroutine
-	// for its whole duration. The budget stops the pass; the segment keeps its
-	// committed progress and resumes on the next sweep.
-	budget := int64(t.cfg.MaxBytesPerSweep)
-	// A pass never stops MID-LINE without persisting where it stopped. `carry`
-	// is a per-pass local, and the oversize escape fires at MaxEntryBytes+4096
-	// — 1 MiB + 4 KiB against a 1 MiB default budget — so a single line at or
-	// above the budget could never reach either the escape or a newline within
-	// one pass: nothing was fed, `committed` could not advance, segmentsFed
-	// stayed false, and the same megabyte was re-read every sweep forever,
-	// pinning an fd and starving the sweep goroutine. Once the budget is spent
-	// the loop keeps reading until that line progresses — either whole (fed,
-	// fedTo advances) or by the discarded chunk the oversize escape just
-	// dropped (skipTo advances) — and stops there, so the next pass resumes
-	// past it instead of re-reading it.
-	//
-	// overrunFrom is the frontier the escape armed at, and it is what ENDS the
-	// overrun. Re-deriving the escape from `len(carry) > 0` instead re-armed it
-	// after every read whose 64 KiB boundary did not happen to fall on a
-	// newline — essentially every read — so a pass that ran out of budget
-	// mid-line went on to read the WHOLE owed range (up to a rotated kubelet
-	// log's 10 MiB) in one go, with a synchronous export per BatchSize, on the
-	// single sweep goroutine that serves every file on the node. The budget
-	// bounded nothing in exactly the open-ended rotation-while-down case it was
-	// written for.
-	overrun := false
-	var overrunFrom int64
-	// One clock read per read chunk, exactly as consume does — see the note
-	// there for why f.lastFed does not need a per-line reading.
-	var fedAt time.Time
-	for remaining > 0 && (budget > 0 || overrun) {
-		want := remaining
-		if !overrun {
-			want = min(want, budget)
-		}
-		n, rerr := fh.Read(buf[:min(int64(len(buf)), want)])
-		if n > 0 {
-			fedAt = time.Now()
-			remaining -= int64(n)
-			budget -= int64(n)
-			carry = append(carry, buf[:n]...)
-			for {
-				i := bytes.IndexByte(carry, '\n')
-				if i < 0 {
-					// Bound the carried incomplete line exactly as consume
-					// does: a checkpointed segment containing an oversized
-					// line (whose live read was capped and discarded) must
-					// not be slurped whole into memory on replay. The
-					// remainder up to its newline is part of the same line.
-					if len(carry) > t.cfg.MaxEntryBytes+oversizeSlack {
-						cur += int64(len(carry))
-						carry = carry[:0]
-						// Counted once per LINE, exactly like consume's live
-						// path: a line longer than the cap is discarded in as
-						// many slabs as it has, and each pass of a replay that
-						// resumes mid-discard would add another.
-						if !discarding {
-							obs.LogOversizedDropped.Inc()
-						}
-						discarding = true
-						// Persist the discard progress on the segment BEFORE the
-						// flush below (like fedTo): a failed flush rewinds and
-						// ledger.reset zeroes it, and stamping afterwards would
-						// resurrect a frontier the purge invalidated.
-						p.skipTo, p.discarding = cur, true
-					}
-					break
-				}
-				line := carry[:i]
-				start := cur
-				cur += int64(i + 1)
-				carry = carry[i+1:]
-				if discarding {
-					discarding = false // the newline ends the dropped line
-					p.skipTo, p.discarding = cur, false
-					continue
-				}
-				if len(line) > 0 {
-					t.feedLine(ctx, f, string(line), start, cur, fedAt)
-					fed = cur
-				}
-			}
-			// Advance the feed frontier BEFORE the flush below: a failed
-			// flush rewinds and resets it (ledger.reset), and stamping it
-			// afterwards would resurrect a frontier the purge invalidated.
-			p.fedTo = fed
-		}
-		if rerr != nil {
-			lastErr = rerr
-			break
-		}
-		// Spent the budget mid-line: keep going until that line progresses,
-		// then stop (see overrunFrom above).
-		switch {
-		case overrun:
-			if max(fed, p.skipTo) > overrunFrom {
-				overrun = false
-			}
-		case budget <= 0 && len(carry) > 0:
-			overrun, overrunFrom = true, max(fed, p.skipTo)
-		}
-		// Ship what has accumulated rather than holding a whole rotated file
-		// in one payload (which the collector would likely reject anyway).
-		if t.maybeFlush(ctx, f) {
-			// The flush FAILED and rewound the file: the pipeline was purged,
-			// so every line this pass already fed is gone unemitted. Reading
-			// on from the unrewound fd would leave that prefix owed while the
-			// later lines' commits advanced `committed` past it — commitBatch
-			// takes a max, not a contiguous frontier — and the segment would
-			// eventually retire with the prefix never exported. Abandon the
-			// pass; reporting it unfinished leaves segmentsFed false, so the
-			// next sweep replays from what actually committed. drainReader has
-			// carried the same guard all along.
-			return false
-		}
-	}
-	if budget <= 0 && remaining > 0 {
-		// Out of budget with the range unfinished. p.committed is NOT advanced
-		// here — it is commit progress, moved by commitBatch once the entries
-		// actually export, so that a failed export still re-reads them. The
-		// caller leaves segmentsFed false and the next sweep continues from
-		// wherever the commits reached (re-feeding at most the uncommitted
-		// prefix, which is the same at-least-once trade every other path
-		// makes).
-		return false
-	}
-	// The transient-error check comes FIRST, ahead of the open-ended
-	// completion below. It used to come after, so a non-EOF failure part-way
-	// through an OPEN-ENDED replay (to < 0, the rotation-while-down case) was
-	// read as "reached EOF": the segment was pinned at whatever had been fed so
-	// far — or retired outright when nothing had — and its unread remainder
-	// became unrecoverable, with no obs.LogPrefixLost and no warning. That is
-	// silent loss in the recovery path that exists precisely because nothing
-	// else can recover those bytes.
-	if lastErr != nil && !errors.Is(lastErr, io.EOF) {
-		// A transient read error (EIO on a failing disk, a truncated NFS
-		// handle): the range is still owed, so report the pass unfinished
-		// rather than letting segmentsFed strand it.
-		t.log.Warn("reading rotated segment", "path", path, "error", lastErr)
-		return false
-	}
-	if p.to < 0 {
-		// The open-ended replay reached EOF: pin the range so entry commits
-		// can retire the segment. Only FED bytes count (a trailing fragment,
-		// blank line or discarded oversize run can never produce a committing
-		// entry).
-		if fed > p.committed {
-			p.to = fed
-			p.fed = true // the whole pinned range is now live
-		} else {
-			f.retire(p) // nothing recoverable was fed
-		}
-		return true
-	}
-	if remaining > 0 && errors.Is(lastErr, io.EOF) {
-		// The source ended before the owed range did: the rotated file was
-		// truncated or shortened while the agent was down, or identity
-		// matching landed on a shorter file. The missing tail is
-		// unrecoverable — count it and clamp `to` to the fed boundary so the
-		// segment retires through the normal commit path instead of wedging
-		// forever below an offset no commit can ever reach (fd, checkpoint
-		// Pending entry and the commit frontier all pinned). A transient read error
-		// (lastErr not EOF) leaves the segment untouched for a retry.
-		obs.LogPrefixLost.Inc()
-		t.log.Warn("rotated segment shorter than its checkpointed range; missing tail lost",
-			"path", path, "committed", p.committed, "to", p.to, "fed", fed)
-		if fed > p.committed {
-			p.to = fed
-		} else {
-			f.retire(p) // nothing recoverable at all
-		}
-	}
-	// The owed range is covered: its lines are live, so an entry traversing
-	// this segment genuinely reaches `to` and may claim it (see segment.fed).
-	p.fed = true
-	return true
-}
-
-// findRotated locates the rotated-away file matching p's identity in the log's
-// resolved target directory (where the runtime keeps rotated files).
-func (t *Tailer) findRotated(f *file, p *segment) (string, bool) {
-	dir := f.targetDir
-	if dir == "" {
-		if target, err := filepath.EvalSymlinks(f.path); err == nil {
-			dir = filepath.Dir(target)
-		}
-	}
-	if dir == "" {
-		return "", false
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return "", false
-	}
-	for _, de := range entries {
-		full := filepath.Join(dir, de.Name())
-		st, err := os.Stat(full)
-		// The regularity check covers inode reuse by a non-file: opening a
-		// FIFO to fingerprint it would block the sweep goroutine forever.
-		if err != nil || !st.Mode().IsRegular() || inodeOf(st) != p.inode {
-			continue
-		}
-		fh, err := os.Open(full)
-		if err != nil {
-			continue
-		}
-		match := p.fp.matches(fh)
-		_ = fh.Close()
-		if match {
-			return full, true
-		}
-	}
-	return "", false
-}
-
-// drainGone reads whatever the vanished file still holds into the batch. The
-// fd stays OPEN: it is the only handle to the now-unlinked inode, so it must
-// outlive a failed export — release only once the offsets commit.
-//
-// It takes the sweep's ctx: exports here used context.Background(), so the
-// shutdown budget did not cover the final sweep's gone-file drain — a stuck
-// collector could hold shutdown past it and cost the final saveCheckpoints.
-func (t *Tailer) drainGone(ctx context.Context, f *file) {
-	// Re-armed per cycle: chargeGoneStall reads it right after this cycle's
-	// flush, and a verdict left over from an earlier cycle (or a rotation
-	// drain) must not charge a cycle whose drain never ran.
-	f.drainErred = false
-	if !f.resolved {
-		// Nothing was ever read (nothing is read before it can be attributed),
-		// and with the file gone nothing can be: the content is lost. Make the
-		// loss visible — a metadata-service outage overlapping pod deletions
-		// silently eating final logs is exactly what an operator must see.
-		// Count ONCE: drainGone re-runs every sweep until settledGone, and a
-		// gone file can never resolve (the gone check precedes metadata
-		// resolution), so re-counting here spammed the metric and the log ~2/s
-		// per file forever.
-		// Nothing was ever read, so there is nothing to drain: the entry may
-		// settle on this sweep.
-		f.goneDrained = true
-		if f.unresolvedLost {
-			return
-		}
-		f.unresolvedLost = true
-		obs.LogUnresolvedLost.Inc()
-		t.log.Warn("file deleted before its metadata resolved; content lost",
-			"path", f.path, "id", f.containerID)
-		// Checkpointed segments restored by initFile (created before metadata
-		// could resolve) hold fds and checkpoint entries for content that is
-		// now unattributable. Retire them as lost prefixes — without this
-		// settledGone sees the segments and holds the file forever.
-		for len(f.segments) > 0 {
-			obs.LogPrefixLost.Inc()
-			f.retire(f.segments[0])
-		}
+// Call it only once f's in-memory state is CONSISTENT — the new identity
+// adopted, `committed` reset, the old incarnation's segment appended: the
+// forced save writes exactly what it sees. reopen and ensureOpen are the two
+// callers, and they used to carry two copies of this block, one of which ran
+// BEFORE its reset and persisted the new inode paired with the old offset.
+func (t *Tailer) noteHop(f *file) {
+	if !t.checkpointing() {
 		return
 	}
-	if f.excluded {
-		// The workload opted out: nothing was ever read (the sweep never
-		// reads an excluded file) and nothing may be exported now that the
-		// path is gone — feeding restored segments here would ship exactly
-		// the backlog the exclusion refuses. dropExcludedBacklog retired them
-		// at resolve time; the guard holds regardless of that ordering, as
-		// the same intent-not-loss (no counter). goneEnd stays untouched, so
-		// settledGone releases the entry on this sweep.
-		t.dropExcludedBacklog(f)
-		f.goneDrained = true
-		return
+	if f.hopUnsaved {
+		t.saveCheckpoints()
 	}
-	// Incomplete segments are OLDER than the current inode's remainder and
-	// must enter the pipeline first. readFile normally feeds them, but a gone
-	// file is never read again — without this, the prefixes' unexported lines
-	// would be closed forever by release() once everything else settles (a pod
-	// deleted during a collector outage after a rotation).
-	t.feedSegments(ctx, f)
-	if len(f.segments) > 0 && !f.segmentsFed {
-		// Unfinished replay: draining the gone inode now would feed its
-		// (newer) lines ahead of the segments' still-owed remainder — the
-		// same out-of-order fuse readFile gates against. The fd is held and
-		// drainGone re-runs every sweep until settledGone, so the drain
-		// merely waits its turn.
-		return
-	}
-	var drained bool
-	if f.compressed {
-		// A large archive is read incrementally across sweeps; a deletion
-		// mid-read leaves the rest readable from the open fd.
-		drained = t.drainArchive(ctx, f)
-	} else {
-		drained = t.drainFile(ctx, f)
-	}
-	if !drained {
-		// The drain did not reach the end of the inode — a mid-drain flush
-		// failure rewound it, the per-drain cap fired on a deep backlog, or an
-		// archive would not reopen. Stop the cycle here rather than falling
-		// through to the settle accounting below: goneEnd is what releases the
-		// file, and stamping it from a fed boundary the drain never reached
-		// would settle the entry — closing the ONLY handle to the unlinked
-		// inode — with its remainder unread and no counter moving. drainGone
-		// re-runs every sweep until settledGone, so the next one continues
-		// from where this fd stopped.
-		//
-		// Returning is not enough on its own, and it used to be all this did:
-		// on a FIRST cycle goneEnd is still zero, so "committed >= goneEnd"
-		// held after the rewind and settledGone released the fd anyway — every
-		// line past the rewind lost, silently, for a pod deleted during a
-		// collector outage (TestGoneFileMidDrainExportFailureDoesNotSettle).
-		// goneDrained is what tells the gate that goneEnd means nothing yet; it
-		// is stamped below, only by a cycle that reached the end.
-		//
-		// Not feeding pending here is deliberate too: with bytes still owed,
-		// pending is a fragment with more of its line to come, not the
-		// unterminated final line the block below exists for.
-		return
-	}
-	if len(f.pending) > 0 {
-		// An unterminated final line (a process killed mid-write) can never be
-		// completed — the file is gone — and settledGone's pending check would
-		// otherwise hold the fd and the files-map entry forever. Feed it
-		// directly, ending at the REAL EOF: a synthetic terminator advanced
-		// readPos past the file's true size, so every offset downstream named
-		// a byte the file never had — a resurrected (listing-race) file of
-		// unchanged size read as truncated and re-ingested whole, and a
-		// checkpointed offset one past EOF did the same across a restart.
-		// (consume already ran, so pending holds no newline: it IS one
-		// unterminated line.)
-		if f.discarding {
-			// The tail of an oversized discarded line: not a record, so no
-			// entry will ever commit its bytes. Record the boundary the
-			// frontier may cross to (file.skipEnd) like every other never-fed
-			// line, so the flush of this drain's own entries carries the
-			// checkpoint over it.
-			f.discarding = false
-			f.skipEnd = f.readPos
-		} else {
-			t.feedLine(ctx, f, string(f.pending), f.lineStart, f.readPos, time.Now())
-		}
-		f.pending = f.pending[:0]
-		f.lineStart = f.readPos
-	}
-	t.stopPipeline(ctx, f)
-	// The settle target is the FED boundary, not readPos: trailing consumed-
-	// but-never-fed bytes (a blank final line, a rate-DROPPED or oversized-
-	// discarded tail) can never produce a committing entry, and a goneEnd
-	// covering them held the fd and the files-map entry forever (max keeps it
-	// rewind-proof — a failed export must not lower an already-drained end).
-	f.goneEnd = max(f.goneEnd, f.fedEnd())
-	f.goneDrained = true
-}
-
-// resurrect withdraws a gone verdict for a file whose path is proven alive
-// again — a listing (or a stat in the gone branch) racing a rename+recreate
-// rotation, or a rotated-away name taken by a new file. The three fields are
-// ONE decision and must be cleared together, which is why both callers
-// (scanDir's claimPath and sweep's gone branch) come through here: they were
-// written twice and the discovery half already disagreed, leaving goneEnd set.
-//
-//   - goneEnd pinned the PREVIOUS incarnation's EOF. Left set, every later
-//     completion check compares a fresh (usually shorter) stream's committed
-//     offset against a stale, larger one: settledGone can never fire, so the
-//     fd, the files-map entry and its checkpoint line are pinned for the
-//     process lifetime with drainGone+flush re-running every sweep — or, if
-//     the next deletion finds no handle to re-read from, drainArchive's
-//     no-handle arm reports a lost remainder (obs.LogArchiveErrors plus a WARN
-//     quoting committed from one stream and owedTo from another) for a file
-//     whose every record was in fact delivered. A false loss alarm is
-//     indistinguishable from the real one the same counter reports.
-//   - The stall clock dies with the gone verdict: left set, a later gone
-//     episode's first errored cycle reads the stale stamp as an already-spent
-//     budget and gives up on sight (chargeGoneStall).
-//
-// What happens to the bytes is NOT decided here: readFile's rotation detection
-// (or, for an archive, openArchive's identity check) owns the live path again.
-func (f *file) resurrect() {
-	f.gone = false
-	f.goneEnd = 0
-	f.goneDrained = false
-	f.goneStalledSince = time.Time{}
-}
-
-// release closes the file's handles and watches. After this the inode is
-// unreachable, so it must not be called while data read from it is still
-// uncommitted.
-func (t *Tailer) release(f *file) {
-	if f.compressed {
-		t.closeArchive(f)
-	} else if f.f != nil {
-		_ = f.f.Close()
-		f.f = nil
-	}
-	f.closeSegments() // the file is going: its rotated inodes' fds go with it
-	t.unwatchTarget(f)
-}
-
-// settledGone reports whether everything the vanished file held has been
-// committed, so the file (and its unlinked inode) can be let go. It compares
-// against the drained EOF, not readPos: a failed export rewinds readPos back
-// to committed, which would otherwise look settled while the data is still
-// unexported and reachable only through our fd.
-func (t *Tailer) settledGone(f *file) bool {
-	if !f.goneDrained {
-		// No drain has reached the inode's end yet, so goneEnd describes
-		// nothing: the fd is the only route to what is still owed.
-		return false
-	}
-	if len(f.segments) > 0 {
-		// Incomplete segments still hold unexported lines whose only handles
-		// are the retained fds release() would close; commitBatch retires
-		// each segment once its range exports.
-		return false
-	}
-	if _, buffered := f.watermark(); buffered {
-		return false
-	}
-	return f.committed >= f.goneEnd && len(f.pending) == 0
+	f.hopUnsaved, t.hopsUnsaved = true, true
 }
 
 // rewind seeks a file back to its committed offset so unexported data is
@@ -1084,7 +460,7 @@ func (t *Tailer) rewind(f *file) {
 	// pipeline). Returning early here would discard those lines with the
 	// batch while leaving segmentsFed set, so feedSegments would never
 	// re-read them — the rotated tail would be lost on the first failed export.
-	// ledger.reset (via newPipeline) is what clears segmentsFed and re-arms it.
+	// purgeSegmentFeeds (via newPipeline) is what clears segmentsFed and re-arms it.
 	if f.f != nil {
 		if _, err := f.f.Seek(f.committed, 0); err != nil {
 			_ = f.f.Close()

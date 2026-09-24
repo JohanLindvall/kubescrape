@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -43,6 +42,18 @@ func TestValidateConfigRejectsBadSections(t *testing.T) {
 			"route without namespaces",
 			agentConfig{Routing: &route.Config{Routes: []route.Route{{Name: "x"}}}},
 			"namespaces are required",
+		},
+		{
+			// route("name") resolves to the FIRST route of a name, and every
+			// per-route series and failure line is keyed by it, so a second
+			// route of the same name is unreachable by script and
+			// indistinguishable everywhere an operator looks.
+			"duplicate route name",
+			agentConfig{Routing: &route.Config{Routes: []route.Route{
+				{Name: "team", Namespaces: []string{"team-a-*"}, Headers: map[string]string{"X-Scope-OrgID": "a"}},
+				{Name: "team", Namespaces: []string{"team-b-*"}, Headers: map[string]string{"X-Scope-OrgID": "b"}},
+			}}},
+			`name "team" is already used by route 0`,
 		},
 		{
 			"malformed trace-sampling duration",
@@ -85,6 +96,89 @@ func TestValidateConfigAcceptsEmpty(t *testing.T) {
 	}
 }
 
+// A real start CONSUMES what compileConfig compiled instead of compiling each
+// section again behind error branches validation had already made unreachable.
+// So every section it compiles has to come back populated when present — a
+// field left nil would switch that section off at a real start while
+// -check-config went on calling it valid — and nil when absent, which is what
+// run() and the start functions test for. The kubelet endpoint comes back
+// NORMALISED, because startScraper no longer parses the flag at all.
+func TestCompileConfigHandsTheStartEverythingItCompiled(t *testing.T) {
+	restoreKubeletFlags(t)
+	dir := t.TempDir()
+	cfg, err := loadAgentConfig(writeFile(t, dir, "config.yaml", `
+resourceAttributes:
+  static:
+    k8s.cluster.name: prod
+logAttributes:
+  rules:
+    - key: level
+      attribute: log.level
+logScrubbing:
+  builtin: [defaults]
+logMetrics:
+  metrics:
+    - name: errors_total
+      value: "1"
+      match: ["level=error"]
+logs:
+  sources:
+    - name: app
+      include: ["/var/log/app/*.log"]
+  rules:
+    - action: drop
+      match: ["__severity__=debug"]
+metrics:
+  pipelines:
+    all:
+      - action: drop
+        metrics: "go_.*"
+routing:
+  routes:
+    - name: team-a
+      namespaces: ["team-a-*"]
+      headers: {X-Scope-OrgID: a}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transforms := writeFile(t, dir, "transforms.yaml", "logs: |\n  def transform(batch):\n      pass\n")
+	*kubeletEndpoint = "https://fd00:10::5:10250"
+
+	cc, err := compileConfig(*cfg, transforms)
+	if err != nil {
+		t.Fatalf("compileConfig: %v", err)
+	}
+	for name, missing := range map[string]bool{
+		"resourceAttributes": cc.attrs == nil,
+		"logAttributes":      cc.logAttrs == nil,
+		"logScrubbing":       cc.scrub == nil,
+		"logMetrics":         cc.logMetrics == nil,
+		"logs.rules":         cc.logRules == nil,
+		"logs.sources":       len(cc.logSources) != 1,
+		"metrics.pipelines":  cc.metricFilters == nil,
+		"routing":            len(cc.routes) != len(cfg.Routing.Routes),
+		"-transforms-file":   cc.transforms == nil,
+	} {
+		if missing {
+			t.Errorf("%s was compiled and validated but not handed to the start", name)
+		}
+	}
+	if want := "https://[fd00:10::5]:10250"; cc.kubeletBase != want {
+		t.Errorf("kubeletBase = %q, want the normalised %q", cc.kubeletBase, want)
+	}
+
+	*kubeletEndpoint = ""
+	empty, err := compileConfig(agentConfig{}, "")
+	if err != nil {
+		t.Fatalf("compileConfig(empty): %v", err)
+	}
+	if empty.scrub != nil || empty.logMetrics != nil || empty.logRules != nil || empty.logSources != nil ||
+		empty.metricFilters != nil || empty.routes != nil || empty.transforms != nil || empty.kubeletBase != "" {
+		t.Errorf("an absent section must come back nil (run() and the start functions test for it): %+v", *empty)
+	}
+}
+
 // typedFlags makes flagWasSet report exactly these flags as typed. The refusals
 // read the OPERATOR's command line, and a test cannot type one: flag.Set is the
 // only way into flag.Visit's record and there is no way out, so a typed flag
@@ -102,10 +196,44 @@ func restoreFlagValues(t *testing.T) {
 	t.Helper()
 	timeout, limit, burst := *scrapeTimeout, *logsRateLimit, *logsRateBurst
 	inFlight, recv := *ingestMaxInFlight, *ingestGRPCMaxRecv
+	scrapeIv, logsMetricsIv := *scrapeInterval, *logsMetricsEvery
 	t.Cleanup(func() {
 		*scrapeTimeout, *logsRateLimit, *logsRateBurst = timeout, limit, burst
 		*ingestMaxInFlight, *ingestGRPCMaxRecv = inFlight, recv
+		*scrapeInterval, *logsMetricsEvery = scrapeIv, logsMetricsIv
 	})
+}
+
+// A flag value outside its closed set, or -ingest with nothing to bind, is
+// refused by validateConfig — the function -check-config and a real start
+// share — rather than only by run()'s prologue, where these used to live and
+// where no test could reach them. Typed or not: no default spells any of them.
+func TestValidateConfigRefusesUnknownFlagChoices(t *testing.T) {
+	mode, unknown, on, grpcAddr, httpAddr := *ingestMetrics, *logsUnknownFiles, *ingestOn, *ingestGRPC, *ingestHTTP
+	t.Cleanup(func() {
+		*ingestMetrics, *logsUnknownFiles, *ingestOn, *ingestGRPC, *ingestHTTP = mode, unknown, on, grpcAddr, httpAddr
+	})
+	for _, tc := range []struct {
+		name  string
+		apply func()
+		want  string
+	}{
+		{"unknown ingest metrics mode", func() { *ingestMetrics = "per-point" }, `invalid -ingest-metrics-mode "per-point"`},
+		{"unknown unknown-files mode", func() { *logsUnknownFiles = "middle" }, `invalid -logs-unknown-files "middle"`},
+		{"ingest with no listener", func() { *ingestOn, *ingestGRPC, *ingestHTTP = true, "", "" }, "both -ingest-grpc-endpoint and -ingest-http-endpoint are empty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			*ingestMetrics, *logsUnknownFiles, *ingestOn, *ingestGRPC, *ingestHTTP = mode, unknown, on, grpcAddr, httpAddr
+			if err := validateConfig(agentConfig{}, ""); err != nil {
+				t.Fatalf("the stock flags must validate: %v", err)
+			}
+			tc.apply()
+			err := validateConfig(agentConfig{}, "")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want an error containing %q", err, tc.want)
+			}
+		})
+	}
 }
 
 // A flag value that can only ever be a mistake is REFUSED, not normalised. The
@@ -146,8 +274,8 @@ func TestValidateConfigRefusesTypedFlagNonsense(t *testing.T) {
 		{
 			// The neighbouring -otlp-max-send-bytes documents "negative
 			// disables", so a negative here reads as "no bound" and is in fact
-			// normalised to the built-in 32 — while the effective-limits line
-			// prints the value that is NOT in force.
+			// normalised to the built-in 32, which the effective-limits line
+			// then reports where the operator meant "unbounded".
 			"negative ingest in-flight bound", "ingest-max-in-flight",
 			func() { *ingestMaxInFlight = -1 },
 			[]string{"-ingest-max-in-flight=-1", "0 for the default", "-otlp-max-send-bytes"},
@@ -159,6 +287,30 @@ func TestValidateConfigRefusesTypedFlagNonsense(t *testing.T) {
 			"negative ingest recv cap", "ingest-grpc-max-recv-bytes",
 			func() { *ingestGRPCMaxRecv = -1 },
 			[]string{"-ingest-grpc-max-recv-bytes=-1", "0 for the default"},
+		},
+		{
+			// One typed 0, three meanings: the scrape loop never runs, the
+			// cgroup sampler exports on a 30s window of its own, and the
+			// effective-limits line prints 0. None of them is "off".
+			"zero scrape interval", "scrape-interval",
+			func() { *scrapeInterval = 0 },
+			[]string{"-scrape-interval=0s", "positive duration", "-metrics=false"},
+		},
+		{
+			"negative scrape interval", "scrape-interval",
+			func() { *scrapeInterval = -time.Second },
+			[]string{"-scrape-interval=-1s", "positive duration"},
+		},
+		{
+			// Observed at full per-line cost, never exported until shutdown.
+			"zero log-metrics interval", "logs-metrics-interval",
+			func() { *logsMetricsEvery = 0 },
+			[]string{"-logs-metrics-interval=0s", "positive duration", "logMetrics section"},
+		},
+		{
+			"negative log-metrics interval", "logs-metrics-interval",
+			func() { *logsMetricsEvery = -time.Second },
+			[]string{"-logs-metrics-interval=-1s", "positive duration"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -186,6 +338,7 @@ func TestValidateConfigRefusesOnlyTypedValues(t *testing.T) {
 	restoreFlagValues(t)
 	typedFlags(t) // nothing typed
 	*scrapeTimeout, *logsRateLimit, *logsRateBurst = 0, 100, 0.5
+	*scrapeInterval, *logsMetricsEvery = 0, 0
 	if err := validateConfig(agentConfig{}, ""); err != nil {
 		t.Fatalf("refused a value no operator typed: %v", err)
 	}
@@ -195,9 +348,10 @@ func TestValidateConfigRefusesOnlyTypedValues(t *testing.T) {
 // replaces.
 func TestValidateConfigAcceptsUsableTypedFlags(t *testing.T) {
 	restoreFlagValues(t)
-	typedFlags(t, "scrape-timeout", "logs-rate-limit", "logs-rate-burst")
+	typedFlags(t, "scrape-timeout", "logs-rate-limit", "logs-rate-burst", "scrape-interval", "logs-metrics-interval")
 
 	*scrapeTimeout, *logsRateLimit, *logsRateBurst = 30*time.Second, 100, 200
+	*scrapeInterval, *logsMetricsEvery = 15*time.Second, time.Minute
 	if err := validateConfig(agentConfig{}, ""); err != nil {
 		t.Fatalf("refused usable values: %v", err)
 	}
@@ -379,181 +533,6 @@ func TestValidateConfigChecksRouteDestinations(t *testing.T) {
 	}
 }
 
-// A route with no endpoint inherits the flag base — which is not a
-// destination at all when every signal is overridden in export:, since
-// BuildExporter never builds the default chain. Inheriting it there sent a
-// tenant's telemetry to whatever the endpoint flag happened to default to.
-func TestRouteWithoutEndpointRejectedWhenTheBaseIsUnused(t *testing.T) {
-	full := &otlpexport.ExportConfig{
-		Logs:    &otlpexport.ExportOverride{Endpoint: "https://loki:443", Protocol: "http"},
-		Metrics: &otlpexport.ExportOverride{Endpoint: "https://mimir:443", Protocol: "http"},
-		Traces:  &otlpexport.ExportOverride{Endpoint: "https://tempo:443", Protocol: "http"},
-	}
-	headerOnly := []route.Route{{Name: "tenant-a", Namespaces: []string{"a-*"}, Headers: map[string]string{"X-Scope-OrgID": "a"}}}
-
-	cfg := agentConfig{Export: full, Routing: &route.Config{Routes: headerOnly}}
-	if err := validateConfig(cfg, ""); err == nil {
-		t.Fatal("accepted a header-only route inheriting a base the deployment never dials")
-	}
-
-	// With the default chain in play, inheriting the base is the point.
-	partial := &otlpexport.ExportConfig{Logs: full.Logs}
-	cfg = agentConfig{Export: partial, Routing: &route.Config{Routes: headerOnly}}
-	if err := validateConfig(cfg, ""); err != nil {
-		t.Fatalf("rejected a header-only route where the base IS the fallback destination: %v", err)
-	}
-
-	// All three signals overridden, but one override sets only HEADERS — it
-	// inherits the base endpoint through merged(), so the base is still a
-	// destination and an endpoint-less route is legitimate. Testing struct
-	// presence instead of endpoints failed this config at startup.
-	inherits := &otlpexport.ExportConfig{
-		Logs:    full.Logs,
-		Metrics: full.Metrics,
-		Traces:  &otlpexport.ExportOverride{Headers: map[string]string{"X-Scope-OrgID": "traces"}},
-	}
-	cfg = agentConfig{Export: inherits, Routing: &route.Config{Routes: headerOnly}}
-	if err := validateConfig(cfg, ""); err != nil {
-		t.Fatalf("rejected a route inheriting a base that a header-only override still dials: %v", err)
-	}
-}
-
-// routeExportConfig's own-endpoint branch now builds on
-// otlpexport.Config.TransportOnly instead of hand-dropping each credential.
-// The rework must be BIT-IDENTICAL to the old derivation — this test IS that
-// old derivation, compared field-for-field against the new one for every
-// shape the old code distinguished, with ONE deliberate divergence spelled
-// here: an UNSET route `insecure` (nil) keeps the merged base's value instead
-// of a bool's zero, because every route written before the field existed
-// dialled plaintext through -otlp-insecure and must keep doing so across the
-// upgrade. The base is constructed with EVERY destination-scoped flag and
-// section field set, so a field the new derivation drops (or newly inherits)
-// cannot hide behind a zero value.
-func TestRouteExportConfigMatchesTheOldDerivation(t *testing.T) {
-	oldDerivation := func(exp *otlpexport.ExportConfig, rt route.Route) otlpexport.Config {
-		rcfg := exp.ApplyBase(baseExportConfig())
-		if len(rt.Headers) > 0 {
-			merged := make(map[string]string, len(rcfg.Headers)+len(rt.Headers))
-			for k, v := range rcfg.Headers {
-				merged[k] = v
-			}
-			for k, v := range rt.Headers {
-				merged[k] = v
-			}
-			rcfg.Headers = merged
-		}
-		if rt.Endpoint != "" {
-			rcfg.Endpoint = rt.Endpoint
-			rcfg.BearerTokenFile = rt.BearerTokenFile
-			rcfg.ClientCertFile = rt.ClientCertFile
-			rcfg.ClientKeyFile = rt.ClientKeyFile
-			rcfg.CAFile = rt.CAFile
-			if rt.Insecure != nil {
-				rcfg.Insecure = *rt.Insecure
-			}
-		}
-		return rcfg
-	}
-
-	// A base with every destination-scoped field populated: bearer, CA,
-	// skip-verify from the flags; headers and the mTLS client pair from the
-	// export section.
-	oldEP, oldBearer, oldCA, oldSkip := *otlpEndpoint, *otlpBearer, *otlpCAFile, *otlpSkipTLS
-	defer func() { *otlpEndpoint, *otlpBearer, *otlpCAFile, *otlpSkipTLS = oldEP, oldBearer, oldCA, oldSkip }()
-	*otlpEndpoint = "base-collector:4317"
-	*otlpBearer = "/base/bearer-token"
-	*otlpCAFile = "/base/ca.pem"
-	*otlpSkipTLS = true
-
-	exp := &otlpexport.ExportConfig{
-		Headers:        map[string]string{"X-Scope-OrgID": "base", "X-Base": "1"},
-		ClientCertFile: "/base/client.pem",
-		ClientKeyFile:  "/base/client-key.pem",
-	}
-
-	insecureTrue, insecureFalse := true, false
-	for _, tc := range []struct {
-		name string
-		rt   route.Route
-	}{
-		{"base-only route", route.Route{
-			Name: "t", Namespaces: []string{"t-*"},
-		}},
-		{"own-endpoint route with credentials", route.Route{
-			Name: "t", Namespaces: []string{"t-*"},
-			Endpoint:        "https://tenant.example.com:443",
-			BearerTokenFile: "/route/bearer-token",
-			ClientCertFile:  "/route/client.pem",
-			ClientKeyFile:   "/route/client-key.pem",
-			CAFile:          "/route/ca.pem",
-			Insecure:        &insecureTrue,
-		}},
-		{"own-endpoint route with an explicit insecure:false", route.Route{
-			Name: "t", Namespaces: []string{"t-*"},
-			Endpoint: "tenant.example.com:4317",
-			Insecure: &insecureFalse,
-		}},
-		{"own-endpoint route without credentials", route.Route{
-			Name: "t", Namespaces: []string{"t-*"},
-			Endpoint: "https://tenant.example.com:443",
-		}},
-		{"headers merge onto an own-endpoint route", route.Route{
-			Name: "t", Namespaces: []string{"t-*"},
-			Endpoint: "https://tenant.example.com:443",
-			Headers:  map[string]string{"X-Scope-OrgID": "route", "X-Route": "1"},
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := routeExportConfig(exp, tc.rt)
-			if err != nil {
-				t.Fatalf("routeExportConfig: %v", err)
-			}
-			if want := oldDerivation(exp, tc.rt); !reflect.DeepEqual(got, want) {
-				t.Errorf("derivation drifted from the old one:\n got: %+v\nwant: %+v", got, want)
-			}
-		})
-	}
-}
-
-// A route config written before the `insecure` field existed reached its
-// plaintext in-cluster collector through the flag base's -otlp-insecure
-// (default true). The field's introduction must not flip those routes to TLS
-// on upgrade — the exports fail as endless transient Unavailable, which
-// -check-config cannot see — so unset (nil) inherits the merged base and an
-// explicit value wins in either direction.
-func TestRouteInsecureUnsetInheritsTheFlagBase(t *testing.T) {
-	rt := route.Route{Name: "t", Namespaces: []string{"t-*"}, Endpoint: "collector.team-a:4317"}
-
-	got, err := routeExportConfig(nil, rt)
-	if err != nil {
-		t.Fatalf("routeExportConfig: %v", err)
-	}
-	if !got.Insecure {
-		t.Fatal("an insecure-less own-endpoint route flipped to TLS: pre-field configs dial plaintext through the base")
-	}
-
-	// An explicit false is the operator choosing TLS, base notwithstanding.
-	no := false
-	rt.Insecure = &no
-	if got, err = routeExportConfig(nil, rt); err != nil || got.Insecure {
-		t.Fatalf("insecure:false must mean TLS whatever the base (insecure=%v, err=%v)", got.Insecure, err)
-	}
-
-	// And with a TLS base, unset still inherits while explicit true wins.
-	oldInsecure := *otlpInsecure
-	defer func() { *otlpInsecure = oldInsecure }()
-	*otlpInsecure = false
-	rt.Insecure = nil
-	if got, err = routeExportConfig(nil, rt); err != nil || got.Insecure {
-		t.Fatalf("unset insecure must inherit a TLS base (insecure=%v, err=%v)", got.Insecure, err)
-	}
-	yes := true
-	rt.Insecure = &yes
-	if got, err = routeExportConfig(nil, rt); err != nil || !got.Insecure {
-		t.Fatalf("insecure:true must mean plaintext whatever the base (insecure=%v, err=%v)", got.Insecure, err)
-	}
-}
-
 // The `type: script` tail-sampling cross-check is TIER-ONLY, like every other
 // tier-only refusal in validateConfig. ONE ConfigMap is mounted into the
 // DaemonSet, the events/Azure singleton and the tier, and the chart renders
@@ -566,7 +545,8 @@ func TestScriptTailSamplingPolicyIsRefusedOnlyOnTheTier(t *testing.T) {
 		Policies: []tailsample.PolicyConfig{{Name: "keep-interesting", Type: tailsample.TypeScript}},
 	}}}
 	// The DaemonSet / events singleton: the section is ignored here
-	// (startServiceGraph warns that it is), so nothing about it may be fatal.
+	// (the config summary's tierOnlySections line says so, at Info), so
+	// nothing about it may be fatal.
 	if err := validateConfig(cfg, ""); err != nil {
 		t.Fatalf("off the trace tier a script tail-sampling policy must not be fatal — the workload never reads the section: %v", err)
 	}

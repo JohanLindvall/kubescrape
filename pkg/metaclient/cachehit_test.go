@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 // A hit must be servable while another goroutine holds the cache for READING.
@@ -54,9 +56,9 @@ func TestCacheHitRefreshesTheIdleStampWithinTheWindow(t *testing.T) {
 	// Long-lived, so every read below is a HIT: the 304 path re-stamps under the
 	// write lock it already takes, and would hide whether the hit path stamps at
 	// all.
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		atomic.AddInt32(&hits, 1)
+		hits.Add(1)
 		w.Header().Set("Cache-Control", "max-age=3600")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"name":"web","uid":"u1"}`))
@@ -77,7 +79,7 @@ func TestCacheHitRefreshesTheIdleStampWithinTheWindow(t *testing.T) {
 			t.Fatalf("read at %v: %v", elapsed, err)
 		}
 	}
-	if n := atomic.LoadInt32(&hits); n != 1 {
+	if n := hits.Load(); n != 1 {
 		t.Fatalf("server hits = %d, want 1: the reads above must all be cache hits", n)
 	}
 	c.mu.Lock()
@@ -114,4 +116,51 @@ func BenchmarkCacheHitParallel(b *testing.B) {
 			}
 		}
 	})
+}
+
+// TestCacheHitAllocationBudget pins what a HIT costs, and so what the cache is
+// for: the key built by concatenation and the caller's result struct — two
+// allocations — and nothing else. Every lookup used to build its URL with
+// fmt.Sprintf (boxing each argument), and Container formatted `?wait=<d>` on
+// every call only for the key derivation to cut it off again: 5 allocations on
+// a warm Container hit at wait=0, 6 at wait=2s. The wait is now rendered only
+// when a request is made. The copy is SHALLOW on purpose — a deep one would be
+// this budget's multiple (see TestCacheHitsShareMapsAndSlicesWithTheCache).
+func TestCacheHitAllocationBudget(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("allocation budgets are meaningless under -race")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=3600")
+		w.Header().Set("ETag", `"v1"`)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"containerId":"abc","name":"web","uid":"u1","pod":{"name":"web"}}`))
+	}))
+	t.Cleanup(srv.Close)
+	c := New(Config{Base: srv.URL, Timeout: 5 * time.Second})
+	ctx := context.Background()
+
+	const ceiling = 2
+	for _, tc := range []struct {
+		name   string
+		lookup func() error
+	}{
+		{"Container/wait=0", func() error { _, err := c.Container(ctx, "containerd://abc", 0); return err }},
+		{"Container/wait=2s", func() error { _, err := c.Container(ctx, "abc", 2*time.Second); return err }},
+		{"PodByUID", func() error { _, err := c.PodByUID(ctx, "u1"); return err }},
+		{"PodByName", func() error { _, err := c.PodByName(ctx, "ns", "web"); return err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.lookup(); err != nil { // populate
+				t.Fatal(err)
+			}
+			if got := testing.AllocsPerRun(200, func() {
+				if err := tc.lookup(); err != nil {
+					t.Fatal(err)
+				}
+			}); got > ceiling {
+				t.Errorf("a warm cache hit allocates %.0f times, want <= %d", got, ceiling)
+			}
+		})
+	}
 }

@@ -10,7 +10,18 @@
 set -uo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 need_cluster
-trap cleanup_writers EXIT
+
+# The fault is ours to undo. Interrupted mid-outage (Ctrl-C, a failed wait)
+# this used to remove only the writers, leaving the harness with NO collector —
+# and the next scenario then failed in gap_report's grab with "is the reader
+# sidecar present?", pointing at the wrong cause. The scale is idempotent, so
+# the success path runs it harmlessly too (apiserver-blackhole.sh unpauses its
+# control plane the same way).
+cleanup() {
+  cleanup_writers
+  "${KCTL[@]}" -n "$NS" scale deploy/otel-collector --replicas=1 >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 
 MARK="CHAOSCOL$(date +%s)"
 NODE="${NODE:-$("${KCTL[@]}" get nodes -o jsonpath='{.items[1].metadata.name}')}"
@@ -20,6 +31,22 @@ OUTAGE="${OUTAGE:-90}"
 # old default of 200 the writer outlived the outage by 110s and most lines took
 # the ordinary path.
 COUNT="${COUNT:-$OUTAGE}"
+
+# The loss counters the agents keep (a batch the collector REJECTED rather than
+# failed to receive is dropped, not retried, and counted). Read BEFORE the
+# outage, because scaling the collector to zero gives its replacement a fresh
+# emptyDir: afterwards there is no "before" left to read.
+#
+# kubescrape_buffer_full_total is deliberately NOT here: for logs a full disk
+# buffer is back-pressure (the tailer rewinds and re-reads), which a long outage
+# against a small -buffer-max-bytes produces without losing anything. The
+# buffer_* counters exist only with -buffer-dir, which the shipped manifests do
+# not set; on those they stay absent and compare as 0 -> 0.
+LOSS_METRICS=(kubescrape_log_permanent_dropped_total kubescrape_buffer_dropped_batches_total)
+BASELINE="$CAP_DIR/collector-outage.baseline.json"
+say "loss-counter baseline (before the outage wipes the capture)"
+loss_baseline "$BASELINE" "${LOSS_METRICS[@]}" || \
+  fail "could not read the collector's metrics capture before the outage — without a baseline the loss-counter assertion would be vacuous"
 
 # The collector goes down FIRST, and only then does the writer start. Every
 # line is therefore produced while there is nowhere to deliver it, so every
@@ -46,12 +73,13 @@ say "letting the writer finish and the agent catch up"
 sleep $((COUNT + 60))
 
 say "verdict"
-if gap_report "$MARK" "$COUNT"; then
-  echo
-  echo "CHAOS PASS: no line lost across a ${OUTAGE}s collector outage"
-else
-  echo
-  fail "lines were lost across the collector outage"
-fi
-say "loss counters (all must be zero or absent)"
-counters permanent_dropped; counters buffer_dropped; counters buffer_full
+gap_report "$MARK" "$COUNT" || fail "lines were lost across the collector outage"
+
+# The catch-up sleep above outlasts the agents' self-metrics push period (1m by
+# default), so each has reported its counters to the recovered collector by
+# now — and assert_losses_flat refuses to pass if none has.
+say "loss counters (none may have moved since the baseline)"
+assert_losses_flat "$BASELINE" "${LOSS_METRICS[@]}"
+
+echo
+echo "CHAOS PASS: no line lost across a ${OUTAGE}s collector outage, and no agent counted a loss"

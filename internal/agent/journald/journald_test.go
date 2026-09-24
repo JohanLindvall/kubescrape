@@ -13,6 +13,7 @@ import (
 	"github.com/JohanLindvall/enrich"
 	"go.opentelemetry.io/collector/pdata/plog"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -134,12 +135,22 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 
 func startReader(t *testing.T, cfg Config, entries []rawEntry, ended bool, failures int) (*captureExporter, context.CancelFunc) {
 	t.Helper()
+	return startReaderWith(t, cfg, fakeOpener(entries, ended), failures)
+}
+
+// startReaderWith is startReader over a caller-supplied opener.
+func startReaderWith(t *testing.T, cfg Config, open openFunc, failures int) (*captureExporter, context.CancelFunc) {
+	t.Helper()
 	exp := &captureExporter{failures: failures}
 	cfg.Exporter = exp
 	cfg.FlushInterval = 20 * time.Millisecond
 	cfg.RestartBackoff = 10 * time.Millisecond
 	r := New(cfg)
-	r.open = fakeOpener(entries, ended)
+	r.open = open
+	// Every commit durable at once, so a test waiting on the positions file
+	// does not depend on how the entries happened to split into batches
+	// (TestCursorPersistIsRateLimited pins the production cadence).
+	r.cursorPersistEvery = 0
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); r.Run(ctx) }()
@@ -202,20 +213,116 @@ func TestJournalCursorResume(t *testing.T) {
 	cancel()
 
 	// A fresh reader resumes past the committed cursor: nothing re-emitted.
-	exp2, _ := startReader(t, Config{Positions: mustOpenPositions(t, posPath)}, entries, false, 0)
-	time.Sleep(150 * time.Millisecond)
-	if got := exp2.records(); len(got) != 0 {
-		t.Fatalf("resumed run re-emitted %v", got)
+	// Asserted on the cursor the reader OPENS with — resuming is the source's
+	// job (SeekCursor and skip), handing it the committed cursor is the
+	// reader's — rather than by sleeping and seeing nothing exported, which
+	// proves only that the wait was short.
+	opened := make(chan string, 1)
+	replay := fakeOpener(entries, false)
+	startReaderWith(t, Config{Positions: mustOpenPositions(t, posPath)}, func(cfg Config, after string) (source, error) {
+		select {
+		case opened <- after:
+		default:
+		}
+		return replay(cfg, after)
+	}, 0)
+	select {
+	case after := <-opened:
+		if after != "c02" {
+			t.Fatalf("the resumed reader opened after cursor %q, want the committed c02", after)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the resumed reader never opened its source")
 	}
 }
 
-func TestJournalExportFailureRereads(t *testing.T) {
+// The committed cursor is written to the positions file at the tailer's
+// cadence, not once per batch: every write rewrites the WHOLE shared document
+// (every tailed file's offset too) with two fsyncs under the mutex the tailer
+// takes, ~11 ms, and at the default 2s flush a per-batch write was 5x the
+// tailer's own rate. The commit itself stays per batch — only its durability
+// is paced — and the FIRST commit is written at once, because a store holding
+// no cursor reopens at the journal TAIL: that window must not widen.
+func TestCursorPersistIsRateLimitedExceptTheFirst(t *testing.T) {
+	pos := mustOpenPositions(t, filepath.Join(t.TempDir(), "positions.json"))
+	r := New(Config{Positions: pos, Exporter: &captureExporter{}})
+	now := time.Unix(1_700_000_000, 0)
+	r.now = func() time.Time { return now }
+	ctx := context.Background()
+	commit := func(cursor string) {
+		t.Helper()
+		r.ingest(mkEntry(cursor, "a.service", "m", "6"), "m", 0)
+		if err := r.flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if r.cursor != cursor {
+			t.Fatalf("in-memory commit = %q after exporting %s; the commit must not wait for the file", r.cursor, cursor)
+		}
+	}
+
+	commit("c00")
+	if got := pos.JournalCursor(); got != "c00" {
+		t.Fatalf("first commit persisted as %q, want c00 at once: with no stored cursor a crash reopens at the tail", got)
+	}
+	commit("c01")
+	now = now.Add(cursorPersistEvery - time.Second)
+	commit("c02")
+	if got := pos.JournalCursor(); got != "c00" {
+		t.Fatalf("stored cursor = %q inside the interval, want c00: the positions file was rewritten per batch", got)
+	}
+	now = now.Add(time.Second)
+	commit("c03")
+	if got := pos.JournalCursor(); got != "c03" {
+		t.Fatalf("stored cursor = %q once the interval elapsed, want c03", got)
+	}
+	commit("c04")
+	if got := pos.JournalCursor(); got != "c03" {
+		t.Fatalf("stored cursor = %q right after a write, want c03", got)
+	}
+	if !r.saveCursor(true) || pos.JournalCursor() != "c04" {
+		t.Fatalf("forced save left %q, want c04", pos.JournalCursor())
+	}
+}
+
+// Stopping writes the newest committed cursor whatever the cadence owed, so a
+// graceful restart (every rolling update) re-reads nothing it already shipped.
+func TestStopPersistsTheNewestCursor(t *testing.T) {
+	entries := []rawEntry{
+		mkEntry("c00", "a.service", "one", "6"),
+		mkEntry("c01", "a.service", "two", "6"),
+		mkEntry("c02", "a.service", "three", "6"),
+	}
+	posPath := filepath.Join(t.TempDir(), "positions.json")
+	pos := mustOpenPositions(t, posPath)
+	exp := &captureExporter{}
+	r := New(Config{Positions: pos, Exporter: exp, BatchSize: 1, // a batch, and a commit, per entry
+		FlushInterval: 20 * time.Millisecond, RestartBackoff: 10 * time.Millisecond})
+	r.open = fakeOpener(entries, false)
+	fixed := time.Unix(1_700_000_000, 0)
+	r.now = func() time.Time { return fixed } // the interval never elapses
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); r.Run(ctx) }()
+
+	waitFor(t, "3 records", func() bool { return len(exp.records()) == 3 })
+	if got := pos.JournalCursor(); got != "c00" {
+		t.Fatalf("stored cursor = %q while running, want only the first commit (c00)", got)
+	}
+	cancel()
+	<-done
+	if got := mustOpenPositions(t, posPath).JournalCursor(); got != "c02" {
+		t.Fatalf("positions file holds %q after a graceful stop, want the newest commit c02", got)
+	}
+}
+
+func TestJournalExportFailureRetriesInPlace(t *testing.T) {
 	entries := []rawEntry{
 		mkEntry("c00", "a.service", "one", "6"),
 		mkEntry("c01", "a.service", "two", "6"),
 	}
-	// One injected export failure: the uncommitted batch is re-read after the
-	// reader restarts (no cursor committed), so both entries arrive.
+	// One injected export failure: the reader keeps the batch and retries the
+	// SAME payload in place (flushRetry) rather than reopening the source and
+	// re-reading it, so both entries arrive, in order.
 	exp, _ := startReader(t, Config{
 		Positions: mustOpenPositions(t, filepath.Join(t.TempDir(), "positions.json")),
 	}, entries, false, 1)
@@ -246,7 +353,7 @@ func TestJournalEnrich(t *testing.T) {
 	// PRIORITY (6 = info) when enrichment is on.
 	msg := `{"@t":"2026-01-02T03:04:05Z","level":"error","msg":"boom"}`
 	entries := []rawEntry{mkEntry("c0", "a.service", msg, "6")}
-	exp, _ := startReader(t, Config{Enrich: true}, entries, false, 0)
+	exp, _ := startReader(t, Config{Chain: logchain.Config{Enrich: true}}, entries, false, 0)
 	waitFor(t, "one record", func() bool { return len(exp.records()) == 1 })
 
 	exp.mu.Lock()
@@ -274,7 +381,7 @@ func TestJournalLogAttrs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exp, _ := startReader(t, Config{LogAttrs: ex}, entries, false, 0)
+	exp, _ := startReader(t, Config{Chain: logchain.Config{LogAttrs: ex}}, entries, false, 0)
 	waitFor(t, "2 records", func() bool { return len(exp.records()) == 2 })
 
 	exp.mu.Lock()
@@ -327,6 +434,7 @@ func TestJournalPermanentRejectionSkips(t *testing.T) {
 	cfg := Config{Positions: pos, Exporter: exp, FlushInterval: 20 * time.Millisecond, RestartBackoff: 10 * time.Millisecond}
 	r := New(cfg)
 	r.open = fakeOpener(entries, false)
+	r.cursorPersistEvery = 0 // see startReader
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); r.Run(ctx) }()
@@ -367,6 +475,7 @@ func TestJournalPermanentRejectionCountsRecords(t *testing.T) {
 	}
 	r := New(cfg)
 	r.open = fakeOpener(entries, false)
+	r.cursorPersistEvery = 0 // see startReader
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); r.Run(ctx) }()

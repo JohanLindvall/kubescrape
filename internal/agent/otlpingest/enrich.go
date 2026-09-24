@@ -1,12 +1,22 @@
-// Package otlpingest receives OTLP logs and metrics pushed by applications on
-// the node and enriches each resource with Kubernetes metadata deduced from a
-// container ID or pod UID already present on the data, then hands the result
-// to the shared exporter. It closes the "apps push OTLP for enrichment" gap
-// that otherwise requires a separate collector with the k8sattributes
-// processor.
+// Package otlpingest receives OTLP pushed by applications — logs and metrics on
+// the node agent's -ingest listeners, traces on the trace tier's application
+// ports (ServerConfig.Traces) — and enriches each resource with Kubernetes
+// metadata deduced from a container ID or pod UID already present on the data
+// (or, opt-in, from the connection's peer address), then hands the result to
+// the shared exporter. It closes the "apps push OTLP for enrichment" gap that
+// otherwise requires a separate collector with the k8sattributes processor.
 //
-// Enrichment never overwrites an attribute the sender already set: the sender
-// is authoritative for anything it chose to declare.
+// The sender is authoritative for the DESCRIPTIVE attributes it chose to
+// declare, which enrichment never overwrites. Two exceptions, both deliberate:
+// the RESOLVED-IDENTITY keys (k8s.namespace.name and its siblings), which this
+// receiver just read from the API server for that resource and which overwrite
+// the sender's claim (Enricher.resolvedWins — routing keys tenancy on them);
+// and the split path, where a resource describes an object OTHER than the
+// sender and that object's resolved identity replaces the copied sender's
+// (split.go, overwriteAttrs). On the application-facing listeners the sender's
+// Kubernetes identity CLAIM is stripped at receipt as well, before anything
+// resolves — nothing at an unauthenticated door can verify it
+// (ServerConfig.ReservedAttrs, wired from Enricher.SenderIdentityStrip).
 package otlpingest
 
 import (
@@ -22,11 +32,9 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
-	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
-	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
 )
 
 // MetadataSource resolves pod/container metadata; implemented by
@@ -64,18 +72,13 @@ type Config struct {
 	Wait time.Duration
 	// MetricsMode selects resource-level vs data-point enrichment.
 	MetricsMode MetricsMode
-	// EnrichLines parses each pushed log record's body for a timestamp,
-	// severity, trace/span IDs and structured fields (as -logs-enrich does),
-	// filling only fields the sender left unset.
-	EnrichLines bool
-	// Scrub redacts sensitive values from pushed log bodies before enrichment
-	// copies from them (nil disables).
-	Scrub *logscrub.Scrubber
 	// PeerIPFallback resolves the sending pod by the connection's peer IP
 	// when the resource carries no container ID or pod UID, and merges its
-	// k8s attributes (never overwriting sender values). Opt-in: peer IPs can
-	// be rewritten by NAT, and hostNetwork senders share the node IP (those
-	// never resolve — the metadata service only indexes pod-IP-owning pods).
+	// k8s attributes per mergeAttrs (the sender's descriptive attributes are
+	// kept; the resolved-identity keys overwrite the sender's). Opt-in: peer
+	// IPs can be rewritten by NAT, and hostNetwork senders share the node IP
+	// (those never resolve — the metadata service only indexes pod-IP-owning
+	// pods).
 	//
 	// It is only ever correct at FIRST RECEIPT. The peer address names the
 	// process at the other end of THIS connection, so it means the sender
@@ -161,202 +164,6 @@ type Enricher struct {
 	splitCapWarnGate *logdedupe.Table
 }
 
-// reqCache is the state one push's enrichment shares across every decision it
-// makes: memoised lookups (N resources naming one id cost one round trip) and
-// the budgets bounding what a single request may cost. One per request — the
-// Enricher itself is shared by concurrent handlers and memoises nothing.
-type reqCache struct {
-	// ids memoises attribution lookups (issued with the full Config.Wait) per
-	// kind-tagged token.
-	ids map[string]idResult
-	// probes memoises wait-free resolvability answers, negatives included:
-	// metaclient never caches a 404, so without the negative entry the split
-	// path issued one live GET per DATA POINT for the same dead id.
-	probes map[string]bool
-	// counted marks tokens whose enriched/unresolved outcome has been tallied.
-	// It decouples COUNTING from CACHING: sameObject resolves its candidate
-	// tokens through attrsFor, which fills ids WITHOUT counting, so a "was the
-	// token already cached?" gate tallied nothing for a token sameObject had
-	// already resolved.
-	counted map[string]struct{}
-	// lookups counts the live metadata lookups issued — probes and attribution
-	// builds alike — bounded by maxLookupsPerRequest; probeLookups counts the
-	// probe half alone, bounded by maxProbeLookupsPerRequest so a walk of
-	// unresolvable point ids can never spend the attribution's share.
-	lookups      int
-	probeLookups int
-	// waitSpent is the server-side wait time this request's attribution
-	// lookups have actually consumed, bounded by lookupWaitBudgetFactor x
-	// Config.Wait (containerLookup): the count budgets above bound how many
-	// lookups a push may issue, this bounds how long they may BLOCK. Elapsed
-	// time, not requested waits — a lookup that resolves fast spends only
-	// what it waited.
-	waitSpent time.Duration
-
-	// tokBuf renders a kind-tagged token for a MAP LOOKUP without allocating
-	// (map[string(buf)] reads do not copy). Only the auto-mode point walk uses
-	// it, and only within one call — a token that has to be STORED is
-	// materialised as a string first.
-	tokBuf []byte
-
-	// peer memoises the peer-IP attribution: the peer is a property of the
-	// CONNECTION, so every resource in a payload has the same one (and
-	// /v1/pod-ips is deliberately uncacheable — recycled IPs need immediacy).
-	peer         pcommon.Map
-	peerResolved bool
-	peerRejected bool
-	peerDone     bool
-
-	// splitGroups/splitCopied are the splitter's per-payload budgets: the group
-	// count and the estimated bytes of minted copies (split.go). They live here
-	// because both must span every input ResourceMetrics of one push.
-	splitGroups int
-	splitCopied int
-}
-
-// newReqCache allocates only what EVERY push writes. probes and counted are
-// filled on their own paths (the resolvability walk, the described-object
-// tally) and a push that takes neither used to pay for both maps regardless —
-// on the request path, per push, on the unauthenticated listener. Reading a nil
-// map is legal, so only the writers check.
-func newReqCache() *reqCache {
-	return &reqCache{ids: map[string]idResult{}}
-}
-
-// idResult is one kind-tagged token's lookup outcome. resolved and the
-// identity fields come from the LOOKUP RESULT, never from built: built is the
-// operator-FILTERED attribute rendering (enable/disable lists, defaults:
-// false can empty it), so an empty built does not mean the object is unknown —
-// reading it that way let a resourceAttributes filter change attribution
-// decisions (sameObject, the auto-mode demotion, which resource a split point
-// lands on) and count resolved lookups as unresolved.
-type idResult struct {
-	built     pcommon.Map // rendered k8s attributes; may be empty for a resolved object
-	resolved  bool
-	podUID    string
-	container string // container name; "" when the token names a whole pod
-}
-
-// maxLookupsPerRequest bounds the live metadata lookups one push may trigger.
-// The listeners are unauthenticated and lookups run serially inside the
-// handler, so without a bound a payload naming tens of thousands of DISTINCT
-// bogus ids (each a memo miss by construction) held its in-flight slot for the
-// whole walk and the metadata service for one GET each. Twice maxSplitGroups
-// because one attributable object may legitimately cost two lookups — the
-// wait-free resolvability probe and the attribution build. Past the budget an
-// id is treated as unresolvable.
-const maxLookupsPerRequest = 2 * maxSplitGroups
-
-// maxProbeLookupsPerRequest is the share of maxLookupsPerRequest the
-// resolvability PROBES may spend; the remainder is reserved for ATTRIBUTION.
-//
-// The two halves are not interchangeable. A probe answers "is this id worth
-// splitting on", and an unresolvable one is deliberately not evidence of
-// anything — so the auto-mode decision walks EVERY distinct data-point id
-// before the resource's own attribution is even attempted. Sharing one
-// allowance let a push of invented point ids exhaust it during that walk and
-// leave the sender itself unattributed: a resolvable resource-level
-// container.id resolving to nothing, exported wholly unenriched and counted
-// unresolved, indistinguishable from an id the cluster never had.
-const maxProbeLookupsPerRequest = maxLookupsPerRequest - maxSplitGroups
-
-// lookupWaitBudgetFactor sizes the per-request WAIT-TIME budget for
-// attribution lookups, as a multiple of Config.Wait. The count budget above
-// bounds how many lookups one push may issue but not how long each may park:
-// a waited container lookup sits in the metadata service's waiter map for the
-// full -ingest-metadata-wait, serially, inside this handler — so with a
-// non-default wait, a push naming distinct fabricated ids held its in-flight
-// slot (and, on HTTP, its byte-budget charge) for count x wait, and ~32 such
-// sockets shed the node's whole ingest. Four waits covers the legitimate
-// shape — a push racing the kubelet posting a few of its OWN ids, each wait
-// released the moment the id appears — without letting invented ids stack
-// maxLookupsPerRequest waits. The budget is charged by time actually ELAPSED,
-// never by waits requested, so a lookup that resolves fast spends almost
-// nothing; past it a lookup proceeds with wait 0, which still resolves every
-// already-posted id.
-const lookupWaitBudgetFactor = 4
-
-// lookupBudgetWarnEvery throttles the over-budget warning: past the budget
-// EVERY further distinct id takes that path, and the diagnosis is per push,
-// not per id.
-const lookupBudgetWarnEvery = time.Minute
-
-// warnLookupBudget names WHICH allowance bound, since the two degrade
-// different things: the probe share only makes further point ids read as
-// unresolvable to the split/auto DECISION (which is not evidence of anything),
-// while the request total takes attribution with it.
-func (e *Enricher) warnLookupBudget(exhausted string, bound int) {
-	if !e.lookupWarnGate.Allow(lookupBudgetWarnEvery) {
-		return
-	}
-	e.log.Warn("ingest: a push named more distinct ids than one request may look up; the remainder is treated as unresolvable",
-		"exhausted", exhausted, "budget", bound)
-}
-
-// noteSplitCapped reports the point-split degradation: past either bound the
-// remaining objects' points fold onto the sender's own resource UNENRICHED, so
-// their series keep flowing and quietly describe the wrong object — the
-// failure mode a counter alone reads as a small number next to a large one.
-//
-// grouped distinguishes the two shapes worth telling apart: an object that
-// never got a resource of its own (the group cap) from one that has a resource
-// and is being refused further descriptor copies (the byte cap), which is the
-// mid-push bind an operator has no other way to see.
-func (e *Enricher) noteSplitCapped(grouped bool, cache *reqCache) {
-	reason := "groups"
-	if grouped || cache.splitCopied >= maxSplitCopyBytes {
-		reason = "copied_bytes"
-	}
-	if allow, _ := e.splitCapWarnGate.Allow(reason); !allow {
-		return
-	}
-	e.log.Warn("ingest: a push describes more objects than one payload may split into, so the remainder is "+
-		"forwarded on the SENDER's resource without Kubernetes attribution; those series describe one object "+
-		"and are labelled with another. Have the sender batch fewer objects per push",
-		"reason", reason, "objects", cache.splitGroups, "maxObjects", maxSplitGroups,
-		"bytes", cache.splitCopied, "maxBytes", maxSplitCopyBytes)
-}
-
-// noteLookupFailed reports a metadata lookup that failed for a reason OTHER
-// than "the object is unknown".
-//
-// The two are not the same event and only one is actionable. A 404 is ordinary:
-// an id races the API server, a sender names a container that has already gone,
-// a pod uid belongs to another node — the Debug line above is the right level
-// for it, and kubescrape_ingest_resources_total{outcome="unresolved"} carries
-// the rate. Anything else — a refused connection, a 5xx, a body that does not
-// decode — means the metadata service is not answering THIS agent, and the
-// visible symptom is every pushed resource silently losing its Kubernetes
-// attribution while the counter that moves says only "unresolved", the same
-// thing it says for a stale id. That was diagnosable only at Debug, which is
-// not on during the outage it explains.
-//
-// Throttled and unkeyed: the condition is the metadata service, and during an
-// outage every id in every push takes this path.
-func (e *Enricher) noteLookupFailed(err error) {
-	if metaclient.IsNotFound(err) {
-		return
-	}
-	if !e.metaWarnGate.Allow(lookupBudgetWarnEvery) {
-		return
-	}
-	e.log.Warn("ingest: the metadata service is not answering lookups, so pushed telemetry is being forwarded "+
-		"without Kubernetes attribution (it is not dropped). Check the metadata service and -metadata-endpoint",
-		"error", err)
-}
-
-// warnWaitBudget is the wait variant: the third allowance degrades the least —
-// past it lookups still run and still resolve already-posted ids, they just no
-// longer park in the metadata service's waiter map for ids that may never
-// appear.
-func (e *Enricher) warnWaitBudget() {
-	if !e.waitWarnGate.Allow(lookupBudgetWarnEvery) {
-		return
-	}
-	e.log.Warn("ingest: a push's distinct ids exhausted the per-request metadata wait budget; further lookups run without waiting (already-posted ids still resolve)",
-		"exhausted", "wait", "budget", lookupWaitBudgetFactor*e.cfg.Wait)
-}
-
 // NewEnricher creates an Enricher.
 func NewEnricher(cfg Config) *Enricher {
 	log := cfg.Logger
@@ -374,110 +181,27 @@ func NewEnricher(cfg Config) *Enricher {
 	}
 }
 
-// EnrichLogs enriches every resource in ld in place. When line enrichment is
-// enabled, each record's body is additionally parsed for a timestamp,
-// severity, trace/span IDs and structured fields (as the tailer does),
-// without overwriting values the sender already set.
+// EnrichLogs enriches every resource in ld in place, merging per mergeAttrs
+// (the resolved-identity keys overwrite the sender's; everything else the
+// sender set is kept). It is resource-only, like EnrichTraces: the per-record
+// half of the log path — scrub, lift, line enrichment, log-metrics, rules —
+// is the server's applyLogChain (ServerConfig.Scrub, EnrichLines and the
+// rest), which runs right after this. Resource enrichment reads no body, so
+// scrubbing there rather than here changes nothing it could see.
 func (e *Enricher) EnrichLogs(ctx context.Context, ld plog.Logs) {
 	// One lookup + attribute build per distinct ID across the request.
 	cache := newReqCache()
 	rls := ld.ResourceLogs()
 	for i := 0; i < rls.Len(); i++ {
-		rl := rls.At(i)
-		e.enrichResource(ctx, rl.Resource(), cache)
-		if e.cfg.Scrub == nil {
-			continue
-		}
-		sls := rl.ScopeLogs()
-		for j := 0; j < sls.Len(); j++ {
-			lrs := sls.At(j).LogRecords()
-			for k := 0; k < lrs.Len(); k++ {
-				// Scrub BEFORE anything reads the body: enrichment (which
-				// runs later, in the server's applyLogChain — one bounded
-				// body render shared with log-metrics and the rules) copies
-				// body slices (exception attributes) that must not carry
-				// secrets, and the metric/rule chain matches against the
-				// same scrubbed view.
-				e.scrubBody(lrs.At(k).Body(), 0)
-			}
-		}
+		e.enrichAttrs(ctx, rls.At(i).Resource().Attributes(), cache)
 	}
 }
 
-// LinesEnabled reports whether per-line body enrichment (-enrich) is on. The
-// enrichment itself runs in the server's applyLogChain — beside log-metrics
-// and the rules, over ONE bounded rendering of the body — but the flag lives
-// in this config.
-func (e *Enricher) LinesEnabled() bool { return e.cfg.EnrichLines }
-
-// maxBodyScrubDepth bounds the walk over a structured body. Bodies come from
-// unauthenticated senders, so the recursion needs a ceiling; real structured
-// logs nest a handful of levels at most.
-const maxBodyScrubDepth = 8
-
-// scrubBody redacts every string leaf of a log body, whatever shape it has.
-//
-// The OTel logging SDKs and the collector's json_parser/transform emit
-// STRUCTURED bodies — a map or a slice — for exactly the records most likely to
-// carry credentials as a field. Scrubbing only ValueTypeStr meant the same
-// message redacted on the tailer path (where it is a raw line) and shipped in
-// clear when an SDK sent it as a kvlist, with nothing counted and the choice
-// invisible to the operator.
-func (e *Enricher) scrubBody(v pcommon.Value, depth int) { e.scrubValue("", v, depth) }
-
-// scrubValue redacts v, using key for context when v is a map entry.
-//
-// The key matters: the patterns are written for LINES, where a secret appears
-// as `password=hunter2`. Split across a map entry the value alone is an opaque
-// string no pattern can judge, so a keyed entry is probed as "key=value" and
-// only the value replaced. Self-contained secrets (bearer tokens, AWS keys, PEM
-// blocks) still match the value on its own, which is tried first.
-func (e *Enricher) scrubValue(key string, v pcommon.Value, depth int) {
-	if depth > maxBodyScrubDepth {
-		return
-	}
-	switch v.Type() {
-	case pcommon.ValueTypeStr:
-		if scrubbed := e.cfg.Scrub.Scrub(v.Str()); scrubbed != v.Str() {
-			v.SetStr(scrubbed)
-			return
-		}
-		if key == "" {
-			return
-		}
-		probe := key + "=" + v.Str()
-		scrubbed := e.cfg.Scrub.Scrub(probe)
-		if scrubbed == probe {
-			return
-		}
-		// Take the tail after the key we prefixed — NOT after the first '='
-		// anywhere, which for a key like "auth=token" yielded a value of
-		// "token=[REDACTED]". And when the pattern consumed the key too (a
-		// user rule whose replacement carries no '=', which the default
-		// [REDACTED] does not), fall back to redacting the whole value: the
-		// old code left it UNTOUCHED while Scrub had already counted a
-		// redaction, so the metric reported a redaction that never happened
-		// and the secret shipped in clear.
-		if tail, ok := strings.CutPrefix(scrubbed, key+"="); ok {
-			v.SetStr(tail)
-			return
-		}
-		v.SetStr(scrubbed)
-	case pcommon.ValueTypeMap:
-		m := v.Map()
-		m.Range(func(k string, mv pcommon.Value) bool {
-			e.scrubValue(k, mv, depth+1)
-			return true
-		})
-	case pcommon.ValueTypeSlice:
-		sl := v.Slice()
-		for i := 0; i < sl.Len(); i++ {
-			// A slice element has no key of its own; it inherits the key of the
-			// entry holding the slice ("args": ["api_key=sk-1"]).
-			e.scrubValue(key, sl.At(i), depth+1)
-		}
-	}
-}
+// usesPeerIP reports whether this enricher ever reads the connection's peer
+// address — its opt-in peer-IP fallback (Config.PeerIPFallback), the only
+// reader — so the transports can skip stamping it (Server.stampPeer). Safe on
+// a nil receiver.
+func (e *Enricher) usesPeerIP() bool { return e != nil && e.cfg.PeerIPFallback }
 
 // EnrichTraces enriches every resource in td in place (traces are otherwise a
 // passthrough signal).
@@ -485,18 +209,20 @@ func (e *Enricher) EnrichTraces(ctx context.Context, td ptrace.Traces) {
 	cache := newReqCache()
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
-		e.enrichResource(ctx, rss.At(i).Resource(), cache)
+		e.enrichAttrs(ctx, rss.At(i).Resource().Attributes(), cache)
 	}
 }
 
 // EnrichMetrics enriches md according to the configured mode, returning the
-// (possibly regrouped) metrics to export.
+// (possibly regrouped) metrics to export. Export the RETURNED value: when the
+// push is regrouped (datapoint mode, or auto demoted to it) md is consumed —
+// its data points are moved into the result, not copied (splitAndEnrich).
 func (e *Enricher) EnrichMetrics(ctx context.Context, md pmetric.Metrics) pmetric.Metrics {
 	switch e.mode {
 	case MetricsDatapoint:
 		return e.splitAndEnrich(ctx, newReqCache(), md)
 	case MetricsResource:
-		e.enrichMetricResources(ctx, md)
+		e.enrichMetricResources(ctx, newReqCache(), md)
 		return md
 	default: // auto
 		// One cache for the decision AND the enrichment that follows — on BOTH
@@ -505,7 +231,7 @@ func (e *Enricher) EnrichMetrics(ctx context.Context, md pmetric.Metrics) pmetri
 		// budget spans the whole push rather than re-arming at the demotion.
 		cache := newReqCache()
 		if e.resourceModeSuffices(ctx, cache, md) {
-			e.enrichMetricResourcesWith(ctx, cache, md)
+			e.enrichMetricResources(ctx, cache, md)
 			return md
 		}
 		return e.splitAndEnrich(ctx, cache, md)
@@ -513,184 +239,46 @@ func (e *Enricher) EnrichMetrics(ctx context.Context, md pmetric.Metrics) pmetri
 }
 
 // enrichMetricResources enriches each ResourceMetrics from its own resource
-// attributes.
-func (e *Enricher) enrichMetricResources(ctx context.Context, md pmetric.Metrics) {
-	e.enrichMetricResourcesWith(ctx, newReqCache(), md)
-}
-
-// enrichMetricResourcesWith is enrichMetricResources against a caller-supplied
-// cache, so the auto-mode decision's lookups are reused.
-func (e *Enricher) enrichMetricResourcesWith(ctx context.Context, cache *reqCache, md pmetric.Metrics) {
+// attributes, against the caller's request cache (the auto-mode decision's, so
+// its lookups are reused, or a fresh one).
+func (e *Enricher) enrichMetricResources(ctx context.Context, cache *reqCache, md pmetric.Metrics) {
 	rms := md.ResourceMetrics()
 	for i := 0; i < rms.Len(); i++ {
-		e.enrichResource(ctx, rms.At(i).Resource(), cache)
+		e.enrichAttrs(ctx, rms.At(i).Resource().Attributes(), cache)
 	}
 }
 
-// resourceModeSuffices reports whether enriching each ResourceMetrics from its
-// own resource attributes attributes everything correctly — i.e. every resource
-// carries an ID and NO data point carries one of its own.
+// enrichAttrs resolves the id on a resource's attributes a and merges the k8s
+// attributes it maps to per mergeAttrs: the resolved-identity keys overwrite
+// the sender's claim, every other attribute the sender set is kept. The token
+// comes from resolvableToken — the one chooser the auto-mode decision and the
+// split path use too, so one payload is attributed by the same id whatever the
+// mode — and a resource carrying no id falls back to the connection's peer.
 //
-// The data-point half is not optional. A resource-level container.id is set
-// automatically by every SDK container detector (Go's resource.WithContainerID,
-// Java's ContainerResource, the collector's resourcedetection/container), and it
-// is in the default -ingest-container-id-keys. An exporter that DESCRIBES other
-// objects — the kube-state-metrics shape this mode exists for — therefore has a
-// resource ID naming ITSELF while each data point names a different pod. Asking
-// only about resources sent that straight down the resource branch and stamped
-// every point with the exporter's own pod and service.name, silently, with
-// kubescrape_ingest_resources_total{enriched} reading healthy. The same payload
-// in explicit datapoint mode split correctly, which is what
-// TestSplitResourceUsesDescribedObjectIdentity pins.
-//
-// The two halves run as two PASSES, cheapest first. Interleaving them let an
-// early resource's point walk run to completion before a later resource that
-// carries no ID at all — which alone forces false — was ever looked at, and that
-// walk spends the request's lookup budget on probes whose answer cannot change
-// the outcome.
-func (e *Enricher) resourceModeSuffices(ctx context.Context, cache *reqCache, md pmetric.Metrics) bool {
-	rms := md.ResourceMetrics()
-	for i := 0; i < rms.Len(); i++ {
-		if !e.hasID(rms.At(i).Resource().Attributes()) {
-			return false
+// The outcome is counted exactly ONCE per call, i.e. per RESOURCE:
+// kubescrape_ingest_resources_total counts resources, so a resource carrying
+// two unresolvable ids must not tally two (attrsFor, which resolvableToken
+// probes the container id through, counts nothing). enriched keys on RESOLVED,
+// not on a non-empty rendering: the operator's attribute filter can empty the
+// build for an object the lookup found, and that must not read as unresolved.
+// cache memoises the lookups per token for the duration of one request.
+func (e *Enricher) enrichAttrs(ctx context.Context, a pcommon.Map, cache *reqCache) {
+	tok := e.resolvableToken(ctx, cache, a)
+	if tok == "" {
+		// Resolved by the connection, not by an attribute: no key on a is the
+		// lookup input, so none is exempt from the overwrite.
+		if built, resolved := e.peerFallback(ctx, cache); resolved {
+			e.mergeAttrs(built, a, nil)
 		}
+		return
 	}
-	for i := 0; i < rms.Len(); i++ {
-		rm := rms.At(i)
-		resID, ok := e.findID(rm.Resource().Attributes())
-		if !ok {
-			return false
-		}
-		// FOREIGN, not merely present. A point ID equal to the resource's own
-		// describes the sender itself — an app labelling its metrics with its
-		// container id, which SDK metric views do — and the resource branch
-		// attributes it identically while leaving the sender authoritative
-		// about itself. Demoting it to the split path instead regrouped its
-		// points and OVERWROTE its service.name/k8s.* with the derived ones
-		// (overwriteAttrs, correct only for a describing exporter), so an
-		// ordinary sender silently changed job identity by adding a label.
-		if e.anyForeignDataPointID(ctx, cache, rm, resID) {
-			return false
-		}
+	r := e.attrsFor(ctx, cache, tok)
+	if !r.resolved {
+		obs.Ingested.WithLabelValues("unresolved").Inc()
+		return
 	}
-	return true
-}
-
-// anyForeignDataPointID reports whether any data point in rm carries an ID
-// attribute naming a DIFFERENT object than resID (one pass, first hit wins).
-func (e *Enricher) anyForeignDataPointID(ctx context.Context, cache *reqCache, rm pmetric.ResourceMetrics, resID string) bool {
-	sms := rm.ScopeMetrics()
-	for i := 0; i < sms.Len(); i++ {
-		ms := sms.At(i).Metrics()
-		for j := 0; j < ms.Len(); j++ {
-			if e.metricPointsHaveForeignID(ctx, cache, ms.At(j), resID) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (e *Enricher) metricPointsHaveForeignID(ctx context.Context, cache *reqCache, m pmetric.Metric, resID string) bool {
-	has := func(a pcommon.Map) bool {
-		prefix, val, ok := e.idValue(a)
-		return ok && e.foreignPointID(ctx, cache, prefix, val, resID)
-	}
-	switch m.Type() {
-	case pmetric.MetricTypeGauge:
-		dps := m.Gauge().DataPoints()
-		for i := 0; i < dps.Len(); i++ {
-			if has(dps.At(i).Attributes()) {
-				return true
-			}
-		}
-	case pmetric.MetricTypeSum:
-		dps := m.Sum().DataPoints()
-		for i := 0; i < dps.Len(); i++ {
-			if has(dps.At(i).Attributes()) {
-				return true
-			}
-		}
-	case pmetric.MetricTypeHistogram:
-		dps := m.Histogram().DataPoints()
-		for i := 0; i < dps.Len(); i++ {
-			if has(dps.At(i).Attributes()) {
-				return true
-			}
-		}
-	case pmetric.MetricTypeExponentialHistogram:
-		dps := m.ExponentialHistogram().DataPoints()
-		for i := 0; i < dps.Len(); i++ {
-			if has(dps.At(i).Attributes()) {
-				return true
-			}
-		}
-	case pmetric.MetricTypeSummary:
-		dps := m.Summary().DataPoints()
-		for i := 0; i < dps.Len(); i++ {
-			if has(dps.At(i).Attributes()) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// enrichResource resolves the ID on res and merges the k8s attributes it maps
-// to, without overwriting attributes the sender already set. cache memoizes
-// the built attributes per ID token for the duration of one request.
-func (e *Enricher) enrichResource(ctx context.Context, res pcommon.Resource, cache *reqCache) {
-	e.applyMetadata(ctx, res.Attributes(), cache)
-}
-
-// applyMetadata looks up the ID in a and merges the derived k8s attributes
-// into a, leaving existing keys untouched. It reports whether an ID resolved.
-func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache *reqCache) bool {
-	cTok, cOK := e.tokenFrom(a, e.containerIDKeys, tokContainer)
-	uTok, uOK := e.tokenFrom(a, e.podUIDKeys, tokPodUID)
-	if !cOK && !uOK {
-		built, resolved := e.peerFallback(ctx, cache)
-		if resolved {
-			e.mergeAttrs(built, a)
-			return true
-		}
-		return false
-	}
-	// Try the container id first, then fall back to the pod uid: a stale
-	// container id the store no longer knows must not block a resolvable pod
-	// uid the sender also provided. Probe with attrsFor (no counting) and count
-	// exactly ONCE below — kubescrape_ingest_resources_total counts RESOURCES,
-	// so a resource carrying two unresolvable ids must not tally two. enriched
-	// keys on RESOLVED, not on a non-empty rendering: the operator's attribute
-	// filter can empty the build for an object the lookup found, and that must
-	// not read as unresolved.
-	if cOK {
-		if r := e.attrsFor(ctx, cache, cTok); r.resolved {
-			obs.Ingested.WithLabelValues("enriched").Inc()
-			e.mergeAttrs(r.built, a)
-			return true
-		}
-	}
-	if uOK {
-		if r := e.attrsFor(ctx, cache, uTok); r.resolved {
-			obs.Ingested.WithLabelValues("enriched").Inc()
-			e.mergeAttrs(r.built, a)
-			return true
-		}
-	}
-	obs.Ingested.WithLabelValues("unresolved").Inc()
-	return false
-}
-
-// tokenFrom returns the first non-empty value under keys as a kind-tagged
-// token. The concatenation allocates; the loop over keys does not — which is
-// why the auto-mode point walk goes through idValue instead and materialises a
-// token only when one has to be STORED.
-func (e *Enricher) tokenFrom(a pcommon.Map, keys []string, prefix string) (string, bool) {
-	if v, ok := valueUnder(a, keys); ok {
-		return prefix + v, true
-	}
-	return "", false
+	obs.Ingested.WithLabelValues("enriched").Inc()
+	e.mergeAttrs(r.built, a, e.lookupKeysOf(tok))
 }
 
 // valueUnder returns the first non-empty string value under keys.
@@ -703,10 +291,13 @@ func valueUnder(a pcommon.Map, keys []string) (string, bool) {
 	return "", false
 }
 
-// idValue is findID in PARTS: the kind prefix and the raw id value, with no
-// token built. The auto-mode decision visits every data point of a push, and
-// the concatenation findID does was one heap allocation each — the largest
-// non-pdata allocator on the default mode's default path.
+// idValue returns the first id in a, container keys first, in PARTS: the kind
+// prefix and the raw id value, with no token built. The auto-mode decision
+// visits every data point of a push, and building the concatenated token there
+// was one heap allocation each — the largest non-pdata allocator on the default
+// mode's default path. It does not decide BETWEEN the two kinds (that needs a
+// lookup: resolvableToken); the point walk only asks whether a point names an
+// id, and which one it names first.
 func (e *Enricher) idValue(a pcommon.Map) (prefix, val string, ok bool) {
 	if v, ok := valueUnder(a, e.containerIDKeys); ok {
 		return tokContainer, v, true
@@ -723,94 +314,55 @@ func (e *Enricher) hasID(a pcommon.Map) bool {
 	return ok
 }
 
-// tokenIs reports whether the kind-tagged token tok is prefix+val, comparing in
-// place rather than building the concatenation to compare it against.
-func tokenIs(tok, prefix, val string) bool {
-	return len(tok) == len(prefix)+len(val) && tok[:len(prefix)] == prefix && tok[len(prefix):] == val
-}
-
-// resolves reports whether token names an object the metadata service knows,
-// without building or caching its attributes. Used to choose between a
-// container id and a pod uid when a sender supplies both, and by the auto-mode
-// foreign-point walk.
-//
-// It is a PROBE — it asks "does this resolve", never "attribute this record" —
-// so it never passes Config.Wait: the server-side wait exists to hold an
-// ATTRIBUTION until a not-yet-posted id appears, and each waited request is
-// parked in the metadata service's waiter map for the full wait — a hold an
-// unauthenticated sender controls, one per distinct id it invents.
-func (e *Enricher) resolves(ctx context.Context, cache *reqCache, token string) bool {
-	if r, ok := cache.ids[token]; ok {
-		return r.resolved // already attributed: the full lookup answers the probe
-	}
-	// Memoised per request, INCLUDING the negative answer. metaclient caches
-	// 200s, but the case this probe exists for — a stale container id — answers
-	// 404, which is never cached, so on the split path (one call per DATA
-	// POINT) a payload of 500 points issued 500 live GETs from inside the
-	// handler for the same dead id.
-	if v, ok := cache.probes[token]; ok {
-		return v
-	}
-	pod, _ := e.lookupByID(ctx, cache, token, 0, true)
-	if cache.probes == nil {
-		cache.probes = map[string]bool{}
-	}
-	cache.probes[token] = pod != nil
-	return pod != nil
-}
-
 // resolvableToken picks the id token to attribute a resource (or data point)
 // by, preferring the container id — it names the exact incarnation — but
 // falling back to the pod uid when the container id does not resolve. A stale
 // container id (the container restarted, or its tombstone expired) must not
-// veto a pod uid the sender also supplied. The probe only runs when BOTH kinds
+// veto a pod uid the sender also supplied. The lookup only runs when BOTH kinds
 // are present, so the common single-id case costs nothing extra.
 //
-// Split mode needs this as much as resource mode: without it an identical
-// payload was attributed differently by mode, and the split path additionally
-// reduced the resource to the bare unresolved id, discarding every attribute
-// the sender had set.
+// It is the ONE token chooser: resource enrichment (enrichAttrs), the auto-mode
+// decision's resource id (resourceModeSuffices) and the split path's per-point
+// and resource-level ids all call it, because each used to choose its own way
+// and the same payload was attributed differently by mode. The last of those
+// splits was the LOOKUP: resource enrichment asked the waited attribution
+// lookup whether the container id resolved while the split path asked a
+// wait-free probe, so with -ingest-metadata-wait set, a container id the kubelet
+// had not yet posted named the container in resource/auto mode and only the pod
+// in datapoint mode (TestTokenChoiceIsModeIndependent). The question is now
+// always attrsFor's: memoised per request, clamped by the per-push wait budget,
+// and the very lookup the chosen container token is then attributed with, so it
+// costs nothing extra when the container id resolves.
+//
+// It runs per DATA POINT on the split path, so its tokens come from the
+// request's interner (reqCache.token) rather than a concatenation, and the
+// pod-uid token is not built at all when the container id resolves.
 func (e *Enricher) resolvableToken(ctx context.Context, cache *reqCache, a pcommon.Map) string {
-	cTok, cOK := e.tokenFrom(a, e.containerIDKeys, tokContainer)
-	uTok, uOK := e.tokenFrom(a, e.podUIDKeys, tokPodUID)
+	cVal, cOK := valueUnder(a, e.containerIDKeys)
+	uVal, uOK := valueUnder(a, e.podUIDKeys)
 	switch {
 	case cOK && uOK:
-		if e.resolves(ctx, cache, cTok) {
+		if cTok := cache.token(tokContainer, cVal); e.attrsFor(ctx, cache, cTok).resolved {
 			return cTok
 		}
-		return uTok
+		return cache.token(tokPodUID, uVal)
 	case cOK:
-		return cTok
-	default:
-		return uTok // "" when neither is present
+		return cache.token(tokContainer, cVal)
+	case uOK:
+		return cache.token(tokPodUID, uVal)
 	}
-}
-
-// attrsFor resolves and caches a token's lookup outcome WITHOUT counting it,
-// for callers that probe more than one candidate token for a single resource
-// and must count exactly once themselves. The attribution lookup carries the
-// configured wait — a not-yet-posted id the sender is about to be attributed
-// by may legitimately appear within it.
-func (e *Enricher) attrsFor(ctx context.Context, cache *reqCache, token string) idResult {
-	if r, ok := cache.ids[token]; ok {
-		return r
-	}
-	r := idResult{built: emptyAttrs}
-	if pod, container := e.lookupByID(ctx, cache, token, e.cfg.Wait, false); pod != nil {
-		r.resolved = true
-		r.podUID = pod.UID
-		if container != nil {
-			r.container = container.Name
-		}
-		r.built = e.buildFor(pod, container)
-	}
-	cache.ids[token] = r
-	return r
+	return ""
 }
 
 // buildFor renders the configured k8s resource attributes for a resolved pod
 // (and, when the ID named one, its exact container) — the one build shared by
 // the token path (attrsFor) and the peer-IP path (peerAttrs).
+//
+// It returns the scratch resource's OWN attribute map rather than a copy of it:
+// the resource is local and never escapes any other way, and a built map is
+// READ-ONLY by contract (see emptyAttrs — every consumer Ranges over it and
+// writes to its own destination). The copy doubled the allocations of every
+// resolved attribution for nothing (TestBuildForDoesNotCopyTheMapItBuilt).
 func (e *Enricher) buildFor(pod *kubemeta.Pod, container *kubemeta.Container) pcommon.Map {
 	r := pcommon.NewResource()
 	actx := attrs.Context{Pod: pod, Container: container}
@@ -818,47 +370,13 @@ func (e *Enricher) buildFor(pod *kubemeta.Pod, container *kubemeta.Container) pc
 		actx.Node = e.cfg.NodeInfo()
 	}
 	e.cfg.Attrs.Build(r, actx)
-	built := pcommon.NewMap()
-	r.Attributes().CopyTo(built)
-	return built
-}
-
-// builtAttrs returns the lookup outcome for a kind-tagged ID token — attrsFor
-// plus the outcome counting, for single-token callers: the metadata lookup,
-// the attribute build and the enriched/unresolved tally each happen once per
-// distinct token per cache (so the per-resource counters stay per-resource;
-// resource() is memoized by id).
-//
-// The tally is gated on the cache's counted set, NOT on whether attrsFor had
-// to build the attributes. The split path calls sameObject (merge-vs-overwrite)
-// BEFORE builtAttrs for the same id, and sameObject resolves both tokens through
-// attrsFor — so by the time builtAttrs runs the id is already in the cache. The
-// old "was it cached?" gate therefore tallied NOTHING for every described
-// object on the datapoint/split path (foreign objects AND same-pod merges),
-// silently zeroing the enriched/unresolved signal for exactly the mode it
-// matters most. The marker fires the FIRST time builtAttrs sees a token per
-// request and never again, so it stays once-per-object and cannot double-count
-// when both sameObject and builtAttrs — or two groupers sharing the cache — run
-// for the same id.
-func (e *Enricher) builtAttrs(ctx context.Context, cache *reqCache, token string) idResult {
-	r := e.attrsFor(ctx, cache, token)
-	if _, counted := cache.counted[token]; !counted {
-		if cache.counted == nil {
-			cache.counted = map[string]struct{}{}
-		}
-		cache.counted[token] = struct{}{}
-		if r.resolved {
-			obs.Ingested.WithLabelValues("enriched").Inc()
-		} else {
-			obs.Ingested.WithLabelValues("unresolved").Inc()
-		}
-	}
-	return r
+	return r.Attributes()
 }
 
 // emptyAttrs is the shared "nothing was built" attribute map. Every consumer of
-// a built map only READS it (mergeAttrs/overwriteAttrs Range over the source),
-// so the not-applicable answers need no map of their own — and they are the
+// a built map only READS it (mergeAttrs/overwriteAttrs Range over the source) —
+// the contract that also lets buildFor hand out the map it built — so the
+// not-applicable answers need no map of their own — and they are the
 // common ones: an unresolved token per distinct id, and the peer fallback on
 // every id-less resource of every push while the fallback is off, which is the
 // default.
@@ -897,32 +415,58 @@ var emptyAttrs = pcommon.NewMap()
 // UNRESOLVABLE resource the sender's declaration is the only namespace that
 // exists, which is why the application-facing listeners also strip these keys
 // at receipt — see Enricher.SenderIdentityStrip.
-func (e *Enricher) mergeAttrs(src, dst pcommon.Map) {
-	src.Range(func(k string, v pcommon.Value) bool {
-		if _, exists := dst.Get(k); !exists || e.resolvedWins(k) {
-			v.CopyTo(dst.PutEmpty(k))
-		}
-		return true
-	})
+//
+// by is the lookup-key set the resolution was made BY (e.containerIDKeys or
+// e.podUIDKeys, per the kind of token that resolved; nil when the attribution
+// came from the connection's peer address) — see resolvedWins for why only
+// that kind is exempt.
+//
+// attrs.Merge does the writing, linear in both sides: a per-key Put loop is
+// quadratic, and here BOTH are tenant-authored (the resolved pod's label
+// count, the sender's resource width), merged once per resource of every push.
+func (e *Enricher) mergeAttrs(src, dst pcommon.Map, by []string) {
+	attrs.Merge(src, dst, func(k string) bool { return e.resolvedWins(k, by) })
+}
+
+// lookupKeysOf is the configured attribute-key set a kind-tagged token's value
+// is read from: the pod-uid keys for a pod-uid token, the container-id keys
+// otherwise.
+func (e *Enricher) lookupKeysOf(token string) []string {
+	if strings.HasPrefix(token, tokPodUID) {
+		return e.podUIDKeys
+	}
+	return e.containerIDKeys
 }
 
 // resolvedWins reports whether THIS receiver's resolution of a key outranks
 // the sender's claim about it.
 //
-// Reserved-identity keys yes (see mergeAttrs) — with TWO exceptions, and they
-// are exactly the two the receipt strip already carves out
-// (Enricher.SenderIdentityStrip). That is the point: the two lists are one
-// decision about what a sender owns, and if they disagreed the exemption would
-// hold only on the path it is least needed and evaporate on the common one.
+// Reserved-identity keys yes (see mergeAttrs) — with TWO exceptions. The
+// receipt strip is this very predicate (Enricher.SenderIdentityStrip filters
+// attrs.ReservedIdentityKeys() through it), so the strip and the merge cannot
+// disagree about what a sender owns: if they did, the exemption would hold only
+// on the path it is least needed and evaporate on the common one. The one input
+// they legitimately differ in is the lookup input's WIDTH, below: the strip
+// runs before anything resolves and passes BOTH kinds as `by` (stripping a
+// lookup key there would leave enrichment nothing to resolve by), while the
+// merge passes the kind that resolved.
 //
-// The LOOKUP INPUT (container.id / k8s.pod.uid, per-Enricher configuration via
+// The LOOKUP INPUT — `by`, the key set of the KIND the resolution was made BY
+// (container.id or k8s.pod.uid, per-Enricher configuration via
 // -ingest-container-id-keys / -ingest-pod-uid-keys — which is why this hangs
-// off the Enricher rather than being a package function): these are the keys
-// the resolution was made BY, so the answer is a function of the value the
-// sender wrote and there is no independent truth to correct it with, and
-// rewriting it into this agent's own spelling (a raw `cafe01` becoming
-// `containerd://cafe01`) would silently change a join key the sender's other
-// telemetry uses.
+// off the Enricher rather than being a package function): the answer is a
+// function of the value the sender wrote there, so there is no independent
+// truth to correct it with, and rewriting it into this agent's own spelling (a
+// raw `cafe01` becoming `containerd://cafe01`) would silently change a join key
+// the sender's other telemetry uses. The OTHER kind is not exempt, because that
+// premise is false for it: when container.id resolved, a sender's k8s.pod.uid
+// is a claim this receiver can check against the pod it just read, and leaving
+// a non-matching one in place shipped one resource naming two pods (the
+// resolved k8s.pod.name/namespace beside a foreign uid). An honest sender's
+// matching uid is overwritten with the same value. The reverse direction
+// changes nothing today — a pod-uid resolution builds no container.id — and a
+// peer-IP attribution (by == nil) exempts nothing, since no attribute was its
+// input.
 //
 // senderControlledIdentity (service.namespace / service.instance.id): the
 // sender names ITSELF to the backend with the OTLP service triple, and
@@ -942,27 +486,26 @@ func (e *Enricher) mergeAttrs(src, dst pcommon.Map) {
 // of attrs.SenderIdentityKeys() (service.name included) before overwriteAttrs
 // rather than merging. "The sender is authoritative about itself" is the same
 // rule in both places; only the question of whose resource it is changes.
-func (e *Enricher) resolvedWins(k string) bool {
+func (e *Enricher) resolvedWins(k string, by []string) bool {
 	if !attrs.ReservedIdentity(k) {
 		return false
 	}
 	if slices.Contains(senderControlledIdentity, k) {
 		return false
 	}
-	return !slices.Contains(e.containerIDKeys, k) && !slices.Contains(e.podUIDKeys, k)
+	return !slices.Contains(by, k)
 }
 
 // overwriteAttrs sets src's attributes on dst, replacing what the sender set.
 // Used only where the resource describes an object OTHER than the sender (the
 // datapoint-split path): there the sender's identity attributes name itself,
 // not the object, so they are not authoritative. Keys absent from src are left
-// alone.
-func overwriteAttrs(src, dst pcommon.Map) {
-	src.Range(func(k string, v pcommon.Value) bool {
-		v.CopyTo(dst.PutEmpty(k))
-		return true
-	})
-}
+// alone. attrs.Merge for mergeAttrs' reason: linear in both sides.
+func overwriteAttrs(src, dst pcommon.Map) { attrs.Merge(src, dst, replaceAll) }
+
+// replaceAll is overwriteAttrs' replace predicate: a package func, so passing
+// it costs no closure.
+func replaceAll(string) bool { return true }
 
 // peerRejectWarnEvery throttles the rejected-peer warning. A relay in front of
 // the listener rewrites EVERY connection, so the condition is either absent or
@@ -1000,7 +543,17 @@ func (e *Enricher) peerAttrs(ctx context.Context, cache *reqCache) (built pcommo
 		return emptyAttrs, false, false
 	}
 	built = emptyAttrs
-	if pod, err := e.cfg.Meta.PodByIP(ctx, ip); err == nil && pod != nil {
+	pod, err := e.cfg.Meta.PodByIP(ctx, ip)
+	if err != nil {
+		// Reported exactly as lookupByID reports its own: every id-less sender
+		// takes this path while the fallback is on, so a metadata service that
+		// is not answering would otherwise read only as outcome=unresolved —
+		// the same thing a hostNetwork peer's ordinary 404 says, and the blind
+		// spot noteLookupFailed exists to close. It skips 404s itself and is
+		// throttled, and this runs at most once per request (the memo below).
+		e.log.Debug("ingest: pod-ip lookup failed", "peer", ip, "error", err)
+		e.noteLookupFailed(err)
+	} else if pod != nil {
 		if e.cfg.PeerReject != nil && e.cfg.PeerReject(pod) {
 			// The address did not come from an application: something between
 			// the sender and this listener replaced it, and the pod it now names
@@ -1032,7 +585,7 @@ func (e *Enricher) peerAttrs(ctx context.Context, cache *reqCache) (built pcommo
 // like every other outcome of kubescrape_ingest_resources_total.
 //
 // ONE helper for the two sites because they had drifted: the resource path
-// (applyMetadata) counted all three outcomes while the splitter's ""-group
+// (enrichAttrs) counted all three outcomes while the splitter's ""-group
 // counted peer_ip and unresolved but NOTHING for a rejected peer — behind a
 // comment claiming the rejection "has already been counted", which no site did
 // — so -ingest-metrics-mode=datapoint (and an auto push demoted to split)
@@ -1056,58 +609,6 @@ func (e *Enricher) warnPeerRejected(ip string, pod *kubemeta.Pod) {
 	}
 	e.log.Warn("refusing to attribute pushed telemetry by peer IP: the connection's source address belongs to this receiver's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, or an internal hop addressed to the application port). Those resources stay unenriched; give senders a resource-level container.id or k8s.pod.uid, or make the path preserve the client address",
 		"peer", ip, "namespace", pod.Namespace, "pod", pod.Name)
-}
-
-// idToken tags an ID value with its kind so a later lookup knows which
-// endpoint to use, without re-scanning the key set.
-const (
-	tokContainer = "c\x00"
-	tokPodUID    = "u\x00"
-)
-
-// foreignID reports whether a data-point token names a DIFFERENT OBJECT than
-// the resource's token — the question the auto-mode decision actually needs.
-//
-// An UNRESOLVABLE point token is not evidence of a foreign object: it used to
-// demote the payload from the resource path (which would have enriched the
-// sender correctly) to the split path, where a group whose id resolves to
-// nothing has its copied resource CLEARED — deleting every attribute the
-// sender set, so service.name vanished and the Prometheus job became
-// unknown_service. A token that DOES resolve is foreign exactly when it names
-// a different object than the resource's — one predicate, sameObject, shared
-// with the split path (see its comment for the drift this repaired).
-func (e *Enricher) foreignID(ctx context.Context, cache *reqCache, tok, resID string) bool {
-	if tok == resID {
-		return false
-	}
-	if !e.resolves(ctx, cache, tok) {
-		return false // unresolvable: not evidence of anything
-	}
-	return !e.sameObject(ctx, cache, tok, resID)
-}
-
-// foreignPointID is foreignID for a data point's id, taking the id in PARTS.
-// Same answer, same order of decisions — but the kind-tagged token is only
-// materialised on a MEMO MISS, i.e. at most once per distinct id per push,
-// instead of once per data point. Every earlier exit reads the memo through
-// map[string(buf)], which does not copy the key.
-func (e *Enricher) foreignPointID(ctx context.Context, cache *reqCache, prefix, val, resID string) bool {
-	if tokenIs(resID, prefix, val) {
-		return false // the sender's own id: the resource branch attributes it
-	}
-	buf := append(cache.tokBuf[:0], prefix...)
-	buf = append(buf, val...)
-	cache.tokBuf = buf
-	if r, ok := cache.ids[string(buf)]; ok {
-		if !r.resolved {
-			return false // unresolvable: not evidence of anything
-		}
-		return !sameResolved(r, e.attrsFor(ctx, cache, resID))
-	}
-	if resolved, ok := cache.probes[string(buf)]; ok && !resolved {
-		return false
-	}
-	return e.foreignID(ctx, cache, string(buf), resID)
 }
 
 // sameObject reports whether two kind-tagged ID tokens name the same
@@ -1172,80 +673,4 @@ func sameResolved(ra, rb idResult) bool {
 		return false
 	}
 	return ra.container == rb.container || ra.container == "" || rb.container == ""
-}
-
-// findID reports the first container ID or pod UID found in a, as a
-// kind-tagged token (container keys first — a container ID names the exact
-// incarnation).
-func (e *Enricher) findID(a pcommon.Map) (token string, ok bool) {
-	if tok, ok := e.tokenFrom(a, e.containerIDKeys, tokContainer); ok {
-		return tok, true
-	}
-	return e.tokenFrom(a, e.podUIDKeys, tokPodUID)
-}
-
-// lookupByID resolves a kind-tagged ID token to metadata (nil pod on miss),
-// charging the request's lookup budget: past it every id reads as unresolvable.
-// wait is the caller's — probes pass 0, attribution passes Config.Wait — and
-// probe says which half of the budget the call spends (see
-// maxProbeLookupsPerRequest); a positive wait is additionally clamped against
-// the request's wait-time budget (containerLookup).
-func (e *Enricher) lookupByID(ctx context.Context, cache *reqCache, token string, wait time.Duration, probe bool) (*kubemeta.Pod, *kubemeta.Container) {
-	if cache.lookups >= maxLookupsPerRequest {
-		e.warnLookupBudget("request", maxLookupsPerRequest)
-		return nil, nil
-	}
-	if probe && cache.probeLookups >= maxProbeLookupsPerRequest {
-		e.warnLookupBudget("probes", maxProbeLookupsPerRequest)
-		return nil, nil
-	}
-	cache.lookups++
-	if probe {
-		cache.probeLookups++
-	}
-	switch {
-	case len(token) >= 2 && token[:2] == tokContainer:
-		id := token[2:]
-		md, err := e.containerLookup(ctx, cache, id, wait)
-		if err != nil {
-			e.log.Debug("ingest: container lookup failed", "id", id, "error", err)
-			e.noteLookupFailed(err)
-			return nil, nil
-		}
-		return &md.Pod, &md.Container
-	case len(token) >= 2 && token[:2] == tokPodUID:
-		uid := token[2:]
-		pod, err := e.cfg.Meta.PodByUID(ctx, uid)
-		if err != nil {
-			e.log.Debug("ingest: pod-uid lookup failed", "uid", uid, "error", err)
-			e.noteLookupFailed(err)
-			return nil, nil
-		}
-		return pod, nil
-	}
-	return nil, nil
-}
-
-// containerLookup issues the container lookup, charging the request's
-// wait-time budget for the server-side block a positive wait buys (see
-// lookupWaitBudgetFactor). The clamp is against time already ELAPSED, and the
-// spend is measured around the call itself: a lookup that resolves the moment
-// the id appears — the case the wait exists for — burns only that moment, so
-// the whole budget stays available for the ids that actually park.
-func (e *Enricher) containerLookup(ctx context.Context, cache *reqCache, id string, wait time.Duration) (*kubemeta.ContainerMetadata, error) {
-	if wait <= 0 {
-		return e.cfg.Meta.Container(ctx, id, 0)
-	}
-	remaining := lookupWaitBudgetFactor*e.cfg.Wait - cache.waitSpent
-	if remaining <= 0 {
-		e.warnWaitBudget()
-		return e.cfg.Meta.Container(ctx, id, 0)
-	}
-	if wait > remaining {
-		wait = remaining
-	}
-	start := time.Now()
-	md, err := e.cfg.Meta.Container(ctx, id, wait)
-	cache.waitSpent += time.Since(start)
-	return md, err
 }

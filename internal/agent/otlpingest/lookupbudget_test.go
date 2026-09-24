@@ -10,12 +10,15 @@ package otlpingest
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -59,7 +62,7 @@ func TestAutoModeProbeLookupsAreBoundedAndWaitFree(t *testing.T) {
 	dps := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().
 		SetEmptyGauge().DataPoints()
 	ids := maxLookupsPerRequest + 100
-	for i := 0; i < ids; i++ {
+	for i := range ids {
 		dp := dps.AppendEmpty()
 		dp.SetIntValue(1)
 		dp.Attributes().PutStr("container.id", fmt.Sprintf("bogus-%d", i))
@@ -82,10 +85,11 @@ func TestAutoModeProbeLookupsAreBoundedAndWaitFree(t *testing.T) {
 	}
 }
 
-// Split mode with BOTH id kinds on every point probes the container id per
-// distinct pair before the group cap can short-circuit, then builds the
-// admitted groups' attributions; probes and builds share one budget, so the
-// total stays bounded whatever the payload's shape.
+// Split mode with BOTH id kinds on every point resolves the container id per
+// distinct pair (resolvableToken's lookup, the one every mode shares) before the
+// group cap can short-circuit, then builds the admitted groups' attributions;
+// all of it draws on the one request budget, so the total stays bounded
+// whatever the payload's shape.
 func TestSplitModeLookupsAreBoundedPerPush(t *testing.T) {
 	meta := &recordingMeta{fakeMeta: &fakeMeta{}}
 	e := NewEnricher(Config{Meta: meta, MetricsMode: MetricsDatapoint})
@@ -95,7 +99,7 @@ func TestSplitModeLookupsAreBoundedPerPush(t *testing.T) {
 		Metrics().AppendEmpty().SetEmptyGauge().DataPoints()
 	// Sized so probes alone stay under the budget but probes + builds do not.
 	points := maxLookupsPerRequest - maxSplitGroups + 1000
-	for i := 0; i < points; i++ {
+	for i := range points {
 		dp := dps.AppendEmpty()
 		dp.SetIntValue(1)
 		dp.Attributes().PutStr("container.id", fmt.Sprintf("c-%d", i))
@@ -113,8 +117,44 @@ func TestSplitModeLookupsAreBoundedPerPush(t *testing.T) {
 	for id, waits := range meta.waits {
 		for _, w := range waits {
 			if w != 0 {
-				t.Fatalf("split-path probe for %s carried wait %v, want 0", id, w)
+				t.Fatalf("split-path lookup for %s carried wait %v with no -ingest-metadata-wait configured, want 0", id, w)
 			}
 		}
+	}
+}
+
+// A sender-supplied id has no length bound on the wire, and a lookup for it is
+// a URL path segment the metadata service refuses past its 8 KiB header bound —
+// while the failure is logged with that URL in it. An over-long id is therefore
+// unresolvable without a lookup: no request, no budget spent, no log line
+// carrying megabytes of it; the resource is forwarded unenriched and counted.
+func TestOverlongLookupIDIssuesNoMetadataRequest(t *testing.T) {
+	meta := &recordingMeta{fakeMeta: newMeta()}
+	log, logged := capturedLogger()
+	e := NewEnricher(Config{Meta: meta, MetricsMode: MetricsAuto, Logger: log})
+
+	huge := strings.Repeat("a", 2<<20)
+	ld := plog.NewLogs()
+	ld.ResourceLogs().AppendEmpty().Resource().Attributes().PutStr("container.id", huge)
+	pod := ld.ResourceLogs().AppendEmpty()
+	pod.Resource().Attributes().PutStr("k8s.pod.uid", huge)
+	// An ordinary id in the same push still resolves: the bound refuses the one
+	// id, not the request.
+	ld.ResourceLogs().AppendEmpty().Resource().Attributes().PutStr("container.id", "cafe01")
+	before := obs.Ingested.WithLabelValues("unresolved").Value()
+
+	e.EnrichLogs(context.Background(), ld)
+
+	if meta.calls != 1 {
+		t.Errorf("metadata lookups = %d, want 1 (only the ordinary id)", meta.calls)
+	}
+	if got := obs.Ingested.WithLabelValues("unresolved").Value() - before; got != 2 {
+		t.Errorf("unresolved moved %v, want 2", got)
+	}
+	if v, _ := ld.ResourceLogs().At(2).Resource().Attributes().Get("k8s.pod.name"); v.Str() != "web-1" {
+		t.Errorf("the ordinary id in the same push did not resolve: k8s.pod.name = %q", v.Str())
+	}
+	if n := len(logged()); n > 64<<10 {
+		t.Errorf("the refusal logged %d bytes", n)
 	}
 }

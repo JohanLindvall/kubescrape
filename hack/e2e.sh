@@ -4,9 +4,13 @@
 # AGENTS.md has always said informer/store/API changes should be verified
 # against a real cluster; this script is that checklist as code. It builds the
 # image, loads it into the kind cluster (created if absent — cluster-up.sh is
-# idempotent), deploys the SHIPPED manifests (deploy/*.yaml — the copy
-# internal/manifestcheck guards textually) plus the debug collector, and then
-# asserts the pipeline actually works:
+# idempotent), deploys two of the SHIPPED manifests (deploy/kubernetes.yaml
+# and deploy/agent.yaml, the metadata service and the DaemonSet) plus the debug
+# collector, and then asserts the pipeline actually works. deploy/events.yaml
+# and deploy/servicegraph.yaml are NOT applied here: they are guarded only
+# statically (internal/manifestcheck reads them as text — every flag they pass
+# exists, every host mount a pipeline needs is present), so nothing in this
+# script proves an event or a trace edge arrives. The assertions:
 #
 #   1. both readiness gates clear (the agent's /readyz genuinely depends on
 #      the metadata service, so the DaemonSet rollout is itself an assertion),

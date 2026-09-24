@@ -33,7 +33,7 @@ func (s *sink) ExportTraces(_ context.Context, td ptrace.Traces) error {
 func batch(n int) ptrace.Traces {
 	td := ptrace.NewTraces()
 	ss := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		sp := ss.Spans().AppendEmpty()
 		var id [16]byte
 		id[15] = byte(i + 1)
@@ -49,7 +49,7 @@ func TestRateCapIsWarnedOnceWithTheKnob(t *testing.T) {
 	s.now = func() time.Time { return time.Unix(1000, 0) } // no refill
 
 	ctx := context.Background()
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if err := s.ExportTraces(ctx, batch(8)); err != nil {
 			t.Fatal(err)
 		}

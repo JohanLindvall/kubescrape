@@ -1,6 +1,11 @@
 package logline
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
+)
 
 func TestParseSelectors(t *testing.T) {
 	t.Parallel()
@@ -110,5 +115,121 @@ func TestExactSelectorUnescapeSinglePass(t *testing.T) {
 	}
 	if match(`a"b`) {
 		t.Error(`a\\"b must not double-decode to a"b`)
+	}
+}
+
+// The memo is a table keyed by the selector hash: every stored outcome must
+// read back, hashes sharing their low bits (the index) must not shadow each
+// other, and Reset must forget everything — including across the wrap of the
+// per-line stamp, where a slot written 2^32 lines ago would otherwise read as
+// current.
+func TestMatchContextMemoizesEveryHashUntilReset(t *testing.T) {
+	t.Parallel()
+	var c MatchContext
+	c.Reset()
+	const n = 1000
+	// Every hash shares its low 16 bits, so they all probe from one slot.
+	hash := func(i int) uint64 { return uint64(i+1)<<16 | 0x5a5a }
+	for i := range n {
+		if _, known := c.Cached(hash(i)); known {
+			t.Fatalf("hash %d known before it was stored", i)
+		}
+		c.Store(hash(i), i%3 == 0)
+	}
+	for i := range n {
+		got, known := c.Cached(hash(i))
+		if !known || got != (i%3 == 0) {
+			t.Fatalf("hash %d: (%v, %v), want (%v, true)", i, got, known, i%3 == 0)
+		}
+	}
+	c.Reset()
+	for i := range n {
+		if _, known := c.Cached(hash(i)); known {
+			t.Fatalf("hash %d survived Reset", i)
+		}
+	}
+	// Across the stamp's wrap: an entry written under the stamp the wrap
+	// restarts at must not read as current afterwards.
+	var w MatchContext
+	w.Reset() // stamp 1
+	w.Store(hash(7), true)
+	w.gen = ^uint32(0)
+	w.Reset() // wraps back to stamp 1
+	w.Store(hash(9), false)
+	if _, known := w.Cached(hash(7)); known {
+		t.Fatal("an entry from before the stamp's wrap reads as current")
+	}
+	if got, known := w.Cached(hash(9)); got || !known {
+		t.Fatalf("hash 9 after the wrap: (%v, %v), want (false, true)", got, known)
+	}
+	// A context used without a Reset still memoizes.
+	var fresh MatchContext
+	fresh.Store(0, true)
+	if got, known := fresh.Cached(0); !got || !known {
+		t.Fatalf("un-Reset context: (%v, %v), want (true, true)", got, known)
+	}
+}
+
+// memoRules builds n two-selector rule sets sharing their FIRST selector
+// (true for every line) with a distinct, false second one — the shape that
+// made the old slice memo quadratic: n distinct outcomes stored per line, and
+// the shared true one looked up n times.
+func memoRules(tb testing.TB, n int) []*Selectors {
+	tb.Helper()
+	rules := make([]*Selectors, n)
+	for i := range rules {
+		s, err := ParseSelectors([]string{"ns=prod", fmt.Sprintf("app=a%d", i)}, nil)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		rules[i] = s
+	}
+	return rules
+}
+
+func memoLookup(k string) string {
+	if k == "ns" {
+		return "prod"
+	}
+	return "other"
+}
+
+// Matching a line against hundreds of rules through one context allocates
+// nothing once the context is warm — the table grows only past the largest
+// line it has seen.
+func TestMatchContextIsAllocationFreeWhenWarm(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("the race detector adds allocations")
+	}
+	rules := memoRules(t, 200)
+	var c MatchContext
+	line := func() {
+		c.Reset()
+		for _, r := range rules {
+			if r.Match(memoLookup, &c) {
+				t.Fatal("no rule should match")
+			}
+		}
+	}
+	if got := testing.AllocsPerRun(100, line); got != 0 {
+		t.Fatalf("allocs per line = %v, want 0", got)
+	}
+}
+
+// BenchmarkSelectorMemo is the per-line cost of evaluating every rule through
+// the memo, which must stay flat per rule as the rule count grows.
+func BenchmarkSelectorMemo(b *testing.B) {
+	for _, n := range []int{10, 50, 200} {
+		b.Run(fmt.Sprintf("rules=%d", n), func(b *testing.B) {
+			rules := memoRules(b, n)
+			var c MatchContext
+			b.ReportAllocs()
+			for b.Loop() {
+				c.Reset()
+				for _, r := range rules {
+					r.Match(memoLookup, &c)
+				}
+			}
+		})
 	}
 }

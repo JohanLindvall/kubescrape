@@ -18,6 +18,68 @@ func retainedTypeBytes(p *Parser) int {
 	return n
 }
 
+// retainedNameBytes is what the name intern table holds alive, counted off the
+// table rather than off nameBytes.
+func retainedNameBytes(p *Parser) int {
+	n := 0
+	for k := range p.names {
+		n += len(k)
+	}
+	return n
+}
+
+// The name intern table had a count cap (MaxTrackedFamilies) and a per-entry
+// length cap (256 B) and no byte budget, so one scrape of 99,990 distinct
+// 256-byte metric names left 29.5 MiB retained — and a POOLED parser keeps the
+// table warm on purpose, clearing it only past half a bound, so up to ~15 MiB
+// of one target's names could sit in every pooled parser between scrapes. Every
+// other per-exposition table here is held to 1 MiB; so is this one now, and a
+// recycled parser keeps at most half of that.
+func TestNameInternTableIsBoundedByBytes(t *testing.T) {
+	const (
+		names   = 20_000
+		nameLen = maxInternedNameLen // the longest a name may be and still intern
+	)
+	var sb strings.Builder
+	for i := range names {
+		sb.WriteString(strings.Repeat("n", nameLen-8))
+		sb.WriteString(pad8(i))
+		sb.WriteString(" 1\n")
+	}
+	pp := Get(Options{})
+	defer Put(pp)
+	n := 0
+	if _, err := pp.Parse(strings.NewReader(sb.String()), func(s Sample) error {
+		// Past the budget a name is allocated normally, never lost.
+		if want := strings.Repeat("n", nameLen-8) + pad8(n); s.Name != want {
+			t.Fatalf("sample %d is named %.12s..., want the name it was written with", n, s.Name)
+		}
+		n++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if n != names {
+		t.Fatalf("emitted %d samples, want %d", n, names)
+	}
+	if got := retainedNameBytes(pp.p); got > maxInternedNameBytes || got != pp.p.nameBytes {
+		t.Fatalf("name table retains %d bytes (charged %d) after %d distinct %d-byte names, want <= %d",
+			got, pp.p.nameBytes, names, nameLen, maxInternedNameBytes)
+	}
+	if len(pp.p.names) < 100 {
+		t.Fatalf("only %d names interned: the byte bound must stop the table GROWING, not disable it", len(pp.p.names))
+	}
+
+	// What a recycled parser carries into its next scrape: the pool round trip,
+	// on this same parser (see Pooled.reset).
+	pp.release()
+	pp.reset(Options{})
+	if got := retainedNameBytes(pp.p); got >= maxInternedNameBytes/2 || got != pp.p.nameBytes {
+		t.Fatalf("a recycled parser keeps %d bytes of names (charged %d), want < %d",
+			got, pp.p.nameBytes, maxInternedNameBytes/2)
+	}
+}
+
 // A count cap is not a memory cap: the TYPE table's KEYS are names the target
 // chooses. The reported production shape is one annotated pod serving a ~2 MiB
 // gzip body of 100k `# TYPE <16 KiB name> counter` lines and no samples at all,
@@ -30,7 +92,7 @@ func TestTypeTableRetentionIsBoundedByBytes(t *testing.T) {
 		nameLen = 1000 // under maxFamilyNameBytes: the per-token cap must not be what saves us
 	)
 	var sb strings.Builder
-	for i := 0; i < names; i++ {
+	for i := range names {
 		sb.WriteString("# TYPE ")
 		sb.WriteString(strings.Repeat("a", nameLen-8))
 		sb.WriteString(pad8(i))
@@ -161,7 +223,7 @@ func TestRepeatedTypeDeclarationIsChargedOnce(t *testing.T) {
 	const repeats = 2000
 	name := strings.Repeat("r", 1000) // 2 MB if every repeat were charged
 	var sb strings.Builder
-	for i := 0; i < repeats; i++ {
+	for range repeats {
 		sb.WriteString("# TYPE " + name + " counter\n")
 	}
 	sb.WriteString("# TYPE later_family counter\nlater_family 1\n")
@@ -183,6 +245,44 @@ func TestRepeatedTypeDeclarationIsChargedOnce(t *testing.T) {
 	}
 }
 
+// An UNCHANGED redeclaration — the exporters that repeat TYPE before every
+// sample repeat HELP too — changes no classification, so it must not invalidate
+// the per-name memo that spares every sample classify's map probe and suffix
+// walks. A real type change still must, or the family's later samples keep the
+// role they had under the old type.
+func TestUnchangedTypeRedeclarationKeepsTheClassifyMemo(t *testing.T) {
+	p := New(Options{})
+	body := "# TYPE x counter\n# HELP x h\nx_total 1\n# TYPE x counter\n# HELP x h\n"
+	if _, err := p.Parse(strings.NewReader(body), func(Sample) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if !p.lastClassOK {
+		t.Fatal("an unchanged TYPE+HELP redeclaration invalidated the classify memo")
+	}
+
+	var got []Sample
+	body = "# TYPE y counter\ny_total 1\n# TYPE y counter\ny_total 2\n# TYPE y gauge\ny_total 3\n"
+	if _, err := p.Parse(strings.NewReader(body), func(s Sample) error {
+		got = append(got, s)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []struct {
+		role   SampleRole
+		family string
+	}{{RoleCounter, "y"}, {RoleCounter, "y"}, {RoleGauge, "y_total"}}
+	if len(got) != len(want) {
+		t.Fatalf("got %d samples, want %d", len(got), len(want))
+	}
+	for i, w := range want {
+		if got[i].Role != w.role || got[i].Family != w.family {
+			t.Errorf("sample %d: role=%v family=%q, want role=%v family=%q (a retyped family must reclassify)",
+				i, got[i].Role, got[i].Family, w.role, w.family)
+		}
+	}
+}
+
 // The budget is per EXPOSITION, like the table it bounds. A charge left
 // standing over a cleared table would silently untype the next scrape's
 // families — on both entry points, since the pooled path and Parse clear the
@@ -192,7 +292,7 @@ func TestTypeBudgetResetsBetweenExpositions(t *testing.T) {
 	// even an 11-byte family cannot be admitted afterwards — a leak of any size
 	// would otherwise hide in the headroom a rounder number leaves behind.
 	var sb strings.Builder
-	for i := 0; i < maxTypeBytes/maxFamilyNameBytes+16; i++ {
+	for i := range maxTypeBytes/maxFamilyNameBytes + 16 {
 		sb.WriteString("# TYPE " + strings.Repeat("a", maxFamilyNameBytes-8) + pad8(i) + " counter\n")
 	}
 	exhaust, second := sb.String(), "# TYPE fresh_total counter\nfresh_total 1\n"
@@ -214,18 +314,17 @@ func TestTypeBudgetResetsBetweenExpositions(t *testing.T) {
 		}
 	})
 
-	// The pooled entry point clears the table in its own place, so it gets its
-	// own round trip — Put followed by Get hands back the same *Pooled with high
-	// probability, which is how TestAudit_PooledReuseNoCrossContamination pins
-	// the sibling leaks through this path.
+	// The pooled entry point gets its own round trip, on ONE parser: a Put
+	// followed by a Get may hand back a fresh parser (and under -race the pool
+	// drops one Put in four on purpose), which would pass vacuously.
 	t.Run("Pooled", func(t *testing.T) {
 		pp := Get(Options{})
+		defer Put(pp)
 		if _, err := pp.Parse(strings.NewReader(exhaust), func(Sample) error { return nil }); err != nil {
 			t.Fatal(err)
 		}
-		Put(pp)
-		pp = Get(Options{})
-		defer Put(pp)
+		pp.release()
+		pp.reset(Options{})
 		var got []Sample
 		if _, err := pp.Parse(strings.NewReader(second), func(s Sample) error {
 			got = append(got, s)
@@ -300,5 +399,139 @@ func TestMetaBudgetTracksRetentionAcrossRedeclaration(t *testing.T) {
 	}
 	if got, want := p.metaBytes, len("f")+len("a much longer help string"); got != want {
 		t.Errorf("metaBytes = %d, want %d (the retained text, not the sum of declarations)", got, want)
+	}
+}
+
+// retainedLineBytes is the text the per-LINE reuse state holds alive after a
+// parse: every string in the two positional caches and the two label buffers,
+// read across their whole backing arrays — a [:0] reslice hides an entry from
+// len() and not from the GC, which is the bug this measures.
+func retainedLineBytes(p *Parser) (caches, labelTails int) {
+	for _, c := range [][]lastKV{p.lastKV, p.exLastKV} {
+		for _, kv := range c[:cap(c)] {
+			caches += len(kv.name) + len(kv.value)
+		}
+	}
+	for _, ls := range [][]Label{p.labels, p.exLabels} {
+		for _, l := range ls[len(ls):cap(ls)] {
+			labelTails += len(l.Name) + len(l.Value)
+		}
+	}
+	return caches, labelTails
+}
+
+// decreasingLabelBody is the shape that pinned one long value per label
+// POSITION: line k carries k labels and its LAST one is long, so the next line
+// (one label fewer) never reaches that position again and neither the
+// positional cache nor the label buffer's tail is ever overwritten. Every line
+// is malformed (the value does not parse), so no sample, budget or counter
+// other than the malformed total ever sees it. With exemplar=true the long
+// labels ride on an OpenMetrics exemplar instead, whose cache is separate.
+func decreasingLabelBody(positions, longLen int, exemplar bool) string {
+	long := strings.Repeat("x", longLen)
+	var sb strings.Builder
+	for k := positions; k >= 1; k-- {
+		if exemplar {
+			sb.WriteString("m_total 1 # {")
+		} else {
+			sb.WriteString("m{")
+		}
+		for i := 0; i < k; i++ {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString("l")
+			sb.WriteString(itoa(i))
+			sb.WriteString(`="`)
+			if i == k-1 {
+				sb.WriteString(long)
+			}
+			sb.WriteByte('"')
+		}
+		if exemplar {
+			sb.WriteString("} 1\n")
+		} else {
+			sb.WriteString("} notanumber\n")
+		}
+	}
+	if exemplar {
+		sb.WriteString("# EOF\n")
+	}
+	return sb.String()
+}
+
+// The positional last-seen caches and the reused label buffers must hold a
+// BOUNDED amount of text whatever the exposition does. Measured before the
+// bound: 128 lines of decreasing label count and one ~1 MiB value each left
+// 127 MiB retained with the parser alive — one value per position, up to
+// MaxLabelsPerSample x MaxLineBytes in principle — from a scrape recording
+// nothing but malformed lines. Scaled down to 64 x 256 KiB (16 MiB attempted).
+func TestPositionalCachesRetainBoundedText(t *testing.T) {
+	const positions, longLen = 64, 256 << 10
+	for _, tc := range []struct {
+		name     string
+		exemplar bool
+	}{{"sample labels", false}, {"exemplar labels", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := New(Options{OpenMetrics: tc.exemplar, Exemplars: tc.exemplar})
+			if _, err := p.Parse(strings.NewReader(decreasingLabelBody(positions, longLen, tc.exemplar)), func(Sample) error { return nil }); err != nil {
+				t.Fatal(err)
+			}
+			caches, tails := retainedLineBytes(p)
+			// Intern-sized entries are bounded by position count x the length
+			// caps; everything longer by maxLongCacheBytes.
+			ceiling := maxLongCacheBytes + 2*MaxLabelsPerSample*(maxInternedNameLen+maxInternedValueLen)
+			if caches > ceiling {
+				t.Fatalf("positional caches retain %d bytes after the parse, want <= %d "+
+					"(%d lines each leaving a %d-byte value at a position no later line reaches)",
+					caches, ceiling, positions, longLen)
+			}
+			if tails != 0 {
+				t.Fatalf("label buffers retain %d bytes PAST their length: an earlier, longer line's strings "+
+					"are still referenced by the backing array", tails)
+			}
+		})
+	}
+}
+
+// And a pooled parser, which can sit in the pool indefinitely, gives back every
+// string of its last parse when it is returned (only the intern tables are
+// meant to stay warm): the per-line state, the classification memo — whose name
+// aliases the last line's metric name, never interned past maxInternedNameLen —
+// and the per-exposition TYPE and HELP/UNIT tables. The body therefore declares
+// a family and ENDS on a long un-interned name. Not parallel: another test's Get
+// could otherwise take the parser out of the pool between the Put and the
+// inspection.
+func TestPutReleasesLineReferences(t *testing.T) {
+	fam := strings.Repeat("f", maxFamilyNameBytes) // declarable, and too long to intern
+	long := strings.Repeat("m", 64<<10)
+	body := decreasingLabelBody(8, 4096, false) + "ok{a=\"b\"} 1\n" +
+		"# TYPE " + fam + " gauge\n# HELP " + fam + " " + strings.Repeat("h", 4096) + "\n" +
+		fam + "{a=\"b\"} 1\n" + long + "{a=\"b\"} 1\n"
+	pp := Get(Options{})
+	var last string
+	if _, err := pp.Parse(strings.NewReader(body), func(s Sample) error { last = s.Name; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	p := pp.p
+	// The fixture must really leave what the assertions below look for.
+	if last != long || len(p.lastClass.name) != len(long) || len(p.types) != 1 || len(p.metas) != 1 {
+		t.Fatalf("fixture did not take: last sample %d bytes (want %d), memo name %d bytes, %d TYPE and %d HELP entries (want 1 each)",
+			len(last), len(long), len(p.lastClass.name), len(p.types), len(p.metas))
+	}
+	Put(pp)
+	if caches, tails := retainedLineBytes(p); caches != 0 || tails != 0 || len(p.labels) != 0 {
+		t.Fatalf("a returned parser still holds %d bytes in its positional caches and %d in its label buffers", caches, tails+len(p.labels))
+	}
+	if p.lastMetric != "" || p.longCacheBytes != 0 || p.exemplar.Labels != nil {
+		t.Fatalf("a returned parser still holds line state: lastMetric=%q longCacheBytes=%d", p.lastMetric, p.longCacheBytes)
+	}
+	if p.lastClassOK || p.lastClass != (classified{}) {
+		t.Fatalf("a returned parser still holds its classification memo: %d-byte name, %d-byte family, %d-byte help",
+			len(p.lastClass.name), len(p.lastClass.family), len(p.lastClass.help))
+	}
+	if len(p.types) != 0 || p.typeBytes != 0 || len(p.metas) != 0 || p.metaBytes != 0 {
+		t.Fatalf("a returned parser still holds the exposition's tables: %d TYPE entries (%d bytes), %d HELP/UNIT entries (%d bytes)",
+			len(p.types), p.typeBytes, len(p.metas), p.metaBytes)
 	}
 }

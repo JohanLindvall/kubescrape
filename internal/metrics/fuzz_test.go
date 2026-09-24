@@ -93,32 +93,25 @@ func FuzzLineFields(f *testing.F) {
 	})
 }
 
-// sanitizeLabelKey restricts a fuzzed key to characters that survive the
-// serialized form: parseLabels cuts keys at '=', trims surrounding space, and
-// cannot represent quotes/backslashes/newlines/commas in keys (values may
-// contain anything — they are escaped; keys are not, by design).
-// Whitespace is deliberately NOT trimmed: an edge space in a key is
-// representable (escapeKey escapes it) and the round trip must preserve it —
-// hashed identity and rendered identity are the same identity.
-func sanitizeLabelKey(k string) string {
-	return strings.Map(func(r rune) rune {
-		switch r {
-		case '=', ',', '"', '\\', '\n', '{', '}':
-			return -1
-		}
-		return r
-	}, k)
-}
-
-// FuzzLabelsParse checks that String/parseLabels round-trip arbitrary label
-// sets (keys sanitized to the representable alphabet, values fully arbitrary)
-// and that parseLabels never panics on arbitrary input.
+// FuzzLabelsParse checks that String/parseLabels round-trip ARBITRARY label
+// sets — keys as well as values — and that parseLabels never panics on
+// arbitrary input.
+//
+// Keys are not restricted. They used to be sanitized down to an alphabet that
+// stripped exactly the bytes escapeKey exists to escape ('=', ',', '"', '\\',
+// '\n') under a doc saying keys were not escaped "by design", which escapeKey
+// contradicts: resource keys are arbitrary pcommon map keys, and a key that
+// renders differently from the key that was hashed is two series exporting
+// byte-identical attributes. The seeds below reach every escapeKey branch.
 func FuzzLabelsParse(f *testing.F) {
 	f.Add("app", "web", "ns", "prod", "z", "1", `{a="1", b="2"}`)
 	f.Add("k", `quote " backslash \ newline`+"\n", "k2", "a,b=c", "k3", `\`, `{`)
 	f.Add("a", "", "", "v", " spaced ", "x", `{k="v\n\\\""}`)
 	f.Add("k", `"`, "k2", `\n`, "k3", ",", "not-a-label-string")
 	f.Add("\xff\xfe", "\x00", "é", "ü", "k", "v", `{k=}`)
+	// Every byte escapeKey escapes, plus the braces and edge spaces.
+	f.Add("a=\"b\\,\n{}", "v", " edge ", "w", "k\\", "x", `{a\=b="v"}`)
+	f.Add(`\`, "v", "=", "w", ",", "x", `{\,="v", \ ="w"}`)
 
 	f.Fuzz(func(t *testing.T, k1, v1, k2, v2, k3, v3, arbitrary string) {
 		// parseLabels must never panic on arbitrary input.
@@ -129,7 +122,7 @@ func FuzzLabelsParse(f *testing.F) {
 
 		var l labels
 		for _, p := range []kv{{k1, v1}, {k2, v2}, {k3, v3}} {
-			l = l.set(sanitizeLabelKey(p.key), p.value)
+			l = l.set(p.key, p.value)
 		}
 
 		s := l.String()

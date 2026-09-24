@@ -153,18 +153,61 @@ func TestContainerNotFound(t *testing.T) {
 	getJSON(t, srv.URL+"/v1/containers/nope?wait=0", http.StatusNotFound, nil)
 }
 
+// A lookup for a container the store does not know yet PARKS, and the pod
+// upsert that names it releases it with the answer. The pod is added only once
+// the lookup is observed parked (store.BlockedLookups): a sleep racing the
+// request let a slow GET arrive after the upsert and pass on a plain index hit
+// without ever touching the blocking wait this is named for. MaxWait is long
+// so a loaded machine cannot turn the park into a timeout either.
 func TestContainerWaitsForLateMetadata(t *testing.T) {
 	st := store.New(time.Minute)
-	srv := testServer(t, st, closedChan())
+	srv := httptest.NewServer(New(Config{
+		Store: st, Services: services.NewIndex(), Resolver: stubResolver{},
+		MaxWait: 30 * time.Second, Ready: closedChan(),
+	}).Handler())
+	t.Cleanup(srv.Close)
 
+	type result struct {
+		status int
+		md     kubemeta.ContainerMetadata
+		err    error
+	}
+	done := make(chan result, 1)
 	go func() {
-		time.Sleep(50 * time.Millisecond)
-		addPod(st)
+		var r result
+		resp, err := http.Get(srv.URL + "/v1/containers/cafe01")
+		if err != nil {
+			r.err = err
+			done <- r
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		r.status = resp.StatusCode
+		if r.status == http.StatusOK {
+			r.err = json.NewDecoder(resp.Body).Decode(&r.md)
+		}
+		done <- r
 	}()
-	var md kubemeta.ContainerMetadata
-	getJSON(t, srv.URL+"/v1/containers/cafe01", http.StatusOK, &md)
-	if md.Pod.Name != "web-abc-xyz" {
-		t.Fatalf("metadata = %+v", md)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for st.BlockedLookups() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the lookup for an unknown container never parked in the store")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	addPod(st)
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if r.status != http.StatusOK || r.md.Pod.Name != "web-abc-xyz" {
+			t.Fatalf("parked lookup answered %d with %+v, want 200 for web-abc-xyz", r.status, r.md)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pod upsert did not release the parked lookup")
 	}
 }
 
@@ -587,11 +630,11 @@ func TestPodByIPEndpoint(t *testing.T) {
 	getJSON(t, srv.URL+"/v1/pod-ips/10.1.2.3", http.StatusNotFound, nil)
 }
 
-// /metrics serves Go runtime/process metrics only (kubescrape_* metrics are
-// pushed over OTLP, not exposed here).
-// OTLP is the only egress: there is no Prometheus exposition endpoint. The Go
-// runtime and process series are pushed through obs.Registry with everything
-// else (see internal/obs.TestRuntimeMetricsExportOverOTLP).
+// The metadata API handler serves no /metrics. The Prometheus exposition lives
+// on its own listener (-metrics-listen, obs.ServeMetrics): Go runtime/process
+// metrics always, plus the kubescrape_* Registry metrics through the Dump
+// bridge when the OTLP self-metrics push is off (-self-metrics-interval=0) —
+// see internal/obs's runtime.go and TestRuntimeHandlerInternalToggle.
 func TestNoPrometheusExpositionEndpoint(t *testing.T) {
 	st := store.New(time.Minute)
 	srv := testServer(t, st, closedChan())
@@ -644,7 +687,7 @@ func addTargetPod(st *store.Store, i int) {
 // avoid. A leading-zero half is not exotic at 1-in-16 per digit.
 func TestEntityTagIsFixedWidthHex(t *testing.T) {
 	seen := map[string]string{}
-	for i := 0; i < 20000; i++ {
+	for i := range 20000 {
 		body := []byte(strconv.Itoa(i))
 		tag := entityTag(body)
 		if len(tag) != 34 || tag[0] != '"' || tag[33] != '"' {

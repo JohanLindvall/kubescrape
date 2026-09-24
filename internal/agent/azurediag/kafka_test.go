@@ -22,6 +22,8 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kfake"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
+	"github.com/twmb/franz-go/pkg/sasl/plain"
 )
 
 func TestKafkaEndToEnd(t *testing.T) {
@@ -51,6 +53,24 @@ func TestKafkaEndToEnd(t *testing.T) {
 		}
 	}
 	produce(logEnvelope)
+
+	// The first reader is torn down only once its commit has reached the
+	// broker, never after a guessed delay: with autocommit off, a commit
+	// cancelled or not yet sent makes the second reader re-consume, and the
+	// test would then fail with the message a real resume bug produces.
+	// Observed at RECEIPT, which is enough: the cluster hands the commit to the
+	// group's goroutine before it reads another request, so the replacement
+	// reader's OffsetFetch is answered after it. The send must not block — this
+	// runs on kfake's cluster goroutine, and a second commit would wedge it.
+	committed := make(chan struct{}, 1)
+	cluster.ControlKey(int16(kmsg.OffsetCommit), func(kmsg.Request) (kmsg.Response, error, bool) {
+		cluster.KeepControl()
+		select {
+		case committed <- struct{}{}:
+		default:
+		}
+		return nil, nil, false // observe only; the cluster handles it as normal
+	})
 
 	run := func(exp *captureExporter, wantRecords int) {
 		t.Helper()
@@ -85,8 +105,13 @@ func TestKafkaEndToEnd(t *testing.T) {
 			case <-time.After(20 * time.Millisecond):
 			}
 		}
-		// Give the commit after the last export a moment before tearing down.
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-committed:
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("the reader exported its records but never committed their offset")
+		}
 		cancel()
 		<-done
 	}
@@ -166,8 +191,12 @@ func TestScopedFetchErrorsAreNotFatal(t *testing.T) {
 		// Informational: kgo resets consuming itself.
 		{"data loss", errFetch("insights-logs-audit", 0, &kgo.ErrDataLoss{Topic: "insights-logs-audit"})},
 		// Informational: kgo rejoins the group itself. Event Hubs recycles
-		// connections aggressively, so this one is routine.
+		// connections aggressively, so this one is routine. These three are
+		// Retriable=false like the authorization refusals, which is why the
+		// fatal set is an ALLOW-list and not "!Retriable".
 		{"group session", errFetch("", 0, &kgo.ErrGroupSession{Err: kerr.RebalanceInProgress})},
+		{"group session, illegal generation", errFetch("", 0, &kgo.ErrGroupSession{Err: kerr.IllegalGeneration})},
+		{"group session, unknown member", errFetch("", 0, &kgo.ErrGroupSession{Err: kerr.UnknownMemberID})},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			msgs, healthy, err := pollResult(tc.fetches, log, nil)
@@ -185,9 +214,14 @@ func TestScopedFetchErrorsAreNotFatal(t *testing.T) {
 }
 
 // The other half: a condition no further fetch can clear still reaches Run's
-// reopen-with-backoff arm. Unscoped and non-retriable means every hub is
-// unreachable, which is the only shape a fresh client (with freshly read
-// credentials) can recover from.
+// reopen-with-backoff arm — a credential refused for the whole namespace, the
+// only shape a fresh client (with freshly read credentials) can recover from.
+//
+// The fixtures are the shape kgo PRODUCES: every group-management failure is
+// injected unscoped (topic "", partition 0) as *kgo.ErrGroupSession wrapping
+// the broker's error (consumer_group.go's manageFailWait). This test used to
+// feed raw, unwrapped kerr errors — a shape kgo never emits — and so passed
+// while the classifier exempted the real one and the rebuild was unreachable.
 func TestUnscopedFatalFetchErrorsFailThePoll(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -196,8 +230,8 @@ func TestUnscopedFatalFetchErrorsFailThePoll(t *testing.T) {
 		fetches kgo.Fetches
 		want    error
 	}{
-		{"cluster authorization", errFetch("", -1, kerr.ClusterAuthorizationFailed), kerr.ClusterAuthorizationFailed},
-		{"sasl authentication", errFetch("", -1, kerr.SaslAuthenticationFailed), kerr.SaslAuthenticationFailed},
+		{"group authorization", errFetch("", 0, &kgo.ErrGroupSession{Err: kerr.GroupAuthorizationFailed}), kerr.GroupAuthorizationFailed},
+		{"cluster authorization", errFetch("", 0, &kgo.ErrGroupSession{Err: kerr.ClusterAuthorizationFailed}), kerr.ClusterAuthorizationFailed},
 		{"client closed", errFetch("", -1, kgo.ErrClientClosed), kgo.ErrClientClosed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -212,6 +246,60 @@ func TestUnscopedFatalFetchErrorsFailThePoll(t *testing.T) {
 				t.Errorf("healthy=%v msgs=%v, want neither from a failed poll", healthy, msgs)
 			}
 		})
+	}
+}
+
+// End to end against a real broker: a credential with read on the hub and on
+// the cluster but NOT on the consumer group — the likeliest shape of a partial
+// role assignment. kgo reports it only through the group session, so this is
+// the fetch error that must reach Run's rebuild (and the credential
+// invalidation that comes with it) rather than be logged as a per-hub hiccup
+// kgo will retry while nothing streams.
+func TestGroupAuthorizationRefusalFailsThePoll(t *testing.T) {
+	const hub = "insights-logs-audit"
+	cluster, err := kfake.NewCluster(
+		kfake.NumBrokers(1),
+		kfake.SeedTopics(1, hub),
+		kfake.EnableSASL(),
+		kfake.EnableACLs(),
+		kfake.Superuser("PLAIN", "admin", "admin"),
+		kfake.User("PLAIN", "reader", "reader-pw",
+			kfake.ACL{Resource: kmsg.ACLResourceTypeTopic, Name: hub, Pattern: kmsg.ACLResourcePatternTypeLiteral, Operation: kmsg.ACLOperationAll, Allow: true},
+			kfake.ACL{Resource: kmsg.ACLResourceTypeCluster, Name: "kafka-cluster", Pattern: kmsg.ACLResourcePatternTypeLiteral, Operation: kmsg.ACLOperationAll, Allow: true},
+		),
+	)
+	if err != nil {
+		t.Skipf("kfake unavailable: %v", err)
+	}
+	defer cluster.Close()
+
+	src, err := newKafkaSource(&Config{
+		Kafka: KafkaConfig{
+			Brokers: cluster.ListenAddrs(), Group: "kubescrape-test", Topics: []string{hub},
+			Mechanism: plain.Auth{User: "reader", Pass: "reader-pw"}.AsMechanism(),
+		},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for {
+		_, _, err := src.poll(ctx)
+		if err == nil {
+			continue
+		}
+		if ctx.Err() != nil {
+			t.Fatal("no poll failed within 20s: a group authorization refusal was treated as a retried, " +
+				"per-hub fetch error, so the consumer is never rebuilt with fresh credentials")
+		}
+		if !errors.Is(err, kerr.GroupAuthorizationFailed) {
+			t.Fatalf("poll failed with %v, want the group authorization refusal", err)
+		}
+		return
 	}
 }
 

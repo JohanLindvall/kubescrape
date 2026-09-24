@@ -282,8 +282,10 @@ func TestBucketsOnlyForHistogram(t *testing.T) {
 	}
 }
 
-// A zero or negative maxAge would mark every sample idle on every export,
-// silently turning counters into per-interval deltas; reject at load.
+// A zero or negative maxAge would send every sample idle at the next export:
+// a running gauge would be zeroed every interval (a per-interval delta) and a
+// cumulative kind exported only when observed, restarting from zero after the
+// 4-minute grace; reject at load.
 //
 // A MALFORMED one must also name the field: this was the one duration parser
 // in the repo that returned time.ParseDuration's bare error, so

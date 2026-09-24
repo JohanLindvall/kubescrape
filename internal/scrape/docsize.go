@@ -12,14 +12,20 @@ import "github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 // the document re-marshals it once per target, while the pod's own annotations
 // and labels were bounded by the API server only at its 256 KiB per-object
 // limit. (Annotations are bounded at the SOURCE now — kubemeta.MaxAnnotationBytes
-// — but labels still are not, and cannot be; see WHAT REMAINS below.) Measured through the real derivation, with every other ceiling on this
-// path (the path bytes, the per-endpoint chain, the merged chain, the
-// contributor list) fully respected: ONE pod carrying a 200 KiB annotation,
+// — but labels still are not, and cannot be; see WHAT REMAINS below.) Measured
+// through the real derivation, with every other ceiling on this path (the path
+// bytes, the per-endpoint chain, the merged chain, the contributor list) fully
+// respected: ONE pod carrying ~200 KiB of labels (first measured as one 200 KiB
+// annotation, the route MaxAnnotationBytes has since closed),
 // prometheus.io/scrape=true and a 16-entry port annotation yielded 16 targets
 // and a 3,283,798-byte body — ten such pods on a node is ~33 MB per agent poll,
 // re-derived and re-marshalled every cycle, in a singleton the chart requests
-// 128Mi for and deliberately gives no memory limit. writeCached must build the
-// body to hash its ETag, so the 304 path does not save it either.
+// 128Mi for and deliberately gives no memory limit. The node-targets memo does
+// not bound it: an agent whose node's list is unchanged is answered 304 without
+// a derivation, but any pod change on that node — or any Service, monitor,
+// owner or namespace change anywhere in the cluster, which the same tenant can
+// make at will — lapses the memo, and every rebuild builds the whole body to
+// hash its ETag.
 //
 // This is the ceiling that ends that shape by CONSTRUCTION rather than by
 // adding a sixth per-field bound: the charge is the whole target document, so
@@ -56,7 +62,7 @@ const MaxTargetBytesPerPod = 256 << 10
 //     every per-pod scan. KEEP.
 //   - MaxTargetPathBytes (2 KiB) and the monitor door's parse-time field bounds
 //     (servicemonitors.enforceFieldBounds) refuse a FIELD, and a per-field
-//     refusal is the better DIAGNOSTIC: PathRefusedNote names the annotation and
+//     refusal is the better DIAGNOSTIC: pathRefusedNote names the annotation and
 //     its size, where a byte refusal can only say the pod is too large overall.
 //     They also bind where this one cannot — on the pod's FIRST target, which is
 //     unconditional, and (for the monitor door) on what the INDEX retains
@@ -220,11 +226,35 @@ func TargetOwnBytes(t *kubemeta.ScrapeTarget) int {
 			n += len(l) + 3
 		}
 	}
-	if s := t.Service; s != nil {
-		n += serviceFixedBytes + len(s.Name) + len(s.Namespace) + len(s.UID) +
-			stringMapBytes(s.Labels) + stringMapBytes(s.Annotations)
+	return n + ServiceViewBytes(t.Service)
+}
+
+// ServiceViewBytes estimates the marshalled size of a target's Service view,
+// 0 for none. It is TargetOwnBytes' Service term, exported because the server's
+// swap arms have to tell a view's growth apart from the rest of a target's:
+// the view is the one part of a target whose size a tenant controls without
+// any per-field ceiling — a Service's LABELS are bounded only by the object's
+// size limit, like a pod's (see WHAT REMAINS above).
+func ServiceViewBytes(s *kubemeta.Service) int {
+	if s == nil {
+		return 0
 	}
-	return n
+	return serviceFixedBytes + len(s.Name) + len(s.Namespace) + len(s.UID) +
+		stringMapBytes(s.Labels) + stringMapBytes(s.Annotations)
+}
+
+// ServiceIdentityView is a Service view reduced to what identifies the Service
+// — name, namespace and UID — without its labels and annotations. It is what
+// a target keeps when the per-pod byte budget refuses a full view on one of
+// the server's swap arms (server.targetDedup.add): k8s.service.name and
+// k8s.service.uid are the attributes the agent derives from a view by default,
+// so the attribution survives, and only the tenant-sized half is refused. A
+// resource-attribute template reading .Service.Labels on that target sees none.
+func ServiceIdentityView(s *kubemeta.Service) *kubemeta.Service {
+	if s == nil {
+		return nil
+	}
+	return &kubemeta.Service{Name: s.Name, Namespace: s.Namespace, UID: s.UID}
 }
 
 // objectMetaBytes is the namespace-metadata half of a pod document.

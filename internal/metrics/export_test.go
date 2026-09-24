@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -245,8 +246,7 @@ func (c *capExporter) ExportMetrics(_ context.Context, md pmetric.Metrics) error
 // newest payload first, so multi-export tests see the current value — the
 // first-match order once masked a CounterFunc double-count).
 func (c *capExporter) find(name string) (pmetric.Metric, bool) {
-	for x := len(c.md) - 1; x >= 0; x-- {
-		md := c.md[x]
+	for _, md := range slices.Backward(c.md) {
 		rms := md.ResourceMetrics()
 		for i := 0; i < rms.Len(); i++ {
 			sms := rms.At(i).ScopeMetrics()

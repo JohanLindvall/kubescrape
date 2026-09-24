@@ -2,10 +2,17 @@
 // HTTP — the wire contract for its API, so clients can decode responses
 // without redeclaring the types (pkg/metaclient does exactly that).
 //
-// It also holds the conversion from Kubernetes API objects into that model
-// (FromPod) and NormalizeContainerID, which reduces the runtime-prefixed
-// container IDs Kubernetes reports ("containerd://<hex>", "docker://<hex>")
-// to the bare ID the API and the container runtimes' log filenames use.
+// The conversion from Kubernetes API objects into that model
+// (kubeconvert.FromPod) lives in the kubeconvert subpackage, so a client that
+// only decodes responses does not compile k8s.io/api. This package holds the
+// pieces both sides share: NormalizeContainerID, which reduces the
+// runtime-prefixed container IDs Kubernetes reports ("containerd://<hex>",
+// "docker://<hex>") to the bare ID the API and the container runtimes' log
+// filenames use; the metadata filter every served object passes through
+// (CopyMeta, CopyOwnerMeta and FilterAnnotations, with the omission notes
+// AnnotationsOmitted and LabelsOmitted detect); and CompileRelabelRegex, the
+// one compile of a RelabelRule's regex, with RelabelRegexCost, the bound it
+// and the metadata service's parse door both refuse on.
 package kubemeta
 
 import "time"
@@ -13,7 +20,8 @@ import "time"
 // Owner identifies one object in a pod's ownership chain, e.g. a
 // ReplicaSet and the Deployment that owns it. Labels and Annotations are
 // filled for kinds the service keeps metadata informers for (ReplicaSets,
-// Deployments, Jobs, CronJobs).
+// Deployments, StatefulSets, DaemonSets, Jobs, CronJobs); any other kind is a
+// bare reference.
 type Owner struct {
 	APIVersion  string            `json:"apiVersion"`
 	Kind        string            `json:"kind"`
@@ -36,6 +44,15 @@ type ObjectMeta struct {
 type NodeMetadata struct {
 	Name string `json:"name"`
 	ObjectMeta
+}
+
+// NodeTargets is the response of the node targets endpoint
+// (GET /v1/nodes/{node}/targets): the node's scrape targets, deduped and in a
+// deterministic order. Targets is never null on the wire — a node with no
+// targets serves an empty list.
+type NodeTargets struct {
+	Node    string         `json:"node"`
+	Targets []ScrapeTarget `json:"targets"`
 }
 
 // ContainerPort is a port declared on a container spec.
@@ -150,9 +167,11 @@ type Service struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
-// ScrapeTarget is one Prometheus endpoint, derived either from a pod's own
-// prometheus.io/* annotations (source "pod") or from those of a Service
-// selecting the pod (source "service").
+// ScrapeTarget is one Prometheus endpoint. Source says what derived it: a
+// pod's own prometheus.io/* annotations ("pod"), those of a Service selecting
+// the pod ("service"), a ServiceMonitor endpoint resolved through a selected
+// Service ("servicemonitor"), or a PodMonitor endpoint selecting the pod
+// directly ("podmonitor").
 type ScrapeTarget struct {
 	URL     string `json:"url"`
 	Scheme  string `json:"scheme"`
@@ -172,26 +191,10 @@ type ScrapeTarget struct {
 	// scraping it once per monitor. Absent whenever Monitor alone describes
 	// the target, so existing consumers decode unchanged.
 	Monitors []string `json:"monitors,omitempty"`
-	// InsecureSkipVerify scrapes an https target without verifying its
-	// certificate (from the monitor endpoint's tlsConfig).
-	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
-	// AuthSecret references a bearer-token Secret as "namespace/name/key";
-	// agents resolve it via GET /v1/scrape-auth/{ns}/{name}/{key} (served
-	// only when the metadata service runs with -scrape-auth-secrets).
-	AuthSecret string `json:"authSecret,omitempty"`
-	// BasicAuthUser/Pass, AuthType/AuthCredentials and the TLS* fields carry the
-	// endpoint's remaining auth material as "namespace/name/key" secret
-	// references, resolved by agents through the same /v1/scrape-auth channel as
-	// AuthSecret (so they are served only when the service runs
-	// -scrape-auth-secrets). TLSServerName is a literal, not a reference.
-	BasicAuthUser   string `json:"basicAuthUser,omitempty"`
-	BasicAuthPass   string `json:"basicAuthPass,omitempty"`
-	AuthType        string `json:"authType,omitempty"`
-	AuthCredentials string `json:"authCredentials,omitempty"`
-	TLSCA           string `json:"tlsCA,omitempty"`
-	TLSCert         string `json:"tlsCert,omitempty"`
-	TLSKey          string `json:"tlsKey,omitempty"`
-	TLSServerName   string `json:"tlsServerName,omitempty"`
+	// ScrapeAuth is the target's auth/TLS material, from the monitor
+	// endpoint that produced it. Embedded UNTAGGED, so its fields sit on the
+	// target's own JSON object exactly where they always did.
+	ScrapeAuth
 	// Interval and ScrapeTimeout override the agent's -scrape-interval and
 	// -scrape-timeout for this target; empty = the agent's default. Set from a
 	// ServiceMonitor/PodMonitor endpoint's own cadence, and carried in the
@@ -210,6 +213,39 @@ type ScrapeTarget struct {
 	// metricRelabelings, applied per sample by the agent.
 	MetricRelabelings []RelabelRule `json:"metricRelabelings,omitempty"`
 	Pod               Pod           `json:"pod"`
+}
+
+// ScrapeAuth is the auth/TLS group of a scrape endpoint — the fields that
+// select WHAT credential and trust a scrape presents. It is one group because
+// it is compared and adopted WHOLE when two monitors' endpoints meet on one
+// URL: mixing one monitor's client certificate with another's CA (or
+// serverName, or skip-verify) would build a TLS client neither CR describes.
+// internal/servicemonitors' parsed Endpoint carries the same struct, so a
+// target is stamped from its endpoint by one assignment and the two cannot
+// drift apart field by field. Comparable (==) by design: the merge compares
+// the group without allocating.
+type ScrapeAuth struct {
+	// InsecureSkipVerify scrapes an https target without verifying its
+	// certificate (from the monitor endpoint's tlsConfig).
+	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
+	// AuthSecret references a bearer-token Secret as "namespace/name/key";
+	// agents resolve it via GET /v1/scrape-auth/{ns}/{name}/{key} (served
+	// only when the metadata service runs with -scrape-auth-secrets).
+	AuthSecret string `json:"authSecret,omitempty"`
+	// BasicAuthUser/Pass, AuthType/AuthCredentials and the TLS* fields carry the
+	// endpoint's remaining auth material as "namespace/name/key" secret
+	// references, resolved by agents through the same /v1/scrape-auth channel as
+	// AuthSecret (so they are served only when the service runs
+	// -scrape-auth-secrets). TLSServerName is a literal, not a reference, and
+	// AuthType is the authorization scheme (empty = Bearer).
+	BasicAuthUser   string `json:"basicAuthUser,omitempty"`
+	BasicAuthPass   string `json:"basicAuthPass,omitempty"`
+	AuthType        string `json:"authType,omitempty"`
+	AuthCredentials string `json:"authCredentials,omitempty"`
+	TLSCA           string `json:"tlsCA,omitempty"`
+	TLSCert         string `json:"tlsCert,omitempty"`
+	TLSKey          string `json:"tlsKey,omitempty"`
+	TLSServerName   string `json:"tlsServerName,omitempty"`
 }
 
 // RelabelRule is the keep/drop subset of a Prometheus relabel_config:

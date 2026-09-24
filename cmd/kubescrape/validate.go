@@ -25,7 +25,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"strings"
 	"time"
 
@@ -56,6 +55,18 @@ func validateConfig(log *slog.Logger) error {
 	// real start, where it is equally fatal.
 	if err := scrapeAuthShape().Validate(); err != nil {
 		return err
+	}
+	// The self-metrics exporter's transport, judged by the exporter's OWN
+	// shape check (otlpexport.Config.Validate is what New runs first) over the
+	// Config run() hands it. Gated on the push being on, because with
+	// -self-metrics-interval=0 no exporter is built and the service needs no
+	// OTLP endpoint at all — refusing -otlp-* values then would refuse a legal
+	// configuration over flags nothing reads. Shape only: the CA and token
+	// files are the real start's to read.
+	if *selfMetricsIntv > 0 {
+		if err := selfExportConfig().Validate(); err != nil {
+			return fmt.Errorf("-otlp-* (self-metrics exporter): %w", err)
+		}
 	}
 	// Errors AND a warning (the cap is a memory bound wearing a count), so it
 	// runs after the refusals and before the rest of the warnings.
@@ -108,57 +119,42 @@ func checkFlagValues() error {
 	return nil
 }
 
-// checkListenAddrs refuses the two listener mistakes that produce a RUNNING pod
-// serving nothing an operator can reach.
+// checkListenAddrs refuses the listener mistakes that produce a RUNNING pod
+// serving nothing an operator can reach, or a pod that dies at bind with an
+// error that does not name the flag.
 //
-// An address already in use names itself at startup and is fatal, so it needs
-// no check. These two do not: an unparseable address fails inside
-// net.Listen with a message that names neither the flag nor what was wrong with
-// the value, and an EMPTY -listen is worse than either — net/http reads it as
-// ":http", so the API binds port 80 while every probe, Service and agent in the
-// manifests points at 8080. Nothing fails; the pod simply never answers.
+// An EMPTY -listen is the worst of them: net/http reads it as ":http", so the
+// API binds port 80 while every probe, Service and agent in the manifests
+// points at 8080. Nothing fails; the pod simply never answers. The rest is
+// cli.CheckListeners, the rule the agent's dry run applies too: an unparseable
+// address refused by flag name (net.Listen's own error names the value and not
+// the flag), and two listeners on one socket — which, since the metrics
+// endpoint binds first and is fatal, would otherwise cost the API its bind.
 func checkListenAddrs() error {
-	// Empty is the documented "off" for both observability listeners and is
-	// therefore only checked when set; -listen has no off.
+	// Empty is the documented "off" for both observability listeners;
+	// -listen has no off.
 	if strings.TrimSpace(*listen) == "" {
 		return errors.New("-listen is empty: net/http reads an empty address as \":http\", so the metadata API would bind port 80 " +
 			"while the manifests' probes, Service and agents all address the configured port. Pass a host:port (the default is :8080)")
 	}
-	seen := map[string]string{}
-	for _, l := range []struct{ flag, addr string }{
-		{"listen", *listen},
-		{"metrics-listen", *metricsListen},
-		{"pprof-listen", *pprofListen},
-	} {
-		if l.addr == "" {
-			continue
-		}
-		if _, _, err := net.SplitHostPort(l.addr); err != nil {
-			return fmt.Errorf("-%s %q is not a listen address: %w (want host:port, or :port for every interface)", l.flag, l.addr, err)
-		}
-		// Two listeners on one address is a bind failure for whichever binds
-		// second — which, since the metrics endpoint binds first and is fatal,
-		// is usually the API. The three ports exist because they have
-		// different exposure profiles (pprof serves goroutine stacks and heap
-		// contents), so a collision is never what was meant.
-		if other, dup := seen[l.addr]; dup {
-			return fmt.Errorf("-%s and -%s are both %q: the second listener to bind fails with 'address already in use'. "+
-				"The three ports are separate because they have different exposure profiles — pprof in particular serves goroutine stacks and heap contents", other, l.flag, l.addr)
-		}
-		seen[l.addr] = l.flag
-	}
-	return nil
+	return cli.CheckListeners([]cli.Listener{
+		{Flag: "-listen", Addr: *listen},
+		{Flag: "-metrics-listen", Addr: *metricsListen},
+		{Flag: "-pprof-listen", Addr: *pprofListen, Note: cli.PprofNote},
+	})
 }
 
 // checkMonitorNamespaces refuses an entry that can never match.
 //
 // -monitor-namespaces is an EXACT set (parseNamespaceSet builds a map and
-// monitorAllowed does a lookup), and that is the trap: this repo's other
-// namespace flags — the agent's -logs-exclude-namespaces, a log source's
-// `namespaces` — are path.Match GLOBS, so `kube-*` here reads like it would
-// work. It does not, and the failure is silent in the worst direction: the
-// monitors an admin meant to allow are simply never indexed, no target is ever
-// served for them, and nothing anywhere says why.
+// monitorAllowed does a lookup), and that is the trap: a log source's
+// `namespaces`/`excludeNamespaces` in the agent's config are path.Match GLOBS,
+// so `kube-*` here reads like it would work. It does not, and the failure is
+// silent in the worst direction: the monitors an admin meant to allow are
+// simply never indexed, no target is ever served for them, and nothing
+// anywhere says why. (The agent's -logs-exclude-namespaces FLAG is an exact
+// list like this one, matched with slices.Contains — only those two config
+// fields take globs.)
 //
 // So anything that is not a legal namespace name is refused, and a glob
 // metacharacter is refused with its own sentence, since that is the mistake

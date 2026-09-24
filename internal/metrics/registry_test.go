@@ -2,6 +2,8 @@ package metrics
 
 import (
 	"context"
+	"errors"
+	"maps"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,15 +22,13 @@ func TestVecConcurrentFirstUse(t *testing.T) {
 
 	const goroutines, n = 8, 200
 	var wg sync.WaitGroup
-	for g := 0; g < goroutines; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < n; i++ {
+	for range goroutines {
+		wg.Go(func() {
+			for range n {
 				cv.WithLabelValues("same").Inc()
 				_ = cv.WithLabelValues("same").Value()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if got := cv.WithLabelValues("same").Value(); got != goroutines*n {
@@ -53,7 +53,7 @@ func TestRegistryConcurrentExportAndObserve(t *testing.T) {
 	resAttrs := pcommon.NewResource()
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -70,16 +70,14 @@ func TestRegistryConcurrentExportAndObserve(t *testing.T) {
 			}
 		}(i)
 	}
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 50; j++ {
+	for range 2 {
+		wg.Go(func() {
+			for range 50 {
 				if err := r.Export(context.Background(), &capExporter{}, resAttrs); err != nil {
 					t.Error(err)
 				}
 			}
-		}()
+		})
 	}
 	time.Sleep(50 * time.Millisecond)
 	close(stop)
@@ -120,7 +118,7 @@ func TestGaugeFuncReentrant(t *testing.T) {
 	}
 }
 
-// vecKey's netstring encoding must keep aliasing tuples distinct: with a plain
+// appendVecKey's netstring encoding must keep aliasing tuples distinct: with a plain
 // separator, ("x\x00y","z") and ("x","y\x00z") would collide. Only the
 // single-label fast path may return the raw value.
 func TestVecKeyMultiLabelCollisionProof(t *testing.T) {
@@ -144,6 +142,28 @@ func TestVecKeyMultiLabelCollisionProof(t *testing.T) {
 		if got := v.WithLabelValues(tc.vals...).Value(); got != tc.want {
 			t.Fatalf("tuple %q = %v, want %v (tuples aliased)", tc.vals, got, tc.want)
 		}
+	}
+}
+
+// A tuple whose key outgrows the stack buffer (vecKeyBuf) takes append's heap
+// growth instead. It must still resolve to ONE cached wrapper per tuple — the
+// miss arm materialises the grown key, and the next hit must find it under the
+// same bytes.
+func TestLongMultiLabelTupleResolvesToOneSeries(t *testing.T) {
+	r := NewRegistry()
+	v := r.CounterVec("test_veckey_long_total", "t", "a", "b")
+	long := strings.Repeat("x", 3*vecKeyBuf)
+	first := v.WithLabelValues(long, "y")
+	first.Add(1)
+	if again := v.WithLabelValues(long, "y"); again != first {
+		t.Fatal("a long tuple resolved to a second wrapper: the grown key was cached under different bytes")
+	}
+	v.WithLabelValues(long, "y").Add(2)
+	if got := first.Value(); got != 3 {
+		t.Fatalf("long tuple value = %v, want 3", got)
+	}
+	if got := v.WithLabelValues(long, "z").Value(); got != 0 {
+		t.Fatalf("a different long tuple aliased the first: value = %v, want 0", got)
 	}
 }
 
@@ -270,7 +290,10 @@ func TestRegistryExport(t *testing.T) {
 }
 
 // Run exports periodically and once more on shutdown; vec labels land on
-// the data points.
+// the data points. The shutdown export is asserted, not assumed: a bump made
+// after the periodic exports must be in the LAST payload, and that payload
+// must have gone out under the final export's own deadline (the periodic ones
+// run on the caller's deadline-less ctx), so it cannot be a stray tick.
 func TestRegistryRun(t *testing.T) {
 	r := NewRegistry()
 	cv := r.CounterVec("test_run_counter", "labeled counter", "shard")
@@ -292,9 +315,16 @@ func TestRegistryRun(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	if exp.count() == 0 {
+		t.Fatal("Run never exported on its interval")
+	}
+	cv.WithLabelValues("a").Add(10) // after the periodic exports, before shutdown
 	cancel()
 	<-done
 
+	if !exp.lastHadDeadline() {
+		t.Fatal("the last payload was not the shutdown export (it carried no deadline of its own)")
+	}
 	m, ok := exp.snapshot().find("test_run_counter")
 	if !ok {
 		t.Fatal("counter never exported")
@@ -306,22 +336,102 @@ func TestRegistryRun(t *testing.T) {
 			vals[v.Str()] = dps.At(i).DoubleValue()
 		}
 	}
-	if vals["a"] != 1 || vals["b"] != 2 {
-		t.Fatalf("counter vec values = %v", vals)
+	if vals["a"] != 11 || vals["b"] != 2 {
+		t.Fatalf("counter vec values in the shutdown export = %v, want a=11 (the bump before cancel) b=2", vals)
+	}
+}
+
+// failNExporter fails its first `fail` calls, then succeeds. Safe to poll
+// from the test goroutine while Run exports.
+type failNExporter struct {
+	mu    sync.Mutex
+	fail  int
+	calls int
+}
+
+func (f *failNExporter) ExportMetrics(context.Context, pmetric.Metrics) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.calls <= f.fail {
+		return errors.New("collector unavailable")
+	}
+	return nil
+}
+
+func (f *failNExporter) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// A failed self-metrics export cannot be COUNTED — the counter that would
+// record it rides in the payload that is not arriving — so Run's narration is
+// the only signal there is: one WARN when the outage starts (claiming the
+// throttle slot, so the next failures inside the window are Debug rather than
+// a second WARN), and one Info when it ends that says how many attempts it
+// spanned.
+func TestRegistryRunNarratesFailureAndRecovery(t *testing.T) {
+	r := NewRegistry()
+	r.Counter("test_run_narrate_total", "c").Inc()
+	exp := &failNExporter{fail: 3}
+	log, buf := capture()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx, exp, 5*time.Millisecond, pcommon.NewResource(), log); close(done) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for exp.count() < 5 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	if exp.count() < 5 {
+		t.Fatalf("Run exported %d times in 5s, want at least 5", exp.count())
+	}
+
+	out := buf.String()
+	if n := strings.Count(out, "level=WARN"); n != 1 {
+		t.Errorf("WARN lines = %d, want exactly 1 (the outage's first failure; repeats inside the window are Debug):\n%s", n, out)
+	}
+	if !strings.Contains(out, "exporting self-metrics failed; this process's own telemetry is not reaching the collector") {
+		t.Errorf("the WARN must say what is failing:\n%s", out)
+	}
+	if n := strings.Count(out, `level=DEBUG msg="exporting self-metrics failed"`); n != 2 {
+		t.Errorf("Debug repeats = %d, want 2 (failures 2 and 3):\n%s", n, out)
+	}
+	var recovered []string
+	for ln := range strings.SplitSeq(out, "\n") {
+		if strings.Contains(ln, "succeeded again") {
+			recovered = append(recovered, ln)
+		}
+	}
+	if len(recovered) != 1 || !strings.Contains(recovered[0], "level=INFO") || !strings.Contains(recovered[0], "failures=3") {
+		t.Errorf("want exactly one INFO recovery line carrying failures=3, got %q\n%s", recovered, out)
 	}
 }
 
 // lockedCapExporter is a capExporter safe for polling from another goroutine
 // (Registry.Run exports concurrently with the test's checks).
 type lockedCapExporter struct {
-	mu    sync.Mutex
-	inner capExporter
+	mu       sync.Mutex
+	inner    capExporter
+	deadline bool // the last export's ctx carried a deadline
 }
 
 func (c *lockedCapExporter) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	_, c.deadline = ctx.Deadline()
 	return c.inner.ExportMetrics(ctx, md)
+}
+
+// lastHadDeadline reports whether the most recent export's context carried a
+// deadline — Run's shutdown export does, its periodic ones do not.
+func (c *lockedCapExporter) lastHadDeadline() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deadline
 }
 
 func (c *lockedCapExporter) count() int {
@@ -481,6 +591,85 @@ func TestRegistryCounterFuncVec(t *testing.T) {
 	}
 	if v, _ := live(exp3, "latency"); v != 10 {
 		t.Fatalf("latency = %v, want 10 — per-label delta state leaked between label values", v)
+	}
+
+	// A value fn stops reporting stays on the push at its last total, and its
+	// delta state survives: when it reappears unchanged it continues rather
+	// than re-adding its whole total (the CounterFuncVec doc's claim).
+	delete(totals, "latency")
+	exp4 := &capExporter{}
+	if err := r.Export(context.Background(), exp4, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := live(exp4, "latency"); !ok || v != 10 {
+		t.Fatalf("vanished latency on the push = %v (found %v), want frozen at 10", v, ok)
+	}
+	totals["latency"] = 10
+	exp5 := &capExporter{}
+	if err := r.Export(context.Background(), exp5, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := live(exp5, "latency"); v != 10 {
+		t.Fatalf("reappearing latency = %v, want 10 — the total was re-added", v)
+	}
+}
+
+// GaugeFuncVec's contract is a key set that never shrinks, because the two
+// delivery modalities disagree about a label value fn stops reporting: the
+// push keeps exporting its last reading (Registry series never expire and
+// nothing unlinks the absent value), while Dump, built from fn alone, drops it.
+// This pins that answer so a data-driven caller is a deliberate choice rather
+// than a discovery — and so the doc on GaugeFuncVec cannot drift from it.
+func TestGaugeFuncVecVanishedLabelValueFreezesOnThePush(t *testing.T) {
+	r := NewRegistry()
+	vals := map[string]float64{"a": 1, "b": 2}
+	r.GaugeFuncVec("test_backlog", "d", "signal", func() map[string]float64 {
+		out := make(map[string]float64, len(vals))
+		maps.Copy(out, vals)
+		return out
+	})
+	pushed := func() map[string]float64 {
+		t.Helper()
+		exp := &capExporter{}
+		if err := r.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
+			t.Fatal(err)
+		}
+		m, ok := exp.find("test_backlog")
+		if !ok {
+			t.Fatal("test_backlog not exported")
+		}
+		got := map[string]float64{}
+		dps := m.Gauge().DataPoints()
+		for i := 0; i < dps.Len(); i++ {
+			lv, _ := dps.At(i).Attributes().Get("signal")
+			got[lv.Str()] = dps.At(i).DoubleValue()
+		}
+		return got
+	}
+	dumped := func() map[string]float64 {
+		got := map[string]float64{}
+		for _, s := range r.Dump() {
+			if s.Name != "test_backlog" {
+				continue
+			}
+			for _, p := range s.Points {
+				got[p.Labels[0][1]] = p.Value
+			}
+		}
+		return got
+	}
+
+	if got := pushed(); len(got) != 2 || got["a"] != 1 || got["b"] != 2 {
+		t.Fatalf("first push = %v, want a=1 b=2", got)
+	}
+
+	delete(vals, "b")
+	vals["a"] = 5
+	if got := pushed(); len(got) != 2 || got["a"] != 5 || got["b"] != 2 {
+		t.Fatalf("push after b vanished = %v, want a=5 and b FROZEN at 2", got)
+	}
+	if got := dumped(); len(got) != 1 || got["a"] != 5 {
+		t.Fatalf("dump after b vanished = %v, want only a=5", got)
 	}
 }
 

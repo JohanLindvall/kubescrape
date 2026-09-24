@@ -8,12 +8,12 @@ import (
 
 // A single line with a pathological number of labels must be dropped as
 // malformed rather than run the O(n²) dedupe scan to completion (which the
-// scrape timeout cannot interrupt). Regression for maxLabelsPerSample.
+// scrape timeout cannot interrupt). Regression for MaxLabelsPerSample.
 func TestLabelBombIsDroppedAndFast(t *testing.T) {
 	var b strings.Builder
 	b.WriteString("m{")
-	const n = 200_000 // ~well past maxLabelsPerSample, ~1 MiB
-	for i := 0; i < n; i++ {
+	const n = 200_000 // ~well past MaxLabelsPerSample, ~1 MiB
+	for i := range n {
 		if i > 0 {
 			b.WriteByte(',')
 		}
@@ -36,7 +36,7 @@ func TestLabelBombIsDroppedAndFast(t *testing.T) {
 	if emitted != 0 {
 		t.Errorf("a label-bomb line emitted %d samples; want 0 (dropped as malformed)", emitted)
 	}
-	// With the cap the scan is bounded to ~maxLabelsPerSample²; without it this
+	// With the cap the scan is bounded to ~MaxLabelsPerSample²; without it this
 	// line takes tens of seconds. A generous ceiling catches the quadratic.
 	if elapsed > 3*time.Second {
 		t.Errorf("parsing a label bomb took %v; the per-sample label cap is not bounding the quadratic scan", elapsed)

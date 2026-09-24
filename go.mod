@@ -18,6 +18,7 @@ require (
 	github.com/prometheus/client_model v0.6.3
 	github.com/twmb/franz-go v1.22.0
 	github.com/twmb/franz-go/pkg/kfake v0.0.0-20260816150254-beb096adff00
+	github.com/twmb/franz-go/pkg/kmsg v1.14.0
 	go.opentelemetry.io/collector/pdata v1.67.0
 	go.starlark.net v0.0.0-20260908191801-89a6a09411d5
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260921155816-b14227669459
@@ -64,7 +65,6 @@ require (
 	github.com/prometheus/common v0.71.0 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
-	github.com/twmb/franz-go/pkg/kmsg v1.14.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.opentelemetry.io/collector/featuregate v1.67.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect

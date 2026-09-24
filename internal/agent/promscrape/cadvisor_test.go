@@ -16,6 +16,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -104,7 +105,7 @@ func TestMemoCadvisorLargeBodyNoAliasing(t *testing.T) {
 	var sb strings.Builder
 	for _, fam := range []string{"container_cpu_usage_seconds_total", "container_memory_usage_bytes"} {
 		fmt.Fprintf(&sb, "# TYPE %s gauge\n", fam)
-		for i := 0; i < n; i++ {
+		for i := range n {
 			fmt.Fprintf(&sb, "%s{namespace=\"ns%d\",pod=\"pod-%d\",container=\"app-%d\",id=%q} %d\n",
 				fam, i, i, i, id(i), i)
 		}
@@ -811,5 +812,104 @@ func TestPerScrapeComplaintsAreDedupedPerTarget(t *testing.T) {
 	}
 	if got := obs.ScrapeMalformed.WithLabelValues(pipelineTargets).Value() - beforeMalformed; got != 3*cycles {
 		t.Errorf("malformed samples counted = %v, want %v: the counter is the ongoing signal", got, 3*cycles)
+	}
+}
+
+// recreatedPodSource answers for web-0 under whichever uid it currently holds:
+// a StatefulSet pod deleted and recreated under its old name.
+type recreatedPodSource struct {
+	fakeMetaSource
+	uid atomic.Value // string
+}
+
+func (r *recreatedPodSource) PodByName(_ context.Context, namespace, name string) (*kubemeta.Pod, error) {
+	r.podCalls.Add(1)
+	if namespace != "ns1" || name != "web-0" {
+		return nil, notFound()
+	}
+	p := pod1Meta
+	p.Name, p.UID = "web-0", r.uid.Load().(string)
+	p.Owners = []kubemeta.Owner{{Kind: "StatefulSet", Name: "web"}}
+	return &p, nil
+}
+
+// The by-name pod cache was keyed by namespace/name alone. After a same-name
+// recreation the still-fresh entry for the PREDECESSOR was served, refused by
+// podAnswersFor, and the new incarnation went out unresolved — service.name
+// "web-0" rather than "web" — for up to podMetaCacheTTL, without the metadata
+// service (which would have placed it) ever being asked.
+func TestRecreatedPodIsAskedAboutAgainNotRefusedFromTheCache(t *testing.T) {
+	const uidA, uidB = "aaaaaaaa-0000-0000-0000-000000000001", "aaaaaaaa-0000-0000-0000-000000000002"
+	src := &recreatedPodSource{}
+	src.uid.Store(uidA)
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: time.Second,
+		Targets: staticTargets{}, Exporter: &captureExporter{},
+		Kubelet: KubeletConfig{Meta: src},
+	})
+	ctx := context.Background()
+	if actx, resolved, _ := s.resolveContext(ctx, "", "ns1", "web-0", uidA, ""); !resolved || actx.Pod.UID != uidA {
+		t.Fatalf("the first incarnation did not resolve (resolved=%v)", resolved)
+	}
+
+	src.uid.Store(uidB) // deleted and recreated under the same name
+	actx, resolved, _ := s.resolveContext(ctx, "", "ns1", "web-0", uidB, "")
+	if !resolved || actx.Pod == nil || actx.Pod.UID != uidB {
+		t.Fatalf("the new incarnation did not resolve (resolved=%v): it was refused from its predecessor's cache entry", resolved)
+	}
+	if got := src.podCalls.Load(); got != 2 {
+		t.Errorf("PodByName calls = %d, want 2 (one per incarnation)", got)
+	}
+	// Each incarnation is still cached: asking again issues nothing.
+	s.resolveContext(ctx, "", "ns1", "web-0", uidB, "")
+	if got := src.podCalls.Load(); got != 2 {
+		t.Errorf("PodByName calls = %d after a repeat, want 2 (the answer is cached per uid)", got)
+	}
+}
+
+// A containerMeta cache HIT serves the cached pod and container themselves, as
+// podMeta serves its cached pod. It used to copy both into a fresh
+// ContainerMetadata only for resolveContext to take the two fields' addresses
+// again: two allocations per container resource per chunk, and per container
+// per cgroupstats export, defending nothing — a Pod's maps and slices were
+// shared by the copy anyway, and nothing writes through either pointer.
+func TestContainerMetaHitServesTheCachedValues(t *testing.T) {
+	src := &fakeMetaSource{}
+	s := newKubeletScraper(t, "http://unused", src, &captureExporter{}, false)
+	ctx := context.Background()
+	pod, ctr, answered := s.containerMeta(ctx, appCID, nil)
+	if pod == nil || ctr == nil || !answered {
+		t.Fatalf("the container did not resolve (pod=%v container=%v answered=%v)", pod, ctr, answered)
+	}
+	pod2, ctr2, _ := s.containerMeta(ctx, appCID, nil)
+	if got := src.containerCalls.Load(); got != 1 {
+		t.Fatalf("Container calls = %d, want 1: the second lookup was not a cache hit", got)
+	}
+	if pod2 != pod || ctr2 != ctr {
+		t.Error("a cache hit returned a copy of the cached pod/container instead of the cached values")
+	}
+	if testrace.Enabled {
+		return // -race perturbs allocation counts; the identity check above still ran
+	}
+	// The one allocation left is the cache key's concatenation.
+	if got := testing.AllocsPerRun(200, func() { s.containerMeta(ctx, appCID, nil) }); got > 1 {
+		t.Errorf("a containerMeta cache hit costs %v allocs, want at most 1 (the key)", got)
+	}
+}
+
+// cycle() runs the kubelet scrapes concurrently (cadvisor, /metrics and
+// /stats/summary, spawned back to back on one schedule) over an HTTP/1.1
+// transport, so each needs its own connection. A pool of ONE idle connection
+// closed the others after every cycle and re-dialled them — a fresh TCP+TLS
+// handshake per extra scrape per interval against the kubelet (21 connections
+// over 10 cycles of 3, measured, where 3 is the steady state).
+func TestKubeletTransportKeepsAnIdleConnectionPerConcurrentScrape(t *testing.T) {
+	c := newKubeletHTTPClient(KubeletConfig{InsecureTLS: true}, time.Second)
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("the kubelet client's transport is a %T", c.Transport)
+	}
+	if tr.MaxIdleConnsPerHost < len(kubeletDueKeys) {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want at least %d (one per kubelet scrape a cycle may run at once)", tr.MaxIdleConnsPerHost, len(kubeletDueKeys))
 	}
 }

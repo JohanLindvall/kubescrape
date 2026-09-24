@@ -5,6 +5,17 @@ run:
 
 linters:
   default: standard
+  enable:
+    # Pre-1.2x idioms (wg.Add/go/Done, sort.Slice, 3-clause int loops, loops
+    # that are slices.Contains/maps.Copy, errors.As into a var...) in
+    # production AND test code; `go fix` applies the same suite.
+    - modernize
+  settings:
+    modernize:
+      disable:
+        # Go 1.27's promoted fields in composite literals: the explicit
+        # ObjectMeta: metav1.ObjectMeta{...} spelling is the Kubernetes idiom.
+        - embedlit
 
 formatters:
   enable:

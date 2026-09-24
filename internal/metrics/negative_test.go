@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"math"
 	"strings"
 	"testing"
@@ -336,5 +337,205 @@ func TestPermanentRejectionIsNotNarratedAsRetained(t *testing.T) {
 	set2.noteExport(set2.export(context.Background(), failExporter{}, 0))
 	if line := buf.String(); !strings.Contains(line, "failed; the undelivered samples are retained and re-offered") {
 		t.Errorf("a transient failure DOES retain, and must still say so:\n%s", line)
+	}
+}
+
+// A permanent rejection recurs: the store keeps every live series, so the next
+// snapshot re-renders the same resources into the same refused chunk on every
+// interval, on every node. The per-chunk Error was the one line on this path
+// with no throttle — one Error per chunk per interval per node for as long as
+// the rejection lasted, beside a transition Warn that was throttled. The
+// counter carries the rate; the line restates the running total.
+func TestPermanentRejectionLineIsThrottled(t *testing.T) {
+	setTimeForTest(time.Unix(1_700_900_900, 0))
+	defer testEpoch.Store(0)
+
+	log, buf := capture()
+	set, err := newTestSet([]Dynamic{{Name: "c_total", Type: CounterType, Value: "1"}},
+		WithLogger(log), WithPermanentClassifier(func(error) bool { return true }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	set.Add(nil, nil, noRes(), "anything")
+	for range 3 {
+		set.noteExport(set.export(context.Background(), failExporter{}, 0))
+	}
+
+	out := buf.String()
+	const msg = `msg="dropping a permanently rejected log-metrics chunk"`
+	errs := 0
+	for ln := range strings.SplitSeq(out, "\n") {
+		if strings.Contains(ln, msg) && strings.Contains(ln, "level=ERROR") {
+			errs++
+			if !strings.Contains(ln, "dropped=") {
+				t.Errorf("the line must restate the running total:\n%s", ln)
+			}
+		}
+	}
+	if errs != 1 {
+		t.Errorf("permanent-rejection ERROR lines over three cycles = %d, want 1 (the repeats are Debug until the re-warn interval):\n%s", errs, out)
+	}
+	if n := strings.Count(out, msg); n != 3 {
+		t.Errorf("permanent-rejection lines at any level = %d, want one per cycle (the suppressed ones at Debug):\n%s", n, out)
+	}
+	if got := set.DroppedUndelivered(); got != 3 {
+		t.Errorf("dropped-undelivered = %d, want 3: the live sample was rejected once per cycle", got)
+	}
+}
+
+// sequenceExporter answers its calls with errs in order, repeating the last.
+type sequenceExporter struct {
+	errs  []error
+	calls int
+}
+
+func (e *sequenceExporter) ExportMetrics(context.Context, pmetric.Metrics) error {
+	err := e.errs[min(e.calls, len(e.errs)-1)]
+	e.calls++
+	return err
+}
+
+// In a cycle where one chunk fails TRANSIENTLY and a later one PERMANENTLY, the
+// export used to return the first error it met — so noteExport's Warn, the one
+// that says "rejected PERMANENTLY and those observations are LOST", carried the
+// transient error as the reason, and the operator chasing the loss read an
+// unrelated outage. The permanent error is the one that explains the loss.
+func TestPermanentRejectionIsReportedWithThePermanentError(t *testing.T) {
+	setTimeForTest(time.Unix(1_700_901_000, 0))
+	defer testEpoch.Store(0)
+
+	errTransient := errors.New("TRANSIENT-unavailable")
+	errPermanent := errors.New("PERMANENT-rejection")
+	log, buf := capture()
+	set, err := newTestSet([]Dynamic{{Name: "c_total", Type: CounterType, Value: "1"}},
+		WithLogger(log), WithPermanentClassifier(func(err error) bool { return errors.Is(err, errPermanent) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	set.Add(nil, nil, res(map[string]string{"k8s.pod.name": "a"}), "anything")
+	set.Add(nil, nil, res(map[string]string{"k8s.pod.name": "b"}), "anything")
+
+	// maxBytes 1: every resource is its own chunk, so the two sends are the
+	// transient one and then the permanent one.
+	exp := &sequenceExporter{errs: []error{errTransient, errPermanent}}
+	dropped, gotErr := set.export(context.Background(), exp, 1)
+	if exp.calls != 2 {
+		t.Fatalf("sends = %d, want 2 (one chunk per resource)", exp.calls)
+	}
+	if dropped != 1 {
+		t.Fatalf("dropped resources = %d, want 1", dropped)
+	}
+	if !errors.Is(gotErr, errPermanent) {
+		t.Fatalf("export returned %v, want the PERMANENT error that explains the loss", gotErr)
+	}
+
+	set.noteExport(dropped, gotErr)
+	for ln := range strings.SplitSeq(buf.String(), "\n") {
+		if strings.Contains(ln, "LOST") && !strings.Contains(ln, "error=PERMANENT-rejection") {
+			t.Errorf("the loss Warn carries the wrong reason:\n%s", ln)
+		}
+	}
+}
+
+// A transform script's emit_metric reaches the same value guard as a rule's
+// extraction — refused, counted, never admitted, and NOT a script error (which
+// would fail the export and have the tailer re-run the batch forever). But the
+// refusal line's remedy used to say "check the rule's value/valueRegexp", a
+// source that played no part: the script computed the value.
+func TestEmitMetricRefusalNamesTheScriptNotARule(t *testing.T) {
+	setTimeForTest(time.Unix(1_700_901_100, 0))
+	defer testEpoch.Store(0)
+
+	log, buf := capture()
+	set, err := newTestSet([]Dynamic{{Name: "c_total", Type: CounterType, Value: "1"}}, WithLogger(log))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []float64{math.NaN(), -2} {
+		if err := set.EmitDirect("c_total", v, nil, noRes()); err != nil {
+			t.Fatalf("EmitDirect(%v) = %v, want nil: a refused value is counted, not a script error", v, err)
+		}
+	}
+	if set.DroppedNaN() != 1 || set.DroppedNegative() != 1 {
+		t.Fatalf("drops nan=%d negative=%d, want 1 each", set.DroppedNaN(), set.DroppedNegative())
+	}
+	if n := set.rules[0].series.count; n != 0 {
+		t.Fatalf("a refused value was admitted: %d series", n)
+	}
+	out := buf.String()
+	if n := strings.Count(out, "emit_metric"); n != 2 {
+		t.Errorf("want both refusal lines to name emit_metric as the source (%d did):\n%s", n, out)
+	}
+	if strings.Contains(out, "value/valueRegexp against") {
+		t.Errorf("a script-supplied value must not send the operator to a rule's extraction:\n%s", out)
+	}
+
+	// A rule's own extraction keeps the rule remedy.
+	buf.Reset()
+	set.rules[0].series.lastNonFinite, set.rules[0].series.lastNegative = 0, 0 // re-open both hourly gates
+	s := set.rules[0].series
+	r := pcommon.NewMap()
+	s.observe(nil, math.NaN(), resourceAccum(r), r, nil)
+	if out := buf.String(); !strings.Contains(out, "value/valueRegexp") || strings.Contains(out, "emit_metric") {
+		t.Errorf("a rule-fed refusal must name the rule's extraction:\n%s", out)
+	}
+}
+
+// Every Registry series is built in obs's package-level var blocks, BEFORE
+// either main installs its handler with slog.SetDefault. A logger captured at
+// construction is therefore the stdlib bridge: the refusal Warn came out as
+// `level=INFO msg="WARN ..."` with every attribute flattened into the message,
+// or not at all under a Warn-level handler — and for a Registry refusal, whose
+// count is deliberately unpublished, that line is the only signal there is.
+func TestRegistryRefusalLogsThroughTheHandlerInstalledAfterConstruction(t *testing.T) {
+	setTimeForTest(time.Unix(1_700_901_200, 0))
+	defer testEpoch.Store(0)
+
+	r := NewRegistry() // built under whatever default the test binary started with
+	c := r.Counter("kubescrape_test_late_handler_total", "help")
+
+	buf := &syncBuf{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+
+	c.Add(-1)
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "metric=kubescrape_test_late_handler_total") {
+		t.Fatalf("want a structured WARN naming the metric through the handler installed after construction, got:\n%q", out)
+	}
+}
+
+// The Registry's door must stamp roleSelfMetric. roleLogMetric is the zero
+// value, so dropping the role from Registry.add compiles, and every test that
+// builds a series by hand with the role spelled out keeps passing — while every
+// self-metric refusal starts sending the operator to a
+// kubescrape_log_metrics_dropped_* counter that is flat for it by construction.
+// This goes through Registry.Counter itself, and through slog.Default() the
+// way every Registry series logs (its logger is resolved at the call).
+func TestRegistryRefusalSpeaksTheSelfMetricVocabulary(t *testing.T) {
+	setTimeForTest(time.Unix(1_700_901_300, 0))
+	defer testEpoch.Store(0)
+
+	r := NewRegistry()
+	neg := r.Counter("kubescrape_test_vocab_negative_total", "help")
+	nan := r.Counter("kubescrape_test_vocab_nan_total", "help")
+
+	log, buf := capture()
+	prev := slog.Default()
+	slog.SetDefault(log)
+	defer slog.SetDefault(prev)
+
+	neg.Add(-1)
+	nan.Add(math.NaN())
+	out := buf.String()
+	if n := strings.Count(out, "level=WARN"); n != 2 {
+		t.Fatalf("want one WARN per refusal (2), got %d:\n%s", n, out)
+	}
+	if !strings.Contains(out, "self-metric") {
+		t.Errorf("a Registry refusal must speak the self-metric vocabulary:\n%s", out)
+	}
+	if strings.Contains(out, "log-metric") || strings.Contains(out, "kubescrape_log_metrics_dropped") {
+		t.Errorf("a Registry refusal must not describe itself as a log-metric or cite the log-metrics drop counters:\n%s", out)
 	}
 }

@@ -41,25 +41,25 @@ func recordingLogger() (*slog.Logger, func() string) {
 // makes protoFamily report. The name is the attacker-controlled part.
 func mixedHistogramFamily(name string) *dto.MetricFamily {
 	native := &dto.Metric{
-		Label: []*dto.LabelPair{{Name: ptr("svc"), Value: ptr("a")}},
+		Label: []*dto.LabelPair{{Name: new("svc"), Value: new("a")}},
 		Histogram: &dto.Histogram{
-			SampleCount: ptr(uint64(3)), SampleSum: ptr(0.9),
-			Schema: ptr(int32(2)), ZeroThreshold: ptr(1e-9), ZeroCount: ptr(uint64(1)),
-			PositiveSpan:  []*dto.BucketSpan{{Offset: ptr(int32(1)), Length: ptr(uint32(1))}},
+			SampleCount: new(uint64(3)), SampleSum: new(0.9),
+			Schema: new(int32(2)), ZeroThreshold: new(1e-9), ZeroCount: new(uint64(1)),
+			PositiveSpan:  []*dto.BucketSpan{{Offset: new(int32(1)), Length: new(uint32(1))}},
 			PositiveDelta: []int64{2},
 		},
 	}
 	classic := &dto.Metric{
-		Label: []*dto.LabelPair{{Name: ptr("svc"), Value: ptr("b")}},
+		Label: []*dto.LabelPair{{Name: new("svc"), Value: new("b")}},
 		Histogram: &dto.Histogram{
-			SampleCount: ptr(uint64(4)), SampleSum: ptr(1.5),
+			SampleCount: new(uint64(4)), SampleSum: new(1.5),
 			Bucket: []*dto.Bucket{
-				{UpperBound: ptr(0.5), CumulativeCount: ptr(uint64(3))},
-				{UpperBound: ptr(math.Inf(1)), CumulativeCount: ptr(uint64(4))},
+				{UpperBound: new(0.5), CumulativeCount: new(uint64(3))},
+				{UpperBound: new(math.Inf(1)), CumulativeCount: new(uint64(4))},
 			},
 		},
 	}
-	return &dto.MetricFamily{Name: ptr(name), Type: dto.MetricType_HISTOGRAM.Enum(), Metric: []*dto.Metric{native, classic}}
+	return &dto.MetricFamily{Name: new(name), Type: dto.MetricType_HISTOGRAM.Enum(), Metric: []*dto.Metric{native, classic}}
 }
 
 // THE ATTACK: one target serves a protobuf exposition whose every family is
@@ -76,13 +76,13 @@ func TestScrapedBodyCannotMintWarnKeys(t *testing.T) {
 	})
 
 	fams := make([]*dto.MetricFamily, 0, maxWarnKeys*2)
-	for i := 0; i < maxWarnKeys*2; i++ {
+	for i := range maxWarnKeys * 2 {
 		fams = append(fams, mixedHistogramFamily(fmt.Sprintf("attack_bucket_shape_%d", i)))
 	}
 	cb := newBatcher(func(pcommon.Resource) {}, time.Now(), time.Now())
 	ss := s.newScrapeSession(context.Background(), cb, pipelineTargets,
 		"http://10.4.0.1:9090/metrics", "servicemonitor:monitoring/api", nil, true)
-	if _, err := s.parseProtoAndExport(ss, strings.NewReader(string(protoBody(t, fams...)))); err != nil {
+	if _, err := ss.parseProtoAndExport(strings.NewReader(string(protoBody(t, fams...)))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -116,7 +116,7 @@ func TestMixedHistogramNamesTheFamilyOnTheLineClipped(t *testing.T) {
 	huge := "h_" + strings.Repeat("x", 64*1024)
 	cb := newBatcher(func(pcommon.Resource) {}, time.Now(), time.Now())
 	ss := s.newScrapeSession(context.Background(), cb, pipelineTargets, "http://10.4.0.1:9090/metrics", "wk", nil, true)
-	if _, err := s.parseProtoAndExport(ss, strings.NewReader(string(protoBody(t, mixedHistogramFamily(huge))))); err != nil {
+	if _, err := ss.parseProtoAndExport(strings.NewReader(string(protoBody(t, mixedHistogramFamily(huge))))); err != nil {
 		t.Fatal(err)
 	}
 	out := dump()
@@ -133,9 +133,9 @@ func TestMixedHistogramNamesTheFamilyOnTheLineClipped(t *testing.T) {
 // rewrite at will, and it used to be part of the key.
 func TestMonitorFieldValueCannotMintWarnKeys(t *testing.T) {
 	log, dump := recordingLogger()
-	s := &Scraper{cfg: Config{Interval: time.Minute, Timeout: 5 * time.Second}, log: log}
+	s := New(Config{Interval: time.Minute, Timeout: 5 * time.Second, Logger: log})
 
-	for i := 0; i < maxWarnKeys*2; i++ {
+	for i := range maxWarnKeys * 2 {
 		tgt := testTarget("http://10.4.0.1:9090/metrics")
 		tgt.Source, tgt.Monitor = "servicemonitor", "monitoring/api"
 		tgt.Interval = fmt.Sprintf("%d pancakes", i)

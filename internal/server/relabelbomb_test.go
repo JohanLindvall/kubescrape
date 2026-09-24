@@ -111,10 +111,12 @@ func fetchTargets(t *testing.T, st *store.Store, svcs *services.Index, monitors 
 // (scrape.stampEndpoint) and the whole node's targets are marshalled into ONE
 // []byte per request, in a singleton whose chart requests 128Mi and sets no
 // memory limit. Measured before the bound: 1.24 MiB per served target, 12.4 MiB
-// for ten pods on one node — and every DaemonSet agent re-fetches this document
-// on its scrape interval, which handlers.go documents as never hitting the ETag
-// memo. scrape.MaxPortsPerPod does not see it: it bounds the target COUNT
-// against a per-target cost it models as the pod document.
+// for ten pods on one node — and every DaemonSet agent revalidates this document
+// on its scrape interval. The change-token memo answers that 304 only while
+// nothing the node's list reads has changed: a Service, monitor or owner edit
+// anywhere in the cluster (the same tenant can make one at will) rebuilds every
+// node's document in full. scrape.MaxPortsPerPod does not see it: it bounds
+// the target COUNT against a per-target cost it models as the pod document.
 func TestOneMonitorsRelabelChainCannotInflateTheNodeTargetsDocument(t *testing.T) {
 	const (
 		pods  = 10

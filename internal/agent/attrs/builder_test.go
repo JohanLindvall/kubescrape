@@ -145,8 +145,7 @@ func TestTemplateValidation(t *testing.T) {
 	if err == nil {
 		t.Fatal("bad literal regex must fail construction")
 	}
-	var syn *syntax.Error
-	if !errors.As(err, &syn) {
+	if _, ok := errors.AsType[*syntax.Error](err); !ok {
 		t.Errorf("error %q does not unwrap to *syntax.Error", err)
 	}
 	if _, err = NewBuilder(&Config{Attributes: map[string]string{"r": `{{ regexReplace "[" "" .Pod.Name }}`}}, nil); err == nil {

@@ -1,11 +1,14 @@
 package promscrape
 
 // The cadvisor scrape batcher: cgroup-identity routing of kubelet series
-// into one OTLP resource per pod/container, with metadata enrichment via a
-// TTL cache over the metadata service.
+// into one OTLP resource per pod/container, enriched through the package's one
+// identity path (metaresolve.go) — the TTL-cached metadata lookup the summary
+// batcher, the splitters and the cgroup sampler resolve through too.
 
 import (
 	"context"
+	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -14,49 +17,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
-	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
-
 	"github.com/JohanLindvall/kubescrape/pkg/cgroupid"
 )
-
-// podMetaCacheTTL bounds how long resolved (or not-found) metadata is reused
-// across cadvisor scrape cycles.
-const podMetaCacheTTL = time.Minute
-
-// podCacheMaxEntries bounds the metadata cache. Each entry holds a full
-// kubemeta.Pod document, and the objects a splitter describes are the whole
-// cluster's, not this node's.
-const podCacheMaxEntries = 8192
-
-// podCacheLowWater is what a size trim leaves behind. Trimming BELOW the cap
-// rather than down to it amortizes the O(n) sweep over ~2000 inserts instead of
-// running it on every insert while full, which matters because the sweep holds
-// cacheMu — shared by every concurrent scrape goroutine's lookup. Same shape,
-// and the same reason, as metaclient's evictLowWater.
-const podCacheLowWater = podCacheMaxEntries * 3 / 4
-
-// podCacheSweepEvery is how often expired entries are swept below the cap.
-const podCacheSweepEvery = time.Minute
-
-type podCacheEntry struct {
-	pod       *kubemeta.Pod       // nil: lookup failed / unknown
-	container *kubemeta.Container // set for container-ID entries
-	fetched   time.Time
-	// answered records WHY a negative entry is negative, which is the one thing
-	// a caller cannot reconstruct from a nil pod: true means the metadata
-	// service replied and its reply was 404 (this id is not a container of any
-	// pod it knows — a pod sandbox's permanent condition), false means it could
-	// not be reached or could not answer (transport failure, 5xx, an
-	// undecodable body).
-	//
-	// It has to live IN the cache, not just in the return value, because a
-	// negative entry is served for podMetaCacheTTL: reconstructing the reason
-	// as "definitive" on a cache hit would turn one unreachable minute into a
-	// definitive verdict for every lookup inside it — which is exactly the
-	// distinction internal/agent/cgroupstats' retry policy is built on.
-	answered bool
-}
 
 // cadvisorBatcher implements sink, routing each point into a ResourceMetrics
 // chosen by the sample's namespace/pod/container labels. Those labels move
@@ -157,11 +119,13 @@ type cadvisorIdentity struct {
 	// deliberately NOT part of appendKey — the pause row still folds into the
 	// pod's resource, which is the intended behaviour — but it must survive to
 	// putFilteredLabels: with the pod-cgroup row of the same family the two
-	// identities are otherwise byte-identical (the podUID key branch omits
-	// namespace/pod, and the sandbox's containerID and image are cleared in
-	// identityOf), so both land on one metric and the redundant-label elision
-	// then removes the only labels that told them apart — two data points with
-	// identical attribute sets in one metric, which is one series downstream.
+	// identities are otherwise byte-identical (both carry the pod's uid,
+	// namespace and pod with an empty container name — a sandbox's
+	// container="POD" is never stored — and identityOf clears the sandbox's
+	// containerID and image, so appendKey yields one key for both), so both
+	// land on one metric and the redundant-label elision then removes the only
+	// labels that told them apart — two data points with identical attribute
+	// sets in one metric, which is one series downstream.
 	sandbox bool
 	// pathVouched is the CALLER's statement that the cgroup path this identity
 	// was built from really names the container it carries the id of — the one
@@ -370,12 +334,7 @@ func isArchPause(image string) bool {
 	if !ok {
 		return false
 	}
-	for _, a := range archSuffixes {
-		if rest == a {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(archSuffixes, rest)
 }
 
 // isPauseImage reports whether an image reference names a sandbox image.
@@ -436,10 +395,14 @@ func (id cadvisorIdentity) appendKey(b []byte) []byte {
 		// no Prometheus job on container_network_* and every pod-cgroup rollup
 		// row, flapping with cadvisor's row order between scrapes. A row cadvisor
 		// could not attribute now keeps its own resource, which is the same
-		// fail-safe isSandbox's documented gaps take, and stays counted by
-		// obs.CadvisorUnresolved. Container rows are unaffected either way (their
-		// container id is in the key), and on a runtime that attributes every row
-		// — every containerd node — nothing groups differently.
+		// fail-safe isSandbox's documented gaps take. It is NOT counted by
+		// obs.CadvisorUnresolved: naming no pod and vouching for no container,
+		// it is never looked up (see fillResource), and a counter read as "the
+		// metadata service is not answering" must not move for a row nobody
+		// asked about; it is named at Debug instead. Container rows are
+		// unaffected either way (their container id is in the key), and on a
+		// runtime that attributes every row — every containerd node — nothing
+		// groups differently.
 		b = appendLP(b, id.namespace)
 		return appendLP(b, id.pod)
 	}
@@ -507,7 +470,7 @@ func (cb *cadvisorBatcher) scope(ident cadvisorIdentity) pmetric.ScopeMetrics {
 		sm.Scope().SetVersion(obs.ScopeVersion)
 		cb.scopes[key] = sm
 		// One resource per pod/container: its attributes count toward the chunk
-		// size (see convert.go).
+		// size (see otlppoint.go).
 		cb.bytes += resourceBytes(rm.Resource(), scopeNameCadvisor)
 	}
 	cb.lastIdent, cb.lastScope, cb.lastScopeOK = ident, sm, true
@@ -528,160 +491,85 @@ func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIden
 	//
 	// Once per RESOURCE, never per sample: this runs from scope() only when a
 	// pod or container is first seen in a chunk.
+	//
+	// Counted only for an identity the metadata service was (or, past a spent
+	// allowance, would have been) ASKED about. A row cadvisor itself could not
+	// attribute — CRI-O's crio-conmon-<id>.scope, kata's kata_<id> helper —
+	// carries no namespace, pod or container label, so lookupContainerID
+	// withholds its id and resolveContext issues no request at all. Counting
+	// it put two increments per pod per scrape on every healthy CRI-O or kata
+	// node, on a counter whose help, CONFIGURATION.md and FIRST-RUN.md all
+	// read a sustained rate as "the metadata service is not answering".
 	resolved, _ := cb.s.fillIdentityResource(cb.ctx, res, ident)
-	if !resolved && ident.podScoped() {
+	switch {
+	case !resolved && ident.podScoped() && ident.lookedUp():
 		cb.s.reportCadvisorIdentity(ident)
-	} else if ident.sandbox {
+	case !resolved && ident.podScoped():
+		cb.s.debugUnattributable(ident)
+	case ident.sandbox:
 		cb.s.debugSandboxFold(ident)
 	}
 }
 
-// FillContainerResource builds the resource attributes describing one container
-// identified by its CGROUP PATH — the runtime container id and the pod uid of
-// the slice it sits in — using exactly the machinery a cadvisor row goes
-// through: the same metadata lookup, the same TTL cache, the same
-// unresolved-row fallback and the same `cadvisor` attribute builder (hence the
-// same instance prefix).
-//
-// It exists for internal/agent/cgroupstats, whose ten gauges are only worth
-// anything if they JOIN the cadvisor series they explain — and two series join
-// when their resource attributes, and so the derived Prometheus job and
-// instance, are byte-identical. A second implementation would agree with this
-// one until the first edit to either; sharing the body means the sampler cannot
-// drift from the scrape even in principle.
-//
-// The first bool is what a cgroup path costs. A cadvisor row carries namespace,
-// pod and container LABELS, so an unresolvable one still falls back to a
-// resource with a service.name (the pod name) and keeps its Prometheus `job`. A
-// cgroup path yields only two ids, so the same fallback here produces a resource
-// with no service.name at all — a series attributed to nothing, joining none of
-// the cadvisor series the sampler exists to explain, and one successful later
-// lookup away from silently becoming a DIFFERENT series. So the verdict is
-// reported and the caller declines to export what did not resolve; see
-// cgroupstats.Resolver.
-//
-// The second bool CLASSIFIES a failure, and it exists because the two ways to
-// not resolve want opposite retry policies. See cgroupstats.Resolver for the
-// contract and containerMeta for where the classification comes from.
-func (s *Scraper) FillContainerResource(ctx context.Context, res pcommon.Resource, containerID, podUID string) (ok, answered bool) {
-	return s.fillIdentityResource(ctx, res, cadvisorIdentity{containerID: containerID, podUID: podUID, pathVouched: true})
+// lookedUp reports whether resolveContext asks the metadata service anything
+// for this identity: a container id the row vouches for, or a pod name.
+func (id cadvisorIdentity) lookedUp() bool {
+	return id.lookupContainerID() != "" || id.pod != ""
 }
 
-// fillIdentityResource is fillResource's body, lifted onto the Scraper so the
-// exported seam above and the batcher below are literally one code path. It
-// reports whether the metadata service PLACED the identity (as opposed to the
-// resource having been built from the caller's own labels), and whether it
-// ANSWERED at all.
-func (s *Scraper) fillIdentityResource(ctx context.Context, res pcommon.Resource, ident cadvisorIdentity) (bool, bool) {
-	// Exact container incarnation via the cgroup container ID, else the pod.
-	// lookupContainerID, not ident.containerID: a container id a row merely
-	// PARSED out of a cgroup path it does not name itself must not be resolved,
-	// or a supervisor scope inherits the identity of the container it supervises.
-	actx, resolved, answered := s.resolveContext(ctx, ident.lookupContainerID(), ident.namespace, ident.pod, ident.podUID, ident.container, res)
-	actx.Node = s.nodeInfo()
-
-	if !resolved && (ident.pod != "" || ident.podUID != "" || ident.containerID != "") {
-		// Metadata unavailable (or a same-name pod replaced this one, or a
-		// standalone non-k8s container the metadata service cannot know): keep
-		// the identity from the labels and the cgroup path — container.id is a
-		// containerID-only row's ONLY distinguisher, since its id/name/image
-		// labels are elided from the data points as pod-scoped-redundant.
-		a := res.Attributes()
-		if ident.namespace != "" {
-			a.PutStr("k8s.namespace.name", ident.namespace)
-		}
-		if ident.pod != "" {
-			a.PutStr("k8s.pod.name", ident.pod)
-		}
-		if ident.podUID != "" {
-			a.PutStr("k8s.pod.uid", ident.podUID)
-		}
-		if ident.container != "" {
-			a.PutStr("k8s.container.name", ident.container)
-		}
-		if ident.containerID != "" {
-			a.PutStr("container.id", ident.containerID)
-		}
-		// The image label is elided from container-row data points as
-		// resource-redundant; on an unresolved resource it is the only source.
-		if ident.image != "" && (ident.container != "" || ident.containerID != "") {
-			a.PutStr("container.image.name", ident.image)
-		}
-		// service.name is otherwise obtained only as a SIDE EFFECT of attrs.Pod
-		// running inside Build, which needs resolved metadata — so an
-		// unresolved row carried no service.name at all, and the OTLP→Prometheus
-		// translation gives it no `job` label. Metadata resolution is not
-		// stable (a lookup fails, a pod is replaced by one of the same name),
-		// so the SAME series gained and lost its job label as rows resolved and
-		// stopped resolving: two different Prometheus series, flapping.
-		//
-		// attrs.ServiceName's documented fallback chain ends at the pod name,
-		// which is exactly what is known here. Build does not overwrite an
-		// attribute a caller already set, so a later successful resolution
-		// still yields the owner-derived name.
-		if ident.pod != "" {
-			a.PutStr("service.name", ident.pod)
-		}
+// reportCadvisorIdentity counts a cadvisor resource the metadata service did
+// not place, and — at Debug — names it. The counter is the rate; the Debug line
+// is the only thing that says WHICH container, which is the whole question when
+// half a node's series lose their labels and the other half keep them.
+//
+// Not throttled, because it is Debug and because the count per scrape is
+// bounded by the node's container count: this is not a per-item path (one call
+// per resource per exported chunk) and an operator who turned Debug on during
+// an incident wants every one of them.
+func (s *Scraper) reportCadvisorIdentity(ident cadvisorIdentity) {
+	level := "pod"
+	if ident.containerID != "" || ident.container != "" {
+		level = "container"
 	}
-	s.attrsFor(pipelineCadvisor).Build(res, actx)
-	return resolved, answered
+	obs.CadvisorUnresolved.WithLabelValues(level).Inc()
+	if !s.log.Enabled(context.Background(), slog.LevelDebug) {
+		return
+	}
+	// objectLevel, not "level": slog's own severity key IS "level", and a second
+	// pair of that name on the line makes a logfmt reader resolve the record's
+	// severity to "container". The line then reads as DEBUG to a human and as
+	// level="container" to Loki, so a severity filter silently drops it. The
+	// METRIC label stays "level" — a metric has no reserved key, and
+	// METRICS.md documents it under that name.
+	s.log.Debug("the metadata service did not place a cadvisor row; it is exported with the identity its own labels carried",
+		"objectLevel", level, "namespace", ident.namespace, "pod", ident.pod,
+		"container", ident.container, "id", ident.containerID, "uid", ident.podUID)
 }
 
-// The two annotations the kubelet stamps on a mirror pod, both carrying the
-// STATIC pod's own UID: config.hash is written onto the static pod as the
-// kubelet generates that UID from the manifest, and the mirror client copies
-// that value into config.mirror when it creates the API object. Either one on
-// its own is the proof podAnswersFor needs, so both are read — they are written
-// by different code, and a pod that has one has the claim.
-const (
-	annConfigMirror = "kubernetes.io/config.mirror"
-	annConfigHash   = "kubernetes.io/config.hash"
-)
-
-// podAnswersFor reports whether the pod object the API server holds is the pod
-// the KUBELET described under uid. It is the ONE rule behind every by-name
-// resolution in this package, whichever kubelet endpoint the identity came from
-// — the cgroup path in a /metrics/cadvisor row's `id` label, or podRef.uid in a
-// /stats/summary element — because the two pipelines' series are only worth
-// having while they JOIN, and a pod one of them refuses to place must be a pod
-// the other refuses to place too.
-//
-// A UID match is the ordinary case. The MIRROR case is the one that needs
-// explaining: a static pod's UID is minted by the kubelet from its manifest and
-// is what every statistic about it carries, while the object the API server
-// holds is a MIRROR pod under a UID the API server assigned — so a plain UID
-// comparison refuses the answer, and kube-apiserver, etcd, kube-scheduler and
-// kube-controller-manager resolve to nothing on every scrape for the life of
-// the cluster. A mirror pod NAMES the static pod it was minted from, so there
-// is something to check against after all.
-//
-// The cross-check is REDIRECTED, never dropped: resolving a UID miss by name
-// alone lets a pod that merely shares the name lend its identity to statistics
-// about another object — the hazard internal/agent/events resolves its involved
-// objects by UID for, and the one the store's byPodName guard is about. A pod
-// claiming no mirror stays unresolved and is exported with its label identity.
-//
-// An EMPTY uid is the one permissive branch, and it is the caller's statement
-// that the kubelet reported no uid at all — a cgroup layout with no parseable
-// pod segment. There is nothing to check against and no evidence of a mismatch
-// either, so the name is all there is; podRef.uid is always present, so this
-// branch belongs to the cadvisor side alone.
-func podAnswersFor(meta *kubemeta.Pod, uid string) bool {
-	if uid == "" || meta.UID == uid {
-		return true
+// debugSandboxFold reports, per pod per chunk, that a sandbox row was folded
+// into the pod's resource. It answers the question the fold's own doc comment
+// spends thirty lines on — "why does this pod have a resource carrying `pause`,
+// or why does it NOT" — with the evidence for the pod actually in front of the
+// operator. A row that declines the fold gets its own resource and shows up as
+// an ordinary unresolved one above, so the two branches are both visible.
+func (s *Scraper) debugSandboxFold(ident cadvisorIdentity) {
+	if !s.log.Enabled(context.Background(), slog.LevelDebug) {
+		return
 	}
-	return isMirrorOf(meta, uid)
+	s.log.Debug("folded a pod sandbox row into the pod's resource",
+		"namespace", ident.namespace, "pod", ident.pod, "uid", ident.podUID)
 }
 
-// isMirrorOf reports whether the pod the API server holds is the mirror of the
-// static pod whose UID the kubelet reported.
-func isMirrorOf(meta *kubemeta.Pod, staticUID string) bool {
-	if staticUID == "" {
-		// A pod carrying neither annotation would otherwise match "", which is
-		// every pod the metadata service cannot place a UID for.
-		return false
+// debugUnattributable names, at Debug, a pod-scoped row that was exported with
+// its cgroup-path identity WITHOUT a lookup — the row named no pod and vouched
+// for no container, so there was nothing to ask. The counterpart of
+// reportCadvisorIdentity's line, for the rows that counter deliberately skips.
+func (s *Scraper) debugUnattributable(ident cadvisorIdentity) {
+	if !s.log.Enabled(context.Background(), slog.LevelDebug) {
+		return
 	}
-	return meta.Annotations[annConfigMirror] == staticUID || meta.Annotations[annConfigHash] == staticUID
+	s.log.Debug("a cadvisor row names no pod or container, so it was not looked up; it is exported with its cgroup-path identity",
+		"uid", ident.podUID, "id", ident.containerID)
 }
 
 // metric returns the (per-resource) metric for one sample's identity, plus
@@ -812,136 +700,5 @@ func (cb *cadvisorBatcher) putFilteredLabels(attrs pcommon.Map, labels []Label, 
 			continue
 		}
 		attrs.PutStr(l.Name, l.Value)
-	}
-}
-
-// podMeta resolves pod metadata by name with a small TTL cache; nil when
-// unknown. The second value is podCacheEntry.answered: on a nil pod it says
-// whether the metadata service ANSWERED (a 404) or could not be asked.
-func (s *Scraper) podMeta(ctx context.Context, namespace, pod string, obj *objectShed) (*kubemeta.Pod, bool) {
-	key := "n\x00" + namespace + "/" + pod
-	if e, ok := s.cacheGet(key); ok {
-		return e.pod, e.pod != nil || e.answered
-	}
-	lctx, spent, may := s.metaLookup(ctx, obj)
-	if !may {
-		// The scrape has spent its metadata allowance (metabudget.go): the object
-		// keeps its label identity, exactly as it would against a service that
-		// REFUSED the connection. Nothing was asked, so nothing is cached.
-		return nil, false
-	}
-	defer spent()
-	meta, err := s.metaSource().PodByName(lctx, namespace, pod)
-	answered := true
-	if err != nil {
-		meta = nil
-		if lctx.Err() != nil {
-			// A cancellation is not an answer, and it is not cached either. The
-			// LOOKUP's context is what is read, so a lookup cut short by the
-			// allowance is classified the same way — the service said nothing.
-			return nil, false
-		}
-		answered = metaclient.IsNotFound(err)
-	}
-	s.cachePut(key, podCacheEntry{pod: meta, fetched: time.Now(), answered: answered})
-	return meta, meta != nil || answered
-}
-
-// containerMeta resolves the exact container incarnation by runtime ID; nil
-// when unknown. The lookup is non-blocking (wait 0): the scraped series only
-// reference containers that already exist.
-//
-// The second value classifies a MISS, and it is what makes the cgroup sampler's
-// retry policy possible (internal/agent/cgroupstats): a 404 is a definitive
-// statement about this container id — nothing about the node changing will make
-// a pause container's id appear in a pod's containerStatuses — while a
-// transport failure, a 5xx or an undecodable body is a statement about the
-// metadata SERVICE, and the retry that follows must be soon rather than rare.
-// Both still produce a nil here, and the cadvisor path still treats them
-// alike: the row is exported with its label identity either way.
-func (s *Scraper) containerMeta(ctx context.Context, containerID string, obj *objectShed) (*kubemeta.ContainerMetadata, bool) {
-	key := "c\x00" + containerID
-	if e, ok := s.cacheGet(key); ok {
-		if e.pod == nil {
-			return nil, e.answered
-		}
-		return &kubemeta.ContainerMetadata{ContainerID: containerID, Container: *e.container, Pod: *e.pod}, true
-	}
-	lctx, spent, may := s.metaLookup(ctx, obj)
-	if !may {
-		return nil, false // allowance spent; see podMeta
-	}
-	defer spent()
-	md, err := s.metaSource().Container(lctx, containerID, 0)
-	if err != nil {
-		if lctx.Err() != nil {
-			return nil, false // do not negative-cache cancellations
-		}
-		answered := metaclient.IsNotFound(err)
-		s.cachePut(key, podCacheEntry{fetched: time.Now(), answered: answered})
-		return nil, answered
-	}
-	s.cachePut(key, podCacheEntry{pod: &md.Pod, container: &md.Container, fetched: time.Now(), answered: true})
-	return md, true
-}
-
-func (s *Scraper) cacheGet(key string) (podCacheEntry, bool) {
-	s.cacheMu.Lock()
-	defer s.cacheMu.Unlock()
-	e, ok := s.podCache[key]
-	if !ok || time.Since(e.fetched) >= podMetaCacheTTL {
-		return podCacheEntry{}, false
-	}
-	return e, true
-}
-
-func (s *Scraper) cachePut(key string, e podCacheEntry) {
-	s.cacheMu.Lock()
-	defer s.cacheMu.Unlock()
-	s.podCache[key] = e
-	s.evictCacheLocked(time.Now())
-}
-
-// evictCacheLocked bounds the cache: expired entries first, then arbitrary ones
-// down to the low-water mark. Caller holds cacheMu.
-//
-// Expiry alone is NOT a bound and cannot be one. The entries a splitter's
-// enrichment inserts are all fetched inside one TTL window, so above the cap
-// EVERY insert swept the whole map and deleted nothing — 1.3 s per insert at 12k
-// objects, 5.2 s at 20k, all of it holding the mutex the concurrent scrape
-// goroutines share — and the map never left the branch, so a 12k-pod cluster
-// also retained 12k full pod documents. The cadence keeps the sweep amortized
-// and the low-water trim is what makes the cap real; an arbitrary eviction costs
-// the next lookup a metadata request, which is the price of the hard bound.
-func (s *Scraper) evictCacheLocked(now time.Time) {
-	if len(s.podCache) <= podCacheMaxEntries {
-		if now.Sub(s.cacheSwept) < podCacheSweepEvery {
-			return
-		}
-		s.cacheSwept = now
-		s.sweepExpiredLocked(now)
-		return
-	}
-	// The hard trim sweeps on its way to the cap, so the cadence counts from it
-	// too: leaving cacheSwept behind made the next below-cap insert re-run a full
-	// sweep however recently this one finished.
-	s.cacheSwept = now
-	s.sweepExpiredLocked(now)
-	for k := range s.podCache {
-		if len(s.podCache) <= podCacheLowWater {
-			break
-		}
-		delete(s.podCache, k)
-	}
-}
-
-// sweepExpiredLocked drops entries past podMetaCacheTTL — the same predicate
-// cacheGet reads them by, so nothing usable is thrown away. Caller holds
-// cacheMu.
-func (s *Scraper) sweepExpiredLocked(now time.Time) {
-	for k, e := range s.podCache {
-		if now.Sub(e.fetched) >= podMetaCacheTTL {
-			delete(s.podCache, k)
-		}
 	}
 }

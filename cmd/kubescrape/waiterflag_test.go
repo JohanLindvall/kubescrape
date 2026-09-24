@@ -87,8 +87,7 @@ func TestCheckWaiterCap(t *testing.T) {
 func TestWaiterCapReachesTheShedDecision(t *testing.T) {
 	st := newMetadataStore(time.Minute, 1)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	// One blocking lookup for an id no upsert will ever supply: it parks.
 	go func() { _, _, _ = st.GetContainer(ctx, strings.Repeat("a", 64)) }()
 	deadline := time.Now().Add(10 * time.Second)

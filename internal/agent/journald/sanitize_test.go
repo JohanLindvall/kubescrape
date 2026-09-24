@@ -155,15 +155,23 @@ func TestValidMessageUnderTheCapIsFree(t *testing.T) {
 
 func TestSanitizeRepairsAndCaps(t *testing.T) {
 	r := sanitizer(16)
+	// origLen is 0 for a message exported whole and the RAW length for a
+	// truncated one — never a post-repair length — and every branch that cuts
+	// has a case here. A 0 where a cut happened is a SILENT truncation: no
+	// log.truncated on the record, no kubescrape_journal_truncated_total.
 	for _, tc := range []struct {
-		name string
-		in   string
+		name     string
+		in       string
+		wantOrig int
 	}{
-		{"valid in cap", "hello"},
-		{"invalid in cap", "he\xffllo"},
-		{"valid over cap", strings.Repeat("é", 32)},
-		{"invalid over cap", strings.Repeat("\xff", 64)},
-		{"multibyte on the boundary", strings.Repeat("a", 15) + "é"},
+		{"valid in cap", "hello", 0},
+		{"invalid in cap", "he\xffllo", 0},
+		{"valid over cap", strings.Repeat("é", 32), 64},
+		{"invalid over cap", strings.Repeat("\xff", 64), 64},
+		{"multibyte on the boundary", strings.Repeat("a", 15) + "é", 17},
+		// 12 raw bytes fit the cap; each \xff becomes a 3-byte U+FFFD, so the
+		// repaired message is 24 bytes and is cut after all.
+		{"invalid in cap, grows past it", strings.Repeat("a\xff", 6), 12},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body, origLen := r.sanitize(tc.in, "unit.service")
@@ -173,10 +181,8 @@ func TestSanitizeRepairsAndCaps(t *testing.T) {
 			if len(body) > 16 {
 				t.Errorf("body = %d bytes, want at most the cap", len(body))
 			}
-			// origLen is 0 for an untouched message and the RAW length for a
-			// truncated one — never a post-repair length.
-			if origLen != 0 && origLen != len(tc.in) {
-				t.Errorf("origLen = %d, want 0 or the raw length %d", origLen, len(tc.in))
+			if origLen != tc.wantOrig {
+				t.Errorf("origLen = %d, want %d", origLen, tc.wantOrig)
 			}
 		})
 	}

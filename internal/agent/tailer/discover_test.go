@@ -1,5 +1,5 @@
-// Tests for file discovery (discover.go): scanning, watching, source
-// claiming and initial checkpoint state.
+// Tests for file discovery (discover.go, watch.go): scanning, watching,
+// source claiming and initial checkpoint state.
 package tailer
 
 import (
@@ -61,17 +61,37 @@ func TestParseFileName(t *testing.T) {
 	}
 }
 
+// TestExcludeNamespaces: a file in an excluded namespace is never tracked or
+// read, and the decision is counted. Driven synchronously, with a sibling file
+// in a NON-excluded namespace as the positive control: this used to sleep 3s
+// and assert only that nothing was exported, which a dead read path or a scan
+// that never ran would have passed too.
 func TestExcludeNamespaces(t *testing.T) {
 	dir := t.TempDir()
+	ctx := context.Background()
 	exp := &fakeExporter{}
-	tl := newTestTailer(dir, "", exp)
+	tl := driveTailer(dir, exp)
 	tl.cfg.ExcludeNamespaces = []string{"ns1"}
-	stop := startTailer(t, tl)
-	defer stop()
+	tl.scanDir(tl.loadCheckpoints(), true)
 
-	writeLog(t, dir, "2026-07-05T10:00:00Z stdout F excluded")
-	time.Sleep(3 * time.Second) // > dir rescan interval
-	if got := exp.get(); len(got) != 0 {
+	excluded := filepath.Join(dir, logName) // pod1_ns1_app-<id>.log
+	included := filepath.Join(dir, "pod1_ns2_app-fedcba9876543210.log")
+	before := obs.LogFilesSkipped.WithLabelValues(skipExcludedNS).Value()
+	writeLines(t, excluded, "2026-07-05T10:00:00Z stdout F excluded")
+	writeLines(t, included, "2026-07-05T10:00:00Z stdout F included")
+	tl.scanDir(nil, false)
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "included") }, "the non-excluded sibling's record")
+
+	if _, tracked := tl.files[excluded]; tracked {
+		t.Fatal("a file in an excluded namespace is tracked")
+	}
+	if _, tracked := tl.files[included]; !tracked {
+		t.Fatal("positive control: the non-excluded sibling is not tracked")
+	}
+	if got := obs.LogFilesSkipped.WithLabelValues(skipExcludedNS).Value() - before; got != 1 {
+		t.Fatalf("%s moved by %v, want exactly 1 (once per file, not per pass)", skipExcludedNS, got)
+	}
+	if got := exp.get(); slices.Contains(got, "excluded") {
 		t.Fatalf("excluded namespace produced records: %v", got)
 	}
 }
@@ -105,12 +125,7 @@ func TestUnknownFileAutoReadsFromStart(t *testing.T) {
 	stop2 := startTailer(t, tl2)
 	defer stop2()
 	waitFor(t, func() bool {
-		for _, r := range exp2.get() {
-			if r == "while-down" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(exp2.get(), "while-down")
 	}, "content written while down is shipped")
 }
 
@@ -321,8 +336,8 @@ func TestExcludedNamespaceNotResurrectedByLaterSource(t *testing.T) {
 
 // A SOURCE's own excludeNamespaces is a prohibition, not a routing selector:
 // the file it denies is claimed-and-skipped, so a later catch-all source can
-// never resurrect it. Testing wantNamespace (which merges the deny and allow
-// halves) instead of the deny alone lost this guard, and the consequence is
+// never resurrect it. Testing a merged predicate (the deny and allow halves
+// together) instead of the deny alone lost this guard, and the consequence is
 // the observability feedback loop — the agent tails the collector's namespace
 // and amplifies exactly when the collector is struggling.
 func TestSourceExcludedNamespaceNotResurrectedByLaterSource(t *testing.T) {

@@ -78,7 +78,7 @@ func TestBlockedContainerLookupIsLoggedAtDebug(t *testing.T) {
 	if !strings.Contains(line, "container lookup blocked and then woke") {
 		t.Fatalf("no blocked-lookup line in %q", line)
 	}
-	for _, want := range []string{"id=neverappears", "found=false", "waited="} {
+	for _, want := range []string{"id=neverappears", "found=false", "elapsed="} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("log %q is missing %q", line, want)
 		}
@@ -118,8 +118,7 @@ func TestWarmContainerLookupIsSilentAtDebug(t *testing.T) {
 // shared with the readiness park, so the line is the only thing that says which
 // id was refused.
 func TestShedContainerLookupIsLoggedAtDebug(t *testing.T) {
-	st := store.New(time.Minute)
-	st.SetMaxWaiters(0)
+	st := store.New(time.Minute, store.WithMaxWaiters(0))
 	srv, buf := loggedAPI(st, time.Second, slog.LevelDebug, closedChan())
 	if code := getContainer(t, srv, "/v1/containers/neverappears?wait=1s"); code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", code)
@@ -191,8 +190,7 @@ func TestReadinessParkLogsDrainingOutcome(t *testing.T) {
 // The readiness park draws on the SAME cap as the store's waiters, so its
 // refusal moves a counter that cannot say which spot bound. Only this line can.
 func TestReadinessParkShedIsLoggedAtDebug(t *testing.T) {
-	st := store.New(time.Minute)
-	st.SetMaxWaiters(0)
+	st := store.New(time.Minute, store.WithMaxWaiters(0))
 	unready := make(chan struct{})
 	srv, buf := loggedAPI(st, time.Second, slog.LevelDebug, unready)
 	if code := getContainer(t, srv, "/v1/containers/neverappears?wait=1s"); code != http.StatusServiceUnavailable {

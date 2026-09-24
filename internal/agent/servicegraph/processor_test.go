@@ -1,7 +1,9 @@
 package servicegraph
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"slices"
 	"strings"
 	"sync"
@@ -11,6 +13,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/cumagg"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
@@ -57,8 +60,8 @@ func sgTraces(service string, spans ...sgSpan) ptrace.Traces {
 type pairSink struct{ edges []Edge }
 
 // The sink RETAINS every edge, so it must clone: the Edge's dimension slice
-// belongs to the pairing store, which recycles it as soon as Record returns.
-func (s *pairSink) Record(e Edge) { s.edges = append(s.edges, cloneEdge(e)) }
+// belongs to the pairing store, which recycles it as soon as RecordAt returns.
+func (s *pairSink) RecordAt(e Edge, _ time.Time) { s.edges = append(s.edges, cloneEdge(e)) }
 
 func (s *pairSink) only(t *testing.T) Edge {
 	t.Helper()
@@ -71,9 +74,8 @@ func (s *pairSink) only(t *testing.T) Edge {
 // newTestProcessor returns a processor whose clock the test drives.
 func newTestProcessor(t *testing.T, cfg Config) (*Processor, *pairSink, *time.Time) {
 	t.Helper()
-	p := NewProcessor(cfg, nil)
 	sink := &pairSink{}
-	p.SetSink(sink)
+	p := NewProcessor(cfg, sink, nil)
 	clock := t0
 	p.now = func() time.Time { return clock }
 	return p, sink, &clock
@@ -234,35 +236,43 @@ func TestConsumeDatabaseClassification(t *testing.T) {
 			attrs: map[string]string{"db.system": "postgresql"}, want: ConnectionMessagingSystem,
 		},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			p, sink, _ := newTestProcessor(t, Config{})
-			// The attribute-carrying half under test pairs with a bare
-			// partner, ORDERED so the edge's connection_type is decided by
-			// that half alone: merge keeps the first non-empty
-			// classification, so on the messaging kinds — where the partner
-			// carries one too — the half under test must arrive first (the
-			// consumer case would otherwise assert only that the producer's
-			// messaging stuck, not that the consumer's db.* was excluded).
-			// The client/server partners classify Unknown, so their arrival
-			// order cannot mask anything.
-			switch tc.kind {
-			case ptrace.SpanKindClient:
-				p.Consume(sgTraces("checkout", clientSpan(0.1, tc.attrs)))
-				p.Consume(sgTraces("orders", serverSpan(0.05, nil)))
-			case ptrace.SpanKindServer:
-				p.Consume(sgTraces("checkout", clientSpan(0.1, nil)))
-				p.Consume(sgTraces("orders", serverSpan(0.05, tc.attrs)))
-			case ptrace.SpanKindProducer:
-				p.Consume(sgTraces("checkout", producerSpan(0.1, tc.attrs)))
-				p.Consume(sgTraces("shipping", consumerSpan(0.05, nil)))
-			case ptrace.SpanKindConsumer:
-				p.Consume(sgTraces("shipping", consumerSpan(0.05, tc.attrs)))
-				p.Consume(sgTraces("checkout", producerSpan(0.1, nil)))
+		// The attribute-carrying half under test pairs with a bare partner,
+		// and every case runs in BOTH arrival orders: the classification is a
+		// property of the request, so it must not depend on which half reached
+		// the shard first. (It did, for a producer carrying db.*: merge kept
+		// the first non-empty classification, so a consumer arriving first
+		// made the edge messaging_system and one request split across two
+		// connection_type series.)
+		for _, partnerFirst := range []bool{false, true} {
+			order := "under test first"
+			if partnerFirst {
+				order = "partner first"
 			}
-			if e := sink.only(t); e.Connection != tc.want {
-				t.Fatalf("connection = %q, want %q", e.Connection, tc.want)
-			}
-		})
+			t.Run(tc.name+"/"+order, func(t *testing.T) {
+				p, sink, _ := newTestProcessor(t, Config{})
+				var under, partner ptrace.Traces
+				switch tc.kind {
+				case ptrace.SpanKindClient:
+					under, partner = sgTraces("checkout", clientSpan(0.1, tc.attrs)), sgTraces("orders", serverSpan(0.05, nil))
+				case ptrace.SpanKindServer:
+					under, partner = sgTraces("orders", serverSpan(0.05, tc.attrs)), sgTraces("checkout", clientSpan(0.1, nil))
+				case ptrace.SpanKindProducer:
+					under, partner = sgTraces("checkout", producerSpan(0.1, tc.attrs)), sgTraces("shipping", consumerSpan(0.05, nil))
+				case ptrace.SpanKindConsumer:
+					under, partner = sgTraces("shipping", consumerSpan(0.05, tc.attrs)), sgTraces("checkout", producerSpan(0.1, nil))
+				}
+				if partnerFirst {
+					p.Consume(partner)
+					p.Consume(under)
+				} else {
+					p.Consume(under)
+					p.Consume(partner)
+				}
+				if e := sink.only(t); e.Connection != tc.want {
+					t.Fatalf("connection = %q, want %q", e.Connection, tc.want)
+				}
+			})
+		}
 	}
 }
 
@@ -456,7 +466,7 @@ func TestConsumeVirtualNodeCarriesTheObservedHalfsIDs(t *testing.T) {
 }
 
 func TestConsumeTruncatesLabelValues(t *testing.T) {
-	long := strings.Repeat("x", maxDimensionValueBytes+10)
+	long := strings.Repeat("x", cumagg.MaxLabelBytes+10)
 	p, sink, clock := newTestProcessor(t, Config{Wait: "1s", Dimensions: []string{"http.route"}})
 	p.Consume(sgTraces(long, clientSpan(0.1, map[string]string{
 		"peer.service": long,
@@ -466,14 +476,14 @@ func TestConsumeTruncatesLabelValues(t *testing.T) {
 	p.Sweep()
 
 	e := sink.only(t)
-	if len(e.ClientService) != maxDimensionValueBytes {
-		t.Fatalf("client service len = %d, want %d", len(e.ClientService), maxDimensionValueBytes)
+	if len(e.ClientService) != cumagg.MaxLabelBytes {
+		t.Fatalf("client service len = %d, want %d", len(e.ClientService), cumagg.MaxLabelBytes)
 	}
-	if len(e.ServerService) != maxDimensionValueBytes {
-		t.Fatalf("peer len = %d, want %d", len(e.ServerService), maxDimensionValueBytes)
+	if len(e.ServerService) != cumagg.MaxLabelBytes {
+		t.Fatalf("peer len = %d, want %d", len(e.ServerService), cumagg.MaxLabelBytes)
 	}
-	if v := dimsOf(e)["client_http.route"]; len(v) != maxDimensionValueBytes {
-		t.Fatalf("dimension len = %d, want %d", len(v), maxDimensionValueBytes)
+	if v := dimsOf(e)["client_http.route"]; len(v) != cumagg.MaxLabelBytes {
+		t.Fatalf("dimension len = %d, want %d", len(v), cumagg.MaxLabelBytes)
 	}
 }
 
@@ -517,7 +527,7 @@ func TestConsumeSkipsResourcesWithoutServiceName(t *testing.T) {
 	// service.name (two spans), one with an EMPTY service.name (one span).
 	td := sgTraces("checkout", clientSpan(0.1, nil), serverSpan(0.05, nil))
 	anon := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans()
-	for i := byte(0); i < 2; i++ {
+	for i := range byte(2) {
 		s := anon.AppendEmpty()
 		s.SetName("orphan")
 		s.SetKind(ptrace.SpanKindClient)
@@ -585,18 +595,18 @@ func TestConsumeMaxItemsDrops(t *testing.T) {
 	}
 }
 
-// One ticker Sweep must retire everything DUE, not sweepBudget of it.
+// One ticker Sweep must retire everything DUE, not expirePerHold of it.
 //
 // The cadence its caller picks is a promise: sweepInterval takes wait/2 so a
 // promotable half-edge reaches the graph within 1.5x wait. One bounded pass per
-// tick keeps that promise only while fewer than sweepBudget halves are pending —
+// tick keeps that promise only while fewer than expirePerHold halves are pending —
 // past that the sweep is a RATE, and the delay grows with the backlog: a full
-// default store (MaxItems 10,000, sweepBudget 1,024) is ten ticks, so at the
+// default store (MaxItems 10,000, expirePerHold 1,024) is ten ticks, so at the
 // default 5s cadence its last due half-edge waits 45s against a promised 15s.
 // The quiet shard this entry point exists for is where nothing else corrects it.
 func TestSweepDrainsEverythingDue(t *testing.T) {
-	p, sink, clock := newTestProcessor(t, Config{Wait: "1s", MaxItems: sweepBudget * 4})
-	total := sweepBudget*2 + 100
+	p, sink, clock := newTestProcessor(t, Config{Wait: "1s", MaxItems: expirePerHold * 4})
+	total := expirePerHold*2 + 100
 	spans := make([]sgSpan, total)
 	for i := range spans {
 		// Both ids start at 1: a zero trace id is unkeyable by design, and so is
@@ -645,12 +655,11 @@ func TestSweepDrainsEverythingDue(t *testing.T) {
 // first hold. A drain that never released the mutex would emit every edge under
 // one unchanged reading.
 func TestSweepReleasesTheMutexEveryBudget(t *testing.T) {
-	total := sweepBudget*2 + 100
-	p := NewProcessor(Config{Wait: "1s", MaxItems: total * 2}, discardLog())
+	total := expirePerHold*2 + 100
+	sink := &passWatchSink{}
+	p := NewProcessor(Config{Wait: "1s", MaxItems: total * 2}, sink, discardLog())
 	clock := t0
 	p.now = func() time.Time { return clock }
-	sink := &passWatchSink{}
-	p.SetSink(sink)
 
 	p.Consume(unpairableClientSpans(0, total))
 	if s := p.Stats(); s.Items != total {
@@ -678,9 +687,9 @@ func TestSweepReleasesTheMutexEveryBudget(t *testing.T) {
 		t.Fatalf("all %d retirements happened inside ONE lock hold: a deep store stalls every "+
 			"concurrent Consume, and the sink, for the whole drain", total)
 	}
-	if first != sweepBudget {
-		t.Fatalf("the first lock release came after %d retirements, want sweepBudget = %d: "+
-			"the per-hold ceiling is not the constant that documents it", first, sweepBudget)
+	if first != expirePerHold {
+		t.Fatalf("the first lock release came after %d retirements, want expirePerHold = %d: "+
+			"the per-hold ceiling is not the constant that documents it", first, expirePerHold)
 	}
 }
 
@@ -692,7 +701,7 @@ type passWatchSink struct {
 	seen  []float64
 }
 
-func (s *passWatchSink) Record(Edge) {
+func (s *passWatchSink) RecordAt(Edge, time.Time) {
 	if s.watch {
 		s.seen = append(s.seen, obs.ServiceGraphExpired.Value())
 	}
@@ -741,7 +750,7 @@ func TestExpiryKeepsUpAtRealisticRates(t *testing.T) {
 	p, _, clock := newTestProcessor(t, Config{Wait: "5s", MaxItems: maxItems})
 
 	n := uint64(0)
-	for b := 0; b < batches; b++ {
+	for range batches {
 		spans := make([]sgSpan, spansPerBatch)
 		for i := range spans {
 			// Every span its own trace: unpairable, so every one becomes a
@@ -813,7 +822,7 @@ func TestZeroClientSpanIDCannotCrossPair(t *testing.T) {
 // construction, and a span arriving in that window must not panic the ingest
 // goroutine.
 func TestConsumeWithoutSink(t *testing.T) {
-	p := NewProcessor(Config{}, nil)
+	p := NewProcessor(Config{}, nil, nil)
 	p.now = func() time.Time { return t0 }
 	p.Consume(sgTraces("checkout", clientSpan(0.1, nil)))
 	p.Consume(sgTraces("orders", serverSpan(0.05, nil)))
@@ -825,17 +834,16 @@ func TestConsumeWithoutSink(t *testing.T) {
 // Consume runs on the concurrent ingest handler goroutines, so the store's
 // mutex is the only thing between two RPCs pairing at once. Run under -race.
 func TestConsumeConcurrent(t *testing.T) {
-	p := NewProcessor(Config{MaxItems: 1 << 16}, nil)
 	sink := &lockedSink{}
-	p.SetSink(sink)
+	p := NewProcessor(Config{MaxItems: 1 << 16}, sink, nil)
 
 	const goroutines, requests = 8, 200
 	var wg sync.WaitGroup
-	for g := 0; g < goroutines; g++ {
+	for g := range goroutines {
 		wg.Add(1)
 		go func(g int) {
 			defer wg.Done()
-			for i := 0; i < requests; i++ {
+			for i := range requests {
 				tid := traceID(byte(g + 1))
 				sid := spanID(byte(i%200 + 1))
 				// Halves in separate batches, so the two goroutines' inserts
@@ -869,7 +877,7 @@ type lockedSink struct {
 	count int
 }
 
-func (s *lockedSink) Record(Edge) {
+func (s *lockedSink) RecordAt(Edge, time.Time) {
 	s.mu.Lock()
 	s.count++
 	s.mu.Unlock()
@@ -886,14 +894,13 @@ func (s *lockedSink) n() int {
 // (zero) allocation cost.
 type countSink struct{ n int }
 
-func (c *countSink) Record(Edge) { c.n++ }
+func (c *countSink) RecordAt(Edge, time.Time) { c.n++ }
 
 // BenchmarkConsumePair is the warm path: one request's two halves, i.e. one
 // insert and one completion per iteration. It must stay allocation-free — the
 // free list and the array key exist for exactly this.
 func BenchmarkConsumePair(b *testing.B) {
-	p := NewProcessor(Config{}, nil)
-	p.SetSink(&countSink{})
+	p := NewProcessor(Config{}, &countSink{}, nil)
 	td := sgTraces("checkout", clientSpan(0.30, nil), serverSpan(0.25, nil))
 	p.Consume(td) // warm the map and the free list
 	b.ReportAllocs()
@@ -905,8 +912,7 @@ func BenchmarkConsumePair(b *testing.B) {
 // With dimensions configured, the per-span extraction uses a stack scratch and
 // the completed edge pays one map: the cost must be per EDGE, not per span.
 func BenchmarkConsumePairWithDimensions(b *testing.B) {
-	p := NewProcessor(Config{Dimensions: []string{"http.method", "http.route"}}, nil)
-	p.SetSink(&countSink{})
+	p := NewProcessor(Config{Dimensions: []string{"http.method", "http.route"}}, &countSink{}, nil)
 	attrs := map[string]string{"http.method": "GET", "http.route": "/api/v1/orders"}
 	td := sgTraces("checkout", clientSpan(0.30, attrs), serverSpan(0.25, attrs))
 	p.Consume(td)
@@ -925,13 +931,58 @@ func TestConsumeWithDimensionsIsAllocationFree(t *testing.T) {
 	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
-	p := NewProcessor(Config{Dimensions: []string{"http.method", "http.route"}}, nil)
-	p.SetSink(&countSink{})
-	attrs := map[string]string{"http.method": "GET", "http.route": "/api/v1/orders"}
+	for _, tc := range []struct {
+		name string
+		dims []string
+		td   ptrace.Traces
+	}{
+		{"str", []string{"http.method", "http.route"}, func() ptrace.Traces {
+			attrs := map[string]string{"http.method": "GET", "http.route": "/api/v1/orders"}
+			return sgTraces("checkout", clientSpan(0.30, attrs), serverSpan(0.25, attrs))
+		}()},
+		// An INT dimension — the status code every HTTP span carries — is
+		// rendered to the string a half-edge holds. pdata's AsString
+		// allocated for every value outside 0-99, i.e. one allocation per
+		// half; cumagg.ValueStr serves the common range from static strings,
+		// which is also what makes RETAINING one free.
+		{"int", []string{"http.response.status_code"}, func() ptrace.Traces {
+			td := sgTraces("checkout", clientSpan(0.30, nil), serverSpan(0.25, nil))
+			spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+			for i := 0; i < spans.Len(); i++ {
+				spans.At(i).Attributes().PutInt("http.response.status_code", 200)
+			}
+			return td
+		}()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewProcessor(Config{Dimensions: tc.dims}, &countSink{}, nil)
+			td := tc.td
+			p.Consume(td) // warm the map, the free list and the join scratch
+			if n := testing.AllocsPerRun(200, func() { p.Consume(td) }); n != 0 {
+				t.Errorf("Consume allocates %v times per paired request, want 0", n)
+			}
+		})
+	}
+}
+
+// A dimension value past cumagg.MaxLabelBytes has to be cut WITH A COPY where
+// it is kept — a half-edge held for a Wait would otherwise pin the sender's
+// whole string. But only the half that is HELD is kept: the half that completes
+// the pair is emitted on the spot, and its values are cut again by the sink
+// (the key by Trunc, a new series' labels by Retain). Cloning on every arrival
+// paid that copy on both halves of every request; cloning where the store keeps
+// the value pays it once.
+func TestOnlyTheHeldHalfCopiesALongDimension(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	attrs := map[string]string{"http.route": strings.Repeat("r", 2*cumagg.MaxLabelBytes)}
 	td := sgTraces("checkout", clientSpan(0.30, attrs), serverSpan(0.25, attrs))
-	p.Consume(td) // warm the map, the free list and the join scratch
-	if n := testing.AllocsPerRun(200, func() { p.Consume(td) }); n != 0 {
-		t.Errorf("Consume allocates %v times per paired request, want 0", n)
+	p := NewProcessor(Config{Dimensions: []string{"http.route"}}, &countSink{}, nil)
+	p.Consume(td)
+	if n := testing.AllocsPerRun(200, func() { p.Consume(td) }); n != 1 {
+		t.Errorf("Consume allocates %v times per paired request with a %d-byte dimension, want 1 (the held half's copy only)",
+			n, 2*cumagg.MaxLabelBytes)
 	}
 }
 
@@ -940,8 +991,7 @@ func TestConsumeWithDimensionsIsAllocationFree(t *testing.T) {
 // the shape a shard sees when it owns one side of many requests, and the
 // per-batch clock read is amortized across 100 spans rather than 2.
 func BenchmarkConsumeUnpaired(b *testing.B) {
-	p := NewProcessor(Config{MaxItems: 1 << 20}, nil)
-	p.SetSink(&countSink{})
+	p := NewProcessor(Config{MaxItems: 1 << 20}, &countSink{}, nil)
 	spans := make([]sgSpan, 100)
 	for i := range spans {
 		spans[i] = sgSpan{kind: ptrace.SpanKindClient, dur: 0.1,
@@ -963,8 +1013,7 @@ func TestConsumeUnpairedIsAllocationFree(t *testing.T) {
 	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
-	p := NewProcessor(Config{MaxItems: 1 << 20}, nil)
-	p.SetSink(&countSink{})
+	p := NewProcessor(Config{MaxItems: 1 << 20}, &countSink{}, nil)
 	spans := make([]sgSpan, 100)
 	for i := range spans {
 		spans[i] = sgSpan{kind: ptrace.SpanKindClient, dur: 0.1,
@@ -977,14 +1026,14 @@ func TestConsumeUnpairedIsAllocationFree(t *testing.T) {
 	}
 }
 
-// maxSweepPerBatch is a PER-LOCK-HOLD ceiling, not a total budget. Spending
+// expirePerHold is a PER-LOCK-HOLD ceiling, not a total budget. Spending
 // only that much of a larger batch-scaled budget made the scaling a lie: a
 // batch carrying more unpairable half-edges than the ceiling expired fewer than
 // it added, so occupancy climbed past the honest rate x wait working set and
 // pinned at MaxItems — after which the store refuses arriving spans.
 func TestConsumeSweepsItsWholeBatchBudget(t *testing.T) {
-	const n = maxSweepPerBatch * 3
-	p := NewProcessor(Config{Wait: "1s", MaxItems: n * 4}, discardLog())
+	const n = expirePerHold * 3
+	p := NewProcessor(Config{Wait: "1s", MaxItems: n * 4}, nil, discardLog())
 	base := t0
 	p.now = func() time.Time { return base }
 
@@ -1011,8 +1060,8 @@ func TestConsumeSweepsItsWholeBatchBudget(t *testing.T) {
 // elapsed, and the shutdown path claims to emit them. A bounded pass silently
 // discarded the remainder on a busy tier.
 func TestSweepAllDrainsEverythingDue(t *testing.T) {
-	const n = sweepBudget * 3
-	p := NewProcessor(Config{Wait: "1s", MaxItems: n * 2}, discardLog())
+	const n = expirePerHold * 3
+	p := NewProcessor(Config{Wait: "1s", MaxItems: n * 2}, nil, discardLog())
 	base := t0
 	p.now = func() time.Time { return base }
 	p.Consume(unpairableClientSpans(0, n))
@@ -1061,5 +1110,53 @@ func TestDatabaseAttrsAllCarryThePrefix(t *testing.T) {
 		if len(a) <= len(dbAttrPrefix) || a[:len(dbAttrPrefix)] != dbAttrPrefix {
 			t.Errorf("databaseAttrs member %q does not start with %q, so namesDatabase's prefix gate can never reach it", a, dbAttrPrefix)
 		}
+	}
+}
+
+// The same contract end to end, through the gate that runs rather than through
+// the constant: every databaseAttrs member, ALONE among otelhttp-shaped
+// neighbours, classifies the span. A gate that drifted from the list — the
+// prefix bytes edited without the constant, or a member respelled — fails here
+// whichever of the two moved.
+func TestEveryDatabaseAttrClassifiesAlone(t *testing.T) {
+	for _, a := range databaseAttrs {
+		m := pcommon.NewMap()
+		m.PutStr("http.request.method", "GET")
+		m.PutStr("server.address", "orders")
+		m.PutStr("dbx.system", "not a database attribute")
+		m.PutStr(a, "postgresql")
+		if !namesDatabase(m) {
+			t.Errorf("a span carrying only %q is not classified as a database call", a)
+		}
+	}
+	m := pcommon.NewMap()
+	m.PutStr("db", "x")
+	m.PutStr("db.", "x")
+	m.PutStr("db.statement", "SELECT 1")
+	if namesDatabase(m) {
+		t.Error("namesDatabase classified a span carrying no databaseAttrs member")
+	}
+}
+
+// Tap must feed the pairing store only after a SUCCESSFUL export: a failed one
+// is retried by the application with the identical batch, and an edge counted
+// before the export would be counted again on every retry.
+func TestTapPairsOnlyAfterASuccessfulExport(t *testing.T) {
+	p := NewProcessor(Config{}, nil, discardLog())
+	inner := &captureExporter{err: errors.New("nope")}
+	tap := p.Tap(inner)
+
+	if err := tap.ExportTraces(context.Background(), unpairableClientSpans(0, 1)); err == nil {
+		t.Fatal("the tap swallowed an export failure")
+	}
+	if st := p.Stats(); st.Items != 0 {
+		t.Errorf("the pairing store took %d half-edges from a failed export; a retry would double-count them", st.Items)
+	}
+	inner.err = nil
+	if err := tap.ExportTraces(context.Background(), unpairableClientSpans(0, 1)); err != nil {
+		t.Fatalf("ExportTraces: %v", err)
+	}
+	if st := p.Stats(); st.Items != 1 {
+		t.Errorf("the pairing store holds %d half-edges after one CLIENT span, want 1", st.Items)
 	}
 }

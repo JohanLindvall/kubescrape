@@ -3,8 +3,10 @@ package cgroupstats
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -47,22 +49,25 @@ func systemdUID(seed int) string {
 	return string(u)
 }
 
+// The tree helpers take testing.TB, so a benchmark builds its tree through the
+// same code a test does.
+
 // newRoot creates a cgroup v2 root: an empty hierarchy that checkCgroup2
 // accepts.
-func newRoot(t *testing.T) string {
-	t.Helper()
-	root := t.TempDir()
-	writeFile(t, filepath.Join(root, controllersFile), "cpu memory pids\n")
+func newRoot(tb testing.TB) string {
+	tb.Helper()
+	root := tb.TempDir()
+	writeFile(tb, filepath.Join(root, controllersFile), "cpu memory pids\n")
 	return root
 }
 
-func writeFile(t *testing.T, path, content string) {
-	t.Helper()
+func writeFile(tb testing.TB, path, content string) {
+	tb.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 }
 
@@ -95,12 +100,29 @@ func memStat(inactiveFile uint64) string {
 	return s
 }
 
+// fmtUint renders a single-value cgroup file (memory.current).
+func fmtUint(v uint64) string { return strconv.FormatUint(v, 10) + "\n" }
+
 // makeContainer writes the three sampled files into a container cgroup dir.
-func makeContainer(t *testing.T, dir string, usageUsec, memCurrent, inactiveFile uint64) {
-	t.Helper()
-	writeFile(t, filepath.Join(dir, fileCPUStat), cpuStat(usageUsec))
-	writeFile(t, filepath.Join(dir, fileMemCurrent), fmt.Sprintf("%d\n", memCurrent))
-	writeFile(t, filepath.Join(dir, fileMemStat), memStat(inactiveFile))
+func makeContainer(tb testing.TB, dir string, usageUsec, memCurrent, inactiveFile uint64) {
+	tb.Helper()
+	writeFile(tb, filepath.Join(dir, fileCPUStat), cpuStat(usageUsec))
+	writeFile(tb, filepath.Join(dir, fileMemCurrent), fmtUint(memCurrent))
+	writeFile(tb, filepath.Join(dir, fileMemStat), memStat(inactiveFile))
+}
+
+// closeAll releases every descriptor and forgets every container. It is the
+// tests' teardown; production's is Run's stop, whose containers FinalExport
+// then carries.
+func (s *Sampler) closeAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, c := range s.tracked {
+		c.release()
+		delete(s.tracked, id)
+	}
+	clear(s.pending)
+	s.publishCountsLocked()
 }
 
 // kindContainerDir is the path a kind node uses: the whole tree nested under
@@ -148,7 +170,8 @@ func cgroupfsContainerDir(root string, pod int, cid string) string {
 // new container's for its first second. down is the other refusal, and the one
 // the retry policy treats completely differently: the service could not be
 // reached at all, which says nothing about any container. It is mutex-guarded
-// because Run resolves on the sampler goroutine while the test reads the calls.
+// because Run resolves on its discovery goroutine (and once synchronously
+// before the loops start) while the test reads the calls.
 type fakeResolver struct {
 	mu     sync.Mutex
 	calls  []resolveCall
@@ -174,9 +197,7 @@ func (f *fakeResolver) FillContainerResource(ctx context.Context, res pcommon.Re
 	down := f.down
 	delay := f.delay
 	extra := make(map[string]string, len(f.extra))
-	for k, v := range f.extra {
-		extra[k] = v
-	}
+	maps.Copy(extra, f.extra)
 	f.mu.Unlock()
 	if delay > 0 {
 		select {

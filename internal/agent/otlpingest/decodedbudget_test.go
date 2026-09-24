@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -35,7 +36,7 @@ import (
 // live heap each once decoded.
 func manyResources(n int) plog.Logs {
 	ld := plog.NewLogs()
-	for i := 0; i < n; i++ {
+	for range n {
 		ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().
 			LogRecords().AppendEmpty().Body().SetStr("x")
 	}
@@ -46,7 +47,7 @@ func manyResources(n int) plog.Logs {
 // per signal, so each needs its own end-to-end proof.
 func manyResourceMetrics(n int) pmetric.Metrics {
 	md := pmetric.NewMetrics()
-	for i := 0; i < n; i++ {
+	for range n {
 		md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().
 			SetEmptyGauge().DataPoints().AppendEmpty().SetIntValue(1)
 	}
@@ -55,10 +56,36 @@ func manyResourceMetrics(n int) pmetric.Metrics {
 
 func manyResourceSpans(n int) ptrace.Traces {
 	td := ptrace.NewTraces()
-	for i := 0; i < n; i++ {
+	for range n {
 		td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty().SetName("x")
 	}
 	return td
+}
+
+// estimateLogs and its siblings are the charge a payload's WIRE form draws —
+// the only estimate there is, taken before the decode.
+func estimateLogs(ld plog.Logs) int64 {
+	b, err := plogotlp.NewExportRequestFromLogs(ld).MarshalProto()
+	if err != nil {
+		panic(err)
+	}
+	return decodedLogsSize(b)
+}
+
+func estimateMetrics(md pmetric.Metrics) int64 {
+	b, err := pmetricotlp.NewExportRequestFromMetrics(md).MarshalProto()
+	if err != nil {
+		panic(err)
+	}
+	return decodedMetricsSize(b)
+}
+
+func estimateTraces(td ptrace.Traces) int64 {
+	b, err := ptraceotlp.NewExportRequestFromTraces(td).MarshalProto()
+	if err != nil {
+		panic(err)
+	}
+	return decodedTracesSize(b)
 }
 
 // budgetHTTPServer returns the Server behind an httptest listener so a test can
@@ -100,7 +127,7 @@ func TestDecodedStructureIsChargedNotOnlyRawBytes(t *testing.T) {
 	s.decoded.limit = 1 << 20
 
 	ld := manyResources(4000) // ~4 MB of estimated structure, ~120 KB of wire
-	if got := decodedLogsSize(ld); got <= s.decoded.limit {
+	if got := estimateLogs(ld); got <= s.decoded.limit {
 		t.Fatalf("fixture estimates %d bytes, want more than the %d budget", got, s.decoded.limit)
 	}
 	before := ingestRejectedTotal()
@@ -154,7 +181,7 @@ func TestDecodedChargeIsHeldAcrossTheForward(t *testing.T) {
 	go func() { done <- postLogs(t, srv.URL, manyResources(10)).StatusCode }()
 
 	held := <-seen
-	if want := decodedLogsSize(manyResources(10)); held != want {
+	if want := estimateLogs(manyResources(10)); held != want {
 		t.Errorf("decoded budget holds %d bytes while the exporter runs, want %d", held, want)
 	}
 	close(release)
@@ -163,8 +190,9 @@ func TestDecodedChargeIsHeldAcrossTheForward(t *testing.T) {
 	}
 }
 
-// grpcBudgetServer wires a Server exactly as Run wires it — tap, unary
-// interceptor, nesting guard — onto a real listener serving all three signals.
+// grpcBudgetServer wires a Server's admission exactly as Run wires it
+// (admissionOptions: tap, unary interceptor, codec, claim reaper) onto a real
+// listener serving all three signals.
 //
 // Driving a REAL server is the whole point of this helper, and the reason the
 // tests below were rewritten. Their predecessors called s.limitUnary directly
@@ -184,11 +212,7 @@ func grpcBudgetServer(t *testing.T, exp Exporter, traces TracesExporter) (*Serve
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := grpc.NewServer(
-		grpc.InTapHandle(s.tapAdmit),
-		grpc.UnaryInterceptor(s.limitUnary),
-		NestingGuardOption(s.noteTooDeep),
-	)
+	srv := grpc.NewServer(s.admissionOptions()...)
 	plogotlp.RegisterGRPCServer(srv, &logsGRPC{s: s})
 	pmetricotlp.RegisterGRPCServer(srv, &metricsGRPC{s: s})
 	ptraceotlp.RegisterGRPCServer(srv, &tracesGRPC{s: s})
@@ -240,15 +264,15 @@ func grpcSignals() []grpcSignal {
 		{"logs", func(ctx context.Context, conn *grpc.ClientConn, n int) error {
 			_, err := plogotlp.NewGRPCClient(conn).Export(ctx, plogotlp.NewExportRequestFromLogs(manyResources(n)))
 			return err
-		}, func(n int) int64 { return decodedLogsSize(manyResources(n)) }},
+		}, func(n int) int64 { return estimateLogs(manyResources(n)) }},
 		{"metrics", func(ctx context.Context, conn *grpc.ClientConn, n int) error {
 			_, err := pmetricotlp.NewGRPCClient(conn).Export(ctx, pmetricotlp.NewExportRequestFromMetrics(manyResourceMetrics(n)))
 			return err
-		}, func(n int) int64 { return decodedMetricsSize(manyResourceMetrics(n)) }},
+		}, func(n int) int64 { return estimateMetrics(manyResourceMetrics(n)) }},
 		{"traces", func(ctx context.Context, conn *grpc.ClientConn, n int) error {
 			_, err := ptraceotlp.NewGRPCClient(conn).Export(ctx, ptraceotlp.NewExportRequestFromTraces(manyResourceSpans(n)))
 			return err
-		}, func(n int) int64 { return decodedTracesSize(manyResourceSpans(n)) }},
+		}, func(n int) int64 { return estimateTraces(manyResourceSpans(n)) }},
 	}
 }
 
@@ -283,7 +307,7 @@ func TestGRPCDecodedBudgetRefusalIsRetryable(t *testing.T) {
 			if st.Code() != codes.ResourceExhausted {
 				t.Fatalf("code = %v, want ResourceExhausted", st.Code())
 			}
-			if !retryableStatus(st) {
+			if !otlpexport.RetryableStatus(st) {
 				t.Error("the refusal carries no RetryInfo, so a conformant sender drops the batch it still holds")
 			}
 			var hasRetry bool
@@ -448,13 +472,13 @@ func TestDecodedBudgetScalesWithTheRawBudget(t *testing.T) {
 func TestEmptyScopesAreCharged(t *testing.T) {
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		rl.ScopeLogs().AppendEmpty()
 	}
 	if ld.LogRecordCount() != 0 {
 		t.Fatal("fixture must carry no records")
 	}
-	if got, want := decodedLogsSize(ld), int64(decodedResourceBytes+1000*decodedScopeBytes); got != want {
+	if got, want := estimateLogs(ld), int64(decodedResourceBytes+1000*decodedScopeBytes); got != want {
 		t.Errorf("decodedLogsSize = %d, want %d", got, want)
 	}
 }

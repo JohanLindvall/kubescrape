@@ -93,7 +93,7 @@ func TestContributorCeilingRefusesAttributionNotConfiguration(t *testing.T) {
 	// monitor the list has no room to name.
 	rep := MergeMonitorEndpoint(&held, "ns/late", &servicemonitors.Endpoint{
 		Interval: "1s", ScrapeTimeout: "1s",
-		BearerSecret:      "ns/tok/token",
+		ScrapeAuth:        kubemeta.ScrapeAuth{AuthSecret: "ns/tok/token"},
 		MetricRelabelings: []kubemeta.RelabelRule{keepRule},
 	})
 	if !rep.ContributorsCapped {
@@ -116,7 +116,7 @@ func TestContributorCeilingRefusesAttributionNotConfiguration(t *testing.T) {
 // A monitor ALREADY on the list contributing again — its own second endpoint
 // resolving to the same URL — is not a refusal: it contributed and it is on the
 // wire. Reporting it would move the counter and warn about a monitor that lost
-// nothing, on every targets request of every agent holding the pod.
+// nothing, on every target derivation of every node holding the pod.
 func TestListedContributorIsNotRefusedByTheCeiling(t *testing.T) {
 	held := mergeHeld("ns/holder", servicemonitors.Endpoint{Interval: "9000s"})
 	for i := range MaxContributorsPerTarget * 2 {

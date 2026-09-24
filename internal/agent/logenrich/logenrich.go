@@ -6,7 +6,9 @@ package logenrich
 
 import (
 	"encoding/hex"
+	"math"
 	"strings"
+	"time"
 
 	"github.com/JohanLindvall/enrich"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -16,15 +18,18 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
-// Apply enriches one log record from an explicit line (the tailer/journald
-// path). A parsed timestamp replaces the record timestamp (the CRI/journal
-// ingest time belongs in ObservedTimestamp) and an explicit level replaces
-// the severity; enrich's severity numbers are the OTLP severity numbers.
+// Apply enriches one log record from an explicit line — the path of every
+// producer that BUILDS its records (tailer, journald, events, azurediag, all
+// through logchain.Chain.Emit). A parsed timestamp replaces the record
+// timestamp (the CRI/journal ingest time belongs in ObservedTimestamp) and an
+// explicit level replaces the severity; enrich's severity numbers are the OTLP
+// severity numbers.
 //
 // The outcome is counted: obs.LogEnriched by the format that matched, and
-// obs.LogEnrichTimeRejected when a zone-less parsed timestamp is refused. Both
-// are per-RECORD tallies, so a producer that can hand the SAME record here
-// twice must use ApplyUncounted for the repeat.
+// obs.LogEnrichTimeRejected when a parsed timestamp is refused (zone-less, or
+// outside what an OTLP timestamp can hold). Both are per-RECORD tallies, so a
+// producer that can hand the SAME record here twice must use ApplyUncounted
+// for the repeat.
 func Apply(lr plog.LogRecord, line string) {
 	apply(lr, line, true, true)
 }
@@ -110,14 +115,14 @@ func apply(lr plog.LogRecord, line string, overwrite, count bool) {
 	}
 
 	if !e.Time.IsZero() && (overwrite || lr.Timestamp() == 0) {
-		if mayReplaceTimestamp(e.TimeHasZone, lr.Timestamp()) {
+		if mayReplaceTimestamp(e.TimeHasZone, lr.Timestamp(), e.Time) {
 			lr.SetTimestamp(pcommon.NewTimestampFromTime(e.Time))
 		} else if count {
 			obs.LogEnrichTimeRejected.Inc()
 		}
 	}
 	if e.SeverityNumber > 0 && (overwrite || (lr.SeverityNumber() == plog.SeverityNumberUnspecified && lr.SeverityText() == "")) {
-		// Non-overwrite (ApplyBody): a sender-set SeverityText counts as "the
+		// Non-overwrite (ApplyBodyText): a sender-set SeverityText counts as "the
 		// sender expressed severity" even with the number unset — clobbering the
 		// text would discard sender intent.
 		lr.SetSeverityNumber(plog.SeverityNumber(e.SeverityNumber))
@@ -202,8 +207,30 @@ func apply(lr plog.LogRecord, line string, overwrite, count bool) {
 // cares about back-dating tends to use (JSON, logfmt, RFC3339) all carry a
 // zone and are unaffected; ObservedTimestamp carries the ingest time either
 // way; and the refusal is counted (obs.LogEnrichTimeRejected).
-func mayReplaceTimestamp(hasZone bool, producer pcommon.Timestamp) bool {
-	return hasZone || producer == 0
+//
+// A parsed time an OTLP timestamp cannot HOLD is refused whatever its zone:
+// pcommon.NewTimestampFromTime is uint64(t.UnixNano()), which wraps anything
+// before 1970 into a value centuries away (1969-12-31T23:59:59Z shipped as
+// 18446744072709551616, i.e. the year 2554) and is undefined past 2262. That
+// used to displace the producer's accurate time with the nonsense value,
+// uncounted. The epoch itself is refused too, since a zero timestamp means
+// "unset" on the wire.
+func mayReplaceTimestamp(hasZone bool, producer pcommon.Timestamp, t time.Time) bool {
+	return (hasZone || producer == 0) && representable(t)
+}
+
+// The instants a pcommon.Timestamp can carry: after the epoch (zero is
+// "unset") and no later than the last t.UnixNano() an int64 holds
+// (2262-04-11T23:47:16.854775807Z).
+var (
+	epoch            = time.Unix(0, 0)
+	maxRepresentable = time.Unix(0, math.MaxInt64)
+)
+
+// representable reports whether t survives pcommon.NewTimestampFromTime as
+// itself.
+func representable(t time.Time) bool {
+	return t.After(epoch) && !t.After(maxRepresentable)
 }
 
 // parseHexID decodes an ID of want bytes from hex, tolerating dashes

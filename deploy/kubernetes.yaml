@@ -105,7 +105,7 @@ spec:
           # `Always` would either fail the pull or fetch a PUBLISHED :latest
           # over the build under test. Pin the tag to a release or an
           # `@sha256:` digest for a real deployment (the Helm chart's
-          # `image.tag`), and the pull policy stops mattering. See
+          # `image.tag` / `image.digest`), and the pull policy stops mattering. See
           # docs/CONFIGURATION.md, "Accepted security residuals".
           imagePullPolicy: IfNotPresent
           securityContext:
@@ -173,3 +173,26 @@ spec:
     - name: http
       port: 80
       targetPort: http
+
+# PRIORITY-CLASS QUOTA. Some clusters — GKE among them — configure the
+# ResourceQuota admission plugin to refuse a system-cluster-critical pod outside
+# kube-system unless a quota in its namespace covers that class. There the
+# metadata-service Deployment creates NO pod, and the only symptom is a FailedCreate event
+# ("insufficient quota to match these scopes"). Uncomment this document on such
+# a cluster (the Helm chart renders it by default: priorityClassQuota). It
+# bounds only `pods`, far above any real count, so it restricts nothing where
+# that policy is absent.
+#---
+#apiVersion: v1
+#kind: ResourceQuota
+#metadata:
+#  name: kubescrape-cluster-critical
+#  namespace: monitoring
+#spec:
+#  hard:
+#    pods: "100000"
+#  scopeSelector:
+#    matchExpressions:
+#      - scopeName: PriorityClass
+#        operator: In
+#        values: [system-cluster-critical]

@@ -2,13 +2,15 @@ package chartcheck
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
 	"sigs.k8s.io/yaml"
+
+	"github.com/JohanLindvall/kubescrape/internal/manifestcheck"
 )
 
 // The singleton's Role used to grant get/create/update on ALL ConfigMaps and
@@ -33,17 +35,19 @@ import (
 // `create` is deliberately exempt: RBAC ignores resourceNames on create (the
 // object has no name until the request is admitted), and create alone cannot
 // touch an object that already exists, so leaving it unscoped costs nothing.
+//
+// A manifest that passes neither flag — deploy/events.yaml — relies on the
+// binary's DEFAULTS, and those are read from the generated docs/FLAGS.md
+// (flagDefaultFromDocs) rather than copied here: a hand copy is exactly the
+// hardcoded expectation the paragraph above rules out, and it stayed green
+// when a default changed in main.go while deploy/'s Role went on naming the
+// old object.
 var scopedEventsResources = []struct {
-	resource   string // the RBAC resource whose get/update must be name-scoped
-	flag       string // the flag naming the ONE object the code touches
-	defaultVal string // that flag's default, for a manifest that does not pass it
+	resource string // the RBAC resource whose get/update must be name-scoped
+	flag     string // the flag naming the ONE object the code touches
 }{
-	// Defaults mirrored from cmd/kubescrape-agent/main.go, which deploy/events.yaml
-	// relies on by not passing either flag. charts/kubescrape/values.yaml carries
-	// the same two strings; the chart render below asserts the chart's own copies
-	// agree with its RBAC, so only deploy/ is checked against these.
-	{resource: "configmaps", flag: "events-position-configmap", defaultVal: "kubescrape-events-position"},
-	{resource: "leases", flag: "events-lease", defaultVal: "kubescrape-cluster-leader"},
+	{resource: "configmaps", flag: "events-position-configmap"},
+	{resource: "leases", flag: "events-lease"},
 }
 
 // rbacRule is the subset of a PolicyRule this test judges.
@@ -59,19 +63,38 @@ type rbacDoc struct {
 	Rules []rbacRule `json:"rules"`
 }
 
-// docSep splits a multi-document YAML stream, the way internal/manifestcheck
-// does — no dependency on a streaming decoder for three documents.
-var docSep = regexp.MustCompile(`(?m)^---[ \t]*$`)
-
-// eventsFlagValue returns the value the manifest passes to -<flag>, or def when
-// it passes the flag nowhere. Both dash spellings are accepted because Go's
-// flag package accepts both.
-func eventsFlagValue(manifest, flag, def string) string {
-	re := regexp.MustCompile(`(?m)^\s*-\s+--?` + regexp.QuoteMeta(flag) + `=(\S+)\s*$`)
+// eventsFlagValue returns the value the manifest passes to -<flag>, or the
+// binary's registered default (flagDefaultFromDocs) when it passes the flag
+// nowhere. Both dash spellings are accepted because Go's flag package accepts
+// both, and so is a quoted list item (`- "-events-lease=x"`), because YAML
+// strips the quotes: skipping it would fall back to the DEFAULT and judge the
+// Role against a name the manifest does not use, and keeping the closing quote
+// in the value would judge it against `x"`. Neither quote may appear in the
+// value itself — an object name cannot contain one.
+func eventsFlagValue(t *testing.T, manifest, flag string) string {
+	t.Helper()
+	re := regexp.MustCompile(`(?m)^\s*-\s+["']?--?` + regexp.QuoteMeta(flag) + `=([^\s"']+)["']?\s*$`)
 	if m := re.FindStringSubmatch(manifest); m != nil {
 		return m[1]
 	}
-	return def
+	return flagDefaultFromDocs(t, flag)
+}
+
+// The name the Role is judged against is the one the manifest PASSES, in every
+// spelling that passes it. A quoted list item used to miss entirely — the
+// check then fell back to the binary default and judged a Role scoped to a
+// custom name as wrong, or one still scoped to the default as right.
+func TestEventsFlagValueReadsEverySpelling(t *testing.T) {
+	for _, line := range []string{
+		"            - -events-lease=custom-lease",
+		"            - --events-lease=custom-lease",
+		`            - "-events-lease=custom-lease"`,
+		`            - '--events-lease=custom-lease'`,
+	} {
+		if got := eventsFlagValue(t, "args:\n"+line+"\n", "events-lease"); got != "custom-lease" {
+			t.Errorf("%s: eventsFlagValue = %q, want %q", strings.TrimSpace(line), got, "custom-lease")
+		}
+	}
 }
 
 // assertEventsRBACIsScoped is the whole invariant, applied to one rendered
@@ -81,7 +104,7 @@ func eventsFlagValue(manifest, flag, def string) string {
 func assertEventsRBACIsScoped(t *testing.T, where, manifest string) {
 	t.Helper()
 	checked := 0
-	for _, doc := range docSep.Split(manifest, -1) {
+	for _, doc := range manifestcheck.Documents(manifest) {
 		var d rbacDoc
 		if err := yaml.Unmarshal([]byte(doc), &d); err != nil {
 			continue // not a Kubernetes object (helm's leading comment block, say)
@@ -91,7 +114,7 @@ func assertEventsRBACIsScoped(t *testing.T, where, manifest string) {
 		}
 		for _, rule := range d.Rules {
 			for _, want := range scopedEventsResources {
-				if !contains(rule.Resources, want.resource) {
+				if !slices.Contains(rule.Resources, want.resource) {
 					continue
 				}
 				beyondCreate := false
@@ -104,7 +127,7 @@ func assertEventsRBACIsScoped(t *testing.T, where, manifest string) {
 					continue // the unscoped create rule, which is the correct shape
 				}
 				checked++
-				name := eventsFlagValue(manifest, want.flag, want.defaultVal)
+				name := eventsFlagValue(t, manifest, want.flag)
 				if len(rule.ResourceNames) != 1 || rule.ResourceNames[0] != name {
 					t.Errorf("%s: %s rule with verbs %v on %q has resourceNames %v, want exactly [%q] — "+
 						"the code names one %s (-%s) and nothing else, and an unscoped write reaches every "+
@@ -139,7 +162,7 @@ func assertEventsRBACIsScoped(t *testing.T, where, manifest string) {
 func assertEventsClusterRoleReadsOnlyWhatTheReaderReads(t *testing.T, where, manifest string) {
 	t.Helper()
 	seen := 0
-	for _, doc := range docSep.Split(manifest, -1) {
+	for _, doc := range manifestcheck.Documents(manifest) {
 		var d rbacDoc
 		if err := yaml.Unmarshal([]byte(doc), &d); err != nil {
 			continue
@@ -148,11 +171,11 @@ func assertEventsClusterRoleReadsOnlyWhatTheReaderReads(t *testing.T, where, man
 			continue
 		}
 		for _, rule := range d.Rules {
-			if !contains(rule.Resources, "events") {
+			if !slices.Contains(rule.Resources, "events") {
 				continue
 			}
 			seen++
-			if !contains(rule.APIGroups, "") || len(rule.APIGroups) != 1 {
+			if !slices.Contains(rule.APIGroups, "") || len(rule.APIGroups) != 1 {
 				t.Errorf("%s: ClusterRole rule on events has apiGroups %v, want exactly [\"\"] — "+
 					"the reader uses CoreV1() and never EventsV1(), so an events.k8s.io grant is "+
 					"unexercised and misdescribes which representation is read",
@@ -180,20 +203,11 @@ func equalSets(got, want []string) bool {
 		return false
 	}
 	for _, w := range want {
-		if !contains(got, w) {
+		if !slices.Contains(got, w) {
 			return false
 		}
 	}
 	return true
-}
-
-func contains(hay []string, needle string) bool {
-	for _, s := range hay {
-		if s == needle {
-			return true
-		}
-	}
-	return false
 }
 
 // TestEventsRoleScopesWritesToTheObjectsTheFlagsName covers the CHART half,
@@ -201,12 +215,11 @@ func contains(hay []string, needle string) bool {
 // scope has to follow the values that render the flags, not a constant.
 func TestEventsRoleScopesWritesToTheObjectsTheFlagsName(t *testing.T) {
 	helm := helmBin(t)
-	out, err := exec.Command(helm, "template", "kubescrape", "../../charts/kubescrape",
-		"--namespace", "monitoring",
+	out, err := helmTemplate(helm, "monitoring",
 		"--set", "events.enabled=true",
 		"--set", "events.leaseName=custom-leader-lease",
 		"--set", "events.positionConfigMap=custom-position-cm",
-	).CombinedOutput()
+	)
 	if err != nil {
 		t.Fatalf("helm template failed: %v\n%s", err, out)
 	}
@@ -230,14 +243,15 @@ func TestDeployEventsRoleScopesWritesLikeTheChart(t *testing.T) {
 	// The two install paths must agree on the names as well as the shape: the
 	// chart's values and the binary's flag defaults are separate copies of the
 	// same two strings, and deploy/ silently relies on them being equal.
-	values, err := os.ReadFile(filepath.Join("..", "..", "charts", "kubescrape", "values.yaml"))
+	values, err := os.ReadFile(filepath.Join(chartDir, "values.yaml"))
 	if err != nil {
 		t.Fatalf("reading values.yaml: %v", err)
 	}
 	for _, want := range scopedEventsResources {
-		if !strings.Contains(string(values), ": "+want.defaultVal) {
-			t.Errorf("charts/kubescrape/values.yaml no longer defaults to %q, which deploy/events.yaml's "+
-				"resourceNames assume for -%s; the two install paths have drifted", want.defaultVal, want.flag)
+		def := flagDefaultFromDocs(t, want.flag)
+		if !strings.Contains(string(values), ": "+def) {
+			t.Errorf("charts/kubescrape/values.yaml no longer defaults to %q, the binary's default for -%s "+
+				"that deploy/events.yaml's resourceNames rely on; the two install paths have drifted", def, want.flag)
 		}
 	}
 }

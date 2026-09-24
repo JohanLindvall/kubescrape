@@ -15,6 +15,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"go.opentelemetry.io/collector/pdata/plog"
+
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -63,6 +65,24 @@ func (c *backlogClient) stopWatches() {
 		w.Stop() // the stream sees a closed channel and returns at once
 		return true, w, nil
 	})
+}
+
+// cancellingExporter is captureExporter that cancels the reader's context once
+// it has seen `after` export attempts — the lease lost while the collector is
+// down, which is the only thing that ends a backlog walk holding for an export
+// (exportUntil).
+type cancellingExporter struct {
+	*captureExporter
+	after  int
+	cancel context.CancelFunc
+}
+
+func (c *cancellingExporter) ExportLogs(ctx context.Context, ld plog.Logs) error {
+	err := c.captureExporter.ExportLogs(ctx, ld)
+	if c.attempts() >= c.after {
+		c.cancel()
+	}
+	return err
 }
 
 // backlogPage builds one list page: rv is the SNAPSHOT revision (the same on
@@ -139,18 +159,31 @@ func TestReplayCommitsWithoutABookmark(t *testing.T) {
 // still unexported points PAST them, and a restart from it never re-delivers
 // them. Only "every listed entry exported" releases it — which is exactly what
 // the bookmark was standing in for.
+//
+// The walk now WAITS for the collector rather than returning with its backlog
+// unexported (exportUntil), so the only way out of it with entries still owed
+// is the context ending — the leader losing its lease mid-outage — which is
+// what this drives.
 func TestReplayHoldsThePositionUntilTheBacklogIsExported(t *testing.T) {
 	now := time.Now()
 	client := newBacklogClient(t, backlogPage("9900500", "",
 		event("b", "BackOff", "m", "Warning", "9900300", 1, now),
 		event("a", "Started", "m", "Normal", "9900100", 1, now),
 	))
-	exp := &captureExporter{failN: 1 << 30, err: context.DeadlineExceeded}
-	r := New(Config{Client: client, Exporter: exp, BatchSize: 1, FlushInterval: time.Hour})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	exp := &cancellingExporter{
+		captureExporter: &captureExporter{failN: 1 << 30, err: context.DeadlineExceeded},
+		after:           3, cancel: cancel,
+	}
+	r := New(Config{Client: client, Exporter: exp, BatchSize: 1, FlushInterval: time.Hour, RestartBackoff: time.Millisecond})
 	r.relist = true
 
-	if err := r.stream(context.Background()); err == nil {
-		t.Fatal("the pre-stopped watch must end the stream")
+	if err := r.stream(ctx); err == nil {
+		t.Fatal("a walk cut short by its context must fail the stream")
+	}
+	if len(client.watches) != 0 {
+		t.Fatalf("a watch was opened (%q) with the backlog unexported", client.watches)
 	}
 	if got := r.committed.ResourceVersion; got != "" {
 		t.Fatalf("committed = %q with the backlog unexported: a restart from it skips the backlog outright", got)
@@ -167,6 +200,7 @@ func TestReplayHoldsThePositionUntilTheBacklogIsExported(t *testing.T) {
 	exp.mu.Lock()
 	exp.failN = 0
 	exp.mu.Unlock()
+	exp.cancel = func() {}
 	for len(r.batch) > 0 {
 		if err := r.flush(context.Background()); err != nil {
 			t.Fatal(err)
@@ -308,7 +342,7 @@ func TestReplayContinuationExpiryRearmsTheRelist(t *testing.T) {
 func TestShedBacklogEntriesStopBeingOwed(t *testing.T) {
 	r, _, _ := newReader(t, Config{BatchSize: 1000})
 	const n = shedChunk + 40
-	for i := 0; i < n; i++ {
+	for i := range n {
 		r.batch = append(r.batch, entry{rv: strconv.Itoa(100 + i)})
 	}
 	r.replaying, r.replaySecured = false, false
@@ -324,7 +358,7 @@ func TestShedBacklogEntriesStopBeingOwed(t *testing.T) {
 	}
 
 	// Draining the remainder secures the replay rather than leaving it stuck.
-	r.settle(entry{rv: "9900400", when: time.Now()}, len(r.batch))
+	r.settle(Position{ResourceVersion: "9900400", Watermark: time.Now()}, len(r.batch))
 	if !r.replaySecured || r.committed.ResourceVersion != "9900500" {
 		t.Fatalf("secured=%v committed=%q, want the snapshot committed once nothing is owed",
 			r.replaySecured, r.committed.ResourceVersion)
@@ -406,6 +440,78 @@ func TestBacklogIsNotShedWhenBatchSizeExceedsTheRetainCap(t *testing.T) {
 	if !r.replaySecured || r.committed.ResourceVersion != "9999999" {
 		t.Errorf("secured=%v committed=%q after a fully exported backlog, want the snapshot committed",
 			r.replaySecured, r.committed.ResourceVersion)
+	}
+}
+
+// The same loss by a far more ordinary route: ONE transient export failure
+// during the walk. The failed attempt makes flushDue false for FlushInterval,
+// the walk pages at API-server speed, so the batch reached the cap inside that
+// interval and ingest shed runs of entries that were still in the API server —
+// and once the collector answered, the replay secured at the snapshot revision
+// and nothing ever re-listed them. Measured before the fix: 21,888 of 30,000
+// shed for good. The walk must WAIT at the cap instead, and ship everything.
+func TestOneFailedExportDuringTheWalkShedsNothing(t *testing.T) {
+	now := time.Now()
+	const total = 30000
+	client := pagedBacklogClient(t, "9999999", total, func(i int) *corev1.Event {
+		return event("e"+strconv.Itoa(i), "R", "m", "Normal", strconv.Itoa(9900000+i), 1, now)
+	})
+	// Three failures: the count trigger's own, and two in-place retries at the
+	// cap, so the backoff between them is exercised too.
+	exp := &captureExporter{failN: 3, err: context.DeadlineExceeded}
+	r := New(Config{Client: client, Exporter: exp, BatchSize: 512, FlushInterval: 2 * time.Second,
+		RestartBackoff: time.Millisecond})
+	r.relist = true
+
+	// What had shipped at the moment the watch was opened: the replay must be
+	// complete and secured BEFORE it, not left to the watch loop's ticker.
+	var exportedAtWatch int
+	var committedAtWatch string
+	client.onWatch = func() { exportedAtWatch, committedAtWatch = len(exp.records()), r.committed.ResourceVersion }
+
+	shedBefore := obs.EventsOverflowDropped.Value()
+	if err := r.stream(context.Background()); err == nil {
+		t.Fatal("the pre-stopped watch must end the stream")
+	}
+	if shed := obs.EventsOverflowDropped.Value() - shedBefore; shed != 0 {
+		t.Errorf("one transient export failure shed %v of %d backlog entries during the walk; they were still "+
+			"in the API server and nothing re-lists them once the replay secures", shed, total)
+	}
+	if exportedAtWatch != total || committedAtWatch != "9999999" {
+		t.Errorf("at the watch: exported %d of %d, committed %q; want the whole backlog shipped and the "+
+			"snapshot 9999999 committed before the watch opens", exportedAtWatch, total, committedAtWatch)
+	}
+	if exp.attempts() < 4 {
+		t.Errorf("export attempts = %d, want the three failures retried in place", exp.attempts())
+	}
+}
+
+// The tail's half of the same fix: an export that failed within the last
+// FlushInterval of the walk left the tail's flush undue, so the owed entries
+// went to the watch loop — where, the collector still down, the watch's own
+// events fill the batch to the cap and shed. The tail is held until it lands.
+func TestReplayTailIsExportedEvenRightAfterAFailedExport(t *testing.T) {
+	now := time.Now()
+	const total = 600 // one count-triggered export at 512, then an 88-entry tail
+	client := pagedBacklogClient(t, "9999999", total, func(i int) *corev1.Event {
+		return event("e"+strconv.Itoa(i), "R", "m", "Normal", strconv.Itoa(9900000+i), 1, now)
+	})
+	exp := &captureExporter{failN: 1, err: context.DeadlineExceeded}
+	r := New(Config{Client: client, Exporter: exp, BatchSize: 512, FlushInterval: time.Hour,
+		RestartBackoff: time.Millisecond})
+	r.relist = true
+
+	var exportedAtWatch, owedAtWatch int
+	var securedAtWatch bool
+	client.onWatch = func() {
+		exportedAtWatch, owedAtWatch, securedAtWatch = len(exp.records()), r.replayOwed, r.replaySecured
+	}
+	if err := r.stream(context.Background()); err == nil {
+		t.Fatal("the pre-stopped watch must end the stream")
+	}
+	if exportedAtWatch != total || owedAtWatch != 0 || !securedAtWatch {
+		t.Fatalf("at the watch: exported=%d owed=%d secured=%v, want all %d shipped and the replay secured "+
+			"before the watch opens", exportedAtWatch, owedAtWatch, securedAtWatch, total)
 	}
 }
 

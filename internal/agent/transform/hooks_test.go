@@ -4,6 +4,8 @@ import (
 	"context"
 	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,9 +43,6 @@ ingest: |
 	if w.AdmitResource(bad) {
 		t.Fatal("banned resource admitted")
 	}
-	if !w.HasAdmit() {
-		t.Fatal("HasAdmit = false with an ingest section")
-	}
 
 	// Error → fail open.
 	we := hookWrapper(t, "ingest: |\n  def admit(resource):\n      fail(\"boom\")\n")
@@ -51,10 +50,12 @@ ingest: |
 		t.Fatal("a script error must fail OPEN (admit)")
 	}
 
-	// No section → admit, cheaply.
+	// No section → admit, whatever the resource: receivers install
+	// AdmitResource unconditionally (a hot reload may add the section later),
+	// so the absent hook must read as "admit", never as "reject".
 	wn := hookWrapper(t, "logs: |\n  def transform(batch): pass\n")
-	if !wn.AdmitResource(ok) || wn.HasAdmit() {
-		t.Fatal("no ingest section must admit and report HasAdmit=false")
+	if !wn.AdmitResource(ok) || !wn.AdmitResource(bad) {
+		t.Fatal("no ingest section must admit every resource")
 	}
 }
 
@@ -253,6 +254,63 @@ sample: |
 	}
 }
 
+// decide() sees a read-only span, and read-only must not mean NARROWER: every
+// field a traces-batch script can read, a sampling script reads too, with the
+// same value. The two views used to resolve their fields separately and had
+// drifted — status_message and span_id were missing from decide()'s view, so a
+// policy matching on an error message failed on every trace and, a hook
+// failing open, silently abstained.
+func TestSampleSpansReadEveryFieldABatchSpanReads(t *testing.T) {
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	sp := rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	sp.SetName("GET /orders")
+	sp.SetKind(ptrace.SpanKindServer)
+	sp.Status().SetCode(ptrace.StatusCodeError)
+	sp.Status().SetMessage("upstream timed out")
+	sp.SetTraceID(pcommon.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	sp.SetSpanID(pcommon.SpanID{0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 1, 2})
+	start := time.Unix(1_700_000_000, 0)
+	sp.SetStartTimestamp(pcommon.NewTimestampFromTime(start))
+	sp.SetEndTimestamp(pcommon.NewTimestampFromTime(start.Add(250 * time.Millisecond)))
+
+	quoted := make([]string, len(spanReadFields))
+	for i, f := range spanReadFields {
+		quoted[i] = strconv.Quote(f)
+	}
+	fields := "[" + strings.Join(quoted, ", ") + "]"
+
+	// What a traces batch script reads, field by field.
+	prog, err := Compile([]byte("traces: |\n  def transform(batch):\n      for s in batch:\n" +
+		"          s.attributes[\"view\"] = repr([getattr(s, f) for f in " + fields + "])\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prog.traces.runTraces(td, nil); err != nil {
+		t.Fatal(err)
+	}
+	view, ok := sp.Attributes().Get("view")
+	if !ok || !strings.Contains(view.Str(), "upstream timed out") {
+		t.Fatalf("the batch view did not read the span: %v", view.AsString())
+	}
+
+	// decide() must read the same fields, advertise them, and see the same values.
+	w := hookWrapper(t, "sample: |\n  def decide(trace):\n      for s in trace.spans:\n"+
+		"          if not all([f in dir(s) for f in "+fields+"]):\n              return False\n"+
+		"          return repr([getattr(s, f) for f in "+fields+"]) == "+strconv.Quote(view.Str())+"\n")
+	before := obs.TransformErrors.WithLabelValues("sample").Value()
+	sample, abstain := w.SampleDecider()(tailsample.Trace{
+		Spans: []tailsample.Span{{Span: sp, Resource: rs.Resource().Attributes()}},
+	})
+	if got := obs.TransformErrors.WithLabelValues("sample").Value() - before; got != 0 {
+		t.Fatalf("decide() failed reading a field a batch span reads (%v script errors)", got)
+	}
+	if !sample || abstain {
+		t.Fatalf("decide() read different fields or values than the batch span %s (sample=%v abstain=%v)",
+			view.Str(), sample, abstain)
+	}
+}
+
 // A hot reload that REMOVES the sample: section must be as loud as a script
 // error, never a silent abstain: the sectionless file compiles, so it commits
 // as an APPLIED reload, and the startup UsesScript/HasSample cross-check does
@@ -351,7 +409,12 @@ parse: |
 	if _, ok := w.ParseLine("plain"); ok {
 		t.Fatal("None must leave the line unparsed")
 	}
-	if !w.HasParse() {
-		t.Fatal("HasParse = false with a parse section")
+	if !w.Active().HasParse() {
+		t.Fatal("Program.HasParse = false with a parse section")
+	}
+	// No section → every line is left alone.
+	wn := hookWrapper(t, "logs: |\n  def transform(batch): pass\n")
+	if _, ok := wn.ParseLine("<log>hello"); ok {
+		t.Fatal("no parse section must leave the line unparsed")
 	}
 }

@@ -29,10 +29,12 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 
 	"github.com/JohanLindvall/bufpool"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/backoff"
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -64,14 +66,18 @@ type Config struct {
 	// Headers are static headers sent on every export (HTTP request headers /
 	// gRPC metadata) — e.g. a multi-tenant collector's X-Scope-OrgID.
 	//
-	// The transport's own headers WIN, on both protocols: the OTLP framing
-	// (Content-Type, Content-Encoding) and the bearer credential are applied
-	// after this map on the HTTP arm and appended after it on the gRPC one.
-	// Validate refuses the keys where that precedence would be a silent
-	// surprise rather than a rule — the framing keys outright, and
-	// Authorization when a BearerTokenFile is also set (two credentials for
-	// one destination, which the two transports resolved differently: HTTP
-	// replaced the token, gRPC sent both).
+	// The two protocols do NOT resolve a key this map shares with the
+	// transport's own headers (the OTLP framing — Content-Type,
+	// Content-Encoding — and the bearer credential) the same way. On HTTP the
+	// transport's values are Set after this map and OVERWRITE the static one.
+	// On gRPC metadata is multi-valued and the transport's are APPENDED after
+	// it, so the key goes out TWICE (grpc-go itself drops the reserved ones,
+	// content-type among them, but an authorization carries both values and
+	// leaves the collector to pick). That divergence is why Validate refuses
+	// the colliding keys instead of relying on either order — the framing keys
+	// outright, and Authorization when a BearerTokenFile is also set (two
+	// credentials for one destination: HTTP replaced the token, gRPC sent
+	// both).
 	Headers map[string]string
 	// BearerTokenFile is re-read every minute and sent as
 	// "Authorization: Bearer <token>". Empty disables.
@@ -89,7 +95,7 @@ type Config struct {
 	// their own at-least-once retry in the tailer). Minimum 1.
 	RetryAttempts int
 	// RetryBackoff is the initial backoff between metric retries, doubled
-	// per attempt.
+	// per attempt up to backoff.Cap (30s).
 	RetryBackoff time.Duration
 	// MaxSendBytes caps one exported payload's encoded (uncompressed protobuf)
 	// size; a larger payload is split into parts each within the cap before
@@ -129,9 +135,11 @@ type Client struct {
 	// rather than per call; nil withholds the raw path entirely.
 	protoCodec encoding.CodecV2
 
-	// headerKV is cfg.Headers flattened for metadata.AppendToOutgoingContext,
-	// key-sorted so the outgoing metadata reads the same on every export. Built
-	// once here: grpcAuth used to nest one context per header per export.
+	// headerKV is cfg.Headers flattened and key-sorted, built once in New. It
+	// is what BOTH arms send — gRPC via metadata.AppendToOutgoingContext (one
+	// call, where grpcAuth used to nest one context per header per export),
+	// HTTP by setting each pair in order — so the two resolve one config
+	// identically and every export reads the same.
 	headerKV []string
 
 	// HTTP transport.
@@ -228,7 +236,8 @@ func (cfg Config) Validate() error {
 // Content-Encoding, Content-Length) describe the OTLP protobuf body this
 // client just built: a configured Content-Type made every HTTP export a 415,
 // which IsPermanent classifies as a rejection, so the buffered drain dropped
-// the backlog after maxDrainCycles — a total, silent loss from one map entry.
+// each batch on its FIRST attempt (a permanent rejection is never retried) —
+// the whole backlog, a total, silent loss from one map entry.
 // AUTHORIZATION is legitimate on its own (a collector wanting Basic auth has
 // no other spelling here; -otlp-bearer-token-file only writes Bearer), so it
 // is refused only BESIDE a bearer token file: two credentials for one
@@ -239,11 +248,50 @@ func (cfg Config) Validate() error {
 // Keys are compared canonically (HTTP header names are case-insensitive, and
 // gRPC lowercases metadata keys on the wire), and the walk is sorted so a map
 // with two offending keys names the same one on every run.
+//
+// Three more refusals, all for headers NEITHER transport can send, so that
+// -check-config catches what would otherwise be a permanent outage it passes:
+//
+//   - A NAME or VALUE the transports refuse client-side on every send. The
+//     accepted sets are the INTERSECTION of the two protocols' rules, because
+//     one header layer (export.headers, a route's headers) is applied to
+//     whichever protocol the destination speaks: a name is [0-9A-Za-z-_.] (an
+//     HTTP token that is also a gRPC metadata key), a value is printable
+//     ASCII 0x20-0x7E (gRPC's rule for a non-binary key, which also excludes
+//     the CR/LF/NUL net/http refuses). A value with a trailing newline — what
+//     a YAML `|` block produces — failed EVERY export: net/http's "invalid
+//     header field value", grpc-go's codes.Internal. Both classify transient,
+//     and grpc-go's reads as a collector RESPONSE, so the disk buffer neither
+//     dropped nor drained: it retried forever and filled to its cap.
+//   - Host, which net/http takes from the URL and silently ignores in the
+//     header map: a static Host was a no-op that looked configured.
+//   - Two keys that differ only in case. Both transports fold case, so they
+//     are one header with two values: gRPC sent both under one lowercased key,
+//     and HTTP kept whichever its map iteration visited last, so the tenant
+//     changed at random between exports. A YAML map can spell both, and so
+//     can the metadata service's repeatable -otlp-header.
+//
+// Every error names the KEY and never the value: header values are routinely
+// credentials.
 func validateHeaders(cfg Config) error {
+	folded := make(map[string]string, len(cfg.Headers))
 	for _, k := range slices.Sorted(maps.Keys(cfg.Headers)) {
+		if err := validHeaderName(k); err != nil {
+			return err
+		}
+		if !validHeaderValue(cfg.Headers[k]) {
+			return fmt.Errorf("header %q has a value neither transport can send (only printable ASCII, 0x20-0x7E, is accepted — check for a trailing newline from a YAML block scalar)", k)
+		}
+		lower := strings.ToLower(k)
+		if prev, dup := folded[lower]; dup {
+			return fmt.Errorf("headers %q and %q differ only in case: both transports fold header names, so they are ONE header with two values — keep one", prev, k)
+		}
+		folded[lower] = k
 		switch textproto.CanonicalMIMEHeaderKey(k) {
 		case "Content-Type", "Content-Encoding", "Content-Length":
 			return fmt.Errorf("header %q is set by the OTLP transport itself and cannot be overridden by a static header; remove it", k)
+		case "Host":
+			return fmt.Errorf("header %q cannot be set statically: net/http takes the host from the endpoint URL and ignores it in the header map; change the endpoint instead", k)
 		case "Authorization":
 			if cfg.BearerTokenFile != "" {
 				return fmt.Errorf("header %q is set alongside a bearer token file (%s): that is two credentials for one destination — keep the token file, or drop it and send the header alone",
@@ -254,8 +302,79 @@ func validateHeaders(cfg Config) error {
 	return nil
 }
 
+// validHeaderName reports whether k is a header name both transports send: a
+// non-empty run of [0-9A-Za-z-_.].
+func validHeaderName(k string) error {
+	if k == "" {
+		return errors.New("a static header has an empty name")
+	}
+	for i := 0; i < len(k); i++ {
+		switch c := k[i]; {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '-', c == '_', c == '.':
+		default:
+			return fmt.Errorf("header %q has a name neither transport can send (only letters, digits, '-', '_' and '.' are accepted)", k)
+		}
+	}
+	return nil
+}
+
+// validHeaderValue reports whether v is a value both transports send:
+// printable ASCII only.
+func validHeaderValue(v string) bool {
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; c < 0x20 || c > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+// Option configures a Client beyond its Config: what the client IS in the
+// operator's vocabulary, rather than where it sends.
+type Option func(*options)
+
+type options struct {
+	reportLog   *slog.Logger
+	reportWhat  string
+	reportAttrs []any
+}
+
+// WithReport names the destination in this client's health lines (report.go)
+// instead of "the OTLP collector": a routing route's client says "a routing
+// destination route=<name>", so an operator reading the line knows which
+// tenant's collector it is about. attrs are prepended to the endpoint and
+// protocol every line carries. A nil log uses the process default, as the rest
+// of this package does.
+//
+// An option at construction rather than a setter, per the repo's rule that
+// nothing is assigned to a shared client after it is built.
+func WithReport(log *slog.Logger, what string, attrs ...any) Option {
+	return func(o *options) { o.reportLog, o.reportWhat, o.reportAttrs = log, what, attrs }
+}
+
+// HealthReporter is implemented by an exporter that narrates its OWN
+// destination's health (report.go): one line when it starts failing, one when
+// it recovers. A layer fanning out to such exporters — the router — must not
+// narrate them again: two reporters on one destination said everything twice,
+// one of them under the wrong name.
+type HealthReporter interface {
+	// ReportsHealth reports whether this exporter narrates its own outcomes.
+	ReportsHealth() bool
+}
+
+// ReportsHealth implements HealthReporter: every wire send returns through
+// noteSend, which narrates it.
+func (c *Client) ReportsHealth() bool { return c.health != nil }
+
 // New creates a Client for cfg.
-func New(cfg Config) (*Client, error) {
+func New(cfg Config, opts ...Option) (*Client, error) {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if o.reportWhat == "" {
+		o.reportWhat = "the OTLP collector"
+	}
 	if cfg.Protocol == "" {
 		cfg.Protocol = "grpc"
 	}
@@ -304,8 +423,8 @@ func New(cfg Config) (*Client, error) {
 	c := &Client{
 		cfg: cfg, partialLog: partialLog, splitLog: splitLog,
 		gzipLevel: effectiveGzipLevel(cfg.CompressionLevel),
-		health: NewFailureReporter(nil, "the OTLP collector",
-			"endpoint", cfg.Endpoint, "protocol", cfg.Protocol),
+		health: NewFailureReporter(o.reportLog, o.reportWhat,
+			append(slices.Clip(o.reportAttrs), "endpoint", cfg.Endpoint, "protocol", cfg.Protocol)...),
 	}
 	for _, k := range slices.Sorted(maps.Keys(cfg.Headers)) {
 		c.headerKV = append(c.headerKV, k, cfg.Headers[k])
@@ -338,10 +457,7 @@ func New(cfg Config) (*Client, error) {
 			}
 			callOpts = append(callOpts, grpc.UseCompressor(gzipName))
 		}
-		conn, err := grpc.NewClient(cfg.Endpoint,
-			grpc.WithTransportCredentials(creds),
-			grpc.WithDefaultCallOptions(callOpts...),
-		)
+		conn, err := grpc.NewClient(cfg.Endpoint, grpcDialOptions(creds, callOpts)...)
 		if err != nil {
 			return nil, err
 		}
@@ -376,6 +492,39 @@ func New(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("protocol %q (want grpc or http)", cfg.Protocol)
 	}
 	return c, nil
+}
+
+// grpcKeepalive is the client keepalive every gRPC destination dials with.
+//
+// It is here for Timeout, not for the pings. grpc-go sets TCP_USER_TIMEOUT on
+// the socket to Timeout ONLY when keepalive is enabled (Time != infinity), and
+// without it a connection that dies WITHOUT a FIN or RST — the collector's
+// node lost or partitioned, its network namespace torn down under a live
+// socket — keeps taking every export until the kernel gives up retransmitting,
+// about 15 minutes at the default tcp_retries2. Every RPC in that window fails
+// DeadlineExceeded after -otlp-timeout, and an RPC deadline resets only the
+// stream, never the transport, so nothing re-dials: the tailer's single sweep
+// goroutine stalls node-wide, the disk buffer grows, and a rescheduled
+// collector's (or trace-tier shard's) new address is not re-resolved until
+// the dead transport finally errors. With it, unacknowledged export data
+// aborts the socket after Timeout and the channel re-resolves and re-dials.
+//
+// Time is at grpc-go's server default EnforcementPolicy.MinTime (5m), the
+// policy this repo's own receivers keep (otlpingest sets none), so a ping can
+// never earn a too_many_pings GOAWAY. In practice none is ever sent: pings go
+// out only with an RPC in flight (PermitWithoutStream is false) and every
+// export is a unary call far shorter than Time.
+var grpcKeepalive = keepalive.ClientParameters{Time: 5 * time.Minute, Timeout: 20 * time.Second}
+
+// grpcDialOptions is New's gRPC dial configuration, split out so a test can
+// dial with exactly it (plus a capturing dialer) and read the socket options
+// it produces.
+func grpcDialOptions(creds credentials.TransportCredentials, callOpts []grpc.CallOption) []grpc.DialOption {
+	return []grpc.DialOption{
+		grpc.WithTransportCredentials(creds),
+		grpc.WithDefaultCallOptions(callOpts...),
+		grpc.WithKeepaliveParams(grpcKeepalive),
+	}
 }
 
 // tlsMaterial names the TLS setting a destination carries, or "" when it
@@ -482,16 +631,22 @@ func (c *Client) exportLogsOnce(ctx context.Context, ld plog.Logs) error {
 	parts, rep := otlpsplit.LogsWithReport(ld, c.cfg.MaxSendBytes)
 	c.noteSplit("logs", len(parts), rep)
 	// Deliberately NO cap on len(parts) here. The part count is bounded where
-	// it is CREATED — otlpsplit guarantees the parts cost at most
-	// minChunkRoomDiv times the input, whatever shape a sender chose — so a cap
+	// it is CREATED — otlpsplit guarantees the parts cost at most a small
+	// constant multiple of the input (7x for logs and spans, 19x for metrics;
+	// its minChunkRoomDiv says why), whatever shape a sender chose — so a cap
 	// at this seam could only bind on an honest producer's genuinely large
 	// batch, turning a slow delivery into a refusal. A refusal is the right
 	// answer to an unbounded sequence, not to a bounded one.
+	return sendParts(ctx, parts, c.sendLogsOnce)
+}
+
+// sendParts sends a split payload's parts in order. A part-send failure
+// returns immediately; the caller retries the whole payload, re-sending the
+// parts already delivered — at-least-once tolerates the duplicates, and
+// nothing commits until every part lands.
+func sendParts[T any](ctx context.Context, parts []T, send func(context.Context, T) error) error {
 	for _, part := range parts {
-		// A part-send failure returns immediately; the caller retries the whole
-		// payload, re-sending the parts already delivered — at-least-once
-		// tolerates the duplicates, and nothing commits until every part lands.
-		if err := c.sendLogsOnce(ctx, part); err != nil {
+		if err := send(ctx, part); err != nil {
 			return err
 		}
 	}
@@ -530,12 +685,7 @@ func (c *Client) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 func (c *Client) exportTracesOnce(ctx context.Context, td ptrace.Traces) error {
 	parts, rep := otlpsplit.TracesWithReport(td, c.cfg.MaxSendBytes)
 	c.noteSplit("traces", len(parts), rep)
-	for _, part := range parts {
-		if err := c.sendTracesOnce(ctx, part); err != nil {
-			return err
-		}
-	}
-	return nil
+	return sendParts(ctx, parts, c.sendTracesOnce)
 }
 
 func (c *Client) sendTracesOnce(ctx context.Context, td ptrace.Traces) error {
@@ -634,7 +784,9 @@ func (c *Client) noteSend(signal string, err error, started time.Time) error {
 }
 
 // Retry runs send up to attempts times: the sleep comes BEFORE a retry
-// (never after the final failure), the backoff doubles from initial, a
+// (never after the final failure), the backoff doubles from initial up to
+// backoff.Cap (attempts is the operator's -otlp-retry-attempts, which has no
+// upper bound, so an uncapped doubling reached minutes per wait), a
 // PERMANENT rejection (IsPermanent) returns immediately — retrying cannot
 // change it — and ctx cancellation between attempts returns the last error.
 //
@@ -654,21 +806,10 @@ func Retry(ctx context.Context, attempts int, initial time.Duration, send func()
 		attempts = 1
 	}
 	var err error
-	backoff := initial
-	for attempt := 0; attempt < attempts; attempt++ {
-		if attempt > 0 {
-			// NewTimer+Stop, not time.After: a cancelled wait must not leave
-			// the timer live until it fires (During shutdown every producer
-			// retries at once, and the leaked timers pin their goroutine's
-			// wakeups for the full backoff).
-			t := time.NewTimer(backoff)
-			select {
-			case <-ctx.Done():
-				t.Stop()
-				return err
-			case <-t.C:
-			}
-			backoff *= 2
+	bo := backoff.New(initial)
+	for attempt := range attempts {
+		if attempt > 0 && !retryWait(bo, ctx) {
+			return err
 		}
 		if err = send(); err == nil {
 			return nil
@@ -679,6 +820,10 @@ func Retry(ctx context.Context, attempts int, initial time.Duration, send func()
 	}
 	return err
 }
+
+// retryWait is Retry's wait between attempts; a test seam (the wait is real
+// time, and the property worth pinning is the sequence of delays).
+var retryWait = (*backoff.B).Wait
 
 // ExportMetrics sends one metrics payload with bounded retries (Retry).
 func (c *Client) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
@@ -698,12 +843,7 @@ func (c *Client) exportMetricsCounted(ctx context.Context, md pmetric.Metrics) e
 func (c *Client) exportMetricsOnce(ctx context.Context, md pmetric.Metrics) error {
 	parts, rep := otlpsplit.MetricsWithReport(md, c.cfg.MaxSendBytes)
 	c.noteSplit("metrics", len(parts), rep)
-	for _, part := range parts {
-		if err := c.sendMetricsOnce(ctx, part); err != nil {
-			return err
-		}
-	}
-	return nil
+	return sendParts(ctx, parts, c.sendMetricsOnce)
 }
 
 func (c *Client) sendMetricsOnce(ctx context.Context, md pmetric.Metrics) error {
@@ -755,8 +895,8 @@ func (c *Client) grpcAuth(ctx context.Context) (context.Context, error) {
 // — the same verdict a successful gRPC Export with an empty PartialSuccess
 // carries, and never an export failure (the payload WAS accepted).
 func (c *Client) httpExport(ctx context.Context, signal, url string, body []byte, partial func([]byte) (int64, string)) error {
-	var raw []byte
-	if err := c.httpPost(ctx, url, body, &raw); err != nil {
+	raw, err := c.httpPost(ctx, url, body)
+	if err != nil {
 		return err
 	}
 	if len(raw) > 0 {
@@ -846,10 +986,12 @@ func (p *pooledBody) release() {
 	}
 }
 
-func (c *Client) httpPost(ctx context.Context, url string, body []byte, out *[]byte) error {
+// httpPost POSTs one OTLP/HTTP body and returns the 2xx response body (bounded
+// by maxExportRespBytes; empty when the collector sent none).
+func (c *Client) httpPost(ctx context.Context, url string, body []byte) ([]byte, error) {
 	token, err := c.bearer()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var bodyReader io.Reader = bytes.NewReader(body)
 	compressed := c.cfg.Compression == "gzip"
@@ -857,7 +999,7 @@ func (c *Client) httpPost(ctx context.Context, url string, body []byte, out *[]b
 	if compressed {
 		gz, gerr := gzipBody(body, c.gzipLevel)
 		if gerr != nil {
-			return gerr
+			return nil, gerr
 		}
 		pb = &pooledBody{buf: gz}
 		bodyReader = pb
@@ -867,7 +1009,7 @@ func (c *Client) httpPost(ctx context.Context, url string, body []byte, out *[]b
 		if pb != nil {
 			pb.buf.Release() // nothing has read it; safe to pool immediately
 		}
-		return err
+		return nil, err
 	}
 	if pb != nil {
 		// NewRequest doesn't recognize the pooled buffer type, so set the
@@ -878,13 +1020,21 @@ func (c *Client) httpPost(ctx context.Context, url string, body []byte, out *[]b
 		// Released HERE, never by net/http: see pooledBody.
 		defer pb.release()
 	}
-	// Static headers FIRST, the transport's own after — the gRPC arm appends
-	// the credential last too, and the two must not resolve the same config
-	// differently. Validate refuses the keys where this precedence would
-	// otherwise surprise, so in practice nothing here overwrites anything;
-	// this is the ordering that keeps that true if a key ever slips past.
-	for k, v := range c.cfg.Headers {
-		req.Header.Set(k, v)
+	// Static headers FIRST, the transport's own after, so on THIS arm a key
+	// both carry is OVERWRITTEN by the transport's value. The gRPC arm does
+	// not resolve it the same way — it appends, and metadata is multi-valued,
+	// so it would send both (see Config.Headers) — which is why Validate
+	// refuses the colliding keys rather than relying on either order. In
+	// practice nothing here overwrites anything; the ordering is only what
+	// keeps the transport's framing and credential on the wire if a key ever
+	// slipped past.
+	//
+	// Off headerKV, the SORTED flattening the gRPC arm sends, never off the
+	// map: ranging a map visits keys in a random order, so any two keys that
+	// canonicalise alike (Validate refuses them, but this is the order that
+	// keeps a slipped pair deterministic) resolved differently per export.
+	for i := 0; i+1 < len(c.headerKV); i += 2 {
+		req.Header.Set(c.headerKV[i], c.headerKV[i+1])
 	}
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	if compressed {
@@ -895,7 +1045,7 @@ func (c *Client) httpPost(ctx context.Context, url string, body []byte, out *[]b
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
@@ -903,7 +1053,7 @@ func (c *Client) httpPost(ctx context.Context, url string, body []byte, out *[]b
 	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return &HTTPStatusError{Code: resp.StatusCode, Body: strings.TrimSpace(string(msg))}
+		return nil, &HTTPStatusError{Code: resp.StatusCode, Body: strings.TrimSpace(string(msg))}
 	}
 	// A 2xx may still carry partial_success — the protocol's channel for "I
 	// accepted the request and REJECTED n records". Discarding it made every
@@ -911,11 +1061,8 @@ func (c *Client) httpPost(ctx context.Context, url string, body []byte, out *[]b
 	// cursor or position past records the collector threw away: silent,
 	// uncounted, permanent loss. Bounded: an ExportResponse is a handful of
 	// bytes and a message.
-	if out != nil {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxExportRespBytes))
-		*out = b
-	}
-	return nil
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxExportRespBytes))
+	return raw, nil
 }
 
 // maxExportRespBytes bounds the success body read for partial_success. The

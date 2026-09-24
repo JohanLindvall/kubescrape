@@ -252,3 +252,55 @@ func TestRotationHopsArePersistedPerSweepNotPerHop(t *testing.T) {
 			"intermediate inode has no record and a crash loses it outright", pending(), saved)
 	}
 }
+
+// ensureOpen's replaced arm (a rename rotation found while no fd was held) must
+// force its "two unsaved hops" save only once the file's in-memory state is
+// CONSISTENT. Its copy of the hop block ran after the new inode and fingerprint
+// were adopted but before `committed` was reset, so a successful forced save
+// paired the NEW inode with the OLD incarnation's offset: a crash before the
+// sweep's closing save then resumed the replacement mid-file, skipping its
+// prefix and exporting a torn fragment.
+func TestReplacedWhileClosedHopSavePersistsTheResetOffset(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	path := filepath.Join(dir, logName)
+	posPath := filepath.Join(t.TempDir(), "pos.json")
+
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.Positions = mustOpenPositions(t, posPath)
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir, "2026-07-05T10:00:00Z stdout F "+strings.Repeat("a", 200))
+	tl.scanDir(nil, false)
+	driveUntil(t, ctx, tl, func() bool { return len(exp.get()) == 1 }, "the first line exported")
+	f := tl.files[path]
+	if f.committed == 0 {
+		t.Fatal("setup: nothing committed")
+	}
+	oldInode := f.inode
+
+	// The fd is released (idle close), an EARLIER hop of this file is still
+	// unsaved (its saves failed), and the runtime rotates a replacement in.
+	_ = f.f.Close()
+	f.f = nil
+	f.idleClosed = true
+	f.hopUnsaved = true
+	rotateAway(t, dir, 1)
+	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F new")
+	newInode := inodeOfPath(t, path)
+
+	if err := tl.ensureOpen(f); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok := mustOpenPositions(t, posPath).Logs()[path]
+	if !ok {
+		t.Fatal("the forced hop save wrote no entry for the file")
+	}
+	if stored.Inode != newInode || stored.Offset != 0 {
+		t.Fatalf("persisted {Offset: %d, Inode: %d}, want {0, %d}: a restart would resume the replacement at "+
+			"the old incarnation's offset", stored.Offset, stored.Inode, newInode)
+	}
+	if len(stored.Pending) != 1 || stored.Pending[0].Inode != oldInode {
+		t.Fatalf("persisted Pending = %+v, want one entry for the rotated inode %d", stored.Pending, oldInode)
+	}
+}

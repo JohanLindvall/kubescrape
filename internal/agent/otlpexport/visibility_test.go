@@ -56,7 +56,7 @@ func TestUnreachableCollectorIsNamedOnceWithItsEndpointAndARemedy(t *testing.T) 
 	c.health = NewFailureReporter(log, "the OTLP collector", "endpoint", endpoint, "protocol", "http")
 
 	before := obs.Exports.WithLabelValues("logs", "transient").Value()
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if err := c.ExportLogs(context.Background(), oneRecord()); err == nil {
 			t.Fatal("expected the export to fail against a closed port")
 		}
@@ -117,7 +117,7 @@ func TestFailureReporterWarnsOnceThenOnRecovery(t *testing.T) {
 	r.now = func() time.Time { return now }
 
 	boom := status.Error(codes.Unavailable, "connection refused")
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		r.Note("metrics", boom)
 		now = now.Add(10 * time.Second)
 	}
@@ -160,7 +160,7 @@ func TestRejectedPayloadDoesNotFlapDestinationHealth(t *testing.T) {
 	r.now = func() time.Time { return now }
 
 	poison := &HTTPStatusError{Code: 400, Body: "cannot parse"}
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		r.Note("logs", poison) // the poison batch
 		r.Note("logs", nil)    // and everything else, accepted
 		now = now.Add(time.Second)
@@ -195,7 +195,7 @@ func TestRejectionsReWarnOnTheWindowWithTheirCount(t *testing.T) {
 
 	poison := status.Error(codes.InvalidArgument, "bad payload")
 	r.Note("traces", poison)
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		now = now.Add(time.Minute)
 		r.Note("traces", poison)
 	}
@@ -243,6 +243,9 @@ func TestCancelledExportIsNotReportedAsAFailure(t *testing.T) {
 	log, dump := capturedLogger()
 	r := NewFailureReporter(log, "the OTLP collector")
 	r.Note("logs", context.Canceled)
+	// grpc-go's spelling — the default protocol never produces the bare
+	// sentinel (TestCancelledGRPCExportIsNotReportedAsAFailure drives it).
+	r.Note("logs", status.Error(codes.Canceled, "context canceled"))
 	if strings.Contains(dump(), "are failing") {
 		t.Errorf("a cancelled export must not read as a collector failure:\n%s", dump())
 	}
@@ -259,8 +262,13 @@ func TestDiagnoseNamesTheFirstRunMistakes(t *testing.T) {
 		{"refused", errors.New("dial tcp 10.0.0.1:4317: connect: connection refused"), "nothing is listening"},
 		{"dns", errors.New("dial tcp: lookup otel-collector: no such host"), "does not resolve"},
 		{"tls to a plaintext port", errors.New("tls: first record does not look like a TLS handshake"), "-otlp-insecure"},
-		{"untrusted ca", errors.New("x509: certificate signed by unknown authority"), "-otlp-ca-file"},
+		{"untrusted ca", errors.New("x509: certificate signed by unknown authority"), "-otlp-tls-ca-file"},
 		{"unimplemented", status.Error(codes.Unimplemented, "unknown service"), "does not serve this signal"},
+		{"404 through a non-gRPC proxy", status.Error(codes.Unimplemented, "unexpected HTTP status code received from server: 404 (Not Found)"), "404"},
+		// A plaintext gRPC client meeting the wrong listener, as probed.
+		{"grpc to an http/1.1 port", status.Error(codes.Unavailable, `connection error: desc = "error reading server preface: http2: failed reading the frame payload: http2: frame too large, note that the frame header looked like an HTTP/1.1 header"`), "speaks HTTP/1.1, not gRPC"},
+		{"plaintext grpc to a tls port", status.Error(codes.Unavailable, `connection error: desc = "error reading server preface: EOF"`), "insecure: false"},
+		{"plaintext grpc reset", status.Error(codes.Unavailable, `connection error: desc = "error reading server preface: read tcp 10.0.0.2:51234->10.0.0.1:4317: read: connection reset by peer"`), "insecure: false"},
 		{"auth", &HTTPStatusError{Code: 401}, "credentials"},
 		{"too large", &HTTPStatusError{Code: 413}, "-otlp-max-send-bytes"},
 		{"redirect", &HTTPStatusError{Code: 302}, "redirect"},
@@ -307,6 +315,63 @@ func TestSplitPartsAreCounted(t *testing.T) {
 	if got := obs.ExportSplitParts.WithLabelValues("logs").Value() - before; got != 0 {
 		t.Errorf("a payload sent whole must not count as a split, got %v", got)
 	}
+}
+
+// What the split could NOT rescue is the loss half of the split story, and it
+// has two reasons with opposite remedies: ONE record too big for any part
+// ("item"), or framing so large no part has room for content ("framing"). Both
+// counters were read by no test, so a split that stopped reporting — or that
+// reported one reason as the other — shipped the collector's rejections
+// silently.
+func TestOversizePartsAreCountedByReason(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	const capBytes = 4 << 10
+	c, err := New(Config{Endpoint: srv.URL, Protocol: "http", Timeout: 5 * time.Second,
+		Compression: "none", MaxSendBytes: capBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	item := obs.ExportOversizeParts.WithLabelValues("logs", "item")
+	framing := obs.ExportOversizeParts.WithLabelValues("logs", "framing")
+	check := func(name string, ld plog.Logs, wantItem, wantFraming float64) {
+		t.Helper()
+		bi, bf := item.Value(), framing.Value()
+		if err := c.ExportLogs(context.Background(), ld); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got := item.Value() - bi; got != wantItem {
+			t.Errorf("%s: kubescrape_export_oversize_parts_total{logs,item} moved %v, want %v", name, got, wantItem)
+		}
+		if got := framing.Value() - bf; got != wantFraming {
+			t.Errorf("%s: kubescrape_export_oversize_parts_total{logs,framing} moved %v, want %v", name, got, wantFraming)
+		}
+	}
+
+	// One record over the cap beside one that fits: the big one goes alone.
+	ld := plog.NewLogs()
+	sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+	sl.LogRecords().AppendEmpty().Body().SetStr("small")
+	sl.LogRecords().AppendEmpty().Body().SetStr(strings.Repeat("x", 2*capBytes))
+	check("a record over the cap", ld, 1, 0)
+
+	// A resource whose framing leaves less than a quarter of the cap for
+	// content: the split is abandoned and the remainder ships whole.
+	ld = plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("sender.chosen", strings.Repeat("a", capBytes-512))
+	sl = rl.ScopeLogs().AppendEmpty()
+	for range 8 {
+		sl.LogRecords().AppendEmpty().Body().SetStr(strings.Repeat("b", 200))
+	}
+	check("framing too large to split", ld, 0, 1)
+
+	// A payload that splits cleanly reports neither.
+	check("a clean split", buildLogs(1, 200, 200), 0, 0)
 }
 
 // The disk buffer refusing a write was counted and never spoken about, and the

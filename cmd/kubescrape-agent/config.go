@@ -1,19 +1,13 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"log/slog"
-	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
-	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"sigs.k8s.io/yaml"
@@ -22,6 +16,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/cgroupstats"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
 	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
@@ -30,11 +25,8 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
-	"github.com/JohanLindvall/kubescrape/internal/cli"
-	"github.com/JohanLindvall/kubescrape/internal/config"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
-	"github.com/JohanLindvall/kubescrape/internal/selfmeta"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
@@ -107,7 +99,7 @@ type agentConfig struct {
 // section is — both enumerated them by hand before, and the help had already
 // drifted three sections behind the type it describes.
 func sectionNames() []string {
-	t := reflect.TypeOf(agentConfig{})
+	t := reflect.TypeFor[agentConfig]()
 	names := make([]string, t.NumField())
 	for i := range t.NumField() {
 		if name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ","); name != "-" {
@@ -178,22 +170,24 @@ var flagWasSet = func(name string) bool {
 // checkFlagValues refuses flag values whose only workable meaning is not the
 // one the flag reads like.
 //
-// Both are also NORMALISED by their consumers — promscrape.New defaults a
-// non-positive Timeout, tailer.New floors the effective burst at 1 — and that
-// stays: it is the LIBRARY guarantee, giving a zero value arriving
-// programmatically a defined, non-destructive meaning. This is the other
-// question, and the answer differs: what an OPERATOR TYPED. `-scrape-timeout=0`
-// is typed to mean "no timeout" and silently becomes 15s; a bucket of half a
-// token is typed as a small burst and silently becomes 1. Neither operator gets
-// what they asked for, and neither finds out from a fleet they are mid-rollout
-// on. Refusing is this repo's pattern for operator nonsense (the excluded-
-// pipeline errors above), and it puts the discovery in -check-config.
+// Most are also NORMALISED by their consumers — promscrape.New defaults a
+// non-positive Timeout, tailer.New floors the effective burst at 1, the
+// periodic loops substitute or skip a non-positive period — and that stays:
+// it is the LIBRARY guarantee, giving a zero value arriving programmatically a
+// defined, non-destructive meaning. This is the other question, and the answer
+// differs: what an OPERATOR TYPED. `-scrape-timeout=0` is typed to mean "no
+// timeout" and silently becomes 15s; a bucket of half a token is typed as a
+// small burst and silently becomes 1. Neither operator gets what they asked
+// for, and neither finds out from a fleet they are mid-rollout on. Refusing is
+// this repo's pattern for operator nonsense (the excluded-pipeline errors,
+// checkExcludedPipelines in buildtags.go), and it puts the discovery in
+// -check-config.
 //
 // EXPLICITLY TYPED ONLY, so the normalisation still covers everything else.
-// Neither refusal depends on whether the pipeline that reads the value is
-// enabled: a flag belongs to one workload's command line (unlike a -config
-// section, which one ConfigMap shares with three), and making the same typed
-// value legal or illegal according to an unrelated toggle is the trap the
+// No refusal depends on whether the pipeline that reads the value is enabled:
+// a flag belongs to one workload's command line (unlike a -config section,
+// which one ConfigMap shares with three), and making the same typed value
+// legal or illegal according to an unrelated toggle is the trap the
 // composition warning below is careful not to fall into.
 func checkFlagValues() error {
 	// The value is the whole per-request context budget (Scraper.targetTimeout
@@ -254,6 +248,41 @@ func checkFlagValues() error {
 			"Pass %s or more (the default is %s)",
 			*cgroupDiscoverIv, cgroupstats.MinDiscoverInterval, cgroupstats.MinDiscoverInterval, cgroupstats.DefaultDiscoverInterval)
 	}
+	// The trace tier's two export periods, refused for the cgroup sampler's
+	// reason: a non-positive one is neither "off" nor "as fast as possible".
+	// cumagg.Store.Run cannot hand it to time.NewTicker (which panics) and
+	// substitutes a minute instead — while the startup lines and -check-config
+	// print the value that was typed, so the process describes an interval it
+	// does not use.
+	if flagWasSet("ingest-span-metrics-interval") && *spanMetricsIv <= 0 {
+		return fmt.Errorf("-ingest-span-metrics-interval=%s is not an export period: this flag has no spelling for 'as fast as possible' or for 'off' (-ingest-span-metrics=false is off). "+
+			"Pass a positive duration (the default is 1m)", *spanMetricsIv)
+	}
+	if flagWasSet("service-graph-interval") && *serviceGraphIv <= 0 {
+		return fmt.Errorf("-service-graph-interval=%s is not an export period: this flag has no spelling for 'as fast as possible' or for 'off' (-service-graph=false is off). "+
+			"Pass a positive duration (the default is 1m)", *serviceGraphIv)
+	}
+	// The scrape period, and the one typed value that meant something
+	// DIFFERENT to each of its three readers: Scraper.Run warns once and
+	// never scrapes (annotation targets and all three kubelet scrapes alike),
+	// the cgroup sampler — whose export window is this flag — substitutes 30s
+	// and keeps exporting, and the cgroup parity warning skips itself. None of
+	// those is "off" for the pipelines the operator meant, and the effective-
+	// limits line prints the 0 throughout.
+	if flagWasSet("scrape-interval") && *scrapeInterval <= 0 {
+		return fmt.Errorf("-scrape-interval=%s is not a scrape period: a non-positive one stops the whole scrape loop — every annotation-discovered target and all three kubelet scrapes — while -cgroup-stats keeps exporting on a 30s window of its own; this flag has no spelling for 'off' "+
+			"(-metrics=false -cadvisor=false -node-metrics=false -kubelet-summary=false is off). Pass a positive duration (the default is 30s)", *scrapeInterval)
+	}
+	// The log-derived metrics' export period. metrics.DynamicMetricSet.Run
+	// reads a non-positive one as "never export" — every line is still matched
+	// and observed at full per-line cost, and only the shutdown flush ever
+	// sends — and says so only from inside a real start, so -check-config
+	// signed off on a section that would deliver nothing for the process
+	// lifetime.
+	if flagWasSet("logs-metrics-interval") && *logsMetricsEvery <= 0 {
+		return fmt.Errorf("-logs-metrics-interval=%s is not an export period: a non-positive one still matches and observes every log line and never exports the result (only the final flush at shutdown sends); this flag has no spelling for 'off' "+
+			"(removing the logMetrics section is off). Pass a positive duration (the default is 30s)", *logsMetricsEvery)
+	}
 	// A relative cgroup root would be resolved against the process' working
 	// directory, which in a distroless container is "/" — so it would silently
 	// almost-work, finding nothing, which is precisely the outcome this
@@ -264,9 +293,9 @@ func checkFlagValues() error {
 	}
 	// Two ingest bounds whose ONLY documented spelling of "use the built-in
 	// default" is 0. otlpingest.NewServer normalises a non-positive value to the
-	// default, so a typed negative runs at 32 / 4 MiB in silence — and the
-	// effective-limits line prints the value that is NOT in force
-	// (ingestMaxInFlight=-1 beside a shed running at 32).
+	// default, so a typed negative runs at 32 / 4 MiB in silence — the
+	// effective-limits line prints the resolved bound, so it would say 32
+	// where the operator typed -1 meaning "no bound".
 	//
 	// The refusal is worth spelling out because THIS BINARY establishes the
 	// opposite convention one flag away: -otlp-max-send-bytes documents
@@ -277,7 +306,7 @@ func checkFlagValues() error {
 	// them: the bound is what keeps an unauthenticated listener from being an
 	// OOM the process cannot defend against.
 	if flagWasSet("ingest-max-in-flight") && *ingestMaxInFlight < 0 {
-		return fmt.Errorf("-ingest-max-in-flight=%d is not 'unbounded': a negative value is normalised to the built-in default, and the concurrency bound then runs at a number the effective-limits line does not print (it prints the value you typed). "+
+		return fmt.Errorf("-ingest-max-in-flight=%d is not 'unbounded': a negative value is normalised to the built-in default (32), so the concurrency bound runs at the default while the flag reads as unbounded. "+
 			"Pass a positive bound, or 0 for the default; this flag has no spelling for 'no bound' — it is what keeps an unauthenticated listener from being an OOM the process cannot defend against (the neighbouring -otlp-max-send-bytes is the flag where a negative disables)",
 			*ingestMaxInFlight)
 	}
@@ -289,150 +318,125 @@ func checkFlagValues() error {
 	return nil
 }
 
-// kubeletBase normalises -kubelet-endpoint into a base URL net/http will
-// accept, and reports the ones it cannot. Empty stays empty (the kubelet
-// scrapes are then simply not scheduled — configWarnings names that).
+// checkFlagChoices refuses a flag value outside its closed set, or a flag
+// combination that names nothing to do — whether typed or not, unlike
+// checkFlagValues: no default spells any of these, so the "a default must never
+// trip a refusal" rule has nothing to protect.
 //
-// The one repair it makes is BRACKETING an IPv6 literal, because the shipped
-// default cannot spell both address families and the manifests cannot fix it:
-// NODE_IP is status.hostIP, so `https://$(NODE_IP):10250` expands to
-// `https://fd00:10::5:10250` on an IPv6 node — which net/url has refused since
-// Go 1.26 enforced strict colons for http/https (`invalid port ":10::5:10250"
-// after host`, go.dev/issue/75223), so every request the three kubelet
-// pipelines build fails before it is issued, on every node, forever. Writing
-// `https://[$(NODE_IP)]:10250` instead is NOT the fix: that renders
-// `https://[10.0.0.5]:10250` on an IPv4 cluster, which the same parser rejects
-// as an invalid IP-literal. One static value cannot be right for both families,
-// so the bracketing has to happen where the family is known — here, once, at
-// the one place the endpoint is read.
-//
-// It is net.JoinHostPort's treatment, the same one internal/scrape/targets.go
-// already gives pod addresses; only a host that genuinely parses as an IP
-// literal is bracketed, so an IPv4 address and a DNS name are returned
-// untouched and never acquire brackets Go would then reject.
-func kubeletBase(ep string) (string, error) {
-	// Exactly empty, never trimmed: a whitespace-only value is a mistake, and
-	// reading it as "not configured" would disable all three kubelet pipelines
-	// silently — the one outcome configWarnings exists to prevent. It falls
-	// through to the refusal below instead.
-	if ep == "" {
-		return "", nil
+// They used to be checked in run()'s prologue, which -check-config reached too
+// but validate_test could not; here they sit with every other command-line
+// refusal, in the one function both paths call.
+func checkFlagChoices() error {
+	switch otlpingest.MetricsMode(*ingestMetrics) {
+	case otlpingest.MetricsResource, otlpingest.MetricsDatapoint, otlpingest.MetricsAuto:
+	default:
+		return fmt.Errorf("invalid -ingest-metrics-mode %q (want resource, datapoint or auto)", *ingestMetrics)
 	}
-	u, err := url.Parse(ep)
-	if err == nil && u.Host != "" {
-		return ep, nil
+	switch *logsUnknownFiles {
+	case "auto", "end", "start":
+	default:
+		return fmt.Errorf("invalid -logs-unknown-files %q (want auto, end or start)", *logsUnknownFiles)
 	}
-	if fixed, ok := bracketIPLiteralHost(ep); ok {
-		// Re-parsed rather than trusted: the repair must produce something the
-		// request path accepts, or it has merely moved the failure.
-		if v, verr := url.Parse(fixed); verr == nil && v.Host != "" {
-			return fixed, nil
-		}
+	if *ingestOn && *ingestGRPC == "" && *ingestHTTP == "" {
+		return errors.New("-ingest is set but both -ingest-grpc-endpoint and -ingest-http-endpoint are empty")
 	}
-	if err == nil {
-		// Parsed, but with no authority — a scheme-less endpoint like
-		// `10.0.0.5:10250`, which url.Parse reads as scheme+opaque and
-		// http.NewRequest then refuses as an unsupported protocol scheme.
-		err = errors.New("no scheme://host — a bare host:port is read as a URL scheme, not an address")
+	// From the tagged file pair: a build without the `events` tag does not link
+	// the package that defines what -events-start means (see buildtags.go).
+	if err := validateEventsFlags(); err != nil {
+		return err
 	}
-	return "", fmt.Errorf("-kubelet-endpoint=%q is not a base URL the agent can request (%v): all three kubelet scrapes build every request from it, so each would fail before it is issued. "+
-		"Write it as scheme://host[:port] — an IPv6 host may be bare (https://fd00:10::5:10250, which is what $(NODE_IP) expands to on an IPv6 node) or bracketed; an IPv4 host or a name must NOT be bracketed", ep, err)
-}
-
-// bracketIPLiteralHost re-forms scheme://host[:port] with the host bracketed
-// when it is an unbracketed IPv6 literal, returning false for everything else.
-//
-// The two-colon test is what keeps this narrow: an IPv4 authority has at most
-// one colon (its port separator) and a DNS name has none, so neither can reach
-// net.ParseIP here — which matters, because bracketing either is exactly the
-// "invalid IP-literal" refusal this whole function exists to avoid.
-//
-// The ORDER of the two readings is the load-bearing part, and it used to be the
-// other way round. Both can succeed on one string: `fd00::1:8443` is a legal
-// IPv6 address AND a legal `fd00::1` plus port 8443, because a 1-4 digit port is
-// also a legal hextet. Taking the address-only reading first therefore swallowed
-// the port into the address for every port below 10000 — 8443, 9090, 4317, 443 —
-// returning `https://[fd00::1:8443]` with err=nil, so -check-config passed and
-// all three kubelet scrapes then dialled a wrong host on the scheme's default
-// port, forever. Only a 5-digit port survived it, which is the sole reason the
-// shipped :10250 ever worked. A trailing all-decimal group is a port far more
-// often than it is the last hextet of an address someone wrote unbracketed, and
-// the address-only reading is still reachable both from this fallback (its last
-// group is not all digits, or the remainder is not an address) and from the
-// bracketed spelling, which url.Parse accepts without coming here at all.
-func bracketIPLiteralHost(ep string) (string, bool) {
-	scheme, rest, ok := strings.Cut(ep, "://")
-	if !ok {
-		return "", false
-	}
-	authority, tail := rest, ""
-	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
-		authority, tail = rest[:i], rest[i:]
-	}
-	// Userinfo would make the host split ambiguous, and a kubelet endpoint
-	// never carries one (the credential is a bearer token file). Leave it to
-	// the error rather than guess.
-	if strings.Contains(authority, "@") || strings.Count(authority, ":") < 2 {
-		return "", false
-	}
-	if i := strings.LastIndex(authority, ":"); i >= 0 {
-		if host, port := authority[:i], authority[i+1:]; allDigits(port) && net.ParseIP(host) != nil {
-			return scheme + "://" + net.JoinHostPort(host, port) + tail, true
-		}
-	}
-	if ip := net.ParseIP(authority); ip != nil { // an address with no port
-		return scheme + "://[" + authority + "]" + tail, true
-	}
-	return "", false
-}
-
-// allDigits reports whether s is a non-empty run of decimal digits — the shape
-// of a port, and the only trailing group bracketIPLiteralHost will read as one.
-func allDigits(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
-	}
-	return true
+	// The -azure-* flag surface, from the tagged file pair: a build without the
+	// `azure` tag does not link the package that defines what the values mean
+	// (see buildtags.go).
+	return validateAzureFlags()
 }
 
 // validateConfig compiles every section of the unified config (and the
 // separate transforms file) without acquiring a single resource: no listeners,
-// no log files, no positions file, no spools, no network.
-//
-// run() always calls it before touching anything, so a bad config fails fast;
-// -check-config makes run() stop right after it. Keeping ONE function means the
-// dry-run cannot drift from what a real start accepts — adding a config surface
-// means adding it here as well as to agentConfig.
+// no log files, no positions file, no spools, no network — and discards what it
+// compiled. It is compileConfig's dry-run face: -check-config and the tests
+// ask it for a verdict, while run() calls compileConfig itself and consumes
+// the result.
 func validateConfig(cfg agentConfig, transformsFile string) error {
+	_, err := compileConfig(cfg, transformsFile)
+	return err
+}
+
+// compiledConfig is everything compileConfig compiled that a real start goes
+// on to USE, so no section is compiled twice. It used to be: validateConfig
+// compiled every section and threw the results away, and run() and the start
+// functions compiled them again behind error branches validation had already
+// made unreachable (with their own drifted wording), re-parsed the kubelet
+// endpoint behind a should-not-happen fallback, and read the hot-reloadable
+// transforms file a second time — so the program a start ran was not
+// guaranteed to be the one that had just been validated.
+//
+// Every field is nil (or empty) when its section is absent, exactly as the
+// per-section helper returns it.
+type compiledConfig struct {
+	attrs      *attrs.Builders
+	logAttrs   *logattrs.Extractor
+	scrub      *logscrub.Scrubber
+	logMetrics *metrics.DynamicMetricSet
+	// logRules is the logs.rules chain, shared by every log producer.
+	logRules *logline.LineFilter
+	// logSources is the validated logs.sources list; nil means the tailer's
+	// default containerd source over -log-dir.
+	logSources    []tailer.Source
+	metricFilters *promscrape.MetricFilters
+	splitters     []*promscrape.Splitter
+	// kubeletBase is -kubelet-endpoint normalised into a base URL net/http
+	// will accept (kubeletBase); "" when the flag is empty.
+	kubeletBase string
+	// routes holds one exporter config per routing.routes entry, index for
+	// index (validateRoutes); nil without a routing section.
+	routes []otlpexport.Config
+	// transforms is the compiled -transforms-file; nil without the flag.
+	transforms *transform.Program
+}
+
+// compileConfig compiles every section of the unified config and the
+// transforms file, refusing what a start would refuse, and returns what it
+// compiled. run() always calls it before touching anything, so a bad config
+// fails fast; -check-config makes run() stop right after it. ONE function for
+// the verdict and the start means the dry run cannot drift from what a real
+// start accepts — adding a config surface means adding it here as well as to
+// agentConfig.
+//
+// extra reaches only the logMetrics set, and carries what only a real start
+// wants (its logger, its permanent-rejection classifier); neither affects
+// whether the section compiles, so validateConfig passes none.
+func compileConfig(cfg agentConfig, transformsFile string, extra ...metrics.Option) (*compiledConfig, error) {
+	var cc compiledConfig
 	// A pipeline this binary was not built with (buildtags.go). FIRST, because
 	// no amount of valid config makes an absent pipeline run, and because
 	// -check-config is where that has to surface: the alternative is a rollout
 	// where the flag is accepted, nothing is collected, and the only clue is a
 	// missing signal.
 	if err := checkExcludedPipelines(); err != nil {
-		return err
+		return nil, err
 	}
 	// Flag VALUES that can only be a mistake. Beside the pipeline check because
 	// both are about the command line rather than a section, and here rather
 	// than at the consumer because -check-config is the only place a fleet-wide
 	// flag mistake surfaces before the rollout does.
 	if err := checkFlagValues(); err != nil {
-		return err
+		return nil, err
+	}
+	if err := checkFlagChoices(); err != nil {
+		return nil, err
 	}
 	// The kubelet base URL, PARSED — nothing used to parse it at all, so a
 	// value no request can be built from (the commonest being an IPv6 host the
 	// chart cannot bracket for us, see kubeletBase) passed -check-config and
 	// then failed every kubelet scrape on every node for the process lifetime.
-	// The result is discarded here: startScraper re-derives it, and this is the
-	// dry run, which acquires nothing.
-	if _, err := kubeletBase(*kubeletEndpoint); err != nil {
-		return err
+	// NORMALISED here, once, and handed to startScraper: this is the one place
+	// the flag is read.
+	kb, err := kubeletBase(*kubeletEndpoint)
+	if err != nil {
+		return nil, err
 	}
+	cc.kubeletBase = kb
 	// The OTLP transport flags. Shape-only (no dial, no file reads), but they
 	// are the ones that abort a real start: a bad protocol, compression,
 	// compression level or scheme-less endpoint, or TLS material on a
@@ -454,53 +458,53 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// same ConfigMap then CrashLooped the fleet at `creating OTLP exporter` —
 	// produced by the check whose whole purpose is preventing that.
 	if err := cfg.Export.ValidateAgainst(baseExportConfig()); err != nil {
-		return err
+		return nil, err
 	}
-	if _, err := buildAttrs(cfg.ResourceAttributes); err != nil {
-		return fmt.Errorf("resourceAttributes: %w", err)
+	if cc.attrs, err = buildAttrs(cfg.ResourceAttributes); err != nil {
+		return nil, fmt.Errorf("resourceAttributes: %w", err)
 	}
-	if _, err := compileLogAttrs(cfg.LogAttributes); err != nil {
-		return fmt.Errorf("logAttributes: %w", err)
+	if cc.logAttrs, err = compileLogAttrs(cfg.LogAttributes); err != nil {
+		return nil, fmt.Errorf("logAttributes: %w", err)
 	}
-	if _, err := compileScrub(cfg.LogScrubbing); err != nil {
-		return fmt.Errorf("logScrubbing: %w", err)
+	if cc.scrub, err = compileScrub(cfg.LogScrubbing); err != nil {
+		return nil, fmt.Errorf("logScrubbing: %w", err)
 	}
-	if _, err := compileLogMetrics(cfg.LogMetrics); err != nil {
-		return fmt.Errorf("logMetrics: %w", err)
+	if cc.logMetrics, err = compileLogMetrics(cfg.LogMetrics, extra...); err != nil {
+		return nil, fmt.Errorf("logMetrics: %w", err)
 	}
 	if cfg.Metrics != nil {
-		if _, err := promscrape.NewMetricFilters(cfg.Metrics.Pipelines); err != nil {
-			return fmt.Errorf("metrics.pipelines: %w", err)
+		if cc.metricFilters, err = promscrape.NewMetricFilters(cfg.Metrics.Pipelines); err != nil {
+			return nil, fmt.Errorf("metrics.pipelines: %w", err)
 		}
-		if _, err := promscrape.NewSplitters(cfg.Metrics.Splitters); err != nil {
-			return fmt.Errorf("metrics.splitters: %w", err)
+		if cc.splitters, err = promscrape.NewSplitters(cfg.Metrics.Splitters); err != nil {
+			return nil, fmt.Errorf("metrics.splitters: %w", err)
 		}
 	}
-	if _, err := compileSources(cfg.Logs); err != nil {
-		return fmt.Errorf("logs.sources: %w", err)
+	if cc.logSources, err = compileSources(cfg.Logs); err != nil {
+		return nil, fmt.Errorf("logs.sources: %w", err)
 	}
-	if _, err := compileLogRules(cfg.Logs); err != nil {
-		return fmt.Errorf("logs.rules: %w", err)
+	if cc.logRules, err = compileLogRules(cfg.Logs); err != nil {
+		return nil, fmt.Errorf("logs.rules: %w", err)
 	}
 	if cfg.TraceMetrics != nil {
 		if err := cfg.TraceMetrics.Validate(); err != nil {
-			return fmt.Errorf("traceMetrics: %w", err)
+			return nil, fmt.Errorf("traceMetrics: %w", err)
 		}
 	}
 	if cfg.TraceSampling != nil {
 		if err := cfg.TraceSampling.Validate(); err != nil {
-			return fmt.Errorf("traceSampling: %w", err)
+			return nil, fmt.Errorf("traceSampling: %w", err)
 		}
 	}
 	// Shape-only, and it validates the policy list by COMPILING it (regexes,
 	// budgets, durations), so -check-config accepts exactly what a start does.
 	if err := cfg.TailSampling.Validate(); err != nil { // nil-receiver safe
-		return fmt.Errorf("tailSampling: %w", err)
+		return nil, fmt.Errorf("tailSampling: %w", err)
 	}
 	// Both service-graph sections are shape-only (no DNS, no filesystem, no
 	// namespace resolution), so the dry run runs exactly what a start does.
 	if err := cfg.ServiceGraph.Validate(); err != nil { // nil-receiver safe
-		return fmt.Errorf("serviceGraph: %w", err)
+		return nil, fmt.Errorf("serviceGraph: %w", err)
 	}
 	// The shard's receiver takes forwarded spans from every pod in the cluster,
 	// so it is refused unauthenticated — HERE rather than at the listener, so
@@ -510,7 +514,7 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// the file is readable and non-empty is checked at the real start, where
 	// it is equally fatal.
 	if *serviceGraphOn && strings.TrimSpace(*serviceGraphToken) == "" {
-		return errors.New("-service-graph requires -service-graph-token-file: the shard's span receiver is reachable from every pod in the cluster and must not be unauthenticated")
+		return nil, errors.New("-service-graph requires -service-graph-token-file: the shard's span receiver is reachable from every pod in the cluster and must not be unauthenticated")
 	}
 	// A shard with no listener at all receives nothing, pairs nothing, and
 	// reports READY forever (the gate is satisfied by the receiver binding, and
@@ -520,7 +524,7 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// exactly that. The SAME const as the runtime refusal, so the wording
 	// cannot drift.
 	if *serviceGraphOn && *serviceGraphListen == "" && *serviceGraphHTTPListen == "" {
-		return errors.New(msgShardNoListener)
+		return nil, errors.New(msgShardNoListener)
 	}
 	// Two of this process's listeners on one address. Fatal at the real start
 	// (the second bind loses), and the chart renders three of the tier's four
@@ -533,7 +537,7 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// used to sign off on, and -pprof-listen typed onto -metrics-listen's :9090
 	// needs no feature flag at all.
 	if err := listenersDistinct(); err != nil {
-		return err
+		return nil, err
 	}
 	// The SAME merge of flags and section a real start uses, so the dry run
 	// cannot accept a shard set the start rejects (the flags participate: the
@@ -549,7 +553,7 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	if *serviceGraphOn {
 		shards, err := serviceGraphShardConfig(cfg.ServiceGraphShards)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		// ValidateAgainst, not Validate: the section's own shape AND the
 		// per-shard exporter configs NewResharder derives from it over the same
@@ -559,34 +563,22 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 		// protocol: http — so -check-config exited 0 and the same ConfigMap then
 		// aborted every pod of the tier's StatefulSet at startup.
 		if err := shards.ValidateAgainst(baseExportConfig()); err != nil { // its messages already name the section
-			return err
+			return nil, err
 		}
 		// ReshardConfig.Validate is shape-only by contract and cannot see the
 		// flags, so the ring's transport and port are checked against this
 		// shard's own listeners here — the one place that knows both.
 		if err := shardRingReachesThisShard(shards); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if cfg.Routing != nil {
-		for i, rt := range cfg.Routing.Routes {
-			// Validated like any other destination — the dry run used to check
-			// the name, the namespaces and the patterns and stop, so a
-			// scheme-less route endpoint, or TLS material inherited onto a
-			// plaintext route, passed -check-config and CrashLooped the agent
-			// on start, which is the one outcome this check exists to prevent.
-			rcfg, err := validateRoute(cfg.Export, i, rt)
-			if err != nil {
-				return err
-			}
-			if err := rcfg.Validate(); err != nil {
-				return fmt.Errorf("routing route %q: %w", rt.Name, err)
-			}
+		if cc.routes, err = validateRoutes(cfg.Export, cfg.Routing.Routes); err != nil {
+			return nil, err
 		}
 	}
-	prog, err := compileTransforms(transformsFile)
-	if err != nil {
-		return fmt.Errorf("transforms: %w", err)
+	if cc.transforms, err = compileTransforms(transformsFile); err != nil {
+		return nil, fmt.Errorf("transforms: %w", err)
 	}
 	// Cross-file check: a `type: script` tail-sampling policy is only
 	// satisfiable when the transforms file defines a sample: section.
@@ -602,24 +594,24 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// it is READ made every other workload exit 1 at startup — the singleton
 	// unrepairably, since events.yaml exposes no extraVolumes to mount a
 	// transforms file with. Off the tier tailSampling is not read at all, and
-	// configWarnings' "configured but ignored" line is already the right
-	// report.
-	if *serviceGraphOn && cfg.TailSampling.Enabled() && cfg.TailSampling.UsesScript() && !prog.HasSample() {
-		return errors.New("tailSampling: a `type: script` policy requires -transforms-file with a sample: section defining decide(trace)")
+	// the config summary's tier-only-sections line (tierOnlySections) is
+	// already the right report.
+	if *serviceGraphOn && cfg.TailSampling.Enabled() && cfg.TailSampling.UsesScript() && !cc.transforms.HasSample() {
+		return nil, errors.New("tailSampling: a `type: script` policy requires -transforms-file with a sample: section defining decide(trace)")
 	}
-	return nil
+	return &cc, nil
 }
 
 // --- per-section compile helpers ---
 //
 // ONE home per section for "which arguments participate in its validity":
-// validateConfig, run() and the -test-config harness all compile a section
-// through the same helper, so an option that participates in validation (the
-// log-metrics name prefix) or a new refusal cannot land in one path and not
-// the others. validateConfig passes no extras, and every helper acquires
-// NOTHING (no listeners, no log files, no network; compileTransforms reads
-// only the file the flag names, which the dry run always did) — run() supplies
-// loggers and classifiers through the extras.
+// compileConfig (and through it validateConfig and run()) and the -test-config
+// harness's per-case log-metrics set all compile a section through the same
+// helper, so an option that participates in validation (the log-metrics name
+// prefix) or a new refusal cannot land in one path and not the others. Every
+// helper acquires NOTHING (no listeners, no log files, no network;
+// compileTransforms reads only the file the flag names, which the dry run
+// always did) — run() supplies loggers and classifiers through the extras.
 
 // compileScrub compiles the logScrubbing section; nil = no scrubbing.
 func compileScrub(cfg *logscrub.Config) (*logscrub.Scrubber, error) {
@@ -638,8 +630,8 @@ func compileLogAttrs(cfg *logattrs.Config) (*logattrs.Extractor, error) {
 
 // compileLogRules compiles the logs.rules chain; nil when the logs section is
 // absent. Shared by the tailer AND journald (same section, same semantics),
-// which is why run() compiles it outside startLogs — journald must get it even
-// with -logs=false.
+// which is why it is compiled by compileConfig rather than inside startLogs —
+// journald must get it even with -logs=false.
 func compileLogRules(logs *tailer.SourcesConfig) (*logline.LineFilter, error) {
 	if logs == nil {
 		return nil, nil
@@ -654,60 +646,6 @@ func compileSources(logs *tailer.SourcesConfig) ([]tailer.Source, error) {
 		return nil, nil
 	}
 	return tailer.ValidateSources(logs.Sources)
-}
-
-// plainSourcePodSelectionWarnings names the three pod-selection keys on a source
-// that has no pods.
-//
-// `namespaces`, `excludeNamespaces` and `selector` all select by POD identity:
-// the first two are read from the CRI FILENAME at discovery and the third from
-// the pod's labels once metadata resolves, and neither exists for a plain file —
-// so on a plain source all three do nothing at all. Silently: every matched file
-// is collected, -check-config stays green, and the operator's evidence that the
-// filter works is the absence of an error.
-//
-// NAMED, not refused, and the reason is not the usual "it might be deliberate".
-// A refusal here is strictly worse than the inert key it reports: one -config is
-// shared by every workload of this chart, and only ENABLING a pipeline a binary
-// lacks may fail startup — no section belongs to one pipeline, precisely so a
-// shared ConfigMap stays decodable by all of them. Refusing aborts the
-// events/Azure singleton and the trace tier, neither of which ever tails a file,
-// over a key that is inert in their config by construction; and on the DaemonSet
-// that does read it, it turns a running fleet into a CrashLoop at the next
-// rollout for a mistake that costs egress, not correctness. The keys stay inert
-// either way — this makes the operator's evidence a line of output instead of a
-// silence.
-//
-// It is deliberately ungated: the fault is in the config TEXT, so every workload
-// reading that ConfigMap reports the same list, and one `-check-config` in CI
-// speaks for all of them.
-func plainSourcePodSelectionWarnings(logs *tailer.SourcesConfig) []string {
-	if logs == nil {
-		return nil
-	}
-	var out []string
-	for i, s := range logs.Sources {
-		if s.Containerd {
-			continue
-		}
-		var keys []string
-		if len(s.Namespaces) > 0 {
-			keys = append(keys, "namespaces")
-		}
-		if len(s.ExcludeNamespaces) > 0 {
-			keys = append(keys, "excludeNamespaces")
-		}
-		if len(s.Selector) > 0 {
-			keys = append(keys, "selector")
-		}
-		if len(keys) > 0 {
-			out = append(out, fmt.Sprintf(
-				"logs.sources[%d] (%q) is a plain (non-containerd) source and %s selects pods, which its files do not have — the namespace filters read the CRI FILENAME at discovery and the selector reads pod labels at resolve time, so the key is IGNORED and every matched file is collected. "+
-					"Set containerd: true if these are container logs, or narrow the source with include/exclude globs (or logs.rules, which costs the read first).",
-				i, s.Name, strings.Join(keys, " and ")))
-		}
-	}
-	return out
 }
 
 // compileLogMetrics compiles the logMetrics section into a set; nil when the
@@ -730,828 +668,4 @@ func compileTransforms(file string) (*transform.Program, error) {
 		return nil, nil
 	}
 	return transform.CompileFile(file)
-}
-
-// configWarnings reports combinations that are LEGAL but do something other than
-// what they read like. They are warnings rather than errors, and each one has to
-// justify being a warning rather than a refusal: an error is right when the
-// config can only be a mistake, and wrong when it is a supported arrangement
-// with a sharp edge.
-//
-// Emitted by -check-config and by every real start, from the same list, so a dry
-// run says exactly what a start would.
-func configWarnings(cfg agentConfig) []string {
-	var out []string
-
-	// Pod-selection keys on a source that has no pods; see the function for why
-	// this is a warning and not the refusal it was first written as.
-	out = append(out, plainSourcePodSelectionWarnings(cfg.Logs)...)
-
-	// No offset persistence at all, for a pipeline that has offsets. The
-	// consequence differs per pipeline and neither is visible from the flag:
-	// the tailer re-reads per -logs-unknown-files, while journald has NO cursor
-	// file of its own and so seeks to the journal TAIL on every restart, losing
-	// whatever was written while the process was down. This lived inside
-	// startLogs, behind the -logs toggle — so the journald half, the only place
-	// that consequence is written down, could never be said to the
-	// journald-only agent it describes.
-	//
-	// Named rather than refused: running without persistence is a supported
-	// arrangement (the flag's own help says empty disables it), just one whose
-	// cost is invisible until a restart.
-	if *positionsFile == "" && (*logsOn || *journaldOn) {
-		out = append(out, "no -positions-file: offsets are not persisted — a -logs restart re-reads per -logs-unknown-files, and -journald resumes at the journal TAIL, losing every entry written while the process was down (journald has no cursor file of its own)")
-	}
-
-	// A kubelet scrape asked for with no kubelet to scrape. startScraper gates
-	// all three of them on -kubelet-endpoint being non-empty, so the pipeline is
-	// not disabled, not failing and not retrying: it is never SCHEDULED. That is
-	// the quietest failure a pipeline has — nothing is attempted, so no scrape
-	// counter moves, no error is logged, and /debug/targets carries no row for
-	// them (it lists the outcomes of scrapes that RAN); the only evidence is
-	// metrics that never arrive, which reads exactly like a collector or a query
-	// problem. -cadvisor and -node-metrics DEFAULT to on, so the commonest way
-	// in is typing nothing at all.
-	//
-	// The flag VALUES, never whether they were typed: the chart renders
-	// -cadvisor= and -node-metrics= unconditionally, so keying on explicitness
-	// would make one rendered ConfigMap warn and an identical hand-written one
-	// stay silent — the same "does the same effective config behave differently
-	// depending on whether a default was spelled out" trap the guard-rail
-	// warning below refuses.
-	//
-	// Named rather than refused: a logs-only agent that leaves the metric
-	// toggles at their defaults is a legitimate deployment, and refusing to
-	// start it would take a node's log shipping down over a metric it never
-	// asked for.
-	if *kubeletEndpoint == "" {
-		var asked []string
-		if *cadvisorOn {
-			asked = append(asked, "-cadvisor")
-		}
-		if *nodeOn {
-			asked = append(asked, "-node-metrics")
-		}
-		if *summaryOn {
-			asked = append(asked, "-kubelet-summary")
-		}
-		if len(asked) > 0 {
-			out = append(out, fmt.Sprintf(
-				"-kubelet-endpoint is empty, so the kubelet scrapes that depend on it are never scheduled: %s. Nothing is attempted and nothing fails — no scrape counter moves and no error is logged — so the only symptom is the missing metrics. "+
-					"Set -kubelet-endpoint=https://$(NODE_IP):10250 (the shipped manifests and the chart do), or turn those flags off so the startup log describes what is actually collected.",
-				strings.Join(asked, ", ")))
-		}
-	}
-
-	// A DERIVED token bucket below one whole token. The value the operator
-	// typed is -logs-rate-limit, and it is delivered EXACTLY — the floor lifts
-	// the bucket to 1 and leaves the refill accruing at the requested rate — so
-	// nothing they asked for is discarded, which is what separates this from
-	// the typed sub-1 burst checkFlagValues refuses. Refusing here would also
-	// outlaw a legitimate throttle (0.4 lines/s is one line every 2.5s on a
-	// chatty file) and would hang its legality on the 2x derivation constant:
-	// change that to 3x and the same typed rate flips from refused to accepted,
-	// which is not a property of anything the operator wrote. So it is named
-	// rather than refused — silent normalisation is the other half of the trap.
-	if *logsRateLimit > 0 && *logsRateBurst <= 0 {
-		if burst := 2 * *logsRateLimit; burst < 1 {
-			out = append(out, fmt.Sprintf(
-				"-logs-rate-limit=%g derives a token bucket of %g (-logs-rate-burst=0 means 2x the rate), below the one whole token a line costs: the tailer raises the bucket to 1 — the refill rate stays %g/s — because a bucket that cannot hold a token pauses every file forever, or with -logs-rate-drop discards every line. Set -logs-rate-burst explicitly to choose the bucket.",
-				*logsRateLimit, burst, *logsRateLimit))
-		}
-	}
-
-	// The tier-only sections and flag on a workload that is not the tier. A
-	// configured section that silently does nothing is indistinguishable from
-	// one that is working, so each of them says so once.
-	//
-	// HERE rather than in startServiceGraph, where they used to live: that
-	// function is reached only by a real start, so -check-config — the thing an
-	// operator runs in CI to answer "is this section being applied?" — printed
-	// `config is valid` with no hint that four of the sections in the shared
-	// ConfigMap are inert on this workload, and the pod that started then
-	// printed up to five WARN lines saying they are. The promise above this
-	// function is that a dry run says exactly what a start would; these five
-	// were the one place it did not hold.
-	if !*serviceGraphOn {
-		if cfg.ServiceGraph != nil {
-			out = append(out, "serviceGraph configured but ignored: this process is not the trace tier (-service-graph=false)")
-		}
-		if c := cfg.TraceSampling; c != nil && c.Enabled() {
-			out = append(out, "traceSampling configured but ignored: traces are received by the trace tier (-service-graph), and this process is not it")
-		}
-		if cfg.ServiceGraphShards != nil {
-			out = append(out, "serviceGraphShards configured but ignored: the shard ring is read only by the trace tier (-service-graph), and this process is not it")
-		}
-		if cfg.TailSampling.Enabled() { // nil-receiver safe
-			out = append(out, "tailSampling configured but ignored: a trace can only be judged where all of its spans are, which is the trace tier (-service-graph), and this process is not it")
-		}
-		if *spanMetrics {
-			out = append(out, "-ingest-span-metrics ignored: span metrics are derived from received traces, and traces are received by the trace tier (-service-graph), which this process is not")
-		}
-	}
-
-	// traceSampling (per-SPAN) above tailSampling (per-TRACE). The two nest
-	// correctly for the PROBABILITY — both hash the trace id the same way, so a
-	// tail probabilistic policy at 50% keeps exactly the traces a head
-	// probability of 0.5 already passed — and maxSpansPerSecond is an overload
-	// valve that only truncates when the shard is over budget. The GUARD RAILS
-	// are the problem: they are decided per span, so they rescue the error (or
-	// slow) spans of traces the probability dropped, and hand the tail sampler a
-	// trace that is only its error spans. It judges that fragment as if it were
-	// the trace — latency reads a lower bound, an inverted attribute exclusion
-	// can miss the span that would have vetoed — and can then EXPORT it, which
-	// is a trace that never existed rather than merely an incomplete one.
-	//
-	// Not a refusal, for one concrete reason: keepErrors DEFAULTS to true, so
-	// refusing would reject `traceSampling: {probability: 0.1}` next to any
-	// tailSampling section — the most natural composition there is — and would
-	// make the same effective config legal or illegal depending on whether the
-	// operator spelled the default out. The degradation is also well-defined and
-	// documented (agent/tailsample on partial traces), which is the line: a
-	// sharp edge gets named, an impossibility gets refused.
-	if *serviceGraphOn && cfg.TailSampling.Enabled() && cfg.TraceSampling != nil && cfg.TraceSampling.Enabled() {
-		var rails []string
-		if cfg.TraceSampling.KeepErrors == nil || *cfg.TraceSampling.KeepErrors {
-			rails = append(rails, "keepErrors")
-			if cfg.TraceSampling.KeepErrors == nil {
-				rails[len(rails)-1] = "keepErrors (defaulted on)"
-			}
-		}
-		// The sampler's OWN parse (config.Duration through SlowerThan), not a
-		// re-parse: the warning asks whether the guard rail is armed, and it
-		// must read the field exactly as the code that arms it does.
-		if d, err := cfg.TraceSampling.SlowerThan(); err == nil && d > 0 {
-			rails = append(rails, "keepSlowerThan")
-		}
-		if len(rails) > 0 {
-			out = append(out, fmt.Sprintf(
-				"traceSampling %s runs ABOVE tailSampling and decides PER SPAN: it rescues individual spans of traces the probability dropped, so the tail sampler is handed trace fragments and may export a trace that never existed. "+
-					"Set traceSampling.keepErrors: false (and drop keepSlowerThan), and express the same intent as tail policies — statusCode: [ERROR] and latency — which judge whole traces. "+
-					"traceSampling.probability is safe below a tail sampler (the two nest: a tail probabilistic policy at the same fraction keeps exactly what the head kept) and so is maxSpansPerSecond, which is an overload valve.",
-				strings.Join(rails, " and ")))
-		}
-	}
-
-	// A traceSampling section on the tier that samples NOTHING. The trap is
-	// `probability: 0`: it reads as "ship no traces" and does the exact
-	// opposite, because Probability is a plain float64 — 0 is indistinguishable
-	// from an unset field, so Enabled() is false, buildOwnerChain never wires the
-	// sampler, no "trace sampling enabled" line is logged, and New would map 0 to
-	// keep-all anyway. Nothing else says so either: the configured-but-ignored
-	// warnings only fire OFF the tier, and no counter moves for a sampler that
-	// does not exist, so the only symptom is the egress bill.
-	//
-	// Named rather than refused, and for once the reason is not "it might be
-	// deliberate": 0 CANNOT be told from unset, so refusing it would refuse a
-	// section that merely spells out its defaults. Refusing is what
-	// tracesample.Validate already does for the values that are unambiguously
-	// wrong (a negative, or the 50-for-50% typo). `probability: 1` is left silent
-	// — it is an honest, explicit "keep everything".
-	if *serviceGraphOn && cfg.TraceSampling != nil && !cfg.TraceSampling.Enabled() && cfg.TraceSampling.Probability != 1 {
-		out = append(out, fmt.Sprintf(
-			"traceSampling is configured but samples nothing: probability=%v keeps EVERY trace (only a fraction strictly BETWEEN 0 and 1 samples — 0.1 is a tenth; 0 is indistinguishable from an unset field and means keep-all, not drop-all) and maxSpansPerSecond=%v is uncapped, so the section is inert and 100%% of the cluster's spans are shipped. "+
-				"There is no value here that drops everything — stop the senders, or express the intent as tailSampling policies.",
-			cfg.TraceSampling.Probability, cfg.TraceSampling.MaxSpansPerSecond))
-	}
-
-	// Peer-IP attribution on the trace tier with the self-metadata lookup turned
-	// off. The veto that keeps a rewritten source address from labelling an
-	// application's spans with a kubescrape pod (peerIsOurOwnWorkload) reads the
-	// pod THIS process resolved for -self-attributes; with the lookup never run
-	// it has no pod, and its documented answer for "we do not know yet" — false,
-	// do not veto — becomes the answer for the process LIFETIME.
-	//
-	// A warning rather than a refusal: the fallback still attributes correctly on
-	// a direct hop (the arrangement it is meant for), and -self-attributes is a
-	// legitimate thing to turn off. What must not happen silently is the failure
-	// mode, because it is invisible: the misattribution renders perfectly, and
-	// kubescrape_ingest_resources_total{outcome="peer_ip_rejected"} — documented
-	// as THE signal that peer-IP attribution cannot work on a path — stays flat
-	// whether the veto found nothing or was never able to look.
-	if *serviceGraphOn && *ingestPeerIP && (!*selfAttrsOn || *selfAttrsRefresh <= 0) {
-		off := "-self-attributes=false"
-		if *selfAttrsOn {
-			off = fmt.Sprintf("-self-attributes-refresh=%s (0 disables the lookup)", *selfAttrsRefresh)
-		}
-		out = append(out, fmt.Sprintf(
-			"-ingest-peer-ip-fallback on the trace tier needs this process's own pod to veto an attribution that resolved to the tier's OWN workload, and %s never resolves it: a proxy, mesh or misaddressed hop then labels application spans with a kubescrape pod's identity — on every span, and with peer_ip_rejected flat, so it is indistinguishable from success. "+
-				"Leave -self-attributes on with a positive -self-attributes-refresh, or drop -ingest-peer-ip-fallback and have senders carry k8s.pod.uid / container.id.", off))
-	}
-
-	// A logAttributes rule lifting a LINE value into a resolved-identity
-	// resource attribute hands whatever writes the log line control of that
-	// key — and k8s.namespace.name is what routing keys tenancy on, so a pod
-	// printing a crafted line could steer its records onto another tenant's
-	// destination. The pod-annotation path REFUSES these keys outright
-	// (attrs.ReservedIdentity, tailer/podconfig.go); here the config is the
-	// OPERATOR's own, so a deliberate lift stays legal — but it is the same
-	// boundary crossed from the other side, and it must be named, not silent.
-	if cfg.LogAttributes != nil {
-		for _, r := range cfg.LogAttributes.Rules {
-			attr := r.Attribute
-			if attr == "" {
-				attr = r.Key
-			}
-			// The default, spelled the way pkg/logattrs spells it, because
-			// which marker bites depends on this value and `log` is what an
-			// omitted `target:` means.
-			tgt := r.Target
-			if tgt == "" {
-				tgt = logattrs.TargetLog
-			}
-			// Identity is a RESOURCE concern and nothing else: routing keys on
-			// the resource's k8s.namespace.name, and series identity is the
-			// resource's. A record- or scope-target lift of one of these keys
-			// forges nothing.
-			if tgt == logattrs.TargetResource && attrs.ReservedIdentity(attr) {
-				out = append(out, fmt.Sprintf(
-					"logAttributes rule %q lifts a log-line value into %q, a RESOLVED-IDENTITY resource attribute: whatever writes the line controls it (k8s.namespace.name keys tenancy routing; service.instance.id and k8s.pod.* forge series identity). The pod-annotation path refuses these keys; lift into a differently-named attribute unless the workload is genuinely authoritative for this one.",
-					r.Key, attr))
-			}
-			// The plumbing markers are the SHARPER case, and the two are NOT
-			// honoured in the same place — which is the same Resource/Element
-			// split ingestReservedAttrs wires on the receivers. The router
-			// reads route.ScriptMarker off a RESOURCE and nowhere else; the
-			// transform engine's post-script prune reads transform.DropMarker
-			// off the ELEMENT, which for logs is the log RECORD — logattrs'
-			// DEFAULT target, and the one this loop used to skip entirely.
-			//
-			// So the old single `target: resource` gate was inverted for the
-			// drop marker: it stayed silent on the placement that deletes
-			// records, and on the placement where nothing reads the marker it
-			// emitted a warning ASSERTING that deletion. Each message now names
-			// the consequence that exists for THIS rule's target.
-			//
-			// The gate stays attrs.ReservedPlumbing (the predicate attrs
-			// documents as shared with the pod-annotation surface, so a marker
-			// added there is still reported here) — but a NEW marker lands on
-			// the inert arm until its honoured-here case is added above it.
-			var why string
-			switch {
-			case attr == route.ScriptMarker && tgt == logattrs.TargetResource:
-				why = "the router honours the route marker on a resource BEFORE its namespace globs, so whatever writes the line chooses the destination — and that route's tenant headers"
-			case attr == transform.DropMarker && tgt == logattrs.TargetLog:
-				why = "with any logs: transform program active, the engine's post-script prune DELETES every record carrying the drop marker and counts it into kubescrape_transform_dropped_total{signal=\"logs\"} as an operator-intended drop, so a line's own content decides whether its record ships"
-			case attrs.ReservedPlumbing(attr):
-				why = fmt.Sprintf("nothing reads this marker off a %s, so the rule is inert today — but it is kubescrape's own control-plane key, one changed `target:` away from the surface that does honour it", tgt)
-			}
-			if why != "" {
-				out = append(out, fmt.Sprintf(
-					"logAttributes rule %q lifts a log-line value into %q, which is kubescrape's OWN plumbing, not a describable attribute: %s. The pod-annotation path and the ingest receivers both refuse this key; lift into a differently-named attribute.",
-					r.Key, attr, why))
-			}
-		}
-	}
-
-	// A sampling period that is not comfortably SHORTER than the export window
-	// buys nothing: the window is -scrape-interval, a CPU rate needs two
-	// readings inside one window, and at parity there is at most one reading —
-	// so the CPU gauges would be absent most windows and the memory ones would
-	// report a one-sample "distribution" whose stddev is 0 and whose max and min
-	// are the same number the cadvisor scrape already publishes. Named rather
-	// than refused: the value is legal, it just quietly undoes the reason the
-	// pipeline was enabled, and the threshold (a quarter of the window, i.e.
-	// four-plus samples) is a judgement rather than a correctness boundary.
-	if *cgroupStatsOn && *scrapeInterval > 0 && *cgroupStatsIv*4 > *scrapeInterval {
-		out = append(out, fmt.Sprintf(
-			"-cgroup-stats-interval=%s against a -scrape-interval=%s export window yields at most %d samples per window: the CPU gauges need TWO readings to derive one rate and are omitted below that, and a one- or two-sample window's stddev/max/min is not a distribution — it is the last one re-stated (which the exported container_cpu_usage_samples / container_memory_working_set_bytes_samples then report as 0 or 1), i.e. the average the cadvisor scrape already publishes, under ten new names. "+
-				"Sample at a small fraction of the window (the default 1s against 30s is 30 samples) or turn -cgroup-stats off.",
-			*cgroupStatsIv, *scrapeInterval, *scrapeInterval / *cgroupStatsIv))
-	}
-	// The other end of the same flag, the one that costs the NODE rather than
-	// the signal. Above the floor checkFlagValues refuses, so this is legal —
-	// but three reads per container per period is a cost an operator should
-	// have chosen deliberately, and a burst finer than this window is not
-	// attributable to anything anyway.
-	if *cgroupStatsOn && *cgroupStatsIv > 0 && *cgroupStatsIv < costlyCgroupInterval {
-		out = append(out, fmt.Sprintf(
-			"-cgroup-stats-interval=%s asks this node agent for %.0f cgroup file reads a second per 100 containers — on the process that also tails every log file on the node. "+
-				"The default %s already resolves a burst far shorter than any export window; go below %s only for a measured reason.",
-			*cgroupStatsIv, 300*float64(time.Second)/float64(*cgroupStatsIv),
-			cgroupstats.DefaultInterval, costlyCgroupInterval))
-	}
-	// A fast discovery cadence buys short-lived containers and is paid for by
-	// the METADATA SERVICE rather than by this node: every pass re-offers every
-	// cgroup that has not resolved, and on a node whose pods are still starting
-	// that is one lookup per pod per pass — the sandbox cgroup never resolves,
-	// by construction, and only stops being asked about after its grace period.
-	// Legal above the floor, but it is a fleet-wide cost an operator should
-	// have chosen rather than discovered on the service's request graph.
-	if *cgroupStatsOn && *cgroupDiscoverIv > 0 && *cgroupDiscoverIv < costlyCgroupDiscoverInterval {
-		out = append(out, fmt.Sprintf(
-			"-cgroup-stats-discover-interval=%s re-walks the cgroup hierarchy and re-offers every unresolved cgroup to the metadata service that often; on a 110-pod node that is ~%.0f lookups a second while pods are starting, since each pod's sandbox cgroup is permanently unresolvable. "+
-				"It does buy shorter-lived containers (the default %s misses most containers living under ~10s, and there is no counter for the ones it never sees) — go below %s deliberately, and watch kubescrape_cgroup_unresolved_total.",
-			*cgroupDiscoverIv, 110*float64(time.Second)/float64(*cgroupDiscoverIv),
-			cgroupstats.DefaultDiscoverInterval, costlyCgroupDiscoverInterval))
-	}
-	return out
-}
-
-// costlyCgroupInterval is where -cgroup-stats-interval stops being free and
-// starts being a choice. It is not a boundary — cgroupstats.MinInterval is —
-// which is why it warns rather than refuses.
-const costlyCgroupInterval = 500 * time.Millisecond
-
-// costlyCgroupDiscoverInterval is the same threshold for the discovery
-// cadence, and it is far larger than its sampling sibling because the two spend
-// different budgets: a sweep costs this node three preads per container, while
-// a discovery pass costs the METADATA SERVICE one lookup per unresolved cgroup
-// — a fleet-wide cost, multiplied by every node.
-const costlyCgroupDiscoverInterval = 5 * time.Second
-
-// logConfigWarnings emits configWarnings.
-func logConfigWarnings(cfg agentConfig, log *slog.Logger) {
-	for _, w := range configWarnings(cfg) {
-		log.Warn(w)
-	}
-}
-
-// validateRoute checks one routing route's shape — name and namespaces
-// present, every namespace pattern parseable — and derives its export config
-// through the shared derivation. ONE function called by BOTH validateConfig
-// and run()'s route loop, so a new refusal cannot land in one and not the
-// other; i is the route's index, used only when it has no name to report.
-//
-// The pattern check fails startup because a malformed glob reads as silent
-// no-match at runtime — the route never fires and its tenant's telemetry goes
-// to the default destination, indistinguishable from "no traffic yet"
-// (config.Glob carries the full rationale).
-func validateRoute(exp *otlpexport.ExportConfig, i int, rt route.Route) (otlpexport.Config, error) {
-	if rt.Name == "" || len(rt.Namespaces) == 0 {
-		return otlpexport.Config{}, fmt.Errorf("routing route %d: name and namespaces are required", i)
-	}
-	for _, pat := range rt.Namespaces {
-		if err := config.Glob(pat); err != nil {
-			return otlpexport.Config{}, fmt.Errorf("routing route %q: invalid namespace pattern %q: %w", rt.Name, pat, err)
-		}
-	}
-	// The SAME derivation on both paths, so a config the dry run accepts is a
-	// config that starts.
-	return routeExportConfig(exp, rt)
-}
-
-// routeExportConfig derives one route destination's client config: the flag
-// base, plus the export section's base additions (headers, client cert), plus
-// the route's own endpoint and headers (which win per key).
-//
-// ONE derivation, shared by validateConfig and the real start, for the same
-// reason validateConfig itself is shared — a dry run that builds something
-// else proves nothing about what will start.
-//
-// A route with no endpoint of its own inherits the flag base, and that is an
-// ERROR when the base is not a destination this deployment uses: with all
-// three signals overridden in export:, BuildExporter never constructs the
-// default chain, so the flag endpoint is whatever it happened to default to
-// (the stock otel-collector.monitoring address). Inheriting it silently sent
-// a tenant's telemetry to a collector nobody configured.
-func routeExportConfig(exp *otlpexport.ExportConfig, rt route.Route) (otlpexport.Config, error) {
-	rcfg := exp.ApplyBase(baseExportConfig())
-	rcfg.Headers = otlpexport.MergeHeaders(rcfg.Headers, rt.Headers)
-	if rt.Endpoint != "" {
-		// A route naming its OWN endpoint does not inherit the default chain's
-		// credentials. Those authenticate this deployment to ITS collector, and
-		// this is a different host — usually a different tenant's, sometimes a
-		// different organization's. Carrying the base BearerTokenFile and mTLS
-		// client certificate over presented them to whatever address the route
-		// named, which is a credential disclosure with no way to opt out: there
-		// was no per-route field to override them with. So the destination is
-		// rebuilt on otlpexport.Config.TransportOnly — the one spelling of the
-		// transport-vs-destination partition, shared with the reshard hop's
-		// client derivation — and every destination field is taken from the
-		// route or left unset.
-		out := rcfg.TransportOnly()
-		out.Endpoint = rt.Endpoint
-		// Deliberate carryovers from the merged base: the MERGED base headers
-		// still ride to an own-endpoint route (a possible header leak, noted by
-		// review — changing it is a product decision, not this refactor), so
-		// does -otlp-insecure-skip-verify, which a route has no field of its
-		// own for, and so does Insecure when the route leaves its own field
-		// unset (below).
-		out.Headers = rcfg.Headers
-		out.InsecureSkipVerify = rcfg.InsecureSkipVerify
-		out.BearerTokenFile = rt.BearerTokenFile
-		out.ClientCertFile = rt.ClientCertFile
-		out.ClientKeyFile = rt.ClientKeyFile
-		out.CAFile = rt.CAFile
-		// The third carryover, overridable: an UNSET route insecure inherits
-		// the merged base's (the ExportOverride pattern). Every own-endpoint
-		// route written before the field existed reached its plaintext
-		// in-cluster collector through the base's -otlp-insecure — a bool zero
-		// value here flipped those to TLS on upgrade, an endless transient
-		// export failure that -check-config could not see. Plaintext-ness is
-		// transport to the named host, not a credential, so this is not the
-		// disclosure the rebuild above exists to prevent.
-		out.Insecure = rcfg.Insecure
-		if rt.Insecure != nil {
-			out.Insecure = *rt.Insecure
-		}
-		return out, nil
-	}
-	if baseEndpointUnused(exp) {
-		return otlpexport.Config{}, fmt.Errorf("routing route %q: no endpoint, and the flag base is not a destination here (export: gives every signal its own endpoint, so nothing dials -otlp-endpoint) — give the route its own endpoint", rt.Name)
-	}
-	return rcfg, nil
-}
-
-// baseEndpointUnused reports whether NOTHING dials the flag base endpoint:
-// every signal is overridden AND every override names its own endpoint.
-//
-// Struct presence is not the test. An override that sets only headers (or a
-// bearer file, or TLS) inherits the base ENDPOINT through merged(), so the
-// base is still the address that signal reaches — and rejecting an
-// endpoint-less route there would fail a config the exporter builds happily,
-// which is the CrashLoop the shared derivation exists to prevent.
-func baseEndpointUnused(exp *otlpexport.ExportConfig) bool {
-	if exp == nil {
-		return false
-	}
-	for _, o := range []*otlpexport.ExportOverride{exp.Logs, exp.Metrics, exp.Traces} {
-		if o == nil || o.Endpoint == "" {
-			return false
-		}
-	}
-	return true
-}
-
-// printConfigSummary is the EFFECTIVE CONFIGURATION dump: what this process
-// will do, where it will send it, what it will listen on, who it thinks it is,
-// and the knobs most likely to be wrong.
-//
-// It is emitted by every real start AND by -check-config, from one function, so
-// the dry run and the start cannot describe different agents — the same
-// discipline validateConfig already holds for the refusals. On a first live run
-// this is the one thing an operator can grep to answer "is it even configured
-// the way I think?" before any pipeline has produced a byte.
-//
-// A few lines rather than one: an operator greps a message ("effective
-// destinations") and reads the pairs under it, and a single 40-pair line is
-// unreadable in a terminal and in Loki alike. Every line is logfmt, every value
-// is a flag's EFFECTIVE value, and no line carries a credential — only the
-// PATHS credentials are read from (see internal/cli's "never log a secret").
-func printConfigSummary(cfg agentConfig, log *slog.Logger) {
-	on := func(b bool) string {
-		if b {
-			return "on"
-		}
-		return "off"
-	}
-	// DERIVED, not enumerated: a section added to agentConfig updates the -config
-	// help through the same walk, and this summary is what answers "is this what
-	// I meant?" — a section missing from a hand-written list reads as "not
-	// configured", which is the one wrong answer it can give.
-	sections := presentSections(cfg)
-	if len(sections) == 0 {
-		sections = append(sections, "(none)")
-	}
-
-	// -cgroup-stats is the one pipeline a NODE can refuse: on a cgroup v1 host
-	// (or one with no /sys/fs/cgroup mounted into the pod) cgroupstats.New
-	// reports ErrUnsupportedNode and the agent disables this pipeline alone,
-	// keeping every other one running. This summary reads FLAGS and probes
-	// nothing — deliberately, and the node's cgroup version is not knowable
-	// from a dry run anyway, which is the whole reason that classification
-	// exists — so "on" would be this line claiming a pipeline runs where it
-	// may never start. It reports the REQUEST instead; what actually happened
-	// is the startup log's "cgroup sampler started" or "cgroup stats are not
-	// available on this node", which is emitted where the answer is known.
-	cgroupStats := "off"
-	if *cgroupStatsOn {
-		cgroupStats = "requested"
-	}
-
-	log.Info("effective configuration",
-		// Which of the three shapes this process is deployed as. It is derived
-		// from the pipeline toggles rather than from one flag (see shardRole),
-		// and it is the first thing to check when the metrics of two workloads
-		// collide: the role decides service.instance.id.
-		"role", agentRole(),
-		"sections", strings.Join(sections, ","),
-		// Which binary this is, not just whether the config parses: the
-		// optional pipelines are build-tag-gated (buildtags.go).
-		"optionalPipelines", builtPipelines(),
-		"pipelines", fmt.Sprintf("logs=%s metrics=%s cadvisor=%s cgroupStats=%s node=%s summary=%s journald=%s ingest=%s events=%s azure=%s serviceGraph=%s",
-			on(*logsOn), on(*metricsOn), on(*cadvisorOn), cgroupStats, on(*nodeOn), on(*summaryOn), on(*journaldOn), on(*ingestOn), on(*eventsOn), on(*azureOn), on(*serviceGraphOn)),
-		"positionsFile", *positionsFile,
-		"transformsFile", *transformsFile,
-		"enrich", *enrichOn,
-		"selfAttributes", *selfAttrsOn,
-		"logLevel", *logLevel,
-	)
-
-	// Everything this process will TALK to. An endpoint typo is the single most
-	// common first-run failure and it is otherwise only visible as an export
-	// error per interval, long after startup — and the per-signal overrides are
-	// worse than that, because a healthy default endpoint makes the wrong one
-	// look like a collector problem. Credentials appear as PATHS only.
-	dest := []any{
-		"metadataEndpoint", *metadataURL,
-		"otlpEndpoint", *otlpEndpoint,
-		"otlpProtocol", *otlpProtocol,
-		"otlpCompression", *otlpCompression,
-		"otlpInsecure", *otlpInsecure,
-		"otlpTLSSkipVerify", *otlpSkipTLS,
-		"otlpCAFile", *otlpCAFile,
-		"otlpBearerTokenFile", *otlpBearer,
-		"kubeletEndpoint", *kubeletEndpoint,
-		"bufferDir", *bufferDir,
-		"bufferMaxBytes", *bufferMax,
-	}
-	for _, o := range []struct {
-		key string
-		ov  *otlpexport.ExportOverride
-	}{
-		{"otlpLogsEndpoint", exportOverride(cfg.Export, signalLogs)},
-		{"otlpMetricsEndpoint", exportOverride(cfg.Export, signalMetrics)},
-		{"otlpTracesEndpoint", exportOverride(cfg.Export, signalTraces)},
-	} {
-		if o.ov != nil && o.ov.Endpoint != "" {
-			dest = append(dest, o.key, o.ov.Endpoint)
-		}
-	}
-	log.Info("effective destinations", dest...)
-
-	// Every socket this process will bind. An address already in use is a
-	// startup failure that names itself, but a listener that is simply EMPTY —
-	// and therefore never bound — is silent, and "-metrics-listen=\"\" so there
-	// are no metrics" is a question nobody thinks to ask.
-	listeners := []any{
-		"listen", *listen,
-		// WHO may read the data-bearing debug surfaces on that port — the live
-		// OTLP stream is this node's whole telemetry feed, so "who can read it"
-		// belongs on the same line as "what is bound", and -check-config must
-		// answer it before a rollout rather than after.
-		"debugAccess", debugAccessMode(),
-		"metricsListen", *metricsListen,
-		"pprofListen", *pprofListen,
-	}
-	if *ingestOn {
-		listeners = append(listeners, "ingestGRPC", *ingestGRPC, "ingestHTTP", *ingestHTTP)
-	}
-	if *serviceGraphOn {
-		listeners = append(listeners,
-			"serviceGraphInternalGRPC", *serviceGraphListen,
-			"serviceGraphInternalHTTP", *serviceGraphHTTPListen)
-		if *serviceGraphIngest {
-			listeners = append(listeners,
-				"serviceGraphIngestGRPC", *serviceGraphIngestGRPC,
-				"serviceGraphIngestHTTP", *serviceGraphIngestHTTP)
-		}
-	}
-	log.Info("effective listeners", listeners...)
-
-	// Who this process says it is on every series it produces about itself.
-	// service.instance.id is role-dependent, and getting it wrong makes two
-	// workloads interleave counters on one (job, instance) — a failure that
-	// renders perfectly and is wrong everywhere.
-	log.Info("effective identity",
-		"node", *nodeName,
-		"namespace", selfmeta.Namespace(),
-		"serviceName", agentServiceName,
-		"instance", agentInstance(),
-		"selfAttributesRefresh", *selfAttrsRefresh,
-		"selfMetricsInterval", *selfMetricsIntv,
-	)
-
-	// The knobs whose wrong value is expensive and quiet: a cadence, a cap or
-	// an exclusion. Not every flag — docs/FLAGS.md is the full list — but the
-	// ones a first rollout gets wrong.
-	limits := []any{
-		"scrapeInterval", *scrapeInterval,
-		"scrapeTimeout", *scrapeTimeout,
-		"scrapeConcurrency", *scrapeConcurrency,
-		"metadataWait", *metadataWait,
-		"logsExcludeNamespaces", strings.Join(cli.SplitList(*excludeNs), ","),
-		"logsUnknownFiles", *logsUnknownFiles,
-		"logsBatchSize", *logsBatch,
-		"logsFlushInterval", *logsFlush,
-		"logsMaxEntryBytes", *maxEntryBytes,
-		"logsRateLimit", *logsRateLimit,
-		"logsMetricsInterval", *logsMetricsEvery,
-	}
-	if *ingestOn {
-		limits = append(limits, "ingestMaxInFlight", *ingestMaxInFlight, "ingestMetadataWait", *ingestWait)
-	}
-	log.Info("effective limits", limits...)
-
-	if cfg.LogMetrics != nil {
-		log.Info("logMetrics", "rules", len(cfg.LogMetrics.Metrics))
-	}
-	if cfg.Routing != nil {
-		for _, rt := range cfg.Routing.Routes {
-			log.Info("routing route", "route", rt.Name, "namespaces", strings.Join(rt.Namespaces, ","), "endpoint", rt.Endpoint)
-		}
-	}
-	// The MERGED shard set, not the section: the chart configures this feature
-	// through flags alone, so printing the section would report "(none)" for
-	// the deployment the dry run most needs to describe. The shard count and
-	// the tier's name are the two things an operator gets wrong (a count that
-	// does not match the StatefulSet leaves traces unpaired, silently), so they
-	// are what the summary names.
-	if shards, err := serviceGraphShardConfig(cfg.ServiceGraphShards); err == nil && shards.Enabled() {
-		log.Info("service-graph forwarding", "shards", shards.Replicas, "statefulSet", shards.StatefulSet,
-			"namespace", shards.Namespace, "port", shards.Port, "endpoints", strings.Join(shards.Endpoints, ","))
-	}
-	if *serviceGraphOn {
-		log.Info("service-graph shard role", "listen", *serviceGraphListen, "httpListen", *serviceGraphHTTPListen,
-			"interval", *serviceGraphIv, "tokenFile", *serviceGraphToken)
-	}
-}
-
-// agentServiceName is the service.name every metric this process generates
-// about ITSELF carries (agentSelfResource sets it); named here so the summary
-// cannot drift from the resource.
-const agentServiceName = "kubescrape-agent"
-
-// agentRole names the deployment shape this process is in, the way
-// agentSelfResource decides it: the two cluster-scoped roles are keyed on every
-// per-node pipeline being off, never on the flag alone.
-func agentRole() string {
-	switch {
-	case shardRole():
-		return "trace-tier-shard"
-	case singletonRole():
-		return "cluster-singleton"
-	default:
-		return "node-agent"
-	}
-}
-
-// agentInstance is the service.instance.id agentSelfResource will derive: the
-// pod for a cluster-scoped role, the node for a node agent. Reported because a
-// collision here merges two processes' cumulative series.
-func agentInstance() string {
-	if singletonRole() || shardRole() {
-		if inst := selfInstanceName(); inst != "" {
-			return inst
-		}
-	}
-	return *nodeName
-}
-
-// The three OTLP signals, as the export section spells them.
-const (
-	signalLogs    = "logs"
-	signalMetrics = "metrics"
-	signalTraces  = "traces"
-)
-
-// exportOverride returns the export section's per-signal override, or nil.
-// A tiny helper rather than three field reads at the call site, because the
-// summary must not be the place that forgets one when a fourth signal appears.
-func exportOverride(exp *otlpexport.ExportConfig, signal string) *otlpexport.ExportOverride {
-	if exp == nil {
-		return nil
-	}
-	switch signal {
-	case signalLogs:
-		return exp.Logs
-	case signalMetrics:
-		return exp.Metrics
-	case signalTraces:
-		return exp.Traces
-	}
-	return nil
-}
-
-// gateMetadata is satisfied by the first successful node-metadata fetch.
-const gateMetadata = "metadata-service"
-
-// readiness tracks the startup gates /readyz reports on.
-//
-// A DaemonSet rolling update advances only when the new pod reports ready, so
-// this endpoint decides whether a bad rollout stops at the first node or
-// marches across the fleet. It previously returned the same static "ok" as
-// /healthz — the agent was "ready" the instant the mux was built, even if it
-// could not reach the metadata service and could therefore attribute nothing.
-//
-// Gates are registered at startup and satisfied as each becomes true; /readyz
-// is 200 only when none are pending, and reports the pending ones so the
-// failure is diagnosable from the probe alone.
-type readiness struct {
-	mu    sync.Mutex
-	gates map[string]bool
-}
-
-func newReadiness() *readiness { return &readiness{gates: map[string]bool{}} }
-
-// require registers a gate that must be satisfied before the agent is ready.
-func (r *readiness) require(name string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, ok := r.gates[name]; !ok {
-		r.gates[name] = false
-	}
-}
-
-// done marks a gate satisfied. Safe to call repeatedly and from any goroutine.
-func (r *readiness) done(name string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.gates[name] = true
-}
-
-// gate registers a gate and returns the func that satisfies it, so a
-// require/done pair cannot name two different gates. The returned func has
-// done's semantics: idempotent, safe from any goroutine.
-func (r *readiness) gate(name string) func() {
-	r.require(name)
-	return func() { r.done(name) }
-}
-
-// pending returns the unsatisfied gates, sorted for a stable probe body.
-func (r *readiness) pending() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	var out []string
-	for name, ok := range r.gates {
-		if !ok {
-			out = append(out, name)
-		}
-	}
-	slices.Sort(out)
-	return out
-}
-
-// states is every registered gate and whether it is satisfied, for
-// obs.RegisterReadiness — the metric half of the probe body, so a fleet stuck
-// unready is visible without a shell on one of its pods.
-func (r *readiness) states() map[string]bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make(map[string]bool, len(r.gates))
-	for name, ok := range r.gates {
-		out[name] = ok
-	}
-	return out
-}
-
-// How long a gate may stay pending before it is worth a line, and how often to
-// repeat it. A rolling update that stops at the first node is the worst first-run
-// experience there is, and the process itself is otherwise silent about it: the
-// pipelines all logged "started", the kubelet's probe is failing, and nothing in
-// the log says which subsystem is holding it.
-//
-// The grace is generous on purpose — reaching the metadata service takes a few
-// seconds on a cold cluster, and a warning during normal startup teaches
-// operators to ignore this one.
-// Vars, not consts, so a test can drive the warn without sleeping through the
-// grace — the same reason the store's clock is injectable.
-var (
-	readinessGrace  = 30 * time.Second
-	readinessReWarn = 2 * time.Minute
-)
-
-// watch reports readiness once, and keeps reporting a gate that will not clear.
-// It returns as soon as everything is satisfied (the gates are STARTUP gates:
-// they never go back), or when the process is shutting down.
-func (r *readiness) watch(ctx context.Context, log *slog.Logger) {
-	start := time.Now()
-	// A steady poll, never a backoff: /readyz is what a rolling update advances
-	// on, so the ready line must appear when the agent becomes ready rather than
-	// up to a backoff later, and the check is one mutex-guarded map read. Only
-	// the WARNING is throttled.
-	wait := min(time.Second, readinessGrace)
-	var lastWarn time.Time
-	t := time.NewTimer(wait)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			// Worth a line: a pod killed before it ever became ready is a
-			// different story from one that served and was rolled.
-			if pending := r.pending(); len(pending) > 0 {
-				log.Warn("shutting down before becoming ready",
-					"gates", strings.Join(pending, ","), "waited", time.Since(start).Round(time.Second))
-			}
-			return
-		case <-t.C:
-		}
-		pending := r.pending()
-		if len(pending) == 0 {
-			log.Info("ready", "waited", time.Since(start).Round(time.Second),
-				"gates", strings.Join(r.names(), ","))
-			return
-		}
-		if elapsed := time.Since(start); elapsed >= readinessGrace &&
-			(lastWarn.IsZero() || time.Since(lastWarn) >= readinessReWarn) {
-			log.Warn("not ready: /readyz is 503, so a rolling update will not advance past this pod",
-				"gates", strings.Join(pending, ","), "waited", elapsed.Round(time.Second))
-			lastWarn = time.Now()
-		}
-		t.Reset(wait)
-	}
-}
-
-// names is every registered gate, sorted — what the ready line reports, so the
-// one Info line says what was actually waited for.
-func (r *readiness) names() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]string, 0, len(r.gates))
-	for name := range r.gates {
-		out = append(out, name)
-	}
-	slices.Sort(out)
-	return out
 }

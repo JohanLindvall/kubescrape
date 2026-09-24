@@ -3,6 +3,7 @@ package otlpexport
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -124,8 +125,8 @@ func TestBufferedDrainsBothSignals(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel() // stop Run BEFORE the queue Closes deferred above; t.Context() alone ends after them
 	go b.Run(ctx)
 
 	waitFor(t, func() bool { return len(send.gotLogs()) == 2 }, "both log batches delivered")
@@ -153,8 +154,8 @@ func TestBufferedSurvivesRestart(t *testing.T) {
 	b2, ls2, ms2 := openBuffer(t, dir, send, 0)
 	defer func() { _ = ls2.Close() }()
 	defer func() { _ = ms2.Close() }()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel() // stop Run BEFORE the queue Closes deferred above; t.Context() alone ends after them
 	go b2.Run(ctx)
 
 	waitFor(t, func() bool { return len(send.gotMetrics()) == 1 }, "queued metric delivered after restart")
@@ -205,8 +206,8 @@ func TestBufferedDropsPermanentRejection(t *testing.T) {
 	// Rewire the log sink's send to the classifying sender.
 	b.logs.send = send.ExportLogs
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel() // stop Run BEFORE the queue Closes deferred above; t.Context() alone ends after them
 	go b.Run(ctx)
 
 	if err := b.ExportLogs(ctx, logsWith("poison")); err != nil {
@@ -233,8 +234,8 @@ func TestBufferedRequeuesStuckBatch(t *testing.T) {
 	defer func() { _ = ls.Close(); _ = ms.Close() }()
 	b.logs.send = send.ExportLogs
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel() // stop Run BEFORE the queue Closes deferred above; t.Context() alone ends after them
 	go b.Run(ctx)
 
 	if err := b.ExportLogs(ctx, logsWith("stuck")); err != nil {
@@ -245,12 +246,7 @@ func TestBufferedRequeuesStuckBatch(t *testing.T) {
 	}
 	// The stuck batch must not block "good".
 	waitFor(t, func() bool {
-		for _, l := range send.gotLogs() {
-			if l == "good" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(send.gotLogs(), "good")
 	}, "good batch delivered while stuck batch requeues")
 
 	// Clear the failure: the requeued batch is eventually delivered too.
@@ -258,12 +254,7 @@ func TestBufferedRequeuesStuckBatch(t *testing.T) {
 	delete(send.errs, "stuck")
 	send.mu2.Unlock()
 	waitFor(t, func() bool {
-		for _, l := range send.gotLogs() {
-			if l == "stuck" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(send.gotLogs(), "stuck")
 	}, "requeued batch delivered after the error clears")
 }
 
@@ -301,7 +292,7 @@ func TestBufferedFullSpoolDoesNotWedgeOnPoisonHead(t *testing.T) {
 		t.Fatal(err)
 	}
 	good := 0
-	for i := 0; i < 200; i++ {
+	for range 200 {
 		if err := b.ExportLogs(context.Background(), logsWith("good")); err != nil {
 			break // ErrFull: the spool is at its cap
 		}
@@ -311,17 +302,12 @@ func TestBufferedFullSpoolDoesNotWedgeOnPoisonHead(t *testing.T) {
 		t.Fatal("cap too small to hold any good batch behind the poison head")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel() // stop Run BEFORE the queue Closes deferred above; t.Context() alone ends after them
 	go b.Run(ctx)
 
 	waitFor(t, func() bool {
-		for _, l := range send.gotLogs() {
-			if l == "good" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(send.gotLogs(), "good")
 	}, "good batch delivered despite a poison head at a full spool")
 }
 

@@ -1,10 +1,14 @@
 package servicemonitors
 
-// The PodMonitor half of this package is a parallel implementation of the
-// ServiceMonitor half, and every guard added so far went to the ServiceMonitor
-// side: the unparseable-update removal, the deterministic ordering and the
-// namespace convention were each asserted once, on the copy that did not need
-// it twice. These are the mirrors.
+// The two monitor kinds share one skeleton — parseMonitorSpec (decode, selector
+// bounds, endpoint cap, secret-ref namespacing), upsertMonitor (the
+// invalid-update removal and the resourceVersion re-delivery check),
+// sortedMonitors and namespaceSelector.resolve — and differ only in the WIRING
+// each kind supplies to it: its spec type, its endpoint-list key, its index
+// maps and its exported doors (UpsertPodMonitor, PodMonitors, PodNamespaces).
+// These tests pin that PodMonitor wiring, which is where a regression can still
+// hide: when the kinds were parallel implementations every guard was asserted
+// once, on the ServiceMonitor copy, and these began as the mirrors.
 
 import (
 	"testing"
@@ -13,12 +17,7 @@ import (
 )
 
 func podMonitorObj(namespace, name string, spec map[string]any) *unstructured.Unstructured {
-	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "monitoring.coreos.com/v1",
-		"kind":       "PodMonitor",
-		"metadata":   map[string]any{"namespace": namespace, "name": name},
-		"spec":       spec,
-	}}
+	return crObject("PodMonitor", namespace, name, "", spec)
 }
 
 // Mirror of TestIndexUnparseableUpdateRemoves. A PodMonitor edited into an
@@ -59,10 +58,11 @@ func TestPodMonitorUnparseableUpdateRemoves(t *testing.T) {
 }
 
 // Mirror of TestAllIsDeterministicallyOrdered. When two PodMonitors select the
-// same pod and mint the same URL, handleNodeTargets' URL dedup keeps the FIRST
-// — so map-iteration order must not decide which monitor's name, auth and
-// relabelings ride on the surviving target. The PodMonitors() copy carries the
-// fullest comment about that and had no test.
+// same pod and mint the same URL, the server serves ONE merged target
+// (scrape.MergeMonitorEndpoint): the first monitor in sorted order names it and
+// its relabel chain runs first — so map-iteration order must not decide which
+// monitor's name leads, whose rules apply first, or whose auth wins a
+// conflict on the merged target.
 func TestPodMonitorsAreDeterministicallyOrdered(t *testing.T) {
 	ix := NewIndex()
 	for _, spec := range []struct{ ns, name string }{
@@ -156,8 +156,9 @@ func TestPodMonitorNamespaceSelector(t *testing.T) {
 	}
 }
 
-// The two kinds must answer the namespace question IDENTICALLY — the two
-// methods are byte-identical today and nothing pins that they stay so.
+// The two kinds must answer the namespace question IDENTICALLY. Both methods
+// delegate to namespaceSelector.resolve today; this pins that the PodMonitor
+// door keeps doing so, rather than growing a rule of its own.
 func TestBothMonitorKindsAgreeOnNamespaces(t *testing.T) {
 	for _, tc := range []struct {
 		name string

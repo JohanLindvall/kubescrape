@@ -9,39 +9,46 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
-// The undelivered-chunk eviction must drop the resource that has gone QUIETEST,
-// never the one still producing. retryOrder is rebuilt every Export in chunk
-// order — fresh resources first, retained-only ones appended last — so popping
-// index 0 systematically destroyed a live resource's whole retained pile (its
-// sealed aggregation windows and expiry-grace samples are held nowhere else)
-// while a dead pile survived at the tail.
+// finalGen is one retained generation of n FINAL samples (the only kind the
+// retention keeps: values the store no longer holds) snapshotted at ts.
+func finalGen(ts time.Time, n int) seriesSamples {
+	samples := make([]sample, n)
+	for i := range samples {
+		samples[i].final = true
+	}
+	return seriesSamples{samples: samples, ts: ts}
+}
+
+// The undelivered-chunk eviction must drop what has gone QUIETEST, never what
+// is still producing. retryOrder is rebuilt every Export in chunk order —
+// fresh resources first, retained-only ones appended last — so popping index 0
+// systematically destroyed a live resource's whole retained pile (its sealed
+// aggregation windows and expiry-grace samples are held nowhere else) while a
+// dead pile survived at the tail.
 func TestRetainEvictsTheStalestResourceNotTheLiveOne(t *testing.T) {
 	set := &DynamicMetricSet{}
 
 	t1 := time.Now().Add(-time.Minute)
 	t2 := t1.Add(30 * time.Second)
-	gen := func(ts time.Time, n int) seriesSamples {
-		return seriesSamples{samples: make([]sample, n), ts: ts}
-	}
 
 	// The shape one Export past the first failure produces: "live" carries the
 	// retained generation AND a fresh one (mergeRetry prepends the old), "quiet"
 	// only the retained one — and mergeRetry appended "quiet" to the order after
 	// the resources that had fresh samples, so it is at the TAIL.
 	byResource := map[string][]seriesSamples{
-		"live":  {gen(t1, 15_000), gen(t2, 15_000)},
-		"quiet": {gen(t1, 30_000)},
+		"live":  {finalGen(t1, 15_000), finalGen(t2, 15_000)},
+		"quiet": {finalGen(t1, 30_000)},
 	}
 	set.retain(byResource, []string{"live", "quiet"})
 
-	if _, ok := set.retryBy["live"]; !ok {
-		t.Error("the still-producing resource was evicted")
+	if gens := set.retryBy["live"]; len(gens) != 2 {
+		t.Errorf("the still-producing resource lost generations: %d left, want both", len(gens))
 	}
 	if _, ok := set.retryBy["quiet"]; ok {
 		t.Error("the resource that had gone quiet survived the eviction")
 	}
-	if set.DroppedUndelivered() != 1 {
-		t.Errorf("dropped-undelivered = %d, want 1", set.DroppedUndelivered())
+	if got := set.DroppedUndelivered(); got != 30_000 {
+		t.Errorf("dropped-undelivered = %d, want the 30000 samples evicted", got)
 	}
 	total := 0
 	for _, ss := range set.retryBy {
@@ -51,6 +58,45 @@ func TestRetainEvictsTheStalestResourceNotTheLiveOne(t *testing.T) {
 	}
 	if total != set.retainedSamples {
 		t.Errorf("accounting drifted: counted %d, actual %d", set.retainedSamples, total)
+	}
+}
+
+// Past the sample bound the OLDEST GENERATION goes, not the whole resource: the
+// retention is a sliding window over an outage, and dropping a resource's whole
+// pile to make room for one more generation emptied it — a single busy
+// resource lost every retained point at once, about every thirteen cycles.
+func TestRetentionEvictsTheOldestGenerationNotTheWholeResource(t *testing.T) {
+	set := &DynamicMetricSet{}
+	base := time.Now().Add(-time.Hour)
+	for i := range 13 { // 13 x 4000 = 52000, one generation over the bound
+		set.retain(map[string][]seriesSamples{
+			"busy": {finalGen(base.Add(time.Duration(i)*30*time.Second), 4000)},
+		}, []string{"busy"})
+	}
+	gens := set.retryBy["busy"]
+	if len(gens) != 12 {
+		t.Fatalf("retained generations = %d, want 12: only the oldest may go", len(gens))
+	}
+	if !gens[0].ts.Equal(base.Add(30 * time.Second)) {
+		t.Errorf("oldest surviving generation is at %v, want the second one (%v)", gens[0].ts, base.Add(30*time.Second))
+	}
+	if set.retainedSamples != 48_000 || set.DroppedUndelivered() != 4000 {
+		t.Errorf("retained %d / dropped %d, want 48000 / 4000", set.retainedSamples, set.DroppedUndelivered())
+	}
+}
+
+// A retained generation that mixes final and live samples (a fresh snapshot)
+// keeps only the final ones: the live ones are the store's to re-read.
+func TestRetainKeepsOnlyFinalSamples(t *testing.T) {
+	set := &DynamicMetricSet{}
+	mixed := make([]sample, 4)
+	mixed[1].final = true
+	mixed[3].final = true
+	set.retain(map[string][]seriesSamples{
+		"r": {{samples: mixed, ts: time.Now()}},
+	}, []string{"r"})
+	if set.retainedSamples != 2 || len(set.retryBy["r"]) != 1 || len(set.retryBy["r"][0].samples) != 2 {
+		t.Fatalf("retained %d samples, want the 2 final ones", set.retainedSamples)
 	}
 }
 

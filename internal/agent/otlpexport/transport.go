@@ -17,16 +17,18 @@ package otlpexport
 //     a different host leaks a credential across a trust boundary because a
 //     field was left empty.
 //
-// The three derivations that must build on this partition are
-// cmd/kubescrape-agent's routeExportConfig (a route naming its own endpoint
-// drops every base credential — each is taken from the route or left unset),
-// ExportConfig.signalConfig (persignal.go — the same rule for a per-signal
-// `export.<signal>` naming its own endpoint, which used to copy the base
-// wholesale and so presented the collector's bearer token, CA bundle and
-// skip-verify decision to a third-party backend) and
-// servicegraph.ReshardConfig.clientConfig (a shard client inherits only
-// the transport tuning; everything destination-scoped comes from the
-// serviceGraphShards section). All three used to spell the split by hand;
+// The derivations that must build on this partition are
+// ExportConfig.destinationConfig (persignal.go — ONE derivation for a
+// per-signal `export.<signal>` override and a routing route alike, reached
+// through signalConfig and RouteConfig: a destination naming its own endpoint
+// drops the flag base's bearer token, CA bundle and skip-verify decision —
+// each is taken from the override or left unset — while `export.headers` and,
+// unless the override sets its own, the plaintext decision still ride along;
+// the section's client pair rides to a signal and never to a route, argued
+// there) and servicegraph.ReshardConfig.clientConfig (a shard client inherits
+// only the transport tuning; everything destination-scoped comes from the
+// serviceGraphShards section). They used to spell the split by hand, the
+// route's copy living in cmd/kubescrape-agent;
 // TestConfigFieldsAreClassified is what forces a NEW Config field to be
 // assigned to one side deliberately instead of drifting into whichever
 // derivation forgets it.

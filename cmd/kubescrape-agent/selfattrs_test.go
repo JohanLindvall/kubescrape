@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -95,6 +97,59 @@ func TestSelfBuildAppliesConfiguredPipeline(t *testing.T) {
 	}
 	if got := attrOf(t, a, "zone"); got != "eu-1a" {
 		t.Errorf("zone = %q, want eu-1a", got)
+	}
+}
+
+// metricsCapture keeps the last payload an export chain delivered.
+type metricsCapture struct{ md pmetric.Metrics }
+
+func (c *metricsCapture) ExportMetrics(_ context.Context, md pmetric.Metrics) error {
+	c.md = md
+	return nil
+}
+
+// -self-attributes-refresh=0 disables the LOOKUP, not the stamp. The pod source
+// used to stay nil there, and selfmeta.Wrap returns the sink unwrapped for a nil
+// source — so the `self` pipeline's static attributes (a cluster name, the
+// label an alert on the agent's own metrics selects by) silently vanished from
+// every self-metric and span-metric export, which neither the flag nor its docs
+// said. The node pipelines keep theirs with -node-metadata-refresh=0; so must
+// this one.
+func TestSelfAttributesRefreshZeroKeepsTheStaticAttributes(t *testing.T) {
+	defer func(on bool, refresh, intv time.Duration) {
+		*selfAttrsOn, *selfAttrsRefresh, *selfMetricsIntv = on, refresh, intv
+	}(*selfAttrsOn, *selfAttrsRefresh, *selfMetricsIntv)
+	*selfAttrsOn, *selfAttrsRefresh, *selfMetricsIntv = true, 0, time.Minute
+
+	pod := startSelfPod(context.Background(), nil, slog.New(slog.DiscardHandler))
+	if pod == nil {
+		t.Fatal("-self-attributes-refresh=0 returned no pod source: the self pipeline is then skipped outright")
+	}
+	if p := pod(); p != nil {
+		t.Fatalf("with the lookup off the pod must stay unresolved, got %+v", p)
+	}
+
+	b, err := attrs.NewBuilders(&attrs.Config{Static: map[string]string{"k8s.cluster.name": "prod-eu"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &metricsCapture{}
+	out := selfmeta.Wrap(sink, pod, selfBuild(b.Self, nil))
+	md := pmetric.NewMetrics()
+	m := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	m.SetName("kubescrape_up")
+	m.SetEmptyGauge().DataPoints().AppendEmpty().SetIntValue(1)
+	if err := out.ExportMetrics(context.Background(), md); err != nil {
+		t.Fatal(err)
+	}
+	if got := attrOf(t, sink.md.ResourceMetrics().At(0).Resource().Attributes(), "k8s.cluster.name"); got != "prod-eu" {
+		t.Fatalf("k8s.cluster.name = %q with -self-attributes-refresh=0, want prod-eu: the static attributes must not depend on the lookup", got)
+	}
+
+	// And the stamp stays off where it should: -self-attributes=false.
+	*selfAttrsOn = false
+	if startSelfPod(context.Background(), nil, slog.New(slog.DiscardHandler)) != nil {
+		t.Fatal("-self-attributes=false must stamp nothing")
 	}
 }
 
@@ -367,5 +422,44 @@ func TestSelfSinkBypassesTheRouterAndTheTap(t *testing.T) {
 	}
 	if fork, ok := sink.(*transform.Wrapper); !ok || fork.Active() != w.Active() {
 		t.Fatal("the self chain must share the reloaded transform program")
+	}
+}
+
+// countingTransport counts the requests that travel through it.
+type countingTransport struct {
+	next http.RoundTripper
+	n    atomic.Int64
+}
+
+func (c *countingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	c.n.Add(1)
+	return c.next.RoundTrip(r)
+}
+
+// The self-pod lookup keeps its own CLIENT (no Observe hook, its own cache)
+// but must ride the transport run() hands it — the one the shared client uses.
+// With a transport of its own, its 1m refresh (inside both the client's 90s
+// and the service's 120s idle timeouts) held one extra keep-alive connection,
+// and a server goroutine, open on the metadata-service singleton per agent.
+func TestSelfPodLookupRidesTheSharedMetadataTransport(t *testing.T) {
+	defer func(on bool, refresh, intv time.Duration, url string) {
+		*selfAttrsOn, *selfAttrsRefresh, *selfMetricsIntv, *metadataURL = on, refresh, intv, url
+	}(*selfAttrsOn, *selfAttrsRefresh, *selfMetricsIntv, *metadataURL)
+
+	srv := httptest.NewServer(http.NotFoundHandler())
+	defer srv.Close()
+	*selfAttrsOn, *selfAttrsRefresh, *selfMetricsIntv, *metadataURL = true, time.Minute, time.Minute, srv.URL
+
+	rt := &countingTransport{next: metaclient.NewTransport()}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel() // stop the lookup BEFORE the deferred server Close and flag restore; t.Context() ends after them
+	if startSelfPod(ctx, rt, slog.New(slog.DiscardHandler)) == nil {
+		t.Fatal("the lookup was not started")
+	}
+	for deadline := time.Now().Add(5 * time.Second); rt.n.Load() == 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("the self-pod lookup never went through the transport it was handed: it opened a connection pool of its own")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

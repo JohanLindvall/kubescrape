@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -28,7 +29,7 @@ func TestJournaldRulesDropEntries(t *testing.T) {
 	}
 
 	exp := &captureExporter{}
-	r := New(Config{Exporter: exp, FlushInterval: 20 * time.Millisecond, Rules: rules})
+	r := New(Config{Exporter: exp, FlushInterval: 20 * time.Millisecond, Chain: logchain.Config{Rules: rules}})
 	r.open = fakeOpener(entries, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -65,7 +66,7 @@ func TestJournaldLogMetricsSeeDroppedEntries(t *testing.T) {
 	}
 
 	exp := &captureExporter{}
-	r := New(Config{Exporter: exp, FlushInterval: 20 * time.Millisecond, Rules: rules, LogMetrics: set})
+	r := New(Config{Exporter: exp, FlushInterval: 20 * time.Millisecond, Chain: logchain.Config{Rules: rules, LogMetrics: set}})
 	r.open = fakeOpener(entries, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -140,7 +141,7 @@ func TestJournaldLogMetricsCountOncePerRecordNotPerAttempt(t *testing.T) {
 	entries := []rawEntry{mkEntry("c1", "kubelet.service", "one real line", "6")}
 
 	exp := &captureExporter{failures: 2} // two transient failures, then success
-	r := New(Config{Exporter: exp, FlushInterval: 20 * time.Millisecond, LogMetrics: set})
+	r := New(Config{Exporter: exp, FlushInterval: 20 * time.Millisecond, Chain: logchain.Config{LogMetrics: set}})
 	r.open = fakeOpener(entries, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

@@ -3,9 +3,7 @@ package metrics
 import (
 	"fmt"
 	"log/slog"
-	"maps"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -129,6 +127,11 @@ type labelTemplate struct {
 // metricRule is a compiled Dynamic: a series plus the match/label logic that
 // feeds it.
 type metricRule struct {
+	// declared is the name as written in the logMetrics rule, BEFORE
+	// -logs-metrics-name-prefix; series.name carries the prefixed one. A
+	// script's emit_metric names the metric the way the config does, so
+	// EmitDirect matches on this.
+	declared  string
 	series    *series
 	match     *logline.Selectors
 	labels    []labelTemplate // data-point labels
@@ -306,13 +309,15 @@ type DynamicMetricSet struct {
 	hasResLabels bool
 	// Count is the number of configured rules.
 	Count int
-	// retryBy/retryOrder hold previous exports' UNDELIVERED samples, keyed by
-	// resource, so the next Export re-offers them at their original snapshot
-	// times. snapshot() is destructive — it seals aggregation windows, zeroes
-	// idled samples and deletes expired ones — so without this a failed send
-	// ended those observations' lives. Bounded by maxRetainedResources AND
-	// maxRetainedSamples (retainedSamples is the running total); permanently
-	// rejected chunks are dropped counted instead of retained (permanent).
+	// retryBy/retryOrder hold previous exports' UNDELIVERED samples that the
+	// store no longer holds, keyed by resource, so the next Export re-offers
+	// them at their original snapshot times. snapshot() is destructive for
+	// those — it seals aggregation windows, zeroes idled gauges and deletes
+	// expired samples — so without this a failed send ended those
+	// observations' lives (a live series is re-read instead; see retain).
+	// Bounded by maxRetainedResources AND maxRetainedSamples (retainedSamples
+	// is the running total); permanently rejected chunks are dropped counted
+	// instead of retained (permanent).
 	// Guarded by exportMu: the agent runs Export from one goroutine, but the
 	// FINAL export joins the run loop through a BUDGETED wait, and on a blown
 	// budget the two overlap — the old single-goroutine comment promised more
@@ -322,32 +327,53 @@ type DynamicMetricSet struct {
 	retryBy         map[string][]seriesSamples
 	retryOrder      []string
 	retainedSamples int
-	// exportFailures counts consecutive failed export cycles, so a persisting
-	// outage warns once and then restates itself on a schedule instead of once
-	// per interval per node — and so the RECOVERY can be one Info line.
-	// Guarded by exportMu, like the retention beside it.
-	exportFailures int
-	exportFailedAt time.Time
-	// exportWarn throttles the re-warn; evictWarn the retention-eviction one.
-	exportWarn logdedupe.Throttle
-	evictWarn  logdedupe.Throttle
+	// exportOutage is the run of consecutive failed export cycles, so a
+	// persisting outage warns once and then restates itself on a schedule
+	// (reWarnInterval) instead of once per interval per node — and so the
+	// RECOVERY can be one Info line. Guarded by exportMu, like the retention
+	// beside it (logdedupe.Outage is not safe for concurrent use).
+	exportOutage logdedupe.Outage
+	// evictWarn throttles the retention-eviction line and permanentWarn the
+	// per-chunk permanent-rejection line, each on its own gate because they
+	// co-occur with the outage's and one shared gate would let whichever
+	// fired first silence the rest.
+	evictWarn     logdedupe.Throttle
+	permanentWarn logdedupe.Throttle
 }
 
-// DroppedCapped counts observations this set rejected because a metric's
-// label-set cardinality cap was reached.
-func (s *DynamicMetricSet) DroppedCapped() uint64 { return s.drops.Capped() }
-
-// DroppedUndelivered counts undelivered resources dropped because the re-offer
-// buffer filled (maxRetainedResources / maxRetainedSamples) or because the
-// collector rejected them PERMANENTLY (WithPermanentClassifier). Unlike a
-// transiently failed export, which is retried, these observations are gone.
+// DroppedUndelivered counts undelivered SAMPLES (data points) dropped because
+// the re-offer buffer filled (maxRetainedResources / maxRetainedSamples) or
+// because the collector rejected their chunk PERMANENTLY
+// (WithPermanentClassifier). Unlike a transiently failed export, which is
+// re-offered, these observations are gone.
 func (s *DynamicMetricSet) DroppedUndelivered() uint64 { return s.drops.Retained() }
 
 // DroppedCappedByMetric reports this set's cap-refused observations per metric
 // name — the only form an operator can act on, since the cap frees slots only
-// through idleness.
+// through idleness: one burst of high-cardinality labels blinds a metric for
+// maxAge + the grace window (24h by default), and an aggregate says that
+// happened without saying to WHICH metric.
+//
+// It walks the set's unique series (rules sharing a name share one series, so
+// a series' count IS its metric's) and reports only the nonzero ones, so the
+// published family stays absent until something has actually dropped — the
+// data-driven label set obs.RegisterLogMetricsDrops documents. The counts live
+// on the series (series.cappedDrops) rather than in a set-wide map, so the
+// refusal path takes no lock beyond the series' own.
 func (s *DynamicMetricSet) DroppedCappedByMetric() map[string]float64 {
-	return s.drops.CappedByMetric()
+	out := map[string]float64{}
+	seen := make(map[*series]bool, len(s.rules))
+	for _, rule := range s.rules {
+		sr := rule.series
+		if sr == nil || seen[sr] {
+			continue
+		}
+		seen[sr] = true
+		if n := sr.cappedDrops.Load(); n > 0 {
+			out[sr.name] += float64(n)
+		}
+	}
+	return out
 }
 
 // DroppedNaN counts observations this set rejected because the extracted value
@@ -421,7 +447,11 @@ func (ac *addContext) valueLookup(key string) (float64, bool) {
 // NewDynamicMetricSet compiles a metric specification into an evaluatable set.
 // Rules sharing a metric name share one underlying series.
 func NewDynamicMetricSet(metrics []Dynamic, opts ...Option) (*DynamicMetricSet, error) {
-	cfg := setConfig{log: slog.Default()}
+	// log stays nil unless WithLogger sets one: the set and every series it
+	// compiles resolve slog.Default() at the CALL (DynamicMetricSet.logger,
+	// series.logger), so a set built before the process installs its handler
+	// still logs through that handler.
+	cfg := setConfig{}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -529,9 +559,30 @@ func (s *DynamicMetricSet) add(values ValueFunc, lookup func(string) string, res
 // exist in the logMetrics config: declaration is where its type, action,
 // buckets and cardinality cap live, and an undeclared name is a script bug
 // reported as a script error rather than a silently minted unbounded series.
-// The observation lands in the rule's own series under all the usual caps;
-// labels are applied in sorted-key order for a deterministic identity. Safe
-// on a nil set (returns an error naming the reason).
+// The observation lands in the rule's own series under all the usual caps.
+// Safe on a nil set (returns an error naming the reason).
+//
+// name is the metric's name AS DECLARED in logMetrics, without the
+// -logs-metrics-name-prefix the exported series carries: the prefix is a
+// deployment knob, and a script written against the documented contract used
+// to fail every batch — as a script error, i.e. a failed export, and on the
+// tailer's in-place seam a rewind that re-read and re-failed the same files on
+// every sweep — the moment an operator set one. The PREFIXED name is still
+// accepted, as a fallback taken only when no rule declares name itself, so a
+// script that worked around the old behaviour keeps working and the choice
+// stays deterministic even where one rule's declared name is another's
+// prefixed one.
+//
+// Label ORDER does not matter: a series' identity is an order-independent
+// fold (labels.hashAccum) and its rendering sorts (labels.String), so the map
+// is walked as Go ranges it.
+//
+// A NaN/Inf, or a negative on a counter or summary, is refused exactly as a
+// rule's extracted value is — counted, warned at most hourly, never admitted —
+// and NOT reported as a script error: a script error fails the export, the
+// tailer then rewinds and re-runs the same batch, and a data-dependent NaN
+// would wedge log shipping on it. The refusal line says the value came from
+// emit_metric, not from a rule's value/valueRegexp.
 //
 // THE RESOURCE IS READ AT CALL TIME, and that is the contract — not an
 // accident of where the bridge happens to hold a handle. A transform script
@@ -557,27 +608,43 @@ func (s *DynamicMetricSet) EmitDirect(name string, value float64, lbls map[strin
 	if s == nil {
 		return fmt.Errorf("emit_metric %q: no logMetrics section is configured", name)
 	}
-	for _, r := range s.rules {
-		if r.series.name != name {
-			continue
-		}
-		// The one runtime "le" check. Every other door into the store has
-		// static label names (config specs, checked by rejectHistogramLe;
-		// registry label sets, which come from code), but a script's label map
-		// is arbitrary — and an "le" on a histogram would split the
-		// distribution into one sample per value, each rendering its own full
-		// bucket set. An error rather than a silent drop, matching how every
-		// other mistake in emit_metric is reported.
-		if _, ok := lbls[leLabel]; ok && r.series.kind == kindHistogram {
-			return fmt.Errorf("emit_metric %q: a histogram may not set a label named %q — "+
-				"it is the bucket-bound label generated from the histogram's own buckets", name, leLabel)
-		}
-		var buf labels
-		for _, k := range slices.Sorted(maps.Keys(lbls)) {
-			buf = buf.set(k, lbls[k])
-		}
-		r.series.observe(buf, value, resourceAccum(resource), resource, nil)
+	r := s.emitRule(name)
+	if r == nil {
+		return fmt.Errorf("emit_metric %q: no logMetrics rule declares this metric", name)
+	}
+	// The one runtime "le" check. Every other door into the store has static
+	// label names (config specs, checked by rejectHistogramLe; registry label
+	// sets, which come from code), but a script's label map is arbitrary — and
+	// an "le" on a histogram would split the distribution into one sample per
+	// value, each rendering its own full bucket set. An error rather than a
+	// silent drop, matching how every other mistake in emit_metric is reported.
+	if _, ok := lbls[leLabel]; ok && r.series.kind == kindHistogram {
+		return fmt.Errorf("emit_metric %q: a histogram may not set a label named %q — "+
+			"it is the bucket-bound label generated from the histogram's own buckets", name, leLabel)
+	}
+	if r.series.refuse(value, originScript) {
 		return nil
 	}
-	return fmt.Errorf("emit_metric %q: no logMetrics rule declares this metric", name)
+	buf := make(labels, 0, len(lbls))
+	for k, v := range lbls {
+		buf = buf.set(k, v)
+	}
+	r.series.observe(buf, value, resourceAccum(resource), resource, nil)
+	return nil
+}
+
+// emitRule resolves emit_metric's name: the declared name first, the prefixed
+// series name only as a fallback (see EmitDirect).
+func (s *DynamicMetricSet) emitRule(name string) *metricRule {
+	for _, r := range s.rules {
+		if r.declared == name {
+			return r
+		}
+	}
+	for _, r := range s.rules {
+		if r.series.name == name {
+			return r
+		}
+	}
+	return nil
 }

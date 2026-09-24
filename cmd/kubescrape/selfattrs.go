@@ -28,7 +28,8 @@ import (
 )
 
 // selfResolver looks the service's own pod up in its own store, enriching it
-// with the owner chain and namespace metadata exactly as the HTTP handlers do.
+// with the owner chain and namespace metadata exactly as the HTTP handlers do
+// (server.Enrich).
 // It fails until the pod informer has delivered this pod (the lookup retries),
 // and keeps failing — harmlessly, leaving the bare identity in place — when
 // the process is not a pod whose name is its hostname.
@@ -60,8 +61,7 @@ func selfResolver(st *store.Store, resolver server.MetadataResolver) func(contex
 		}
 		obs.SelfMetadataLookups.WithLabelValues(obs.SelfLookupByName).Inc()
 		pod := np.Pod
-		pod.Owners, pod.OwnersOmitted = resolver.Resolve(pod.Namespace, np.OwnerRefs)
-		pod.NamespaceMetadata = resolver.Namespace(pod.Namespace)
+		server.Enrich(resolver, &pod, np.OwnerRefs)
 		return &pod, nil
 	}
 }

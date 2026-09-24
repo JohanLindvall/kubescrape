@@ -21,6 +21,14 @@ import (
 // entries in continuous use survive a rotation and memory stays bounded at 2x
 // the cap.
 //
+// A COUNT bounds memory only while entries are alike in size. Where one entry
+// can cost a million times another (a compiled regexp: a few hundred bytes for
+// a route pattern, tens of MB for a repeat-heavy one) the cache is also given a
+// WEIGHT budget (newWeightedGenCache): a generation rotates at whichever of the
+// two it reaches first, so memory is bounded at about 2x the weight budget
+// (plus one entry's weight per generation, the one that crossed it) however
+// the entries are sized.
+//
 // Hits are lock-free (one atomic pointer load plus a sync.Map read); the mutex
 // is taken only to admit an entry. A nil *genCache is a no-op cache.
 type genCache[V any] struct {
@@ -29,11 +37,24 @@ type genCache[V any] struct {
 	prev atomic.Pointer[sync.Map]
 	n    int // entries admitted into cur; guarded by mu
 	max  int
+	// weigh, when set, is an entry's cost against maxWeight; w is the weight
+	// admitted into cur (guarded by mu).
+	weigh     func(V) int
+	w         int
+	maxWeight int
 }
 
 func newGenCache[V any](limit int) *genCache[V] {
 	c := &genCache[V]{max: limit}
 	c.cur.Store(&sync.Map{})
+	return c
+}
+
+// newWeightedGenCache is newGenCache that also rotates once the weight
+// admitted into the current generation reaches maxWeight.
+func newWeightedGenCache[V any](limit, maxWeight int, weigh func(V) int) *genCache[V] {
+	c := newGenCache[V](limit)
+	c.weigh, c.maxWeight = weigh, maxWeight
 	return c
 }
 
@@ -70,9 +91,12 @@ func (c *genCache[V]) store(key string, v V) {
 		return
 	}
 	c.n++
-	if c.n >= c.max {
+	if c.weigh != nil {
+		c.w += c.weigh(v)
+	}
+	if c.n >= c.max || (c.weigh != nil && c.w >= c.maxWeight) {
 		c.prev.Store(cur)
 		c.cur.Store(&sync.Map{})
-		c.n = 0
+		c.n, c.w = 0, 0
 	}
 }

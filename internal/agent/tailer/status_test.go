@@ -79,9 +79,7 @@ func TestStatusConcurrentScrape(t *testing.T) {
 
 	// Writer: keep the file growing so positions/lag churn under the scrapes.
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		i := 0
 		for {
 			select {
@@ -93,7 +91,7 @@ func TestStatusConcurrentScrape(t *testing.T) {
 			writeLog(t, dir, fmt.Sprintf("%s stdout F line %d", timeNowCRI(), i))
 			time.Sleep(2 * time.Millisecond)
 		}
-	}()
+	})
 
 	// One client with an idle pool as wide as the scraper fleet. The default
 	// transport keeps MaxIdleConnsPerHost=2, so 16 goroutines looping without
@@ -108,9 +106,7 @@ func TestStatusConcurrentScrape(t *testing.T) {
 
 	var scrapes, failures atomic.Int64
 	for range 16 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				select {
 				case <-done:
@@ -137,7 +133,7 @@ func TestStatusConcurrentScrape(t *testing.T) {
 				}
 				scrapes.Add(1)
 			}
-		}()
+		})
 	}
 
 	time.Sleep(duration)
@@ -171,7 +167,7 @@ func TestStalledIsNotRaisedForAHealthyBudgetCutReplay(t *testing.T) {
 	// timeNowCRI() lines vary in length and a per-line byte budget derived
 	// from the first one lets two short lines through a pass.
 	var lines []string
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		lines = append(lines, fmt.Sprintf("2026-07-05T10:00:%02dZ stdout F seg-%d", i, i))
 	}
 	writeLines(t, rot, lines...)

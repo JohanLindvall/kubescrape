@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 )
 
 // sdkResourceAttrs is what an OpenTelemetry-Operator-instrumented pod actually
@@ -49,14 +50,14 @@ const sdkLogBody = `level=info ts=2026-08-18T09:31:07.442Z caller=handler.go:214
 // records, each with a handful of attributes and a ~180-byte line.
 func sdkLogs(resources, scopes, records int) plog.Logs {
 	ld := plog.NewLogs()
-	for r := 0; r < resources; r++ {
+	for r := range resources {
 		rl := ld.ResourceLogs().AppendEmpty()
 		sdkResourceAttrs(rl.Resource().Attributes(), r)
-		for s := 0; s < scopes; s++ {
+		for s := range scopes {
 			sl := rl.ScopeLogs().AppendEmpty()
 			sl.Scope().SetName(fmt.Sprintf("github.com/acme/shop/internal/lib%d", s))
 			sl.Scope().SetVersion("0.4.1")
-			for i := 0; i < records; i++ {
+			for i := range records {
 				lr := sl.LogRecords().AppendEmpty()
 				lr.Body().SetStr(sdkLogBody)
 				lr.SetSeverityNumber(plog.SeverityNumberInfo)
@@ -78,18 +79,18 @@ func sdkLogs(resources, scopes, records int) plog.Logs {
 // a modest label set. 50 metrics x 20 points is a typical service's minute.
 func sdkMetrics(resources, metricsN, points int) pmetric.Metrics {
 	md := pmetric.NewMetrics()
-	for r := 0; r < resources; r++ {
+	for r := range resources {
 		rm := md.ResourceMetrics().AppendEmpty()
 		sdkResourceAttrs(rm.Resource().Attributes(), r)
 		sm := rm.ScopeMetrics().AppendEmpty()
 		sm.Scope().SetName("github.com/acme/shop/internal/metrics")
-		for m := 0; m < metricsN; m++ {
+		for m := range metricsN {
 			me := sm.Metrics().AppendEmpty()
 			me.SetName(fmt.Sprintf("http.server.request.duration.%d", m))
 			me.SetUnit("s")
 			me.SetDescription("Duration of inbound HTTP requests")
 			dps := me.SetEmptySum().DataPoints()
-			for p := 0; p < points; p++ {
+			for p := range points {
 				dp := dps.AppendEmpty()
 				dp.SetDoubleValue(float64(p))
 				dp.SetTimestamp(pcommon.Timestamp(1755500000000000000))
@@ -105,11 +106,11 @@ func sdkMetrics(resources, metricsN, points int) pmetric.Metrics {
 
 func sdkTraces(resources, spans int) ptrace.Traces {
 	td := ptrace.NewTraces()
-	for r := 0; r < resources; r++ {
+	for r := range resources {
 		rs := td.ResourceSpans().AppendEmpty()
 		sdkResourceAttrs(rs.Resource().Attributes(), r)
 		ss := rs.ScopeSpans().AppendEmpty()
-		for i := 0; i < spans; i++ {
+		for i := range spans {
 			sp := ss.Spans().AppendEmpty()
 			sp.SetName("GET /api/v2/cart")
 			sp.SetKind(ptrace.SpanKindServer)
@@ -172,7 +173,7 @@ func BenchmarkNestingWalkLongLines(b *testing.B) {
 	sdkResourceAttrs(rl.Resource().Attributes(), 0)
 	sl := rl.ScopeLogs().AppendEmpty()
 	line := strings.Repeat(sdkLogBody+" ", 8) // ~1.4 KiB, well past the prune
-	for i := 0; i < 512; i++ {
+	for range 512 {
 		sl.LogRecords().AppendEmpty().Body().SetStr(line)
 	}
 	body := marshalLogs(ld)
@@ -249,25 +250,28 @@ func BenchmarkSanitizeTracesClean(b *testing.B) {
 // --- the decoded-size estimator ---
 
 func BenchmarkDecodedSize(b *testing.B) {
-	ld := sdkLogs(4, 8, 256)
-	md := sdkMetrics(4, 50, 20)
-	td := sdkTraces(4, 512)
+	lb, _ := plogotlp.NewExportRequestFromLogs(sdkLogs(4, 8, 256)).MarshalProto()
+	mb, _ := pmetricotlp.NewExportRequestFromMetrics(sdkMetrics(4, 50, 20)).MarshalProto()
+	tb, _ := ptraceotlp.NewExportRequestFromTraces(sdkTraces(4, 512)).MarshalProto()
 	b.Run("logs", func(b *testing.B) {
 		b.ReportAllocs()
+		b.SetBytes(int64(len(lb)))
 		for b.Loop() {
-			_ = decodedLogsSize(ld)
+			_ = decodedLogsSize(lb)
 		}
 	})
 	b.Run("metrics", func(b *testing.B) {
 		b.ReportAllocs()
+		b.SetBytes(int64(len(mb)))
 		for b.Loop() {
-			_ = decodedMetricsSize(md)
+			_ = decodedMetricsSize(mb)
 		}
 	})
 	b.Run("traces", func(b *testing.B) {
 		b.ReportAllocs()
+		b.SetBytes(int64(len(tb)))
 		for b.Loop() {
-			_ = decodedTracesSize(td)
+			_ = decodedTracesSize(tb)
 		}
 	})
 }
@@ -347,8 +351,8 @@ func BenchmarkStripIdentityResource(b *testing.B) {
 // once and runs logenrich over it, per record. Nothing else is configured (no
 // rules, no logMetrics, no logAttributes), which is the shipped shape.
 func BenchmarkApplyLogChainEnrich(b *testing.B) {
-	enr := NewEnricher(Config{Meta: newMeta(), MetricsMode: MetricsAuto, EnrichLines: true})
-	s := NewServer(ServerConfig{Enricher: enr})
+	enr := NewEnricher(Config{Meta: newMeta(), MetricsMode: MetricsAuto})
+	s := NewServer(ServerConfig{Enricher: enr, EnrichLines: true})
 	b.ReportAllocs()
 	for b.Loop() {
 		b.StopTimer()

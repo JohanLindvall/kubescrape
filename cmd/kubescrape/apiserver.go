@@ -66,19 +66,14 @@ type apiserverWatchdog struct {
 	// page an operator every time the process boots.
 	reachable atomic.Bool
 	failures  atomic.Int64
-	// warn throttles the persisting-outage line (logdedupe.Throttle is the
-	// repo's primitive for exactly this).
-	warn logdedupe.Throttle
-	// downSince stamps the transition, and failuresAtDown snapshots the
-	// lifetime counter there so both log lines can report failures for THIS
-	// outage — the number beside a per-outage duration has to have the same
-	// scope, or an operator reads a process-lifetime total as the count for the
-	// minute that just ended. The lifetime total is the metric
-	// (kubescrape_apiserver_probe_failures_total), not the log. Only the probe
-	// goroutine touches either field.
-	downSince      time.Time
-	failuresAtDown int64
-	now            func() time.Time
+	// outage narrates THIS outage: the transition's Warn, the throttled
+	// restatement (apiserverWarnEvery) and the recovery Info, with a failure
+	// count and a duration of the same scope — a process-lifetime total beside
+	// a per-outage duration reads as the count for the minute that just ended.
+	// The lifetime total is the metric (kubescrape_apiserver_probe_failures_total,
+	// failures above), not the log. Only the probe goroutine touches it.
+	outage logdedupe.Outage
+	now    func() time.Time
 }
 
 // newAPIServerWatchdog builds a watchdog around probe. It registers nothing
@@ -140,42 +135,31 @@ func (w *apiserverWatchdog) probeOnce(ctx context.Context) {
 		return
 	}
 	if err != nil {
-		failures := w.failures.Add(1)
-		transition := w.reachable.Swap(false)
-		if transition {
-			w.downSince = w.now()
-			// This probe is the first of the outage, so the snapshot excludes
-			// it: failures - failuresAtDown == 1 on the transition line.
-			w.failuresAtDown = failures - 1
-		}
+		w.failures.Add(1)
+		w.reachable.Store(false)
 		// The transition always speaks; a persisting outage speaks on the
 		// throttle. Flapping therefore costs at most one WARN plus one INFO
 		// per interval, which is itself the news.
-		//
-		// Allow is called BEFORE the disjunction, never inside it: `transition
-		// || Allow(...)` short-circuits, so the transition's own line would not
-		// CLAIM the throttle slot and the very next probe would re-warn — the
-		// per-probe flood the throttle exists to prevent.
-		allow := w.warn.Allow(apiserverWarnEvery)
-		if transition || allow {
+		now := w.now()
+		if _, loud := w.outage.Fail(now, apiserverWarnEvery); loud {
 			// Says what was MEASURED — a new connection did not reach the API
 			// server — and what that does and does not imply. The probe cannot
 			// see the watch streams: the informers may still be receiving
 			// events over connections established before the outage, so "the
 			// cache stopped advancing" would be a claim, not an observation.
 			w.log.Warn("API server unreachable from this pod; the metadata cache may have stopped advancing, so responses may be stale",
-				"error", err, "failedProbes", failures-w.failuresAtDown,
-				"unreachableFor", w.now().Sub(w.downSince).Round(time.Second),
+				"error", err, "failures", w.outage.Failures(),
+				"outage", w.outage.Lasted(now),
 				"note", "/readyz stays 200 by design — an unready service loses its endpoints and would cut every agent off a cache that is still useful")
 		}
 		return
 	}
-	if !w.reachable.Swap(true) {
-		// failedProbes is this outage's, matching unreachableFor beside it; the
+	w.reachable.Store(true)
+	if failed, lasted, ok := w.outage.Recover(w.now()); ok {
+		// failures is this outage's, matching outage beside it; the
 		// process-lifetime total is kubescrape_apiserver_probe_failures_total.
 		w.log.Info("API server reachable again from this pod",
-			"unreachableFor", w.now().Sub(w.downSince).Round(time.Second),
-			"failedProbes", w.failures.Load()-w.failuresAtDown)
+			"outage", lasted, "failures", failed)
 	}
 }
 

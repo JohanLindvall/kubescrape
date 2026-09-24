@@ -31,9 +31,11 @@ package transform
 //     — an operator has no hook, and a watchdog that can only interrupt
 //     BETWEEN steps never sees the 17 GB happen. Every guard here is
 //     PREDICTIVE for the same reason: a charge taken after the value exists
-//     can report the pathology but cannot prevent it, which is why str()/repr()
-//     project their render (renderSize) and re.replace/re.findall project their
-//     result (builtins.go) instead of charging what they just built.
+//     can report the pathology but cannot prevent it, which is why every
+//     render — str()/repr(), log(), print(), fail() and an emit_metric label —
+//     is projected first (renderSize, checkRender) and re.replace/re.findall
+//     project their result (builtins.go) instead of charging what they just
+//     built.
 //   - PER INVOCATION (budget.alloc): every guarded allocation is charged, so
 //     accumulating bounded values in a loop is bounded too.
 //   - WALL CLOCK (budget.start): checked between interpreter steps via
@@ -51,9 +53,13 @@ package transform
 // can already point the agent's exporter anywhere.
 
 import (
+	"bytes"
 	"fmt"
 	"math"
+	"slices"
+	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
@@ -111,28 +117,32 @@ const (
 	// caps cannot bound a loop that keeps appending bounded values: 500
 	// iterations of `l.append("x" * (16<<20))` is 8 GiB and costs ~2500 steps.
 	// Only the guarded amplifiers are charged (concat, repeat, the
-	// materialising builtins) — never the batch itself — so 128 MiB is orders
-	// of magnitude above any real script.
+	// materialising builtins, a re.replace that matched) — never the batch
+	// itself. What that does NOT make it is independent of the batch: an
+	// invocation is one BATCH, so a script rewriting every record's body spends
+	// (rewrites per record) x (the batch's body bytes), and 128 MiB is eight
+	// full rewrites of a 16 MiB ingest push. A re.replace that matches nothing
+	// builds nothing and is not charged (builtins.go), which is what keeps the
+	// ordinary redaction list — a dozen patterns, most missing most records —
+	// far inside it.
 	maxAllocBytes = 128 << 20
 
 	// bytesPerValue is what one element of a materialised sequence costs
 	// before its payload: a starlark.Value is a 16-byte interface word pair.
 	bytesPerValue = 16
 
-	// maxRenderDepth bounds how deep renderSize resolves a nested container
-	// before it falls back to charging its elements a minimum. It is what
-	// makes the projection terminate on a self-referential value (`l = []`
-	// then `l.append(l)`) and what bounds the projection's own cost; 4 is
-	// deeper than any structure a transform has business rendering.
-	maxRenderDepth = 4
-
-	// The floor renderSize charges each part of a render, so that a walk it
-	// cannot resolve exactly is still an over-estimate of nothing: a scalar
-	// renders as at least one character, a container adds its two brackets,
-	// and each element adds its ", " separator.
-	minRenderBytes = 1
-	bracketBytes   = 2
-	sepBytes       = 2
+	// maxRenderDepth is how deeply nested a value renderSize will walk before
+	// it REFUSES the render rather than guessing at the rest. Fail-closed on
+	// purpose: an earlier version stopped descending at depth 4 and charged
+	// everything below it a byte, so `str([[[[[s] * 200]]]])` projected a few
+	// hundred bytes and built 200 MiB. The walk has to follow a value all the
+	// way down to be a bound, and following it all the way down is exactly
+	// what starlark-go's own render does — recursively, with an O(depth) cycle
+	// check per level, so a deep chain is also a CPU amplifier inside one
+	// interpreter step. No transform renders anything a tenth this deep. A
+	// CYCLE is not depth: it renders as `[...]`, and the walk stops there the
+	// way the render does.
+	maxRenderDepth = 64
 )
 
 // wallClock bounds one invocation's elapsed time. Generous — a no-op pass over
@@ -212,6 +222,39 @@ func (b *budget) remaining() int64 {
 		return 0
 	}
 	return maxAllocBytes - b.alloc
+}
+
+// valueCeiling is the most one value may still cost: the per-value limit, or
+// what is left of the invocation budget once pending — bytes the caller has
+// committed but not yet charged — is set aside, whichever is smaller. It is the
+// ceiling every predictive walk stops at, so a projection never costs more
+// than the value it is deciding about.
+func (b *budget) valueCeiling(pending int64) int64 {
+	return max(0, min(int64(maxStringBytes), b.remaining()-pending))
+}
+
+// checkRender is the one refusal every RENDER goes through before it is built
+// — str(), repr(), log(), print(), fail() and an emit_metric label — given the
+// size renderSize projected at valueCeiling(pending) and whether the value was
+// too deep to walk. It refuses a value over the per-value limit, and one that
+// would take the invocation past its budget once pending is added.
+//
+// Both halves are needed, and one copy of this dropped the second: renderSize
+// stops walking at the ceiling, so once less than a per-value limit of budget
+// is left it returns a TRUNCATED figure that passes the per-value check — and
+// the whole value was then rendered and refused only afterwards (measured at
+// 923 MiB allocated for an emit_metric label). The error names no subject;
+// callers prefix their own.
+func (b *budget) checkRender(sz int64, tooDeep bool, pending int64) error {
+	if tooDeep {
+		return fmt.Errorf("nests containers more than %d deep, past what a render is allowed to walk — flatten the value",
+			int64(maxRenderDepth))
+	}
+	if sz > maxStringBytes {
+		return fmt.Errorf("would render at least %d bytes, over the %d-byte limit for one value — render less per call",
+			sz, int64(maxStringBytes))
+	}
+	return b.project(satAdd(pending, sz))
 }
 
 func (b *budget) overBudget(total int64) error {
@@ -540,7 +583,7 @@ func extend(xl *starlark.List, y starlark.Value) (int64, error) {
 	}
 	if yi, ok := y.(starlark.Indexable); ok {
 		n := yi.Len()
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if err := room(); err != nil {
 				return 0, err
 			}
@@ -633,67 +676,261 @@ func boundedInt() *starlark.Builtin {
 	})
 }
 
-// renderSize projects how many bytes str()/repr() will build for v WITHOUT
-// building anything — the missing half of the materialiser bound, and the
-// reason it is needed: the element-COUNT check below bounds the number of
-// references a materialiser copies, which is the whole cost of list()/tuple()/
-// sorted() and friends, but str() and repr() render each element's CONTENTS,
-// so a legal small sequence of large strings (`str([body] * 1024)`) renders to
-// a multiple of the batch with every count and per-value bound respected.
+// renderSize projects how many bytes v.String() will build — the render that
+// str() of a container, repr(), log() and an emit_metric label of a non-string
+// value, and print()/fail() of one, all write — WITHOUT building anything. It
+// is the missing half of the materialiser bound: the element-COUNT check below
+// bounds the references a materialiser copies, which is the whole cost of
+// list()/tuple()/sorted() and friends, but a render writes out each element's
+// CONTENTS, so a legal small sequence of large strings (`str([body] * 1024)`)
+// renders to a multiple of the batch with every count and per-value bound
+// respected.
 //
-// It is a LOWER bound on the real render (escapes, type names, float digits
-// and dict punctuation only add), which is what a refusal needs: a value whose
-// projection fits is never refused, and one whose projection is over the
-// ceiling really is over it. It stops descending at maxRenderDepth and stops
-// accumulating once it passes limit, so a cyclic value terminates and a value
-// already over the ceiling is refused after a handful of elements instead of a
-// full walk.
-func renderSize(v starlark.Value, depth int, limit int64) int64 {
-	if n, ok := textLen(v); ok {
-		return n
-	}
-	switch c := v.(type) {
-	case *starlark.Dict:
-		if depth >= maxRenderDepth {
-			return satAdd(bracketBytes, satMul(int64(c.Len()), minRenderBytes+sepBytes))
+// It mirrors starlark-go's writeValue case for case, so it is EXACT — never
+// below the real render and never above it, which is what both sides of a
+// refusal need: a value whose projection fits is never refused, and one whose
+// projection is over the ceiling really is over it. Two earlier shortcuts were
+// neither: a string was charged len(s) where the render QUOTES it (a control
+// or invalid byte is written \xNN, four bytes for one), and a scalar was
+// charged one byte whatever it held (a million-bit integer renders ~315k
+// digits). The single inexact case is a bignum, whose digit count is a LOWER
+// bound derived from its bit length — the decimal conversion is the O(n²)
+// cost being avoided.
+//
+// The walk stops once it passes limit (children get what is left of it, so a
+// value already over the ceiling is refused after a handful of elements), and
+// a value nested more than maxRenderDepth containers deep reports tooDeep
+// instead of a size — the render is refused, not guessed at. A cycle renders
+// as `[...]`/`{...}` exactly where writeValue detects it (lists and dicts on
+// the current path), so a self-referential value terminates the same way.
+func renderSize(v starlark.Value, limit int64) (size int64, tooDeep bool) {
+	var w renderWalk
+	size = w.size(v, 0, limit)
+	return size, w.deep
+}
+
+// renderWalk carries writeValue's cycle path — the lists and dicts currently
+// being rendered, and only those, since writeValue appends nothing else — and
+// the too-deep verdict, which ends the walk wherever it is found.
+type renderWalk struct {
+	path []starlark.Value
+	deep bool
+}
+
+func (w *renderWalk) onPath(v starlark.Value) bool {
+	return slices.Contains(w.path, v)
+}
+
+func (w *renderWalk) size(v starlark.Value, depth int, limit int64) int64 {
+	switch x := v.(type) {
+	case nil:
+		return int64(len("<nil>"))
+	case starlark.NoneType:
+		return int64(len("None"))
+	case starlark.Bool:
+		if x {
+			return int64(len("True"))
 		}
-		total := int64(bracketBytes)
-		iter := c.Iterate()
+		return int64(len("False"))
+	case starlark.Int:
+		return intRenderLen(x)
+	case starlark.Float:
+		return floatRenderLen(x)
+	case starlark.String:
+		return quotedLen(string(x), false, limit)
+	case starlark.Bytes:
+		return quotedLen(string(x), true, limit)
+	case *starlark.List:
+		if w.onPath(x) {
+			return int64(len("[...]"))
+		}
+		if depth >= maxRenderDepth {
+			w.deep = true
+			return 0
+		}
+		w.path = append(w.path, x)
+		total := int64(len("[]"))
+		for i, n := 0, x.Len(); i < n && total <= limit && !w.deep; i++ {
+			if i > 0 {
+				total = satAdd(total, int64(len(", ")))
+			}
+			total = satAdd(total, w.size(x.Index(i), depth+1, limit-total))
+		}
+		w.path = w.path[:len(w.path)-1]
+		return total
+	case starlark.Tuple:
+		if depth >= maxRenderDepth {
+			w.deep = true
+			return 0
+		}
+		total := int64(len("()"))
+		if len(x) == 1 {
+			total += int64(len(",")) // (x,)
+		}
+		for i := 0; i < len(x) && total <= limit && !w.deep; i++ {
+			if i > 0 {
+				total = satAdd(total, int64(len(", ")))
+			}
+			total = satAdd(total, w.size(x[i], depth+1, limit-total))
+		}
+		return total
+	case *starlark.Dict:
+		if w.onPath(x) {
+			return int64(len("{...}"))
+		}
+		if depth >= maxRenderDepth {
+			w.deep = true
+			return 0
+		}
+		total := int64(len("{}"))
+		iter := x.Iterate()
 		defer iter.Done()
 		var k starlark.Value
-		for iter.Next(&k) && total <= limit {
-			total = satAdd(total, 2*sepBytes) // ": " between, ", " after
-			total = satAdd(total, renderSize(k, depth+1, limit))
-			if val, found, err := c.Get(k); found && err == nil {
-				total = satAdd(total, renderSize(val, depth+1, limit))
+		for first := true; total <= limit && !w.deep && iter.Next(&k); first = false {
+			if !first {
+				total = satAdd(total, int64(len(", ")))
+			}
+			// writeValue renders a KEY on the dict's parent path and the VALUE
+			// with the dict pushed; keys are hashable, so only the value can
+			// lead back to it.
+			total = satAdd(total, w.size(k, depth+1, limit-total))
+			total = satAdd(total, int64(len(": ")))
+			if val, found, err := x.Get(k); found && err == nil {
+				w.path = append(w.path, x)
+				total = satAdd(total, w.size(val, depth+1, limit-total))
+				w.path = w.path[:len(w.path)-1]
 			}
 		}
 		return total
-	case starlark.Indexable: // list, tuple — read by position, no iterator
+	case *starlark.Set:
 		if depth >= maxRenderDepth {
-			return satAdd(bracketBytes, satMul(int64(c.Len()), minRenderBytes+sepBytes))
+			w.deep = true
+			return 0
 		}
-		total := int64(bracketBytes)
-		for i, n := 0, c.Len(); i < n && total <= limit; i++ {
-			total = satAdd(total, sepBytes)
-			total = satAdd(total, renderSize(c.Index(i), depth+1, limit))
-		}
-		return total
-	case starlark.Sequence: // set, and anything else iterable with a length
-		if depth >= maxRenderDepth {
-			return satAdd(bracketBytes, satMul(int64(c.Len()), minRenderBytes+sepBytes))
-		}
-		total := int64(bracketBytes)
-		iter := c.Iterate()
+		total := int64(len("set([])"))
+		iter := x.Iterate()
 		defer iter.Done()
 		var e starlark.Value
-		for iter.Next(&e) && total <= limit {
-			total = satAdd(total, sepBytes)
-			total = satAdd(total, renderSize(e, depth+1, limit))
+		for first := true; total <= limit && !w.deep && iter.Next(&e); first = false {
+			if !first {
+				total = satAdd(total, int64(len(", ")))
+			}
+			total = satAdd(total, w.size(e, depth+1, limit-total))
 		}
 		return total
 	}
-	return minRenderBytes
+	// Everything else renders through its own String(), which is what
+	// writeValue's default arm calls — the host objects' constant names,
+	// functions, builtins, range, a module. Measuring it by calling it is
+	// exact, and the walk stops at the limit after the first one that is
+	// large.
+	return int64(len(v.String()))
+}
+
+// quotedLen is len(syntax.Quote(s, isBytes)) — the form a string takes inside
+// every render but str()'s top level — computed without building it, and
+// abandoned once it passes limit. It mirrors Quote's escape table exactly: a
+// printable rune as itself, `"` and `\` backslashed, the seven C escapes as
+// two bytes, other control bytes, DEL and every INVALID byte as \xNN, and a
+// non-printable rune as \uNNNN or \UNNNNNNNN.
+func quotedLen(s string, isBytes bool, limit int64) int64 {
+	n := int64(len(`""`))
+	if isBytes {
+		n += int64(len("b"))
+	}
+	for i := 0; i < len(s) && n <= limit; {
+		c := s[i]
+		if c < utf8.RuneSelf {
+			i++
+			switch {
+			case c == '"' || c == '\\':
+				n += 2
+			case c >= 0x20 && c < 0x7f:
+				n++
+			case c == '\a' || c == '\b' || c == '\f' || c == '\n' || c == '\r' || c == '\t' || c == '\v':
+				n += 2
+			default:
+				n += 4 // \xNN
+			}
+			continue
+		}
+		r, width := utf8.DecodeRuneInString(s[i:])
+		i += width
+		switch {
+		case width == 1: // an invalid byte (Quote's `width == 1 && r == RuneError`)
+			n += 4
+		case strconv.IsPrint(r):
+			n += int64(width)
+		case r < 0x10000:
+			n += 6 // \uNNNN
+		default:
+			n += 10 // \UNNNNNNNN
+		}
+	}
+	return n
+}
+
+// transcodedLen is the length of what str() of a bytes value returns: the
+// bytes themselves when they are valid UTF-8, and otherwise each byte of an
+// invalid sequence replaced by U+FFFD — three bytes for one.
+func transcodedLen(s string, limit int64) int64 {
+	var n int64
+	for i := 0; i < len(s) && n <= limit; {
+		r, width := utf8.DecodeRuneInString(s[i:])
+		i += width
+		if r == utf8.RuneError && width == 1 {
+			n += int64(utf8.RuneLen(utf8.RuneError))
+		} else {
+			n += int64(width)
+		}
+	}
+	return n
+}
+
+// intRenderLen is how many bytes an Int renders to: exact for a machine word,
+// and for a bignum a lower bound read off its bit length — |x| >= 2^(bits-1),
+// which has floor((bits-1)*log10(2))+1 digits. The constant is log10(2)
+// truncated, so float rounding can only make the bound lower, never above
+// the real digit count.
+func intRenderLen(x starlark.Int) int64 {
+	if v, ok := x.Int64(); ok {
+		n := int64(1)
+		u := uint64(v)
+		if v < 0 {
+			n++
+			u = -u // two's complement: correct for MinInt64 as well
+		}
+		for ; u >= 10; u /= 10 {
+			n++
+		}
+		return n
+	}
+	b := x.BigInt()
+	n := int64(float64(b.BitLen()-1)*0.30102999) + 1
+	if b.Sign() < 0 {
+		n++
+	}
+	return n
+}
+
+// floatRenderLen is how many bytes a Float renders to, formatted exactly as
+// starlark-go's %g does — shortest round-trip digits, plus ".0" when that
+// leaves neither a point nor an exponent — into a stack buffer.
+func floatRenderLen(x starlark.Float) int64 {
+	f := float64(x)
+	switch {
+	case math.IsNaN(f):
+		return int64(len("nan"))
+	case math.IsInf(f, 0):
+		return int64(len("+inf"))
+	}
+	var buf [32]byte
+	s := strconv.AppendFloat(buf[:0], f, 'g', -1, 64)
+	n := int64(len(s))
+	if bytes.IndexByte(s, 'e') < 0 && bytes.IndexByte(s, '.') < 0 {
+		n += int64(len(".0"))
+	}
+	return n
 }
 
 // materialisers are the universe builtins whose result grows with their input:
@@ -709,6 +946,22 @@ var materialisers = []string{"bytes", "dict", "enumerate", "list", "repr", "reve
 // its result is either its string argument or one byte per element, both
 // already inside maxStringBytes/maxSeqElems.
 var renderers = map[string]bool{"repr": true, "str": true}
+
+// materialisedRenderSize is what str(v) or repr(v) builds. repr is the render
+// itself. str differs only at the TOP level: a string comes back as the operand
+// it is (charged at its length, as before, though nothing is copied), and
+// bytes are transcoded to UTF-8 with each invalid byte widened to U+FFFD.
+func materialisedRenderSize(name string, v starlark.Value, limit int64) (int64, bool) {
+	if name == "str" {
+		switch x := v.(type) {
+		case starlark.String:
+			return int64(len(x)), false
+		case starlark.Bytes:
+			return transcodedLen(string(x), limit), false
+		}
+	}
+	return renderSize(v, limit)
+}
 
 func boundedMaterialiser(name string) *starlark.Builtin {
 	inner, ok := starlark.Universe[name].(*starlark.Builtin)
@@ -735,28 +988,47 @@ func boundedMaterialiser(name string) *starlark.Builtin {
 		// whole cost of the other materialisers, but str()/repr() write out
 		// every element's contents.
 		if renders && len(args) == 1 {
-			limit := int64(maxStringBytes)
-			if r := bud.remaining(); r < limit {
-				limit = r
-			}
-			sz := renderSize(args[0], 0, limit)
-			if sz > maxStringBytes {
-				return nil, positioned(th, fmt.Errorf("%s() would build a string of at least %d bytes, over the %d-byte limit for one value — render less per call",
-					name, sz, int64(maxStringBytes)))
-			}
-			if err := bud.project(sz); err != nil {
-				return nil, positioned(th, err)
+			sz, deep := materialisedRenderSize(name, args[0], bud.valueCeiling(0))
+			if err := bud.checkRender(sz, deep, 0); err != nil {
+				return nil, positioned(th, fmt.Errorf("%s(): %w", name, err))
 			}
 		}
 		v, err := inner.CallInternal(th, args, kwargs)
 		if err != nil {
 			return nil, err
 		}
-		if err := bud.spend(valueBytes(v)); err != nil {
+		if err := bud.spend(materialisedBytes(name, v)); err != nil {
 			return nil, positioned(th, err)
 		}
 		return v, nil
 	})
+}
+
+// boxedSliceBytes is the heap header a slice-typed value costs once it is
+// stored in an interface: a starlark.Tuple element of a list is boxed.
+const boxedSliceBytes = 24
+
+// materialisedBytes is what the named materialiser BUILT, which for two of
+// them is more than the references valueBytes charges: enumerate() and zip()
+// return a list of FRESH tuples, each one list word, its slots in a shared
+// backing array, and a boxed slice header (starlark-go's library.go builds
+// exactly that). Charging them as a plain list of len words was 4.5x short —
+// seven retained `enumerate(range(1<<20))` allocated 504 MiB in one
+// invocation against the 128 MiB budget, where a plain list() loop is refused
+// well before it. Small ints need no charge: starlark-go stores them in the
+// interface word itself.
+func materialisedBytes(name string, v starlark.Value) int64 {
+	if name == "enumerate" || name == "zip" {
+		if l, ok := v.(*starlark.List); ok && l.Len() > 0 {
+			arity := int64(2) // enumerate's (index, value)
+			if t, ok := l.Index(0).(starlark.Tuple); ok {
+				arity = int64(len(t)) // zip's: one slot per argument
+			}
+			per := satAdd(satAdd(bytesPerValue, satMul(arity, bytesPerValue)), boxedSliceBytes)
+			return satMul(int64(l.Len()), per)
+		}
+	}
+	return valueBytes(v)
 }
 
 // valueBytes is what a materialised value costs, charged AFTER it is built.

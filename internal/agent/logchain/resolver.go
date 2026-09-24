@@ -12,11 +12,13 @@ package logchain
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
@@ -35,11 +37,24 @@ const SeverityKey = logline.SeverityKey
 // record's own attributes (line-derived + enriched) first, then the resource's
 // (k8s metadata, the journal unit, the ARM resource).
 //
+// The RESOLVED-IDENTITY keys (attrs.ReservedIdentity: k8s.namespace.name,
+// k8s.pod.*, k8s.node.name, container.*, ...) are the exception and resolve
+// RESOURCE-first: identity is a resource concern — routing keys tenancy on the
+// resource's k8s.namespace.name, and a log-derived series' identity is its
+// bound resource — so a record-level copy (a sender's record attribute on the
+// ingest path, a `target: log` lift of the line) must not shadow the resolved
+// value for a logs.rules key or a log-metric label. Record-first, a pushed
+// record declaring k8s.namespace.name=payments satisfied a namespace
+// keep-allowlist and minted that label while the resource it shipped under
+// said otherwise. The record still answers when neither the resource nor a
+// lift carries the key.
+//
 // The three closures are bound once, at construction; per record only the
 // Record/Resource/Severity fields change, so evaluating a record allocates no
 // closures. Callers keep one Resolver per flush/convert and re-point it.
 type Resolver struct {
-	// Record and Resource are the attribute maps consulted, in that order.
+	// Record and Resource are the attribute maps consulted, in that order
+	// (the reverse for a resolved-identity key — see Resolver).
 	Record, Resource pcommon.Map
 	// Lifted are resource attributes extracted from THIS line by
 	// logAttributes, consulted between the two.
@@ -98,15 +113,18 @@ func (r *Resolver) RuleFn() func(string) string { return r.ruleFn }
 // liftedValue returns the last lifted attribute for k (last wins, matching
 // how Put applies them to a resource).
 func (r *Resolver) liftedValue(k string) (any, bool) {
-	for i := len(r.Lifted) - 1; i >= 0; i-- {
-		if r.Lifted[i].Key == k {
-			return r.Lifted[i].Val, true
+	for _, v := range slices.Backward(r.Lifted) {
+		if v.Key == k {
+			return v.Val, true
 		}
 	}
 	return nil, false
 }
 
 func (r *Resolver) label(k string) string {
+	if attrs.ReservedIdentity(k) {
+		return r.identityLabel(k)
+	}
 	if v, ok := r.Record.Get(k); ok {
 		return v.AsString()
 	}
@@ -114,6 +132,22 @@ func (r *Resolver) label(k string) string {
 		return attrString(v)
 	}
 	if v, ok := r.Resource.Get(k); ok {
+		return v.AsString()
+	}
+	return ""
+}
+
+// identityLabel is label() for a resolved-identity key: the resource first,
+// then a lift (which every producer but ingest has already written onto that
+// resource, so the two agree), then the record. See Resolver.
+func (r *Resolver) identityLabel(k string) string {
+	if v, ok := r.Resource.Get(k); ok {
+		return v.AsString()
+	}
+	if v, ok := r.liftedValue(k); ok {
+		return attrString(v)
+	}
+	if v, ok := r.Record.Get(k); ok {
 		return v.AsString()
 	}
 	return ""
@@ -167,30 +201,50 @@ func (r *Resolver) ruleKey(k string) string {
 // (metrics.ValueFunc). Asking the label closure for it afterwards walked all
 // three ranks again on every line whose value key lives on the line, which is
 // the common case.
+//
+// A resolved-identity key ranks resource-first here too (see Resolver), so its
+// label and its value still name the same attribute.
 func (r *Resolver) value(k string) (float64, bool, bool) {
+	if attrs.ReservedIdentity(k) {
+		if v, ok := r.Resource.Get(k); ok {
+			return numeric(v)
+		}
+		if lv, ok := r.liftedValue(k); ok {
+			return liftedNumeric(lv)
+		}
+		if v, ok := r.Record.Get(k); ok {
+			return numeric(v)
+		}
+		return 0, false, false
+	}
 	if v, ok := r.Record.Get(k); ok {
 		return numeric(v)
 	}
 	if lv, ok := r.liftedValue(k); ok {
-		switch x := lv.(type) {
-		case float64:
-			return x, true, true
-		case int64:
-			return float64(x), true, true
-		case string:
-			f, err := strconv.ParseFloat(x, 64)
-			return f, err == nil, x != ""
-		case nil:
-			return 0, false, false
-		default:
-			return 0, false, attrString(x) != ""
-		}
+		return liftedNumeric(lv)
 	}
 	v, ok := r.Resource.Get(k)
 	if !ok {
 		return 0, false, false
 	}
 	return numeric(v)
+}
+
+// liftedNumeric is numeric() for a lifted attribute's Go value.
+func liftedNumeric(lv any) (float64, bool, bool) {
+	switch x := lv.(type) {
+	case float64:
+		return x, true, true
+	case int64:
+		return float64(x), true, true
+	case string:
+		f, err := strconv.ParseFloat(x, 64)
+		return f, err == nil, x != ""
+	case nil:
+		return 0, false, false
+	default:
+		return 0, false, attrString(x) != ""
+	}
 }
 
 // numeric converts a pcommon.Value the way value() needs it, and reports

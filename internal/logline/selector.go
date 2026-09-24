@@ -1,20 +1,20 @@
 // Package logline is the log-line matching and field-extraction DSL shared
-// by the log-derived metrics engine (internal/metrics) and the tailer's log
-// rules: label selectors (exact and regex, with per-line memoization), the
-// keep/drop/sample LineFilter, and single-pass JSON/logfmt field extraction
-// for exactly the keys the rules reference. Both synthetic keys live here, in
-// the shared DSL, even though neither tier resolves both: LineKey ("__line__")
-// is the whole raw line, and SeverityKey ("__severity__") is the RULES tier's
-// enriched severity — named here so the metrics engine, which shares the
-// selector language but cannot resolve it, refuses a config using it instead of
-// compiling a rule that matches nothing.
+// by the log-derived metrics engine (internal/metrics) and the keep/drop log
+// rules every log producer and the ingest path apply: label selectors (exact
+// and regex, with per-line memoization), the keep/drop/sample LineFilter, and
+// single-pass JSON/logfmt field extraction for exactly the keys the rules
+// reference. Both synthetic keys live here, in the shared DSL, even though
+// neither tier resolves both: LineKey ("__line__") is the whole raw line, and
+// SeverityKey ("__severity__") is the RULES tier's enriched severity — named
+// here so the metrics engine, which shares the selector language but cannot
+// resolve it, refuses a config using it instead of compiling a rule that
+// matches nothing.
 package logline
 
 import (
 	"fmt"
 	"math/bits"
 	"regexp"
-	"slices"
 	"strings"
 
 	"github.com/JohanLindvall/haste/rapidhash"
@@ -22,8 +22,10 @@ import (
 
 // A Selectors matches a line against a conjunction of label selectors. Every
 // selector must hold for the set to match. Selectors are either exact
-// (key=value / key!=value) or a regex against the value (key=~re / key!~re,
-// expressed through separate exact/regex input lists — see ParseSelectors).
+// (key=value / key!=value) or a regex against the value, spelled the same
+// way (key=re / key!=re) and told apart only by which input list carries them
+// — see ParseSelectors. There is no =~ operator: "key=~re" in the regex list
+// compiles to a pattern beginning with '~'.
 type Selectors struct {
 	exact []exactSelector
 	regex []regexSelector
@@ -45,35 +47,122 @@ type regexSelector struct {
 // MatchContext memoizes selector outcomes across the metrics evaluated for a
 // single line: two metrics that share a selector (same label+expression, hence
 // same hash) evaluate the underlying lookup once. Reset it per line.
+//
+// It is an open-addressed table keyed by the selector hash, and every slot
+// carries the GENERATION (line) that wrote it, so Reset is one increment
+// rather than a clear. It used to be two slices searched linearly — and a TRUE
+// shared selector scanned the whole false list first — which made one line
+// QUADRATIC in the distinct selectors it evaluated: at 50 two-selector rules
+// the memo cost more than evaluating without it, at 200 about five times more
+// (33-38 us against 6-7 us per line, on every line through logMetrics and the
+// logs rules). A lookup is now one masked index and, at the half-full load
+// the table keeps, a probe or two. The table grows only when a line evaluates
+// more distinct selectors than any line before it, so a pooled context is
+// allocation-free once warm, as the slices were.
 type MatchContext struct {
-	trueHashes, falseHashes []uint64
+	slots []memoSlot // power-of-two length; nil until the first Store
+	gen   uint32     // this line's stamp; a slot stamped otherwise is empty
+	n     int        // slots stamped with gen
 }
+
+// memoSlot is one memoized outcome, live only while gen is the context's.
+type memoSlot struct {
+	hash uint64
+	gen  uint32
+	hit  bool
+}
+
+// minMemoSlots is the table's first size: 8 selectors before it grows.
+const minMemoSlots = 16
 
 // Reset forgets the memoized results: once per line, before the selectors run.
 func (c *MatchContext) Reset() {
-	c.trueHashes = c.trueHashes[:0]
-	c.falseHashes = c.falseHashes[:0]
+	c.n = 0
+	c.gen++
+	if c.gen == 0 {
+		// Wrapped after 2^32 lines: a slot stamped 2^32 lines ago would read
+		// as current. Clear once and restart the stamps.
+		clear(c.slots)
+		c.gen = 1
+	}
 }
 
 // Cached returns the memoized result for hash, if known; Store records one.
 // (Two calls rather than an eval(hash, func() bool) so the hot path does not
 // allocate a closure per selector per line.)
 func (c *MatchContext) Cached(hash uint64) (result, known bool) {
-	if slices.Contains(c.falseHashes, hash) {
-		return false, true
+	if c.n == 0 {
+		return false, false
 	}
-	if slices.Contains(c.trueHashes, hash) {
-		return true, true
+	// The load factor stays at or below one half, so the probe always
+	// reaches an empty slot.
+	mask := uint64(len(c.slots) - 1)
+	for i := hash & mask; ; i = (i + 1) & mask {
+		s := &c.slots[i]
+		if s.gen != c.gen {
+			return false, false
+		}
+		if s.hash == hash {
+			return s.hit, true
+		}
 	}
-	return false, false
 }
 
 // Store records a selector's result under its hash for the rest of the line.
 func (c *MatchContext) Store(hash uint64, result bool) {
-	if result {
-		c.trueHashes = append(c.trueHashes, hash)
-	} else {
-		c.falseHashes = append(c.falseHashes, hash)
+	s, known := c.slot(hash)
+	if !known {
+		c.claim(s, hash)
+	}
+	s.hit = result
+}
+
+// slot is Cached and Store's probe done once, for Match: the slot holding
+// hash, or — known false — the empty slot it belongs in, which the caller
+// fills through claim before the next slot call. It makes room for that one
+// insertion first, so the pointer stays valid.
+func (c *MatchContext) slot(hash uint64) (s *memoSlot, known bool) {
+	if c.gen == 0 {
+		c.gen = 1 // used without a Reset: 0 is what an empty slot carries
+	}
+	if 2*(c.n+1) > len(c.slots) {
+		c.grow()
+	}
+	// The selector hashes are avalanche-finished (pairHash), so the low bits
+	// index the table without a further mix.
+	mask := uint64(len(c.slots) - 1)
+	for i := hash & mask; ; i = (i + 1) & mask {
+		s = &c.slots[i]
+		if s.gen != c.gen {
+			return s, false
+		}
+		if s.hash == hash {
+			return s, true
+		}
+	}
+}
+
+// claim stamps the empty slot slot returned for hash as this line's.
+func (c *MatchContext) claim(s *memoSlot, hash uint64) {
+	s.hash, s.gen = hash, c.gen
+	c.n++
+}
+
+// grow doubles the table and re-inserts this line's entries; the stale ones
+// from earlier lines are simply not carried.
+func (c *MatchContext) grow() {
+	old := c.slots
+	c.slots = make([]memoSlot, max(minMemoSlots, 2*len(old)))
+	mask := uint64(len(c.slots) - 1)
+	for _, s := range old {
+		if s.gen != c.gen {
+			continue
+		}
+		i := s.hash & mask
+		for c.slots[i].gen == c.gen {
+			i = (i + 1) & mask
+		}
+		c.slots[i] = s
 	}
 }
 
@@ -94,23 +183,23 @@ func (s *Selectors) LabelKeys() []string {
 func (s *Selectors) Match(lookup func(string) string, ctx *MatchContext) bool {
 	for i := range s.exact {
 		sel := &s.exact[i]
-		hit, known := ctx.Cached(sel.hash)
+		m, known := ctx.slot(sel.hash)
 		if !known {
-			hit = lookup(sel.label) == sel.value
-			ctx.Store(sel.hash, hit)
+			ctx.claim(m, sel.hash)
+			m.hit = lookup(sel.label) == sel.value
 		}
-		if hit != sel.want {
+		if m.hit != sel.want {
 			return false
 		}
 	}
 	for i := range s.regex {
 		sel := &s.regex[i]
-		hit, known := ctx.Cached(sel.hash)
+		m, known := ctx.slot(sel.hash)
 		if !known {
-			hit = sel.re.MatchString(lookup(sel.label))
-			ctx.Store(sel.hash, hit)
+			ctx.claim(m, sel.hash)
+			m.hit = sel.re.MatchString(lookup(sel.label))
 		}
-		if hit != sel.want {
+		if m.hit != sel.want {
 			return false
 		}
 	}

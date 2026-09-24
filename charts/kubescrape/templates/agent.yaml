@@ -84,15 +84,17 @@ spec:
         # kubescrape discovers prometheus.io/* annotations itself, so the agent
         # scrapes its own runtime metrics like any other pod.
         prometheus.io/scrape: "true"
-        prometheus.io/port: {{ (split ":" .Values.metrics.listen)._1 | quote }}
+        prometheus.io/port: {{ include "kubescrape.port" .Values.metrics.listen | quote }}
         prometheus.io/path: /metrics
         {{- end }}
     spec:
       serviceAccountName: {{ .Release.Name }}-agent
       # The shutdown sequence is bounded but not instant: producers stop
-      # under a budget, then the final log-metrics, span-metrics and
-      # self-metrics exports run, then the disk buffer drains. The kubelet
-      # default of 30s cuts that short during a collector outage.
+      # under a budget, then the final log-metrics, cgroup-stats and
+      # self-metrics exports run, then (with agent.bufferDir) the disk buffer
+      # drains. The kubelet default of 30s cuts that short during a collector
+      # outage; values.yaml's terminationGracePeriodSeconds covers all three
+      # agent-binary workloads.
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.agent.priorityClassName }}
       priorityClassName: {{ . }}
@@ -109,20 +111,14 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- /* Pod-level seccomp. Kubernetes' own default is Unconfined, which is
-             LOOSER than what a plain `docker run` gets, and PodSecurity's
-             `restricted` profile rejects a pod without RuntimeDefault outright
-             — so on a namespace labelled restricted these pods used to fail
-             ADMISSION, which on a first install looks like the chart being
-             broken. Set `seccompProfile: null` to omit the field entirely —
-             NOT `{}`, which cannot work: helm COALESCES a user map onto the
-             chart's default map, so an empty one arrives here as the default
-             `{type: RuntimeDefault}` and renders. Only an explicit null
-             removes the key. */}}
-      {{- with .Values.seccompProfile }}
-      securityContext:
-        seccompProfile:
-          {{- toYaml . | nindent 10 }}
+      {{- /* Pod-level seccomp (kubescrape.podSecurityContext, which says how
+             to omit it). RuntimeDefault is right here too, but it does NOT make
+             this pod admissible on a namespace labelled `restricted`: the agent
+             runs as UID 0 and mounts hostPath /var/log, which `restricted`
+             forbids whatever this says, so its namespace needs `privileged`
+             (see values.yaml's seccompProfile). */}}
+      {{- if .Values.seccompProfile }}
+      {{- include "kubescrape.podSecurityContext" . | nindent 6 }}
       {{- end }}
       containers:
         - name: agent
@@ -135,7 +131,7 @@ spec:
             # /v1/scrape-auth returns Secret values and is authenticated. The
             # flag, the mount and the service's own token all key off this one
             # value so the two sides cannot drift apart.
-            - -scrape-auth-token-file=/etc/kubescrape/scrape-auth/{{ .Values.service.scrapeAuthToken.key | default "token" }}
+            - -scrape-auth-token-file={{ include "kubescrape.scrapeAuthTokenPath" . }}
             {{- end }}
             - -listen={{ .Values.agent.listen }}
             {{- if .Values.agent.debug.tokenSecret.name }}
@@ -150,24 +146,7 @@ spec:
             - -debug-token-file={{ include "kubescrape.debugTokenPath" . }}
             {{- end }}
             - -self-metrics-interval={{ .Values.agent.selfMetricsInterval }}
-            - -otlp-endpoint={{ .Values.agent.otlp.endpoint }}
-            - -otlp-protocol={{ .Values.agent.otlp.protocol }}
-            - -otlp-compression={{ .Values.agent.otlp.compression }}
-            - -otlp-compression-level={{ int64 .Values.agent.otlp.compressionLevel }}
-            - -otlp-insecure={{ .Values.agent.otlp.insecure }}
-            - -otlp-tls-insecure-skip-verify={{ .Values.agent.otlp.tlsInsecureSkipVerify }}
-            {{- with .Values.agent.otlp.caFile }}
-            - -otlp-tls-ca-file={{ . }}
-            {{- end }}
-            - -otlp-timeout={{ .Values.agent.otlp.timeout }}
-            - -otlp-retry-attempts={{ .Values.agent.otlp.retryAttempts }}
-            - -otlp-retry-backoff={{ .Values.agent.otlp.retryBackoff }}
-            {{- with .Values.agent.otlp.maxSendBytes }}
-            - -otlp-max-send-bytes={{ int64 . }}
-            {{- end }}
-            {{- if .Values.agent.otlp.bearerTokenSecret.name }}
-            - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.agent.otlp.bearerTokenSecret.key }}
-            {{- end }}
+            {{- include "kubescrape.agentOtlpArgs" . }}
             - -logs={{ .Values.agent.logs }}
             - -metrics={{ .Values.agent.metrics }}
             - -cadvisor={{ .Values.agent.cadvisor }}
@@ -204,15 +183,7 @@ spec:
             {{- if $cfg }}
             - -config=/etc/kubescrape/config/config.yaml
             {{- end }}
-            {{- with .Values.agent.logsMetrics.interval }}
-            - -logs-metrics-interval={{ . }}
-            {{- end }}
-            {{- with .Values.agent.logsMetrics.maxBytes }}
-            - -logs-metrics-max-bytes={{ include "kubescrape.logsMetricsMaxBytes" . }}
-            {{- end }}
-            {{- with .Values.agent.logsMetrics.namePrefix }}
-            - -logs-metrics-name-prefix={{ . }}
-            {{- end }}
+            {{- include "kubescrape.logsMetricsArgs" . }}
             - -logs-watch={{ .Values.agent.logsWatch }}
             - -logs-poll-interval={{ .Values.agent.logsPollInterval }}
             - -logs-fingerprint-bytes={{ int64 .Values.agent.logsFingerprintBytes }}
@@ -234,7 +205,7 @@ spec:
                    default — reopened exactly this loop. Silently: the files are
                    skipped at DISCOVERY, so nothing counts and nothing warns.
                    The first fix then read BOTH, which broke the same rule from
-                   the other side: with `export.logs` set, `ExportOverride.merged`
+                   the other side: with `export.logs` set, `ExportConfig.signalConfig`
                    REPLACES the base for that signal, so the flag endpoint is a
                    metrics/traces-only address (or, with all three overridden,
                    one `BuildExporter` never dials at all) and excluding its
@@ -262,7 +233,7 @@ spec:
                    receives nothing this flag can suppress, so excluding its
                    namespace would silently stop collecting logs it never
                    caused. There is exactly ONE logs destination, never two:
-                   this mirrors `otlpexport.ExportOverride.merged`, where a
+                   this mirrors `otlpexport.ExportConfig.signalConfig`, where a
                    non-empty `export.logs.endpoint` REPLACES the base for that
                    signal rather than adding to it. Do NOT "simplify" this back
                    into a list of both — that reopens the over-exclusion above,
@@ -311,10 +282,11 @@ spec:
                    one average per scrapeInterval; this ships the distribution
                    (stddev/max/min of the CPU rate and the working set) of the
                    same window, so a two-second burst inside a thirty-second
-                   window is still visible. Needs the read-only /sys/fs/cgroup
-                   mount rendered below — without it the agent sees only its own
-                   cgroup and exports nothing, which it warns about at startup
-                   and reports as kubescrape_cgroup_containers 0. */}}
+                   window is still visible. Needs the read-only host
+                   /sys/fs/cgroup mount rendered below — without it the agent
+                   sees only its own cgroup and exports nothing, which it warns
+                   about at startup and reports as kubescrape_cgroup_containers
+                   0. */}}
             - -cgroup-stats
             - -cgroup-stats-interval={{ .Values.agent.cgroupStats.interval }}
             {{- /* The discovery cadence is the pipeline's blind spot for
@@ -322,9 +294,12 @@ spec:
                    SERVICE's request budget rather than this node's CPU — which
                    is why it is a value and not a constant. */}}
             - -cgroup-stats-discover-interval={{ .Values.agent.cgroupStats.discoverInterval }}
-            {{- with .Values.agent.cgroupStats.root }}
-            - -cgroup-stats-root={{ . }}
-            {{- end }}
+            {{- /* ALWAYS explicit, and never /sys/fs/cgroup by default: see the
+                   mount below for why the host hierarchy lives elsewhere. An
+                   explicit root on a cgroup v1 node is still the node's
+                   property (the sampler disables itself there), so this does
+                   not turn a mixed fleet's v1 nodes into a CrashLoop. */}}
+            - -cgroup-stats-root={{ .Values.agent.cgroupStats.root | default "/host/sys/fs/cgroup" }}
             {{- end }}
             {{- if .Values.agent.ingest.enabled }}
             {{- /* LOGS AND METRICS. Traces are pushed to the trace tier
@@ -338,23 +313,18 @@ spec:
             - -ingest-http-endpoint={{ .Values.agent.ingest.httpEndpoint }}
             - -ingest-metrics-mode={{ .Values.agent.ingest.metricsMode }}
             - -ingest-peer-ip-fallback={{ .Values.agent.ingest.peerIpFallback }}
-            {{- with .Values.agent.ingest.containerIdKeys }}
-            - -ingest-container-id-keys={{ join "," . }}
-            {{- end }}
-            {{- with .Values.agent.ingest.podUidKeys }}
-            - -ingest-pod-uid-keys={{ join "," . }}
-            {{- end }}
-            {{- with .Values.agent.ingest.grpcMaxRecvBytes }}
-            - -ingest-grpc-max-recv-bytes={{ int64 . }}
-            {{- end }}
+            {{- include "kubescrape.ingestKeyArgs" . }}
             {{- end }}
             - -log-level={{ .Values.logLevel }}
             - -metrics-listen={{ if .Values.metrics.enabled }}{{ .Values.metrics.listen }}{{ end }}
             {{- with .Values.pprofListen }}
             - -pprof-listen={{ . }}
             {{- end }}
-            {{- range .Values.agent.extraArgs }}
-            - {{ . }}
+            {{- /* toYaml, not `- {{ . }}`: a bare plain scalar turns "-x=a: b" into a
+                   MAP and silently truncates "-x=y #z" at the comment marker.
+                   The two singletons already rendered it this way. */}}
+            {{- with .Values.agent.extraArgs }}
+            {{- toYaml . | nindent 12 }}
             {{- end }}
           env:
             - name: NODE_NAME
@@ -387,39 +357,47 @@ spec:
               drop: ["ALL"]
           ports:
             - name: http
-              containerPort: {{ (split ":" .Values.agent.listen)._1 | int }}
+              containerPort: {{ include "kubescrape.port" .Values.agent.listen | int }}
             {{- if .Values.metrics.enabled }}
             - name: metrics
-              containerPort: {{ (split ":" .Values.metrics.listen)._1 | int }}
+              containerPort: {{ include "kubescrape.port" .Values.metrics.listen | int }}
             {{- end }}
             {{- if .Values.agent.ingest.enabled }}
-            {{- /* hostPort, optional and off by default, is the ONLY address
-                   the shipped chart can give an application for "the local
-                   agent". Without it the listeners are reachable at the agent's
-                   POD IP and nothing else — no hostNetwork, no Service — and
-                   the obvious workaround, a ClusterIP Service over the
-                   DaemonSet, is the wrong one twice over: it round-robins a
-                   push to some OTHER node's agent, which defeats
-                   -ingest-peer-ip-fallback (the source address then names a
-                   sender the receiving agent's node does not host) and
-                   invalidates the node-local argument that sized
-                   -ingest-max-in-flight. With it on, an SDK reaches the agent
-                   on its own node via the downward API; see
-                   agent.ingest.hostPort in values.yaml for the recipe.
-                   Off by default because a hostPort occupies that port on
-                   EVERY node and collides with anything else claiming it. */}}
+            {{- /* Without agent.ingest.service.enabled (the Service rendered
+                   below this DaemonSet, internalTrafficPolicy: Local) or this
+                   hostPort, the listeners are reachable at the agent's POD IP
+                   and nothing else — no hostNetwork — so an application has no
+                   stable address for "the local agent". The Service is the one
+                   to prefer: it keeps a push on the sender's node, keeps the
+                   sender's source address, which is what
+                   -ingest-peer-ip-fallback reads (kube-proxy, by default, does
+                   not masquerade pod-to-Service traffic), and stays under
+                   agent.ingest.allowFrom. hostPort is for a sender that cannot
+                   use cluster DNS, and costs more than a port: on a CNI that
+                   implements it with the portmap plugin (kind's does) the hop
+                   MASQUERADES a same-node sender, so the agent sees the node's
+                   address and the peer-IP fallback resolves nothing — a sender
+                   behind it must carry k8s.pod.uid or container.id itself (the
+                   recipe in values.yaml does). What NOT to do is a plain
+                   ClusterIP Service over the DaemonSet: it round-robins a push
+                   to some OTHER node's agent, which breaks node locality and
+                   the node-local argument that sized -ingest-max-in-flight
+                   (peer-IP still resolves — /v1/pod-ips is cluster-wide — so
+                   that is not the reason). hostPort is off by default because
+                   it occupies the port on EVERY node and collides with
+                   anything else claiming it. */}}
             {{- with .Values.agent.ingest.grpcEndpoint }}
             - name: otlp-grpc
-              containerPort: {{ (split ":" .)._1 | int }}
+              containerPort: {{ include "kubescrape.port" . | int }}
               {{- if $.Values.agent.ingest.hostPort }}
-              hostPort: {{ (split ":" .)._1 | int }}
+              hostPort: {{ include "kubescrape.port" . | int }}
               {{- end }}
             {{- end }}
             {{- with .Values.agent.ingest.httpEndpoint }}
             - name: otlp-http
-              containerPort: {{ (split ":" .)._1 | int }}
+              containerPort: {{ include "kubescrape.port" . | int }}
               {{- if $.Values.agent.ingest.hostPort }}
-              hostPort: {{ (split ":" .)._1 | int }}
+              hostPort: {{ include "kubescrape.port" . | int }}
               {{- end }}
             {{- end }}
             {{- end }}
@@ -481,17 +459,27 @@ spec:
             {{- /* The mount point follows `root`, because `root` is where the
                    agent LOOKS. Rendering -cgroup-stats-root against a mountPath
                    hardcoded to /sys/fs/cgroup made every non-default value
-                   CrashLoop the DaemonSet: an explicitly configured root that
-                   is not a cgroup v2 hierarchy is fatal by design (an operator
+                   CrashLoop the DaemonSet: an explicitly configured root with
+                   nothing mounted behind it is fatal by design (an operator
                    error, identical on every node), so the value was unusable
                    without hand-rolling a volume through extraVolumes. The
                    hostPath below stays /sys/fs/cgroup — that is where the
                    hierarchy is ON THE NODE, and a node where it is not is one
-                   this feature cannot work on. */}}
+                   this feature cannot work on.
+
+                   The default is /host/sys/fs/cgroup and NOT /sys/fs/cgroup:
+                   the container runs in its own cgroup namespace, where
+                   /sys/fs/cgroup is its OWN cgroup and /proc/self/cgroup says
+                   "/". Mounting the node's root over it made the agent read the
+                   NODE root's memory.max, find no limit, and run with no Go
+                   soft memory limit (GOMEMLIMIT) under a 512Mi cap — the OOM
+                   insurance silently off on exactly the agents that enable
+                   this feature. */}}
             # The host's cgroup hierarchy. Read-only: the sampler reads three
-            # files per container and writes nothing.
+            # files per container and writes nothing. Mounted BESIDE the
+            # container's own /sys/fs/cgroup, never over it.
             - name: cgroup
-              mountPath: {{ .Values.agent.cgroupStats.root | default "/sys/fs/cgroup" }}
+              mountPath: {{ .Values.agent.cgroupStats.root | default "/host/sys/fs/cgroup" }}
               readOnly: true
             {{- end }}
             {{- with .Values.agent.extraVolumeMounts }}
@@ -514,7 +502,7 @@ spec:
         {{- if .Values.service.scrapeAuthSecrets }}
         - name: scrape-auth
           secret:
-            secretName: {{ .Values.service.scrapeAuthToken.existingSecret | default (printf "%s-scrape-auth" .Release.Name) }}
+            secretName: {{ include "kubescrape.scrapeAuthSecretName" . }}
         {{- end }}
         {{- if .Values.agent.debug.tokenSecret.name }}
         - name: debug-token
@@ -535,7 +523,14 @@ spec:
                an absent one — sd_id128_get_machine() fails on it exactly as it
                does on nothing, so the pod would start and read nothing, which
                is the failure this mount exists to close. A node with no
-               /etc/machine-id cannot serve a persistent journal anyway. */}}
+               /etc/machine-id cannot serve a persistent journal anyway — but
+               the cost of `File` there is NOT confined to the journal: the
+               kubelet's hostPath type check fails, so that node's WHOLE agent
+               (logs, metrics, cadvisor) stays in ContainerCreating and the
+               DaemonSet rollout stalls on it. Loud rather than silent, which
+               is this chart's rule for mounts (see the cgroup one below), and
+               documented at agent.journald in values.yaml: with journald
+               enabled every scheduled node needs /etc/machine-id. */}}
         - name: machineid
           hostPath:
             path: /etc/machine-id
@@ -554,6 +549,53 @@ spec:
         {{- with .Values.agent.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+{{- /* Guarded on an endpoint EXISTING, like the ingest NetworkPolicy rule: a
+       Service whose `ports` renders empty is refused by the API server. */}}
+{{- if and .Values.agent.ingest.enabled .Values.agent.ingest.service.enabled (or .Values.agent.ingest.grpcEndpoint .Values.agent.ingest.httpEndpoint) }}
+---
+{{- /*
+  The address an application uses for "the agent on MY node":
+  <release>-agent-ingest.<namespace>:4317/4318.
+
+  internalTrafficPolicy: Local is the whole point, and what separates this from
+  the plain ClusterIP Service values.yaml warns against: kube-proxy sends a
+  connection only to an endpoint on the CLIENT's node, so a push never
+  round-robins to another node's agent (the node-local argument that sized
+  -ingest-max-in-flight holds), and kube-proxy by default leaves a
+  pod-sourced connection's source address alone, so -ingest-peer-ip-fallback
+  still names the sender. Unlike a hostPort it claims no port on the node, and
+  the traffic arrives at the agent's pod IP, so agent.ingest.allowFrom still
+  applies.
+
+  With no READY agent on the sender's node (one starting, or mid-rollout)
+  there is no local endpoint and the push fails rather than leaving the node;
+  the sender's retry covers the gap.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-agent-ingest
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Release.Name }}-agent
+    {{- include "kubescrape.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  internalTrafficPolicy: Local
+  selector:
+    app: {{ .Release.Name }}-agent
+  ports:
+    {{- with .Values.agent.ingest.grpcEndpoint }}
+    - name: otlp-grpc
+      port: {{ include "kubescrape.port" . | int }}
+      targetPort: otlp-grpc
+    {{- end }}
+    {{- with .Values.agent.ingest.httpEndpoint }}
+    - name: otlp-http
+      port: {{ include "kubescrape.port" . | int }}
+      targetPort: otlp-http
+    {{- end }}
+{{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---
 # Agent ingress. The selector must be the AGENT's label: this policy used to
@@ -600,7 +642,7 @@ spec:
     #    and not a path, so the probes are narrowed with it and the `from` must
     #    include whatever your CNI presents the kubelet as.
     - ports:
-        - port: {{ (split ":" .Values.agent.listen)._1 | int }}
+        - port: {{ include "kubescrape.port" .Values.agent.listen | int }}
       {{- with .Values.agent.debug.allowFrom }}
       from:
         {{- toYaml . | nindent 8 }}
@@ -613,7 +655,7 @@ spec:
     #    Undeclared ports (pprof, which exposes goroutine stacks and heap
     #    contents) stay closed on every rule here.
     - ports:
-        - port: {{ (split ":" .Values.metrics.listen)._1 | int }}
+        - port: {{ include "kubescrape.port" .Values.metrics.listen | int }}
     {{- end }}
     {{- /* Guarded on an endpoint EXISTING, not just on `enabled`: a rule whose
            `ports` list renders empty is `ports: null`, which means EVERY port —
@@ -626,17 +668,26 @@ spec:
     #
     #    WHAT THEY EXPOSE, stated plainly: any pod that can reach them can push
     #    arbitrary OTLP logs and metrics through this node's agent, with no
-    #    credential. Enrichment stamps the SENDER's Kubernetes identity where it
-    #    can resolve one, so a forged push is attributable to the pod that sent
-    #    it rather than to whatever it claims — but a sender can still emit
-    #    records naming any service.name it likes, and the cost of the volume it
-    #    pushes is this node's and the collector's. EMPTY MEANS ANY POD MAY PUSH.
+    #    credential. Enrichment resolves the container.id / k8s.pod.uid the
+    #    SENDER supplies (agent.ingest.containerIdKeys / podUidKeys) and stamps
+    #    whatever pod that id names; nothing on an unauthenticated port can
+    #    check that the id is the sender's own. So a pod presenting ANOTHER
+    #    pod's id — which the metadata service's /v1/pods route hands to any
+    #    caller — is attributed as that pod, and with `routing` configured is
+    #    delivered to that pod's tenant endpoint and X-Scope-OrgID
+    #    (docs/CONFIGURATION.md, "Accepted security residuals" #1). The
+    #    source-address fallback (agent.ingest.peerIpFallback) is off by
+    #    default and only ever applies to a resource carrying no id. A sender
+    #    can also name any service.name it likes, and the cost of the volume it
+    #    pushes is this node's and the collector's. EMPTY MEANS ANY POD MAY
+    #    PUSH — and where `routing` separates tenants, this `from` is the lever
+    #    that bounds who can cross between them.
     - ports:
         {{- with .Values.agent.ingest.grpcEndpoint }}
-        - port: {{ (split ":" .)._1 | int }}
+        - port: {{ include "kubescrape.port" . | int }}
         {{- end }}
         {{- with .Values.agent.ingest.httpEndpoint }}
-        - port: {{ (split ":" .)._1 | int }}
+        - port: {{ include "kubescrape.port" . | int }}
         {{- end }}
       {{- with .Values.agent.ingest.allowFrom }}
       from:

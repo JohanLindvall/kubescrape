@@ -95,7 +95,7 @@ func buildPushes(spans, per int, rich bool) []ptrace.Traces {
 	out := make([]ptrace.Traces, 0, spans/per)
 	for i := 0; i < spans; i += per {
 		specs := make([]spanSpec, 0, per)
-		for j := 0; j < per; j++ {
+		for j := range per {
 			specs = append(specs, spanSpec{trace: 1, span: uint64(i + j + 1), end: 10, attrs: map[string]any{
 				"http.route": "/api/v1/orders", "http.status_code": 200,
 			}})

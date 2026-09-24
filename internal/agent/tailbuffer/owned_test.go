@@ -179,8 +179,8 @@ func TestDecidedKeepsSurviveACollectorOutageThroughTheDiskBuffer(t *testing.T) {
 		t.Fatal("the decided trace did not reach the traces spool")
 	}
 
-	rctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	rctx, cancel := context.WithCancel(t.Context())
+	defer cancel() // stop Run BEFORE the spool Close deferred above; t.Context() alone ends after them
 	go spool.Run(rctx)
 	coll.setDown(false)
 	deadline := time.Now().Add(3 * time.Second)
@@ -189,5 +189,20 @@ func TestDecidedKeepsSurviveACollectorOutageThroughTheDiskBuffer(t *testing.T) {
 	}
 	if coll.got() != 1 {
 		t.Fatalf("the spooled trace was not delivered once the collector recovered (got %d spans)", coll.got())
+	}
+}
+
+// Id-less spans decided on arrival are the SENDER's, like late spans: the push
+// still holds them, a NACK makes it retransmit, so the forward must not be
+// marked for the spool.
+func TestIdlessSpansDecidedOnArrivalAreNotOwned(t *testing.T) {
+	cap := &ownCapture{}
+	b, _ := newTestBuffer(t, Config{Config: alwaysCfg(), DecisionWait: "5s"}, cap)
+	if err := b.ExportTraces(context.Background(), payload("checkout", spanSpec{trace: 0, span: 1, end: 10})); err != nil {
+		t.Fatal(err)
+	}
+	got := cap.marks()
+	if len(got) != 1 || got[0] {
+		t.Fatalf("marks = %v, want exactly one UNMARKED export", got)
 	}
 }

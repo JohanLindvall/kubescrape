@@ -186,6 +186,32 @@ func TestAuditFixUnreadablePositionReplaysRatherThanSkipping(t *testing.T) {
 	}
 }
 
+// One Reader serves every leadership term the process wins, and Run calls
+// loadPosition on every entry. A relist expire() armed in the previous term is
+// the reader's only memory that a gap is owed, so an unreadable position in the
+// next term may ARM a relist but must never DISARM one: under `end` the stream
+// would then start at the CURRENT revision and discard the gap since the
+// expired one, with nothing counting it (EventGapDiscarded moves only inside
+// expire).
+func TestUnreadablePositionNeverDisarmsAPendingRelist(t *testing.T) {
+	ctx := context.Background()
+	r := New(Config{Client: listingClient("999"), StartMode: StartEnd})
+	// Term one: something was exported, then the revision aged out.
+	r.committed = Position{ResourceVersion: "500", Watermark: time.Now().Add(-time.Minute)}
+	r.expire(stageWatch)
+	if !r.relist {
+		t.Fatal("precondition: the expiry must arm a relist")
+	}
+	// Term two begins with a failed Get of the stored position.
+	r.cfg.Positions = failingPositions{err: errors.New("etcdserver: request timed out")}
+	r.loadPosition(ctx)
+	start, err := r.startResourceVersion(ctx)
+	if err != nil || !start.replay {
+		t.Fatalf("start = (%+v, %v) after an unreadable position with a relist pending; want the replay, "+
+			"not the current revision — the gap since the expired revision would be discarded uncounted", start, err)
+	}
+}
+
 // failingPositions is a store whose Load always fails — an undecodable
 // document, a 503 or a timeout are one shape here.
 type failingPositions struct{ err error }

@@ -4,8 +4,9 @@
 package services
 
 import (
+	"cmp"
 	"maps"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -116,6 +117,17 @@ func NewIndex() *Index {
 
 // Upsert records the current state of a service.
 func (ix *Index) Upsert(svc *corev1.Service) {
+	// The resync probe runs FIRST, under the read lock — store.UpsertPod's
+	// shape, for its reasons: the conversion below (CopyMeta, the selector
+	// clone, the ports) is the expensive half, and it also COUNTS the
+	// annotation budget's refusal. A relist or `-resync` re-delivers every
+	// Service byte-identical, so converting first allocated a full copy per
+	// Service only to discard it, and re-counted
+	// kubescrape_metadata_annotations_omitted_total{kind="Service"} — a
+	// counter meant to move once per informer EVENT — once per re-delivery.
+	if ix.resyncNoOp(svc) {
+		return
+	}
 	// CopyMeta filters the annotations, like pods, owners and namespaces: a
 	// Service is the fourth annotation-bearing object this API serves and was
 	// the one missed. Its annotations ride on every service- and monitor-derived
@@ -162,19 +174,11 @@ func (ix *Index) Upsert(svc *corev1.Service) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	m := ix.byNamespace[svc.Namespace]
-	// A re-delivery that changes NOTHING must not move the change token. The
-	// token is what holds the server's monitor→Service cross product together
-	// (buildMonitoredServices: 19.8 ms and 9.67 MB at 50 monitors x 2,000
-	// Services), and an informer resync re-delivers every Service byte-identical
-	// — so with `-resync` set, an unconditional bump meant essentially every
-	// agent poll paid a full rebuild. The pod path (store.UpsertPod) has had
-	// this short-circuit all along; the two index paths did not.
-	//
-	// An EMPTY resourceVersion is treated as changed. Only hand-built objects
-	// have one (the informer always sets it), and for those "same version" is
-	// not a statement about content — a test or an embedder mutating a fixture
-	// in place would otherwise have its update silently ignored.
-	if cur := m[svc.UID]; cur != nil && svc.ResourceVersion != "" && cur.resourceVersion == svc.ResourceVersion {
+	// Re-checked under the write lock, since the probe above dropped its lock:
+	// the informer delivers Service events on one goroutine, so nothing can have
+	// changed in between today, but that is the caller's property and not this
+	// type's.
+	if unchangedLocked(m[svc.UID], svc) {
 		return
 	}
 	ix.gen.Add(1)
@@ -192,8 +196,8 @@ func (ix *Index) Upsert(svc *corev1.Service) {
 	// as an Update carrying a new UID — and nothing ever deletes the old one.
 	//
 	// Everything here is keyed by UID, so the name index is the only place the
-	// collision is visible. Left alone, the stale record keeps matching pods in
-	// Matching() and keeps yielding targets derived from a Service
+	// collision is visible. Left alone, the stale record keeps matching pods
+	// (InNamespaces + Selects) and keeps yielding targets derived from a Service
 	// configuration that no longer exists — a removed annotation still
 	// scraped, or a changed port scraped forever at up=0 — until the process
 	// restarts. This is the same guard, for the same reason, that
@@ -211,6 +215,36 @@ func (ix *Index) Upsert(svc *corev1.Service) {
 	}
 	ix.byName[nameKey] = svc.UID
 	m[svc.UID] = rec
+}
+
+// resyncNoOp reports that this delivery carries the resourceVersion the index
+// already holds for the Service — an informer resync or relist of an unchanged
+// object, which has nothing to convert, count or index.
+func (ix *Index) resyncNoOp(svc *corev1.Service) bool {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	return unchangedLocked(ix.byNamespace[svc.Namespace][svc.UID], svc)
+}
+
+// unchangedLocked is the ONE test both halves of Upsert's resync short-circuit
+// apply (the read-locked probe and the write-locked re-check): the index holds
+// a record for this UID at this delivery's resourceVersion.
+//
+// A re-delivery that changes NOTHING must not move the change token. The token
+// is what holds the server's monitor→Service cross product together
+// (buildMonitoredServices: 19.8 ms and 9.67 MB at 50 monitors x 2,000
+// Services), and an informer resync re-delivers every Service byte-identical —
+// so with `-resync` set, an unconditional bump meant essentially every agent
+// poll paid a full rebuild. The pod path (store.UpsertPod) has had this
+// short-circuit all along; the two index paths did not.
+//
+// An EMPTY resourceVersion is treated as changed. Only hand-built objects lack
+// one (the informer always sets it), and for those "same version" is not a
+// statement about content — a test or an embedder mutating a fixture in place
+// would otherwise have its update silently ignored. store.UpsertPod applies the
+// same rule, for the same reason.
+func unchangedLocked(cur *Service, svc *corev1.Service) bool {
+	return cur != nil && svc.ResourceVersion != "" && cur.resourceVersion == svc.ResourceVersion
 }
 
 // Delete removes a service.
@@ -291,32 +325,14 @@ func (ix *Index) All(namespaces []string) []*Service {
 	return out
 }
 
-// Matching returns the services in namespace whose selector matches the
-// given pod labels. Services without a selector never match.
-//
-// It takes the lock per call, so a caller matching MANY pods (every pod on a
-// node, per targets request) wants InNamespaces + Service.Selects instead: this
-// scans every Service in the namespace, and doing that under a fresh RLock once
-// per pod put 110 lock round trips and a map walk apiece on the default
-// annotation path of every scrape cycle.
-func (ix *Index) Matching(namespace string, podLabels map[string]string) []*Service {
-	ix.reads.Add(1)
-	ix.mu.RLock()
-	defer ix.mu.RUnlock()
-
-	var out []*Service
-	for _, svc := range ix.byNamespace[namespace] {
-		if svc.Selects(podLabels) {
-			out = append(out, svc)
-		}
-	}
-	return out
-}
-
 // InNamespaces snapshots the services of each named namespace, each list sorted
 // by name. Absent namespaces are simply missing from the result; the slices and
-// the Services in them are shared and must be treated as immutable (the same
-// contract Matching's results carry).
+// the Services in them are shared and must be treated as immutable.
+//
+// It is also THE way to match pods against Services: take the snapshot once and
+// filter it with Service.Selects per pod. A per-pod locked scan (the removed
+// Matching) put 110 lock round trips and a namespace walk apiece on the default
+// annotation path of every scrape cycle.
 //
 // That contract is now LOAD-BEARING rather than merely tidy: since the memo
 // below, two concurrent callers receive the SAME backing array, so a caller
@@ -412,7 +428,7 @@ func (ix *Index) InNamespaces(namespaces []string) map[string][]*Service {
 			list = append(list, svc)
 		}
 		if len(list) > 1 {
-			sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+			slices.SortFunc(list, func(a, b *Service) int { return cmp.Compare(a.Name, b.Name) })
 		}
 		built[i] = list
 		out[ns] = list

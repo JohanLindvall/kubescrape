@@ -7,7 +7,8 @@
 # image is distroless/STATIC with nothing but the two binaries in it.
 #
 # `make image-static` (TAGS_STATIC defaults to `azure,events`: everything except
-# journald). The default image is untouched — see Dockerfile.
+# journald), or `make image` with any TAGS lacking journald, which picks this
+# file itself. The default image is untouched — see Dockerfile.
 #
 # The trade this image makes is exactly the one AGENTS.md and the README name:
 # no systemd-unit logs (kubelet, containerd), which on many distros are the

@@ -1,11 +1,16 @@
 package positions
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"syscall"
 	"testing"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 func inodeOf(t *testing.T, path string) uint64 {
@@ -195,5 +200,77 @@ func TestSetLogsOwnedTakesTheMapAndStillHandsOutCopies(t *testing.T) {
 	}
 	if got := s2.Logs()["/a.log"]; got.Offset != 1 || len(got.Pending) != 1 || got.Pending[0].To != 10 {
 		t.Fatalf("stored = %+v", got)
+	}
+}
+
+// TestEncodeMatchesMarshal pins the document save writes to be byte-identical
+// to json.Marshal of the doc, in every combination of the two sections and
+// across a cursor-only change that reuses the cached log section — the on-disk
+// format and the identity skip both depend on it.
+func TestEncodeMatchesMarshal(t *testing.T) {
+	odd := `s=<a>&"b"\c;é` // HTML-escaped and quoted by encoding/json
+	logs := map[string]LogPos{
+		"/var/log/<pod>&a.log": {Offset: 7, Inode: 3, FingerprintLen: 5, FingerprintHash: 9},
+		"/var/log/b.log":       {Offset: 1, Pending: []Prefix{{Inode: 2, From: 0, To: 4}}},
+	}
+	s := &Store{logsDirty: true}
+	check := func(when string) {
+		t.Helper()
+		got, err := s.encode()
+		if err != nil {
+			t.Fatalf("%s: %v", when, err)
+		}
+		want, err := json.Marshal(&s.doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s: encoded\n%s\nwant\n%s", when, got, want)
+		}
+	}
+	check("empty store")
+	s.doc.JournalCursor = odd
+	check("cursor only")
+	s.doc.Logs, s.logsDirty = logs, true
+	check("both sections")
+	s.doc.JournalCursor = "s=next"
+	check("cursor changed, log section reused")
+	s.doc.JournalCursor = ""
+	check("logs only")
+	s.doc.Logs, s.logsDirty = map[string]LogPos{}, true
+	check("emptied log section")
+	s.doc.Logs, s.logsDirty = nil, true
+	s.doc.JournalCursor = odd
+	check("nil log section")
+}
+
+// A journald cursor commit — once per settled batch, every
+// -journald-flush-interval — must not re-marshal the tailer's whole unchanged
+// log section: at 3000 tracked files that was ~6000 allocations per commit,
+// under the mutex the tailer's own saves wait on.
+func TestCursorCommitDoesNotReencodeTheLogSection(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	s, err := Open(filepath.Join(t.TempDir(), "positions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := make(map[string]LogPos, 1000)
+	for i := range 1000 {
+		logs[fmt.Sprintf("/var/log/containers/pod-%d_ns_app-%016x.log", i, i)] = LogPos{Offset: int64(i), Inode: uint64(i)}
+	}
+	if err := s.SetLogs(logs); err != nil {
+		t.Fatal(err)
+	}
+	s.doc.JournalCursor = "s=abc;i=1"
+	allocs := testing.AllocsPerRun(20, func() {
+		if _, err := s.encode(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs > 5 {
+		t.Fatalf("encoding the document after a cursor-only change allocated %v times for 1000 unchanged "+
+			"log entries: the log section is being re-marshalled", allocs)
 	}
 }

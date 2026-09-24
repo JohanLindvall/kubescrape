@@ -26,7 +26,8 @@ import (
 // Neither existing guard can see it. TestDocumentedMetricsExist checks label
 // NAMES (it truncates a documented selector at the first of `=!~`), and
 // TestMetricsDocIsCurrent only keeps the generated file in step with whatever
-// obs.go happens to say. So the domain is checked here, against the call sites.
+// the registrations happen to say. So the domain is checked here, against the
+// call sites.
 //
 // The rule is deliberately SELF-SCOPING — it fires only where the help already
 // names at least one value of that label position. A terse help that enumerates
@@ -42,7 +43,7 @@ import (
 // the substring problem namesWord exists to avoid, and a guard that cries wolf
 // gets loosened rather than obeyed.
 func TestHelpEnumeratingLabelValuesNamesThemAll(t *testing.T) {
-	docs, err := ParseMetricDocs("obs.go")
+	docs, err := ParseMetricDocs(".")
 	if err != nil {
 		t.Fatalf("ParseMetricDocs: %v", err)
 	}
@@ -52,7 +53,7 @@ func TestHelpEnumeratingLabelValuesNamesThemAll(t *testing.T) {
 	}
 	// The Go identifier each registration is assigned to — call sites name
 	// obs.Ingested, not kubescrape_ingest_resources_total.
-	varToMetric, err := registrationVars("obs.go")
+	varToMetric, err := registrationVars(".")
 	if err != nil {
 		t.Fatalf("registrationVars: %v", err)
 	}
@@ -110,7 +111,7 @@ func TestHelpEnumeratingLabelValuesNamesThemAll(t *testing.T) {
 				return true
 			}
 			for i, a := range call.Args {
-				lit, ok := constString(a)
+				lit, ok := stringLit(a)
 				if !ok {
 					continue
 				}
@@ -167,16 +168,30 @@ func TestHelpEnumeratingLabelValuesNamesThemAll(t *testing.T) {
 }
 
 // registrationVars maps the identifier a Registry.* registration is assigned to
-// onto the metric name it registers. ParseMetricDocs deliberately does not keep
-// it (docs/METRICS.md names metrics, not variables), and the call sites name
-// only the identifier.
-func registrationVars(filename string) (map[string]string, error) {
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, filename, nil, parser.SkipObjectResolution)
+// onto the metric name it registers, over the same files ParseMetricDocs reads
+// for path. ParseMetricDocs deliberately does not keep it (docs/METRICS.md
+// names metrics, not variables), and the call sites name only the identifier.
+func registrationVars(path string) (map[string]string, error) {
+	files, err := sourceFiles(path)
 	if err != nil {
 		return nil, err
 	}
 	out := map[string]string{}
+	for _, filename := range files {
+		if err := registrationVarsFile(filename, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// registrationVarsFile adds one file's registrations to out.
+func registrationVarsFile(filename string, out map[string]string) error {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filename, nil, parser.SkipObjectResolution)
+	if err != nil {
+		return err
+	}
 	ast.Inspect(f, func(n ast.Node) bool {
 		spec, ok := n.(*ast.ValueSpec)
 		if !ok || len(spec.Names) != 1 || len(spec.Values) != 1 {
@@ -196,38 +211,14 @@ func registrationVars(filename string) (map[string]string, error) {
 		if len(call.Args) == 0 {
 			return true
 		}
-		if name, ok := constString(call.Args[0]); ok && strings.HasPrefix(name, "kubescrape_") {
+		// stringLit is the generator's own literal evaluation (metricdoc.go), so
+		// a fix to how the doc reads a name reaches this guard too.
+		if name, ok := stringLit(call.Args[0]); ok && strings.HasPrefix(name, "kubescrape_") {
 			out[spec.Names[0].Name] = name
 		}
 		return true
 	})
-	return out, nil
-}
-
-// constString evaluates a string literal, including the `"a"+"b"` form gofmt
-// leaves behind (the same rule as metricdoc.go's stringLit, which is unexported
-// there and takes only what its own caller needs).
-func constString(e ast.Expr) (string, bool) {
-	switch v := e.(type) {
-	case *ast.BasicLit:
-		if v.Kind != token.STRING {
-			return "", false
-		}
-		s, err := strconv.Unquote(v.Value)
-		return s, err == nil
-	case *ast.BinaryExpr:
-		if v.Op != token.ADD {
-			return "", false
-		}
-		l, lok := constString(v.X)
-		r, rok := constString(v.Y)
-		if lok && rok {
-			return l + r, true
-		}
-	case *ast.ParenExpr:
-		return constString(v.X)
-	}
-	return "", false
+	return nil
 }
 
 // namesWord reports whether help mentions val as a WHOLE token. Substring
@@ -295,7 +286,7 @@ func sortedIntKeys[V any](m map[int]V) []int {
 // TestHelpEnumeratingLabelValuesNamesThemAll above. Prefer that form when a fix
 // admits it; this one only catches the mistake it already knows about.
 func TestRetiredHelpClaimsStayRetired(t *testing.T) {
-	docs, err := ParseMetricDocs("obs.go")
+	docs, err := ParseMetricDocs(".")
 	if err != nil {
 		t.Fatalf("ParseMetricDocs: %v", err)
 	}

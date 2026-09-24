@@ -1,269 +1,19 @@
 package tailer
 
-// The incremental read path for live (non-archive) files: metadata
-// resolution, the per-sweep read loop, open/identity verification, and
-// fingerprint extension.
+// The incremental read path for live (non-archive) files: the per-sweep read
+// loop, rotation classification, and open/identity verification. Metadata
+// resolution is resolve.go's; the fingerprint itself is fingerprint.go's.
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"os"
 	"syscall"
-	"time"
 
-	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
-	"go.opentelemetry.io/collector/pdata/pcommon"
 )
-
-// Metadata resolution backoff bounds: the first retry is quick (a container
-// genuinely racing the API server resolves within a second or two), the cap
-// keeps a permanently unresolvable file down to one blocking call a minute.
-const (
-	minMetaBackoff = 2 * time.Second
-	maxMetaBackoff = time.Minute
-)
-
-func nextMetaBackoff(cur time.Duration) time.Duration {
-	if cur <= 0 {
-		return minMetaBackoff
-	}
-	if cur >= maxMetaBackoff {
-		return maxMetaBackoff
-	}
-	return min(cur*2, maxMetaBackoff)
-}
-
-// jitterMetaBackoff spreads the retry over [d, 1.25d).
-//
-// Every file on a node is resolved by one goroutine against one service, so a
-// metadata-service rollout puts every file on the SAME schedule: they all
-// fail together, double together and hit the recovered service together — a
-// synchronised burst from every node in the fleet at once, which is how a
-// rollout turns into a second outage. The skew is small (the cap stays ~1m)
-// but it is enough to decorrelate.
-func jitterMetaBackoff(d time.Duration) time.Duration {
-	if d <= 0 {
-		return d
-	}
-	return d + time.Duration(rand.Int64N(int64(d/4)+1))
-}
-
-// resolveMetadata builds the file's resource attributes. Plain files resolve
-// from the source's static attributes plus node metadata (immediately, except
-// while a CONFIGURED node-info provider has not yielded its first value — see
-// resolvePlain); containerd files fetch pod metadata from the service (backing
-// off between attempts), and are not consumed until it is available — the data
-// waits on disk, nothing is lost.
-func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
-	if !f.source.containerd {
-		return t.resolvePlain(f)
-	}
-	if time.Now().Before(f.nextMetaTry) {
-		return false
-	}
-	md, err := t.cfg.Metadata.Container(ctx, f.containerID, t.cfg.MetadataWait)
-	if err != nil {
-		// EXPONENTIAL backoff. The lookup deliberately BLOCKS server-side for
-		// the whole -metadata-wait when the container is unknown, and it runs
-		// on the single sweep goroutine that serves every file on the node, so
-		// a flat retry shorter than the cost of the sweep it spaces out lets a
-		// few permanently unresolvable files (a deleted pod whose tombstone has
-		// expired) monopolise the tailer: nothing is read, no rotation is
-		// noticed, and a file rotating twice inside that window loses the
-		// middle incarnation.
-		f.metaBackoff = nextMetaBackoff(f.metaBackoff)
-		f.nextMetaTry = time.Now().Add(jitterMetaBackoff(f.metaBackoff))
-		if metaclient.IsNotFound(err) {
-			t.log.Debug("container metadata not found yet", "path", f.path, "id", f.containerID)
-		} else if t.metaWarn.Allow(metaWarnEvery) {
-			// THROTTLED, and keyless on purpose. This fails per FILE, on each
-			// file's own backoff, so an unreachable metadata service made every
-			// tracked file on the node warn about the same thing once a minute
-			// — a flood proportional to fleet size for one cluster-wide
-			// condition. The condition is the service; one example file plus
-			// how many are waiting is what an operator acts on, and the rate
-			// lives on kubescrape_metadata_requests_total, which metaclient
-			// moves per attempt. The waiting count is computed INSIDE the
-			// allowed branch: slog evaluates its arguments eagerly, and this
-			// walks every tracked file.
-			t.log.Warn("fetching container metadata failed; these files are tracked but nothing is read from them until it resolves",
-				"path", f.path, "id", f.containerID, "error", err,
-				"files", t.unresolvedFiles(), "backoff", f.metaBackoff)
-		}
-		return false
-	}
-	f.metaBackoff = 0
-	// Retained so the resource can be re-rendered without a second lookup when
-	// the NODE metadata changes (refreshNodeAttrs). It is the value metaclient
-	// already holds in its per-URL cache — the maps are shared under that
-	// cache's treat-as-immutable contract — so this costs one struct per
-	// tracked file, not a copy of the pod.
-	f.meta = md
-	t.buildResource(f, t.nodeInfo())
-	f.resolved = true
-	if !f.source.wantLabels(md.Pod.Labels) {
-		// The source selects pods by label; this one does not match. Labels are
-		// only known now, so the file is tracked — but no data is ever read
-		// from it, unlike a logs.rules drop which pays read+parse+enrich first.
-		f.excluded = true
-		t.log.Debug("pod does not match the source selector; not collecting",
-			"path", f.path, "source", f.source.name)
-		return true
-	}
-	t.applyPodConfig(f, md.Pod.Annotations)
-	return true
-}
-
-// unresolvedFiles counts tracked files that have not been attributed yet — the
-// scale of an attribution outage, which one file's error cannot convey. Walked
-// only from a throttled log branch and from publishStatus, never per file and
-// never per line.
-func (t *Tailer) unresolvedFiles() int {
-	n := 0
-	for _, f := range t.files {
-		if !f.resolved && !f.excluded {
-			n++
-		}
-	}
-	return n
-}
-
-// resolvePlain builds a non-containerd file's resource: node attributes from
-// the builder plus the source's configured static attributes (which win). A
-// source without an explicit service.name defaults it to the source name.
-func (t *Tailer) resolvePlain(f *file) bool {
-	ni := t.nodeInfo()
-	if t.cfg.NodeInfo != nil && ni == nil {
-		// A provider is CONFIGURED but has not produced anything yet. Defer:
-		// the file stays unresolved (nothing is read before it can be
-		// attributed — the containerd path's rule) and the next sweep retries
-		// at one cheap provider call per sweep. This is a first-value guard
-		// only; it is NOT what keeps the resource current, because it cannot
-		// be — the shipped agent seeds selfmeta.Poll with a placeholder
-		// NodeInfo (the bare node name, no labels), so the provider is non-nil
-		// from the first call and this branch never fires there. What covers
-		// the placeholder — and every later node relabel — is refreshNodeAttrs,
-		// which re-renders the resource whenever the provider yields a
-		// different value.
-		return false
-	}
-	t.buildResource(f, ni)
-	f.resolved = true
-	return true
-}
-
-// nodeInfo reads the configured node-metadata provider once, or nil when none
-// is configured. The POINTER it returns is what a file records as "the node
-// metadata my resource was built from": selfmeta.Poll stores a freshly
-// allocated value on every successful resolve, so pointer inequality is exactly
-// "the provider has produced something new since we built".
-func (t *Tailer) nodeInfo() *attrs.NodeInfo {
-	if t.cfg.NodeInfo == nil {
-		return nil
-	}
-	return t.cfg.NodeInfo()
-}
-
-// buildResource renders f.resource from what is known about the file — the
-// retained container metadata for a containerd file, the source's statics and
-// path captures for a plain one — plus the node metadata passed in, and records
-// which node metadata it used.
-//
-// It is called at resolve time and again whenever the node metadata changes
-// (refreshNodeAttrs), so everything that shapes the resource has to live HERE
-// rather than at the resolve call site: an override applied once, next to the
-// resolve, would be silently dropped by the next re-render. That is why the pod
-// annotation's overrides are re-applied from the vetted copy on the file rather
-// than re-parsed (re-parsing would also re-count obs.LogPodAttrsRefused and
-// re-warn, once per refresh, forever).
-func (t *Tailer) buildResource(f *file, ni *attrs.NodeInfo) {
-	res := pcommon.NewResource()
-	actx := attrs.Context{Node: ni}
-	if f.source.containerd {
-		if f.meta == nil {
-			return // nothing to build from; resolveMetadata has not run
-		}
-		actx.Pod, actx.Container = &f.meta.Pod, &f.meta.Container
-		t.cfg.Attrs.Build(res, actx)
-	} else {
-		t.cfg.Attrs.Build(res, actx)
-		a := res.Attributes()
-		if _, ok := f.source.attributes["service.name"]; !ok && f.source.name != "" {
-			if _, set := a.Get("service.name"); !set {
-				a.PutStr("service.name", f.source.name)
-			}
-		}
-		for k, v := range f.source.attributes {
-			a.PutStr(k, v)
-		}
-		// Path-derived attributes land after the statics: a per-file capture is
-		// more specific than the source-wide constant it may share a key with.
-		for i := range f.source.pathAttrs {
-			f.source.pathAttrs[i].apply(f.path, a)
-		}
-		// The source's attributes land AFTER Build so they beat templates and
-		// defaults — but the pipeline's guarantees must still close over the
-		// FINAL set. Re-derive identity (fill-if-absent: a source-declared
-		// k8s.namespace.name now yields service.namespace, so tenancy routing
-		// and the Mimir job agree about the namespace) and re-apply the
-		// operator's global attribute filter (resourceAttributes.disable could
-		// not drop a plain source's static attribute while the stamp bypassed
-		// it).
-		attrs.Identity(res)
-		t.cfg.Attrs.FilterResource(res)
-	}
-	f.resource = res
-	f.nodeInfo = ni
-	f.applyPodResource()
-}
-
-// refreshNodeAttrs re-renders a resolved file's resource when the node-metadata
-// provider has yielded a different value than the one it was built from.
-//
-// The resource used to be LATCHED at first resolve, and that was wrong twice
-// over. The shipped agent seeds selfmeta.Poll with a placeholder NodeInfo
-// carrying the node NAME and no labels, so a file resolved before the first
-// GET /v1/nodes/{name}/metadata landed — deterministically every plain-source
-// file, which resolves on sweep #1 and takes no lookup at all — kept a
-// label-less resource for the whole life of that file while a file discovered a
-// second later carried the real one: ONE node exporting two resource shapes at
-// once, so an operator template over .Node.Labels (k8s.node.zone, the
-// documented example) is missing from half the streams and `sum by
-// (k8s.node.zone)` silently drops them. And with no race at all,
-// -node-metadata-refresh — which exists to propagate a node relabel, and
-// reaches every other pipeline — never reached an already-tailed file.
-//
-// Re-rendering rather than deferring is the shape every other log producer in
-// this repo already has (journald, events, azurediag and ingest rebuild their
-// resource per batch, and so self-heal). Deferring instead would gate log
-// collection on a lookup that can fail forever: a plain source must not stop
-// collecting because the metadata service is unreachable, which is exactly when
-// its logs matter most.
-//
-// It costs one pointer compare per resolved file per sweep, and a re-render
-// only when the provider genuinely produced something new — at most once per
-// -node-metadata-refresh, and never on the per-line path. Records already built
-// are unaffected: flush COPIES f.resource into each ResourceLogs (newScope) and
-// the log-metrics bind cache lives for exactly one flush.
-func (t *Tailer) refreshNodeAttrs(f *file) {
-	if t.cfg.NodeInfo == nil || f.excluded {
-		return
-	}
-	ni := t.cfg.NodeInfo()
-	// nil is a provider that has nothing to say (it cannot happen with
-	// selfmeta.Poll, whose value only ever moves forward). Keep what we have
-	// rather than re-rendering the node attributes away — the same rule as the
-	// resolve-time guard, one direction later.
-	if ni == nil || ni == f.nodeInfo {
-		return
-	}
-	t.buildResource(f, ni)
-}
 
 // swept reports whether every sweep runs this file through readFile's own
 // os.Stat of the path — which is what lets discovery skip its stat (claimPath)
@@ -325,23 +75,19 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		// recorded UN-DRAINED as an open-ended segment (reopen's aborted
 		// arm): draining would feed its lines out of order too, and the
 		// segment machinery replays them in sequence once their turn comes.
+		//
+		// That is handleRotation with draining refused and nothing read this
+		// pass (read = 0, readTo = readPos), which reduces its three arms to
+		// exactly this gate's decisions — rename recorded un-drained,
+		// truncation or same-size copytruncate restarting the tail (the
+		// segments are unaffected: they live on their own inodes) — and names
+		// the arm at Debug like every other rotation. The gate used to carry
+		// its own copy of the classifier, without the reason lines.
 		st, err := os.Stat(f.path)
 		if err != nil {
 			return err
 		}
-		switch {
-		case inodeOf(st) != f.inode:
-			t.reopen(ctx, f, true, false)
-			if err := t.ensureOpen(f); err != nil {
-				t.log.Debug("opening rotated-in file", "path", f.path, "error", err)
-			}
-		case st.Size() < f.readPos,
-			!st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f):
-			// Truncation (or a same-size copytruncate): the tail's content
-			// was replaced; restart it. The segments are unaffected — they
-			// live on their own inodes.
-			t.reopen(ctx, f, false, true)
-		}
+		t.handleRotation(ctx, f, st, 0, f.readPos, false)
 		f.lastMod = st.ModTime()
 		return nil
 	}
@@ -365,6 +111,11 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		if st, err := f.f.Stat(); err == nil &&
 			st.Size() >= f.readPos &&
 			!st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f) {
+			// Named like handleRotation's arms: this is the same copytruncate,
+			// caught before the read instead of after it, and the reason line
+			// is the only thing that tells it from a clean rename.
+			t.log.Debug("log file rotated", "path", f.path, "reason", "copytruncate",
+				"inode", f.inode, "bytes", st.Size(), "readPos", f.readPos)
 			t.reopen(ctx, f, false, true)
 			f.lastMod = st.ModTime()
 			if err := t.ensureOpen(f); err != nil {
@@ -383,6 +134,10 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 	budget := t.cfg.MaxBytesPerSweep
 	buf := t.scratch()
 	read := 0
+	// Where this pass started reading: readFrom+read is how far into the file
+	// the pass got, which a mid-read rewind hides from f.readPos (below).
+	readFrom := f.readPos
+	rewound := false
 	for budget > 0 && !f.limited {
 		limit := min(len(buf), budget)
 		n, err := f.f.Read(buf[:limit])
@@ -398,6 +153,7 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 				// pointing at an inode the path no longer names, or a second
 				// rotation inside the export outage loses the incarnation
 				// between them.
+				rewound = true
 				break
 			}
 		}
@@ -434,8 +190,26 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 	if err != nil {
 		return err
 	}
-	t.handleRotation(ctx, f, st, read)
-	f.lastMod = st.ModTime()
+	// The truncation decision is taken against how far this pass READ, not
+	// against f.readPos: a mid-read flush failure has already rewound readPos
+	// to `committed`, and an in-place rewrite landing inside that failing
+	// export with a size in [committed, readFrom+read) is then invisible to a
+	// `size < readPos` test (and to the copytruncate arm, which needs read ==
+	// 0). An unrewritten file is never smaller than bytes already read from it,
+	// so the high-water is safe to compare against.
+	t.handleRotation(ctx, f, st, read, readFrom+int64(read), true)
+	if !rewound {
+		// A rewound pass leaves lastMod UNSTAMPED. Stamping it consumed the
+		// mtime change of a rewrite the size test above cannot see (same head
+		// size or larger than what was read), and the next sweep's pre-read
+		// fingerprint re-verify — the only other witness — is gated on the
+		// mtime having moved, so the tailer resumed at `committed` mid-way into
+		// the replacement: its prefix lost with no counter moving, and a torn
+		// record exported whenever the line lengths differ. Unstamped, the next
+		// pass re-verifies the head; an unchanged file costs one fingerprint
+		// read, and only after an export failure.
+		f.lastMod = st.ModTime()
+	}
 	return nil
 }
 
@@ -451,7 +225,17 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 // either way), so there was nothing left to retry, the function had a single
 // `return true`, and the caller's abort branch was unreachable code described
 // by a comment that contradicted it. Returning nothing is the honest signature.
-func (t *Tailer) handleRotation(ctx context.Context, f *file, st os.FileInfo, read int) {
+//
+// readTo is the file offset the caller's read pass reached. It equals
+// f.readPos unless a mid-read flush failure rewound the file, and the
+// truncation arm must compare against the larger of the two (see readFile).
+//
+// drain is false only from readFile's unfinished-replay gate: with a segment
+// replay still owed, a renamed-away tail must not be drained (its lines would
+// enter the pipeline ahead of the segments' remainder), so the rename arm
+// records it UN-DRAINED — reopen's aborted arm, an open-ended segment the
+// replay reaches in its turn. The two truncation arms never drain either way.
+func (t *Tailer) handleRotation(ctx context.Context, f *file, st os.FileInfo, read int, readTo int64, drain bool) {
 	// Which ARM was taken, and on what evidence: kubescrape_log_rotations_total
 	// counts all three together, so during an incident ("did logrotate
 	// copytruncate under us and eat a window, or was this a clean rename?")
@@ -472,8 +256,9 @@ func (t *Tailer) handleRotation(ctx context.Context, f *file, st os.FileInfo, re
 		t.log.Debug("log file rotated", "path", f.path, "reason", "rename",
 			"inode", f.inode, "newInode", inodeOf(st), "committed", f.committed, "readPos", f.readPos)
 		// Rename rotation: the path names a new file. Drain what the old
-		// writer appended after our last read, then switch — carrying a
-		// straddling multi-line group across the boundary. An aborted drain
+		// writer appended after our last read (unless drain refuses it: an
+		// unfinished segment replay), then switch — carrying a straddling
+		// multi-line group across the boundary. An aborted or refused drain
 		// (mid-drain flush failure rewound this fd) does NOT abandon the
 		// rotation: reopen records the un-drained inode as an OPEN-ENDED
 		// segment so feedSegments replays its remainder later, and the new
@@ -485,7 +270,7 @@ func (t *Tailer) handleRotation(ctx context.Context, f *file, st os.FileInfo, re
 		// window is not one sweep: the abort only clears once an export
 		// succeeds, so it is the entire export outage, which is exactly when
 		// rotations pile up.
-		drained := t.drainFile(ctx, f)
+		drained := drain && t.drainFile(ctx, f)
 		t.reopen(ctx, f, true, drained)
 		// Open the NEW incarnation now, not on the next sweep. reopen clears
 		// f.f/f.inode/f.fp, so until the file is opened again it has no fd and
@@ -493,17 +278,19 @@ func (t *Tailer) handleRotation(ctx context.Context, f *file, st os.FileInfo, re
 		// drain and records no segment, and the whole inode is unreachable
 		// forever — silently and uncounted. The window is a full sweep, and it
 		// widens to seconds whenever the sweep goroutine is blocked in a
-		// failing export, which is exactly when rotations pile up. The
-		// copytruncate branch above already re-opens for the same reason.
+		// failing export, which is exactly when rotations pile up. The two
+		// truncation arms below and readFile's pre-read copytruncate
+		// re-verify re-open for the same reason.
 		if err := t.ensureOpen(f); err != nil {
 			t.log.Debug("opening rotated-in file", "path", f.path, "error", err)
 		}
-	case st.Size() < f.readPos:
+	case st.Size() < max(f.readPos, readTo):
 		t.log.Debug("log file rotated", "path", f.path, "reason", "truncated",
-			"inode", f.inode, "bytes", st.Size(), "readPos", f.readPos)
+			"inode", f.inode, "bytes", st.Size(), "readPos", max(f.readPos, readTo))
 		// In-place truncation: the unread tail is gone; restart at zero.
 		// (Draining would read the replacement content mid-stream.)
 		t.reopen(ctx, f, false, true)
+		t.reopenTruncated(f)
 	case read == 0 && !st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f):
 		t.log.Debug("log file rotated", "path", f.path, "reason", "copytruncate",
 			"inode", f.inode, "bytes", st.Size(), "readPos", f.readPos)
@@ -511,6 +298,19 @@ func (t *Tailer) handleRotation(ctx context.Context, f *file, st os.FileInfo, re
 		// its head no longer matches: truncated and rewritten to a size at
 		// or beyond our position (same-size copytruncate). Restart.
 		t.reopen(ctx, f, false, true)
+		t.reopenTruncated(f)
+	}
+}
+
+// reopenTruncated opens the truncated file's new content right after a
+// truncation arm's reopen, for the rename arm's reason: reopen clears
+// f.f/f.inode/f.fp, and identityChanged needs a recorded inode, so a rename
+// rotation landing before the next sweep would find nothing to drain and record
+// no segment — everything the truncated inode held since would be lost with no
+// counter and no log line.
+func (t *Tailer) reopenTruncated(f *file) {
+	if err := t.ensureOpen(f); err != nil {
+		t.log.Debug("opening truncated file", "path", f.path, "error", err)
 	}
 }
 
@@ -560,6 +360,15 @@ func (t *Tailer) ensureOpen(f *file) error {
 	// The old incarnation's identity and progress, captured before the
 	// assignments below adopt the new file's — the replaced arm records them.
 	oldInode, oldFp, oldCommitted := f.inode, f.fp, f.committed
+	// The SAME inode with a head that no longer matches is not a rename
+	// rotation: the file was rewritten IN PLACE (copytruncate, a writer
+	// reopening with O_TRUNC) while no fd was held. There is no rotated copy
+	// under this inode to recover anything from — findRotated resolves a
+	// segment by its inode, and the only file carrying it is the live one,
+	// whose head no longer matches — so recording a segment only ever produced
+	// a certain findRotated miss, i.e. a "rotated segment source not found"
+	// loss report for a file that may have been fully caught up.
+	inPlace := replaced && oldInode == inode
 	if replaced {
 		start = 0
 	}
@@ -575,7 +384,24 @@ func (t *Tailer) ensureOpen(f *file) error {
 	if truncated {
 		start = 0
 	}
-	if _, err := fh.Seek(start, 0); err != nil {
+	// An idle close is allowed while an oversized line's discard window is
+	// still OPEN (closeIdleFiles: `committed` sits at the line's start, readPos
+	// far past it, pending empty — a writer that stalled mid-line must not pin
+	// the fd forever). Reopening at `committed` and restarting would then
+	// re-read the already-dropped prefix: the one physical line counted into
+	// kubescrape_log_oversized_dropped_total twice, or counted dropped AND
+	// exported as a truncated record when the re-read happens to meet its
+	// newline before crossing the cap again. The identity was just re-verified
+	// (same inode, same head, not shrunk below what was read), so
+	// [committed, readPos) is the same dropped prefix: resume the window where
+	// it stood instead.
+	resumeDiscard := f.idleClosed && !replaced && !truncated && f.discarding &&
+		len(f.pending) == 0 && f.readPos <= st.Size()
+	seekTo := start
+	if resumeDiscard {
+		seekTo = f.readPos
+	}
+	if _, err := fh.Seek(seekTo, 0); err != nil {
 		_ = fh.Close()
 		return err
 	}
@@ -584,11 +410,38 @@ func (t *Tailer) ensureOpen(f *file) error {
 		_ = fh.Close()
 		return err
 	}
+	// Which door this reopen came through, before the flag is cleared: see the
+	// in-place arm below.
+	wasIdleClosed := f.idleClosed
 	f.f = fh
 	f.inode = inode
 	f.fp = fp
 	f.idleClosed = false // open again: the idle-close stat gate no longer applies
-	if replaced {
+	hop := false
+	switch {
+	case inPlace && !f.compressed:
+		// Counted and named like handleRotation's copytruncate arm, which is
+		// the same physical event seen with an fd held: a rotation, and no
+		// segment — the in-place rewrite destroyed whatever was unread.
+		obs.LogRotations.Inc()
+		t.log.Debug("log file rotated", "path", f.path, "reason", "copytruncate",
+			"inode", inode, "bytes", st.Size(), "committed", oldCommitted)
+		if !wasIdleClosed {
+			// Through the RESTART door (and a rewind whose Seek dropped the
+			// handle) a same-inode head mismatch is also exactly what a rename
+			// rotation, a prune and INODE REUSE while the agent was down look
+			// like — a genuine loss of the checkpointed remainder, which the
+			// segment's findRotated miss used to count. Keep counting it, under
+			// a line that names what was actually observed. Not on the
+			// idle-close door: that file was fully caught up when its fd was
+			// released, and inode reuse would need the rotated inode freed and
+			// reused within one stat-gated sweep.
+			obs.LogPrefixLost.Inc()
+			t.log.Warn("log file was rewritten in place while no descriptor was held; "+
+				"whatever it held past the committed offset is lost",
+				"path", f.path, "inode", inode, "committed", oldCommitted)
+		}
+	case replaced && !f.compressed:
 		// The OLD incarnation rotated away while we held no fd — between
 		// -logs-idle-close releasing it and this reopen, or between a
 		// restart's initFile (whose stat still saw the old inode) and the
@@ -601,28 +454,25 @@ func (t *Tailer) ensureOpen(f *file) error {
 		// pruned the file. Previously the remainder was discarded silently,
 		// with every loss counter flat. Not for archives: their offsets are
 		// in decompressed space and archiveReplaced owns that decision.
-		if !f.compressed {
-			// The one rotation shape no counter distinguishes: it happened
-			// while this process held NO fd, so nothing observed it and the
-			// only evidence is the identity mismatch found here. Whether its
-			// remainder is recovered is decided later by feedSegments (and
-			// counted obs.LogPrefixLost if it is not), so this line is what
-			// says the recovery was even attempted, and from where.
-			t.log.Debug("log file was replaced while no descriptor was held; recording its unread remainder for replay",
-				"path", f.path, "inode", oldInode, "newInode", inode, "committed", oldCommitted)
-			f.segments = append(f.segments, &segment{
-				id: f.tail, inode: oldInode, fp: oldFp, committed: oldCommitted, to: -1, fed: false,
-			})
-			if t.checkpointing() {
-				// The hop must reach disk before the next rotation of this
-				// file, not on the 10s cadence — see reopen's identical block
-				// for the one-file-two-unsaved-hops invariant.
-				if f.hopUnsaved {
-					t.saveCheckpoints()
-				}
-				f.hopUnsaved, t.hopsUnsaved = true, true
-			}
-		}
+		//
+		// Counted like every sibling rotation arm (reopen, the truncated arm
+		// below): kubescrape_log_rotations_total says "rotations and
+		// truncations handled", and this one is handled. It cannot double-count
+		// a rotation reopen already counted — reopen zeroes f.inode, and
+		// identityChanged needs a recorded one.
+		obs.LogRotations.Inc()
+		// The one rotation shape no counter distinguishes: it happened
+		// while this process held NO fd, so nothing observed it and the
+		// only evidence is the identity mismatch found here. Whether its
+		// remainder is recovered is decided later by feedSegments (and
+		// counted obs.LogPrefixLost if it is not), so this line is what
+		// says the recovery was even attempted, and from where.
+		t.log.Debug("log file was replaced while no descriptor was held; recording its unread remainder for replay",
+			"path", f.path, "inode", oldInode, "newInode", inode, "committed", oldCommitted)
+		f.segments = append(f.segments, &segment{
+			id: f.tail, inode: oldInode, fp: oldFp, committed: oldCommitted, to: -1, fed: false,
+		})
+		hop = true
 	}
 	if truncated {
 		// Counted and named like every other rotation. This arm discarded a
@@ -636,7 +486,8 @@ func (t *Tailer) ensureOpen(f *file) error {
 		t.log.Debug("log file rotated", "path", f.path, "reason", "truncated",
 			"inode", inode, "bytes", st.Size(), "committed", oldCommitted)
 	}
-	if replaced || truncated {
+	switch {
+	case replaced || truncated:
 		// A new incarnation, so take the canonical path rather than resetting
 		// byte positions inline. Keeping the OLD tail id attributed the new
 		// inode's bytes to the previous incarnation's segment, and a withheld
@@ -644,37 +495,22 @@ func (t *Tailer) ensureOpen(f *file) error {
 		// here — advancing `committed` past bytes this file never read. The
 		// inline reset also skipped restartAt, so a rate-limit pause or an
 		// oversized-line discard window survived into a file that has nothing
-		// to do with them.
+		// to do with them. (start is 0 on both arms.)
 		f.exportedHighs = nil
-		f.newTail()
-		t.newPipeline(f) // fresh stages; reset() re-arms the segment replay
+		f.beginIncarnation(start)
+		t.newPipeline(f) // fresh stages; its purge re-arms the segment replay
+	case !resumeDiscard:
+		f.restartAt(start)
+		f.committed = start
 	}
-	f.restartAt(start)
-	f.committed = start
+	if hop {
+		// Only now: the forced save inside noteHop writes exactly what it sees,
+		// and before the reset above that was the NEW inode paired with the OLD
+		// incarnation's committed offset — a crash before the sweep's closing
+		// save then resumed the replacement mid-file, skipping its prefix and
+		// exporting a torn fragment.
+		t.noteHop(f)
+	}
 	t.watchTarget(f)
 	return nil
-}
-
-// extendFingerprint grows a short fingerprint once the file has grown past
-// the initial hash length, up to the configured size — but ONLY while the
-// head we already hashed is still there. Re-hashing unconditionally adopts
-// whatever the head happens to be now, so a copytruncate landing between a
-// read and this call would rewrite fp to the REPLACEMENT's head and blind
-// the rotation guards (which compare against fp) — silently, and for every
-// file below FingerprintBytes, i.e. every quiet container.
-//
-// Called from saveCheckpoints AND from readFile after a successful read:
-// without the read-path call, a deployment with no checkpoint store never
-// extends at all, so a file first opened at size 0 keeps the
-// matches-anything empty fingerprint forever and every fp-based rotation
-// guard is permanently blind for it.
-func (t *Tailer) extendFingerprint(f *file) {
-	if f.f == nil || t.cfg.FingerprintBytes <= 0 || f.fp.Len >= int64(t.cfg.FingerprintBytes) || !f.fp.matches(f.f) {
-		return
-	}
-	if st, err := f.f.Stat(); err == nil && st.Size() > f.fp.Len {
-		if fp, err := computeFingerprint(f.f, min(int64(t.cfg.FingerprintBytes), st.Size())); err == nil {
-			f.fp = fp
-		}
-	}
 }

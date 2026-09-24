@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -26,7 +27,7 @@ func TestEnrichedRecords(t *testing.T) {
 	dir := t.TempDir()
 	exp := &fakeExporter{}
 	tl := newTestTailer(dir, "", exp)
-	tl.cfg.Enrich = true
+	tl.cfg.Chain.Enrich = true
 	stop := startTailer(t, tl)
 	defer stop()
 
@@ -102,7 +103,7 @@ func TestLogAttrsGrouping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tl.cfg.LogAttrs = ex
+	tl.cfg.Chain.LogAttrs = ex
 	stop := startTailer(t, tl)
 	defer stop()
 
@@ -164,7 +165,7 @@ func TestMetricResolverRecordAndResourceAttrs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tl.cfg.LogAttrs = ex
+	tl.cfg.Chain.LogAttrs = ex
 
 	// Value from the RECORD attribute; label from a RESOURCE attribute
 	// (k8s.pod.name comes from fakeMeta's metadata).
@@ -175,11 +176,11 @@ func TestMetricResolverRecordAndResourceAttrs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tl.cfg.LogMetrics = set
+	tl.cfg.Chain.LogMetrics = set
 
 	// A drop rule keyed on the RECORD attribute (logchain.Resolver.RuleFn's
 	// attribute arm): lines with req.ms=13 are dropped from export.
-	tl.cfg.Rules = mustLineFilter(t, []logline.LineRule{
+	tl.cfg.Chain.Rules = mustLineFilter(t, []logline.LineRule{
 		{Action: "drop", Match: []string{"req.ms=13"}},
 	})
 
@@ -251,8 +252,8 @@ func TestRulesDrop(t *testing.T) {
 	exp := &fakeExporter{}
 	tl := newTestTailer(dir, "", exp)
 	tl.statusEvery = 30 * time.Millisecond
-	tl.cfg.Enrich = true
-	tl.cfg.Rules = mustLineFilter(t, []logline.LineRule{
+	tl.cfg.Chain.Enrich = true
+	tl.cfg.Chain.Rules = mustLineFilter(t, []logline.LineRule{
 		{Action: "drop", Match: []string{"__severity__=debug"}},
 	})
 	set, err := metrics.NewDynamicMetricSet([]metrics.Dynamic{{
@@ -262,7 +263,7 @@ func TestRulesDrop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tl.cfg.LogMetrics = set
+	tl.cfg.Chain.LogMetrics = set
 	stop := startTailer(t, tl)
 	defer stop()
 
@@ -299,7 +300,7 @@ func TestRulesAllDropped(t *testing.T) {
 	exp := &fakeExporter{}
 	tl := newTestTailer(dir, "", exp)
 	tl.statusEvery = 30 * time.Millisecond
-	tl.cfg.Rules = mustLineFilter(t, []logline.LineRule{
+	tl.cfg.Chain.Rules = mustLineFilter(t, []logline.LineRule{
 		{Action: "drop", MatchRegexp: []string{"__line__=."}},
 	})
 	stop := startTailer(t, tl)
@@ -324,14 +325,14 @@ func TestRulesSample(t *testing.T) {
 	dir := t.TempDir()
 	exp := &fakeExporter{}
 	tl := newTestTailer(dir, "", exp)
-	tl.cfg.Rules = mustLineFilter(t, []logline.LineRule{
+	tl.cfg.Chain.Rules = mustLineFilter(t, []logline.LineRule{
 		{Action: "keep", MatchRegexp: []string{"__line__=chatty"}, Sample: 0.5},
 	})
 	stop := startTailer(t, tl)
 	defer stop()
 
 	lines := make([]string, 0, 21)
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		lines = append(lines, fmt.Sprintf("%s stdout F chatty %02d", timeNowCRI(), i))
 	}
 	lines = append(lines, timeNowCRI()+" stdout F normal line")
@@ -403,7 +404,7 @@ func TestLogAttrsGroupsRewindOnFailedFlush(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tl.cfg.LogAttrs = ex
+	tl.cfg.Chain.LogAttrs = ex
 
 	tl.scanDir(tl.loadCheckpoints(), true)
 	writeLog(t, dir,
@@ -417,7 +418,7 @@ func TestLogAttrsGroupsRewindOnFailedFlush(t *testing.T) {
 	tl.sweep(ctx, true)
 	tl.flush(ctx)
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
 	}
@@ -525,7 +526,7 @@ func TestScrubRedactsExportedBodies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tl.cfg.Scrub = scr
+	tl.cfg.Chain.Scrub = scr
 
 	tl.scanDir(tl.loadCheckpoints(), true)
 	writeLog(t, dir,
@@ -565,12 +566,7 @@ func TestPermanentRejectionDropsAndKeepsShipping(t *testing.T) {
 
 	writeLines(t, filepath.Join(dir, logName), `2026-07-05T10:00:01Z stdout F after`)
 	waitFor(t, func() bool {
-		for _, r := range exp.get() {
-			if r == "after" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(exp.get(), "after")
 	}, "later lines to ship after the drop")
 
 	// The dropped batch must not have been re-sent: its offsets advanced.
@@ -693,7 +689,7 @@ func TestLogMetricResourceCarriesLiftedResourceAttrs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tl.cfg.LogAttrs = ex
+	tl.cfg.Chain.LogAttrs = ex
 
 	set, err := metrics.NewDynamicMetricSet([]metrics.Dynamic{{
 		Name: "lines_total", Type: metrics.CounterType, Value: "1",
@@ -701,7 +697,7 @@ func TestLogMetricResourceCarriesLiftedResourceAttrs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tl.cfg.LogMetrics = set
+	tl.cfg.Chain.LogMetrics = set
 
 	stop := startTailer(t, tl)
 	defer stop()

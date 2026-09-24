@@ -1,8 +1,8 @@
 package chartcheck
 
 import (
+	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -38,8 +38,7 @@ func TestSeccompProfileIsOmittedByNullNotEmptyMap(t *testing.T) {
 		if err := os.WriteFile(f, []byte(valuesYAML), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		out, err := exec.Command(helm, "template", "kubescrape", "../../charts/kubescrape",
-			"--namespace", "monitoring", "--set", on, "-f", f).CombinedOutput()
+		out, err := helmTemplate(helm, "monitoring", "--set", on, "-f", f)
 		if err != nil {
 			t.Fatalf("helm template with %q failed: %v\n%s", valuesYAML, err, out)
 		}
@@ -59,40 +58,105 @@ func TestSeccompProfileIsOmittedByNullNotEmptyMap(t *testing.T) {
 			"field has no way to satisfy it through values")
 	}
 
-	// And the DOCUMENTATION is pinned to what the two renders above prove,
-	// because the defect was never in the template — the template has always
-	// behaved this way. It was five copies of an instruction that does nothing.
-	for _, doc := range []string{
-		"../../charts/kubescrape/values.yaml",
-		"../../charts/kubescrape/templates/agent.yaml",
-		"../../charts/kubescrape/templates/service.yaml",
-		"../../charts/kubescrape/templates/events.yaml",
-		"../../charts/kubescrape/templates/servicegraph.yaml",
-	} {
-		b, err := os.ReadFile(doc)
-		if err != nil {
-			t.Fatal(err)
-		}
-		text := string(b)
-		if !strings.Contains(text, "seccompProfile") {
-			t.Fatalf("%s no longer mentions seccompProfile: this test names the files that "+
-				"carry the instruction, so a moved comment must be re-pointed here", doc)
-		}
-		if strings.Contains(text, "`seccompProfile: {}` to omit") || strings.Contains(text, "Set to `{}`") {
-			t.Errorf("%s tells the operator to omit the seccompProfile with `{}`, which the "+
-				"render above proves does nothing (helm coalesces the empty map onto the "+
-				"chart default). It must say `null`", doc)
-		}
-	}
+	// The documentation is pinned to what these renders prove by
+	// TestSeccompDocumentationSaysNullNotEmptyMap, which needs no helm.
 
 	// The trap the documentation used to send people into. If helm ever stops
-	// coalescing maps this flips, and the comments in values.yaml and the four
-	// templates become wrong in the other direction — so pin it rather than
+	// coalescing maps this flips, and the comments in values.yaml and
+	// _helpers.tpl become wrong in the other direction — so pin it rather than
 	// leave it to be rediscovered.
 	if n := strings.Count(render(t, "seccompProfile: {}\n"), "seccompProfile:"); n != 4 {
 		t.Errorf("`seccompProfile: {}` rendered the field on %d workloads, want 4: helm no "+
 			"longer coalesces an empty user map onto the chart default, so the "+
-			"`null, NOT {}` comments in values.yaml and the four workload templates "+
-			"are now misleading and must be updated", n)
+			"`null, NOT {}` comments in values.yaml and _helpers.tpl "+
+			"(kubescrape.podSecurityContext) are now misleading and must be updated", n)
+	}
+}
+
+// seccompCarriers are the files known to carry the seccompProfile instruction:
+// values.yaml, and _helpers.tpl's kubescrape.podSecurityContext, which all four
+// workload templates include — the instruction is written there ONCE, where it
+// used to be copied into every template. They are the floor, not the scope —
+// the scan below reads every file in the chart.
+var seccompCarriers = []string{
+	"values.yaml",
+	"templates/_helpers.tpl",
+}
+
+// wrongSeccompAdvice returns every file under root that tells the operator to
+// omit the seccompProfile with `{}`, which TestSeccompProfileIsOmittedByNullNotEmptyMap
+// proves does nothing. Every regular file is read, not a list of the ones that
+// carry the instruction today: a list is a SUBSET of the chart by construction
+// (see manifestcheck.ManifestFiles), and a fifth workload template repeating
+// the wrong advice beside its own seccompProfile would never have been opened.
+func wrongSeccompAdvice(root string) ([]string, error) {
+	var bad []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		text := string(b)
+		if strings.Contains(text, "`seccompProfile: {}` to omit") || strings.Contains(text, "Set to `{}`") {
+			bad = append(bad, path)
+		}
+		return nil
+	})
+	return bad, err
+}
+
+// The DOCUMENTATION is pinned to what the renders above prove, because the
+// defect was never in the template — the template has always behaved this way.
+// It was five copies of an instruction that does nothing. This half needs no
+// helm, so it runs on every machine.
+func TestSeccompDocumentationSaysNullNotEmptyMap(t *testing.T) {
+	bad, err := wrongSeccompAdvice(chartDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range bad {
+		t.Errorf("%s tells the operator to omit the seccompProfile with `{}`, which "+
+			"TestSeccompProfileIsOmittedByNullNotEmptyMap proves does nothing (helm coalesces "+
+			"the empty map onto the chart default). It must say `null`", path)
+	}
+	// The floor: the known carriers still carry it. A comment moved elsewhere
+	// is still scanned (the walk reads everything); this only makes a deleted
+	// instruction a deliberate act.
+	for _, rel := range seccompCarriers {
+		b, err := os.ReadFile(filepath.Join(chartDir, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if text := string(b); !strings.Contains(text, "seccompProfile") || !strings.Contains(text, "`null`") {
+			t.Errorf("%s no longer tells the operator to omit seccompProfile with `null`; if the instruction moved, move it in seccompCarriers", rel)
+		}
+	}
+}
+
+// The scan reaches a file nobody listed: a new template repeating the wrong
+// advice, in a subdirectory at that, is reported.
+func TestSeccompDocumentationScanReadsEveryFileInTheChart(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "templates", "extra"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	newTemplate := filepath.Join(root, "templates", "extra", "worker.yaml")
+	for path, text := range map[string]string{
+		filepath.Join(root, "values.yaml"): "# seccompProfile: set to `null` to omit it.\n",
+		newTemplate:                        "{{- /* seccompProfile: Set to `{}` in values to omit it. */}}\n",
+	} {
+		if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bad, err := wrongSeccompAdvice(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bad) != 1 || bad[0] != newTemplate {
+		t.Errorf("wrongSeccompAdvice = %q, want exactly [%s]", bad, newTemplate)
 	}
 }

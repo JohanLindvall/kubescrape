@@ -71,3 +71,18 @@ func TestValidateAzureFlagsRejectsAmbiguousNamespaces(t *testing.T) {
 		t.Fatalf("the managed-identity namespace list was refused: %v", err)
 	}
 }
+
+// An empty consumer group is decidable from the flags, so -check-config must
+// refuse it: kgo only refuses it once the consumer opens, after a rollout, as a
+// Warn per backoff and a readiness gate that never clears.
+func TestValidateAzureFlagsRejectsAnEmptyGroup(t *testing.T) {
+	defer func(on bool, ns, group string) { *azureOn, *azureNamespace, *azureGroup = on, ns, group }(*azureOn, *azureNamespace, *azureGroup)
+	*azureOn, *azureNamespace, *azureGroup = true, "a.example", ""
+	if err := validateAzureFlags(); err == nil || !strings.Contains(err.Error(), "-azure-eventhub-group") {
+		t.Fatalf("err = %v, want a refusal naming -azure-eventhub-group", err)
+	}
+	*azureOn = false // the group is not read when the pipeline is off
+	if err := validateAzureFlags(); err != nil {
+		t.Fatalf("an empty group was refused with -azure-diagnostics off: %v", err)
+	}
+}

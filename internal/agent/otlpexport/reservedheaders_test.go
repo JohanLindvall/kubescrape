@@ -71,9 +71,10 @@ func TestTransportHeadersWinOverStaticOnes(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	// Validate refuses these, so plant them behind its back: this pins the
-	// ORDER, which is the second line of defence rather than the first.
-	c.cfg.Headers["Content-Type"] = "text/plain"
-	c.cfg.Headers["Content-Encoding"] = "identity"
+	// ORDER, which is the second line of defence rather than the first. Into
+	// headerKV, the flattening BOTH arms send from (the HTTP arm used to range
+	// over cfg.Headers, in random order).
+	c.headerKV = append(c.headerKV, "Content-Type", "text/plain", "Content-Encoding", "identity")
 
 	if err := c.ExportLogs(context.Background(), testLogsPayload()); err != nil {
 		t.Fatal(err)

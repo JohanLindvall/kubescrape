@@ -32,11 +32,11 @@ func TestPairingStoreFullIsWarnedOnceWithTheCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := newEdgeStore(cfg, wait, func(Edge) {}, log)
+	st := newEdgeStore(cfg.MaxItems, wait, func(Edge, time.Time) {}, log)
 
 	now := time.Unix(1000, 0)
 	// One entry fills it; every later distinct key is refused.
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		st.upsert(now, makeEdgeKey(traceID(byte(i+1)), spanID(1)), sideClient, halfSpan{service: "a"}, nil)
 	}
 	if st.stats().Dropped == 0 {
@@ -57,7 +57,7 @@ func TestPairingStoreBelowTheCapIsSilent(t *testing.T) {
 	log, dump := capturedLog()
 	cfg := Config{MaxItems: 64}.withDefaults()
 	wait, _ := cfg.wait()
-	st := newEdgeStore(cfg, wait, func(Edge) {}, log)
+	st := newEdgeStore(cfg.MaxItems, wait, func(Edge, time.Time) {}, log)
 	st.upsert(time.Unix(1000, 0), makeEdgeKey(traceID(1), spanID(1)), sideClient, halfSpan{service: "a"}, nil)
 	if out := dump(); out != "" {
 		t.Errorf("a healthy store logged:\n%s", out)
@@ -69,7 +69,7 @@ func TestPairingStoreBelowTheCapIsSilent(t *testing.T) {
 // precisely the one an operator cannot select by.
 func TestUnnamedResourceIsWarnedWithIdentityHints(t *testing.T) {
 	log, dump := capturedLog()
-	p := NewProcessor(Config{}, log)
+	p := NewProcessor(Config{}, nil, log)
 	base := len(dump())
 
 	td := ptrace.NewTraces()
@@ -81,7 +81,7 @@ func TestUnnamedResourceIsWarnedWithIdentityHints(t *testing.T) {
 	sp.SetSpanID(spanID(1))
 	sp.SetKind(ptrace.SpanKindClient)
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		p.Consume(td)
 	}
 	out := dump()[base:]
@@ -96,7 +96,7 @@ func TestUnnamedResourceIsWarnedWithIdentityHints(t *testing.T) {
 // A named resource says nothing: this sits on the receive path.
 func TestNamedResourceIsSilent(t *testing.T) {
 	log, dump := capturedLog()
-	p := NewProcessor(Config{}, log)
+	p := NewProcessor(Config{}, nil, log)
 	base := len(dump())
 	td := ptrace.NewTraces()
 	rs := td.ResourceSpans().AppendEmpty()
@@ -120,7 +120,7 @@ func TestNamedResourceIsSilent(t *testing.T) {
 // on the record size.
 func TestUnnamedWarningClipsSenderSuppliedValues(t *testing.T) {
 	log, dump := capturedLog()
-	p := NewProcessor(Config{}, log)
+	p := NewProcessor(Config{}, nil, log)
 	base := len(dump())
 
 	td := ptrace.NewTraces()
@@ -183,7 +183,7 @@ func TestClipForLogLeavesShortValuesAlone(t *testing.T) {
 // kubescrape_service_graph_completed_total came out inflated several-fold by a
 // fraction that could never have been an edge.
 func TestUnnamedSpansCountsOnlyTheKindsPairingWouldHaveUsed(t *testing.T) {
-	p := NewProcessor(Config{}, discardLog())
+	p := NewProcessor(Config{}, nil, discardLog())
 
 	td := ptrace.NewTraces()
 	rs := td.ResourceSpans().AppendEmpty() // deliberately no service.name
@@ -212,7 +212,7 @@ func TestUnnamedSpansCountsOnlyTheKindsPairingWouldHaveUsed(t *testing.T) {
 // graph nothing, so it moves no counter and writes no line.
 func TestUnnamedResourceWithNoEdgeCapableSpansIsSilent(t *testing.T) {
 	log, dump := capturedLog()
-	p := NewProcessor(Config{}, log)
+	p := NewProcessor(Config{}, nil, log)
 	base := len(dump())
 
 	td := ptrace.NewTraces()
@@ -234,33 +234,43 @@ func TestUnnamedResourceWithNoEdgeCapableSpansIsSilent(t *testing.T) {
 }
 
 // Dropping a dimension is right; doing it silently is not. Config.Validate does
-// not look at Dimensions at all, so without this line the only trace of a list
-// one entry shorter than it reads is the resolved COUNT on a Debug line.
+// not look at Dimensions at all, so without a sentence per drop the only trace
+// of a list one entry shorter than it reads is the resolved COUNT on a Debug
+// line. The sentence is DimensionWarnings' — pure, so configWarnings emits it
+// from -check-config too, which a line logged by NewProcessor never reached.
 func TestDroppedDimensionsAreWarnedWithTheKey(t *testing.T) {
-	log, dump := capturedLog()
-	p := NewProcessor(Config{Dimensions: []string{"http.method", "http.method", "", "http.route"}}, log)
-	out := dump()
+	cfg := Config{Dimensions: []string{"http.method", "http.method", "", "http.route"}}
+	all := strings.Join(cfg.DimensionWarnings(), "\n")
+	if n := strings.Count(all, "repeats an earlier entry"); n != 1 {
+		t.Errorf("want one repeat warning, got %d:\n%s", n, all)
+	}
+	if !strings.Contains(all, `serviceGraph.dimensions[1] "http.method"`) {
+		t.Errorf("the warning does not name the dropped key:\n%s", all)
+	}
+	if n := strings.Count(all, "is empty"); n != 1 {
+		t.Errorf("want one empty-entry warning, got %d:\n%s", n, all)
+	}
 
-	if n := strings.Count(out, "repeated serviceGraph dimension"); n != 1 {
-		t.Errorf("want one repeat warning, got %d:\n%s", n, out)
-	}
-	if !strings.Contains(out, "key=http.method") {
-		t.Errorf("the warning does not name the dropped key:\n%s", out)
-	}
-	if n := strings.Count(out, "empty serviceGraph dimension"); n != 1 {
-		t.Errorf("want one empty-entry warning, got %d:\n%s", n, out)
-	}
+	log, dump := capturedLog()
+	p := NewProcessor(cfg, nil, log)
 	if len(p.dims) != 2 {
 		t.Errorf("resolved %d dimensions, want 2", len(p.dims))
+	}
+	if out := dump(); strings.Contains(out, "level=WARN") {
+		t.Errorf("NewProcessor warned about a dropped dimension; configWarnings owns that line, and a start would print it twice:\n%s", out)
 	}
 }
 
 // A clean dimension list says nothing.
 func TestCleanDimensionsAreSilent(t *testing.T) {
 	log, dump := capturedLog()
-	NewProcessor(Config{Dimensions: []string{"http.method", "http.route"}}, log)
+	cfg := Config{Dimensions: []string{"http.method", "http.route"}}
+	NewProcessor(cfg, nil, log)
 	if out := dump(); strings.Contains(out, "level=WARN") {
 		t.Errorf("a clean dimension list warned:\n%s", out)
+	}
+	if w := cfg.DimensionWarnings(); len(w) != 0 {
+		t.Errorf("a clean dimension list warned: %q", w)
 	}
 }
 
@@ -274,7 +284,7 @@ func TestUnparseableStaleAfterIsWarned(t *testing.T) {
 	log, dump := capturedLog()
 	r := NewRegistry(Config{StaleAfter: "nonsense"}, log)
 	out := dump()
-	if !strings.Contains(out, "staleAfter is unparseable") {
+	if !strings.Contains(out, "staleAfter is invalid") {
 		t.Errorf("the fallback to the default eviction age was silent:\n%s", out)
 	}
 	if got := r.store.StaleAfter(); got != DefaultStaleAfter {

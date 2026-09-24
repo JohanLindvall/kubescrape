@@ -58,7 +58,7 @@ func TestOversizeMonitorPathYieldsNoTarget(t *testing.T) {
 	}
 	// And /v1/explain says WHY, naming the field rather than the port (which
 	// the endpoint did name) and never the value.
-	note := MonitorEndpointNote(basePod(), ep)
+	note := MonitorEndpointNote(basePod(), svc, ep)
 	if !strings.Contains(note, "path") || !strings.Contains(note, "REFUSED") {
 		t.Errorf("explain does not name the refusal: %q", note)
 	}
@@ -89,8 +89,8 @@ func TestRefusedEndpointCarriesNoAuthMaterial(t *testing.T) {
 		"port": "http", "path": "/" + strings.Repeat("a", 1<<20),
 		"bearerTokenSecret": map[string]any{"name": "tok", "key": "token"},
 	})
-	if ep.BearerSecret != "" {
-		t.Errorf("a refused endpoint still names a secret: %q", ep.BearerSecret)
+	if ep.AuthSecret != "" {
+		t.Errorf("a refused endpoint still names a secret: %q", ep.AuthSecret)
 	}
 }
 

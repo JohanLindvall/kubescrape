@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -136,5 +137,36 @@ func TestAnOwnersOversizedAnnotationsAreOmittedAndCounted(t *testing.T) {
 	}
 	if delta := annotationsOmittedCount("ReplicaSet") - before; delta != 1 {
 		t.Errorf("counted %v annotation omissions, want 1", delta)
+	}
+}
+
+// The cap must bound the WORK, not only the served chain. Past MaxOwners every
+// distinct refused UID used to be inserted into a dedup map pre-sized to
+// len(refs) and cost its own counter-key allocation, so a pod with N distinct
+// ownerReferences cost O(N) map growth plus N allocations on EVERY resolution —
+// on unauthenticated per-request routes and in every node-targets derivation
+// (measured: 15,000 refs, 15,058 allocations). The refused tail now grows no
+// state and bumps the counter once per kind, so resolving 10,000 references
+// allocates no more than resolving 16. The counter still carries every refusal.
+func TestTheRefusedOwnerTailCostsNoWorkPerReference(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	r, list := fatRefs(t, 10000, 16)
+	few := list[:2*MaxOwners]
+	small := testing.AllocsPerRun(20, func() { r.Resolve("default", few) })
+	large := testing.AllocsPerRun(20, func() { r.Resolve("default", list) })
+	if large > small {
+		t.Errorf("resolving %d references allocates %v times against %v for %d: the refused tail is "+
+			"still paying per reference", len(list), large, small, len(few))
+	}
+
+	before := counter("ReplicaSet", reasonOwnersCapped)
+	_, omitted := r.Resolve("default", list)
+	if omitted != len(list)-MaxOwners {
+		t.Fatalf("omitted = %d, want %d", omitted, len(list)-MaxOwners)
+	}
+	if delta := counter("ReplicaSet", reasonOwnersCapped) - before; delta != float64(omitted) {
+		t.Errorf("counted %v refused owners, want %d: tallying per kind must not lose any", delta, omitted)
 	}
 }

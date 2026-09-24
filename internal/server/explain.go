@@ -7,10 +7,22 @@ package server
 // whether the annotation is absent, the port entry resolves to nothing, the
 // pod is terminating, or a Service selector misses. This handler walks the
 // SAME decision chain nodeTargets walks, one pod at a time, and reports every
-// verdict along the way. Diagnostic and read-only: it moves no obs counters
-// and emits no warnings (reporting a monitor auth conflict from here would
+// verdict along the way. Diagnostic and read-only as far as the TARGET
+// DERIVATION goes: it moves none of that derivation's decision counters and
+// emits none of its warnings (reporting a monitor auth conflict from here would
 // double-count what the targets path already reports), and it is deliberately
 // per-pod and unindexed — the cost is one enrichment and a handful of matches.
+//
+// What it does NOT suppress is the owner and namespace ENRICHMENT it shares
+// with /v1/pods: that resolves through owners.Resolver exactly as that route
+// does, so an owner that fails to resolve counts
+// kubescrape_owner_resolve_failures_total (owners_capped included) and an
+// oversized annotation set kubescrape_metadata_annotations_omitted_total, once
+// per request, and the resolver may log its own throttled Warn. Those report
+// real object state rather than a decision this handler makes, and /v1/pods
+// moves them the same way; a counter-free enrichment path would buy nothing.
+// Like every route it also moves kubescrape_http_requests_total. And it answers
+// 200 only once the caches have synced — before that, requireReady's 503.
 //
 // Two of the three decision signals on this derivation are suppressed simply by
 // not being CALLED from here (reportInstanceCollision, hence
@@ -119,6 +131,14 @@ type explainDoc struct {
 	// byte ceiling charges once per target. Reported only when that ceiling
 	// actually bound, since it is a derivation detail everywhere else.
 	PodDocumentBytes int `json:"podDocumentBytes,omitempty"`
+	// ServiceViewsTrimmed counts the targets whose Service view the byte
+	// ceiling reduced to the Service's name, namespace and UID: a target that
+	// took on a Service view by merging with another door's declaration of the
+	// same URL, where the view's labels would have spent more than the pod's
+	// budget allows (targetDedup.boundSwapView). Those targets ARE served and
+	// still carry k8s.service.name and k8s.service.uid; only the labels and
+	// annotations are left off. targets[].serviceViewTrimmed marks which.
+	ServiceViewsTrimmed int `json:"serviceViewsTrimmed,omitempty"`
 }
 
 // explainService is one Service whose selector matches the pod.
@@ -171,6 +191,9 @@ type explainTarget struct {
 	// whose two targets overwrite each other's `up` was answered with a list
 	// of two targets and no hint that they collapse.
 	CollidesWith []string `json:"collidesWith,omitempty"`
+	// ServiceViewTrimmed marks a served target whose Service view the byte
+	// ceiling reduced to its identity (see explainDoc.ServiceViewsTrimmed).
+	ServiceViewTrimmed bool `json:"serviceViewTrimmed,omitempty"`
 }
 
 // What one /v1/explain document may MATERIALISE. The derivation below is not
@@ -198,11 +221,13 @@ type explainTarget struct {
 // monitors stopped contributing?") is answered wrong by a short list that
 // looks complete.
 //
-// Nothing here moves a counter or writes a log line, deliberately and for two
-// different reasons. The counter: this handler moves NO obs counters (the
-// package comment above says why, and targetDedup.diagnostic exists to keep it
-// that way), and the pathologies that reach these bounds are already counted
-// where they are DERIVED — kubescrape_monitor_contributors_capped_total,
+// A truncation moves no counter and writes no log line, deliberately and for
+// two different reasons. The counter: this handler moves none of the target
+// derivation's decision counters (the package comment above says why, and
+// which enrichment counters it does share with /v1/pods;
+// targetDedup.diagnostic exists to keep it that way), and the pathologies that
+// reach these bounds are already counted where they are DERIVED —
+// kubescrape_monitor_contributors_capped_total,
 // kubescrape_scrape_targets_capped_total, kubescrape_monitor_fields_ignored_total.
 // The log: the trigger is an unauthenticated request, so a line per truncation
 // is an amplifier of exactly the kind being closed. The report is the document
@@ -251,10 +276,7 @@ func (b *explainBudget) hide(n int) { b.hidden += n }
 // It is the same decision as room for a list that is already built (the port
 // verdicts, which the internal/scrape mirrors produce whole).
 func clipList[T any](b *explainBudget, v []T) ([]T, int) {
-	room := min(b.perList, b.perDoc-b.used)
-	if room < 0 {
-		room = 0
-	}
+	room := max(min(b.perList, b.perDoc-b.used), 0)
 	if len(v) <= room {
 		b.used += len(v)
 		return v, 0
@@ -269,13 +291,14 @@ func clipList[T any](b *explainBudget, v []T) ([]T, int) {
 // string into it.
 func clipValue(v string) string { return clip.Marked(v, maxExplainValueBytes, "…(truncated)") }
 
-// mergeCeilingRef is what an endpoint's note carries when the ceiling it hit
-// has ALREADY been spelled out for its URL. The full wordings live in
-// internal/scrape (the one spelling), run to ~370 bytes each, and were
-// appended to EVERY refused endpoint — so a pile-up of colliding monitors, the
-// exact input the ceilings exist for, paid for the explanation once per
-// endpoint. It is emitted once per (URL, ceiling) now, with the count in
-// mergeCeilings.
+// mergeCeilingRef is what EVERY endpoint a merge ceiling bound carries in its
+// own note — the first one on a URL included — in place of the ceiling's
+// wording. The full wordings live in internal/scrape (the one spelling), run
+// to ~370 bytes each, and were appended to every refused endpoint — so a
+// pile-up of colliding monitors, the exact input the ceilings exist for, paid
+// for the explanation once per endpoint. The wording is now written once per
+// (URL, ceiling), into that URL's mergeCeilings[].note, with the counts beside
+// it.
 const mergeCeilingRef = "; a merge ceiling bound it — see mergeCeilings for this URL"
 
 // ceilingLeadIn is the subject the scrape wordings are suffixes to; see note.
@@ -288,9 +311,11 @@ type explainCeilings struct {
 	order []string
 }
 
-// note records what rep refused for this URL and returns the suffix for THIS
-// endpoint's note: the full wording the first time each ceiling binds on a
-// URL, a short pointer afterwards, nothing when nothing was refused.
+// note records what rep refused into the URL's mergeCeilings entry — each
+// ceiling's wording written there once per (URL, ceiling), every hit counted —
+// and returns the suffix for THIS endpoint's note: mergeCeilingRef for every
+// endpoint a ceiling bound, "" when nothing was refused. The endpoint's note
+// never carries the wording itself, not even the first time.
 func (c *explainCeilings) note(url string, rep scrape.MergeReport) string {
 	if !rep.RelabelCapped && !rep.ContributorsCapped {
 		return ""
@@ -346,7 +371,7 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 	doc, _ := s.explainPod(r.PathValue("namespace"), r.PathValue("name"))
 	// 200 even for a miss: the explanation IS the resource this endpoint
 	// serves, and `curl -f` hiding the body on a 404 would defeat its purpose.
-	writeJSON(w, http.StatusOK, doc)
+	s.writeJSON(w, http.StatusOK, doc)
 }
 
 // explainPod builds the document, returning the ScrapeTargets it derived
@@ -373,7 +398,7 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 
 	doc.NotScrapeableWhy = scrape.ScrapeableReasons(pod)
 	doc.Scrapeable = len(doc.NotScrapeableWhy) == 0
-	doc.PodAnnotated = pod.Annotations[scrape.AnnotationScrape] == "true"
+	doc.PodAnnotated = scrape.OptedIn(pod.Annotations)
 	// Echoed, so clipped: an annotation is the pod's own bytes and it is
 	// served whole elsewhere, but this route is unauthenticated and re-renders
 	// it per request.
@@ -403,7 +428,7 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 	podMonitors := podMonitorsFor(pod, s.allPodMonitors(), nil)
 
 	// Targets, through the same dedup/merge machinery as the node response —
-	// minus the obs counters and warnings (see the package comment above).
+	// minus its decision counters and warnings (see the package comment above).
 	var targets []kubemeta.ScrapeTarget
 	var d targetDedup
 	// Read-only: the ceiling's refusals still fill d.capped, which the document
@@ -443,13 +468,14 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 	// would answer "why is my 16th port not scraped?" with `ports: [n]` and no
 	// note at all — the "it is" inversion the ceiling notes exist to prevent.
 	noteCapped(doc.PortEntries, refused, d.podBytes)
-	// And the pod-level exclusion, which no port mirror can see: for a pod
-	// that is not scrapeable the derivation produced nothing at all, so
-	// `refused` is empty and every entry would otherwise be listed as
-	// resolving — the head saying "not scrapeable" and the entries saying the
-	// annotation works.
-	if !doc.Scrapeable {
-		noteNotScrapeable(doc.PortEntries)
+	// And the door-level opt-in, the one whole-door gate the port mirrors
+	// leave to their caller (see scrape.NoteNotOptedIn): PodTargets refuses an
+	// unannotated pod before it resolves a port, so its declared ports would
+	// read "every declared port is a target" beside an empty target list. The
+	// pod-level exclusion is the mirror's own and wins when both apply — on a
+	// pod that is not scrapeable its entries carry no ports left to retract.
+	if doc.Scrapeable && !doc.PodAnnotated {
+		scrape.NoteNotOptedIn(doc.PortEntries, "the pod")
 	}
 	// Clipped AFTER the verdicts are written, never before: the ceiling's
 	// refusals land on the TAIL of the list, so clipping first would hide
@@ -470,9 +496,9 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 		show := svcBudget.room(len(doc.Services))
 		es := explainService{
 			Name:      svc.Name,
-			Annotated: svc.Annotations[scrape.AnnotationScrape] == "true",
+			Annotated: scrape.OptedIn(svc.Annotations),
 		}
-		if es.Annotated || len(monitored[svc.UID]) > 0 {
+		if serviceOptsIn(svc, monitored) {
 			svcOptIn = true
 		}
 		if show {
@@ -485,14 +511,14 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 			}
 		}
 		noteCapped(es.PortEntries, refused, d.podBytes)
-		if !doc.Scrapeable {
-			noteNotScrapeable(es.PortEntries)
+		if doc.Scrapeable && !es.Annotated {
+			scrape.NoteNotOptedIn(es.PortEntries, "this Service")
 		}
 		es.PortEntries, es.PortEntriesNotShown = clipList(&portBudget, es.PortEntries)
 		for _, sme := range monitored[svc.UID] {
 			// Same rule: the endpoint is offered, merged and counted whatever
 			// the budget says — only the VERDICT may be left out.
-			em := s.explainMonitorEndpoint(&d, &offers, &ceilings, pod, svc, sme)
+			em := s.explainMonitorEndpoint(&d, &offers, &ceilings, &pod, svc, sme)
 			if show && monBudget.room(len(es.Monitors)) {
 				es.Monitors = append(es.Monitors, em)
 			} else {
@@ -514,19 +540,9 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 		for i := range pm.monitor.Endpoints {
 			ep := &pm.monitor.Endpoints[i]
 			em := explainMonitor{Monitor: pm.name}
-			if url, ok := scrape.PodMonitorTargetURL(pod, *ep); ok {
-				em.Resolved, em.URL = true, url
-				if held, taken := d.monitorHolder(url); taken {
-					rep := scrape.MergeMonitorEndpoint(held, pm.name, ep)
-					d.charge(rep.Bytes)
-					em.Note = "merged into the target already held for this URL" + ceilings.note(url, rep)
-				} else {
-					for _, t := range scrape.PodMonitorTargets(pod, pm.name, *ep) {
-						if v := d.add(t); !v.ok() {
-							em.Note = v.note("this endpoint", d.podBytes)
-						}
-					}
-				}
+			if o := d.offerPodMonitor(&pod, pm.name, ep); o.resolved {
+				em.Resolved, em.URL = true, o.url
+				em.Note = explainOfferNote(&d, &ceilings, o)
 			} else {
 				// The wording (and the SIZE-refusal case it also covers) is
 				// scrape's: see scrape.MonitorEndpointNote.
@@ -556,9 +572,11 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 	for _, t := range targets {
 		doc.Targets = append(doc.Targets, explainTarget{
 			URL: t.URL, Source: t.Source, Monitor: t.Monitor, Monitors: t.Monitors,
-			CollidesWith: collidesWith[t.URL],
+			CollidesWith:       collidesWith[t.URL],
+			ServiceViewTrimmed: d.trimmedAt(t.URL) >= 0,
 		})
 	}
+	doc.ServiceViewsTrimmed = len(d.trimmed)
 
 	// The accumulator's own count, which is what the served path reports as
 	// kubescrape_scrape_targets_capped_total for this pod.
@@ -584,7 +602,12 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 		case !doc.PodAnnotated && !svcOptIn && len(podMonitors) == 0:
 			doc.Hint = "nothing opts this pod into scraping: no prometheus.io/scrape=\"true\" pod annotation, no scrape-annotated or monitor-selected Service selecting it, and no PodMonitor matching it"
 		default:
-			doc.Hint = "an opt-in exists but no port resolved; see portEntries / services[].portEntries for the entry-by-entry verdicts"
+			// A monitor may be the ONLY opt-in (an unannotated pod behind a
+			// monitor-selected Service), and then the answer is in the
+			// monitor's endpoint note, not in any door's port entries.
+			doc.Hint = "an opt-in exists but no port resolved; see portEntries / services[].portEntries for the " +
+				"annotation doors' entry-by-entry verdicts and services[].serviceMonitors[].note / podMonitors[].note " +
+				"for the monitor endpoints'"
 		}
 	}
 	return doc, targets
@@ -648,76 +671,51 @@ func noteCapped(verdicts []scrape.PortVerdict, refused map[int32]targetVerdict, 
 	}
 }
 
-// noteNotScrapeable rewrites the verdicts of one door's port entries when the
-// POD is excluded from scraping. It is noteCapped's sibling and it corrects the
-// same class of statement: the mirrors in internal/scrape resolve ports and
-// cannot see Scrapeable, which the DERIVATION checks before it resolves
-// anything, so on a terminating pod every entry read as resolving while the
-// document's own head said the pod yields no targets.
-//
-// An entry that already resolves to nothing keeps its own note: that note is
-// still true and is the sharper answer of the two. A resolving entry loses its
-// `ports`, exactly as a ceiling-refused one does — listing them is what reads
-// as "this port is scraped".
-func noteNotScrapeable(verdicts []scrape.PortVerdict) {
-	for i := range verdicts {
-		v := &verdicts[i]
-		if len(v.Ports) == 0 {
-			continue
-		}
-		ports := make([]string, 0, len(v.Ports))
-		for _, p := range v.Ports {
-			ports = append(ports, strconv.Itoa(int(p)))
-		}
-		v.Ports = nil // omitempty: an empty array reads as "resolves, to nothing"
-		v.Note = scrape.NotScrapeableNote("port " + strings.Join(ports, ", "))
-	}
-}
-
-// explainMonitorEndpoint runs one ServiceMonitor endpoint through the same
-// resolve-then-offer-then-dedup the targets path takes, recording the verdict.
-// Every step here is nodeTargets' step, in nodeTargets' order — the counters
-// and the conflict warning are the only things left out (see the package
-// comment); a step skipped here explains a target the server does not serve.
-func (s *Server) explainMonitorEndpoint(d *targetDedup, offers *monitorOffers, ceilings *explainCeilings, pod kubemeta.Pod, svc *services.Service, sme monitorEndpoint) explainMonitor {
+// explainMonitorEndpoint runs one ServiceMonitor endpoint through the SAME
+// offer step the targets path takes (targetDedup.offerServiceMonitor), recording
+// the verdict. The step is shared rather than mirrored, so it is nodeTargets'
+// step in nodeTargets' order by construction — the counters and the conflict
+// warning are the only things left out (see the package comment), and they are
+// left out by not calling reportMerge / unresolvedReports.
+func (s *Server) explainMonitorEndpoint(d *targetDedup, offers *monitorOffers, ceilings *explainCeilings, pod *kubemeta.Pod, svc *services.Service, sme monitorEndpoint) explainMonitor {
 	em := explainMonitor{Monitor: sme.monitor}
-	url, ok := scrape.MonitorTargetURL(pod, svc, *sme.endpoint)
-	if !ok {
-		em.Note = scrape.MonitorEndpointNote(pod, *sme.endpoint)
+	o := d.offerServiceMonitor(offers, pod, svc, sme)
+	if !o.resolved {
+		em.Note = scrape.MonitorEndpointNote(*pod, svc, *sme.endpoint)
 		return em
 	}
-	em.Resolved, em.URL = true, url
-	if !offers.first(url, sme.endpoint) {
+	em.Resolved, em.URL = true, o.url
+	if o.repeat {
 		// Resolved, and honoured — through the earlier Service. Reporting it as
 		// a fresh merge would be reporting a second fold that does not happen.
 		em.Note = "already folded in through an earlier Service selecting this pod; each monitor endpoint is honoured once per URL, so this repeat changes nothing"
 		return em
 	}
-	if held, taken := d.monitorHolder(url); taken {
+	em.Note = explainOfferNote(d, ceilings, o)
+	return em
+}
+
+// explainOfferNote is the note for a RESOLVED monitor endpoint that was
+// offered (not a repeat), for both monitor kinds.
+func explainOfferNote(d *targetDedup, ceilings *explainCeilings, o endpointOffer) string {
+	if o.merged {
 		// The adopted/conflict verdicts are the counter's and the warning's,
 		// which this endpoint does not move: the targets path reports the
 		// conflict once, and reporting it from here would double-count it. The
-		// The two ceilings move nothing here either, for the same reason — but
-		// they ARE part of the explanation, since nothing else can tell an
-		// operator that half their chain stopped being honoured, or that the
-		// monitor they are looking at merged without being listed.
-		rep := scrape.MergeMonitorEndpoint(held, sme.monitor, sme.endpoint)
-		d.charge(rep.Bytes)
+		// two ceilings move nothing here either, for the same reason — but they
+		// ARE part of the explanation, since nothing else can tell an operator
+		// that half their chain stopped being honoured, or that the monitor
+		// they are looking at merged without being listed.
+		//
 		// The ceiling wording is emitted ONCE PER URL (see explainCeilings):
-		// appending ~370 bytes to every refused endpoint made the document
-		// grow with the pile-up the ceiling exists to refuse.
-		em.Note = "merged into the target already held for this URL" + ceilings.note(url, rep)
-		return em
+		// appending ~370 bytes to every refused endpoint made the document grow
+		// with the pile-up the ceiling exists to refuse.
+		return "merged into the target already held for this URL" + ceilings.note(o.url, o.rep)
 	}
-	for _, t := range scrape.MonitorTargets(pod, svc, sme.monitor, *sme.endpoint) {
-		// Resolved and offered, and REFUSED: the endpoint resolves to a URL
-		// (which is what Resolved reports, exactly as it does on the merged
-		// arm above) but the pod is at the ceiling and it is not scraped. An
-		// empty note here made a refused endpoint byte-identical to a served
-		// one — the inversion this endpoint exists to prevent.
-		if v := d.add(t); !v.ok() {
-			em.Note = v.note("this endpoint", d.podBytes)
-		}
-	}
-	return em
+	// Resolved and offered, and possibly REFUSED: the endpoint resolves to a
+	// URL (which is what Resolved reports, exactly as it does on the merged
+	// arm) but the pod is at the ceiling and it is not scraped. An empty note
+	// there made a refused endpoint byte-identical to a served one — the
+	// inversion this endpoint exists to prevent. Empty when it was accepted.
+	return o.refused.note("this endpoint", d.podBytes)
 }

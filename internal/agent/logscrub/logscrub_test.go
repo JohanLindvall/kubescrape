@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
@@ -31,6 +32,22 @@ func TestDefaultsRedact(t *testing.T) {
 		if got := s.Scrub(in); got != want {
 			t.Errorf("Scrub(%q)\n got %q\nwant %q", in, got, want)
 		}
+	}
+}
+
+// ScrubUncounted is the same redaction with kubescrape_log_scrubbed_total left
+// alone — the entry point for a record an earlier pass already counted (a
+// tailer rewind re-reading the same bytes; logchain.Input.Observed).
+func TestScrubUncountedRedactsIdenticallyAndCountsNothing(t *testing.T) {
+	s := mustNew(t, Config{Builtin: []string{"defaults"}, Rules: []Rule{{Name: "uncounted-probe", Regexp: `pin=\d+`}}})
+	in := "Authorization: Bearer abc.def.ghi pin=1234"
+	c := obs.LogScrubbed.WithLabelValues("uncounted-probe")
+	before := c.Value()
+	if got, want := s.ScrubUncounted(in), s.Scrub(in); got != want {
+		t.Fatalf("ScrubUncounted = %q, Scrub = %q: the redaction must not depend on the count", got, want)
+	}
+	if got := c.Value() - before; got != 1 {
+		t.Fatalf("kubescrape_log_scrubbed_total{pattern=uncounted-probe} moved by %v, want 1 (Scrub's, not ScrubUncounted's)", got)
 	}
 }
 
@@ -325,9 +342,15 @@ func TestSecretKVPrefilterCoversEveryMatchingShape(t *testing.T) {
 }
 
 // The same property, fuzzed: the seed corpus runs on every `go test`, and
-// `-fuzz` explores from there. Any input where the regex matches and the
-// prefilter does not is a redaction the scrubber silently skips.
-func FuzzSecretKVPrefilterNotNarrower(f *testing.F) {
+// `-fuzz` explores from there. Any input where a built-in's regex matches and
+// its prefilter does not is a redaction the scrubber silently skips. It covers
+// EVERY built-in with a prefilter — it used to cover secret-kv alone, leaving
+// the hand-written digitRun and the `://`, '@' and "PRIVATE KEY" gates with no
+// systematic superset check.
+func FuzzBuiltinPrefiltersNotNarrower(f *testing.F) {
+	for _, s := range prefilterProbes {
+		f.Add(s)
+	}
 	for _, s := range []string{
 		"password=hunter2", "token_count=42", "SECRET_KEY=abc", `{"secretKey":"x"}`,
 		"a perfectly innocuous log line", "pwd:'x'", "api-key\t=\tv", "accessToken: abc",
@@ -352,10 +375,17 @@ func FuzzSecretKVPrefilterNotNarrower(f *testing.F) {
 	} {
 		f.Add(s)
 	}
-	p := builtins["secret-kv"]
+	var gated []pattern
+	for _, p := range builtins {
+		if p.prefilter != nil {
+			gated = append(gated, p)
+		}
+	}
 	f.Fuzz(func(t *testing.T, line string) {
-		if p.re.MatchString(line) && !p.prefilter(line) {
-			t.Fatalf("regex matches %q but the prefilter rejects it", line)
+		for _, p := range gated {
+			if p.re.MatchString(line) && !p.prefilter(line) {
+				t.Fatalf("pattern %q: regex matches %q but the prefilter rejects it", p.name, line)
+			}
 		}
 	})
 }
@@ -600,11 +630,11 @@ func minEnumWindow(doc string, names []string) int {
 // docCommentBefore returns the contiguous //-comment block immediately above
 // the line containing decl.
 func docCommentBefore(src, decl string) string {
-	i := strings.Index(src, decl)
-	if i < 0 {
+	before, _, ok := strings.Cut(src, decl)
+	if !ok {
 		return ""
 	}
-	lines := strings.Split(src[:i], "\n")
+	lines := strings.Split(before, "\n")
 	end := len(lines) - 1 // the (partial) line carrying decl
 	start := end
 	for start > 0 && strings.HasPrefix(strings.TrimSpace(lines[start-1]), "//") {

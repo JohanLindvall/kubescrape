@@ -18,8 +18,10 @@ import (
 // slot existed: sync.Pool is drained by every collection, and the agent's GC
 // cadence (1.9-2.5 s under load) is the same as the tailer's flush interval, so
 // the pool missed on ~81% of a live node's compressions and each miss rebuilt a
-// level-5 encoder — 1,076,536 B and 17 allocations against a hit's ~2.4 kB and
-// 1. This is the budget that fails the build if the slot stops holding.
+// level-5 encoder — 17 allocations (about a megabyte) against a hit's 1. The
+// ALLOCATION counts are the claim: a warm-path B/op is one cold construction
+// divided by the iteration count, so it is deliberately not quoted. This is the
+// budget that fails the build if the slot stops holding.
 func TestGzipWriterSurvivesGCAllocationBudget(t *testing.T) {
 	if testrace.Enabled {
 		t.Skip("the race detector's bookkeeping allocations make the ceiling meaningless")
@@ -106,7 +108,7 @@ func TestGzipReaderSurvivesGCAllocationBudget(t *testing.T) {
 // is to hand back a writer that is still pointing at the previous sink.
 func TestWarmGzipWriterIsReusable(t *testing.T) {
 	c := &gzipCodec{}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		var sink countingWriter
 		w, err := c.Compress(&sink)
 		if err != nil {
@@ -197,7 +199,7 @@ func TestWarmGzipWriterRetainedSize(t *testing.T) {
 	runtime.GC()
 	runtime.ReadMemStats(&ms)
 	base := ms.HeapAlloc
-	for i := 0; i < writers; i++ {
+	for range writers {
 		z := newGzipWriter(gzip.DefaultCompression)
 		z.Reset(io.Discard)
 		if _, err := z.Write(body); err != nil {

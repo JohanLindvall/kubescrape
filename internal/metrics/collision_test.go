@@ -174,7 +174,7 @@ func TestCardinalityCapCountsChainedSeries(t *testing.T) {
 	if s.count != 2 {
 		t.Fatalf("count = %d, want 2", s.count)
 	}
-	if s.drops.Capped() != 1 {
-		t.Fatalf("capped drops = %d, want 1", s.drops.Capped())
+	if s.cappedDrops.Load() != 1 {
+		t.Fatalf("capped drops = %d, want 1", s.cappedDrops.Load())
 	}
 }

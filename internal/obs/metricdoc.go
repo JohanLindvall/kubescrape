@@ -5,12 +5,14 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"sort"
+	"os"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
 
-// MetricDoc describes one registered metric, as declared in obs.go.
+// MetricDoc describes one registered metric, as declared in this package.
 type MetricDoc struct {
 	Name   string
 	Kind   string // Counter, CounterVec, Gauge, GaugeFunc, GaugeFuncVec, HistogramVec, CounterFunc
@@ -18,15 +20,65 @@ type MetricDoc struct {
 	Labels []string
 }
 
-// ParseMetricDocs extracts every Registry.* registration from a Go source
-// file. It is the single source of truth behind both docs/METRICS.md and the
-// test that keeps the prose honest.
+// ParseMetricDocs extracts every Registry.* registration from path, which is
+// either this package's DIRECTORY — every non-test Go file in it, which is how
+// the generator and its guards call it — or one Go source file. It is the
+// single source of truth behind both docs/METRICS.md and the test that keeps
+// the prose honest.
+//
+// The directory form is what makes the doc complete by construction: reading
+// one named file documented only what that file registered, so a registration
+// placed in any other file of the package shipped with no doc and no test
+// noticing.
 //
 // Names and label names are a public interface — dashboards and alert rules
 // select on them, and a selector naming something that does not exist matches
 // silently instead of erroring — so they are read from the AST rather than
 // maintained by hand in two places.
-func ParseMetricDocs(filename string) ([]MetricDoc, error) {
+func ParseMetricDocs(path string) ([]MetricDoc, error) {
+	files, err := sourceFiles(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []MetricDoc
+	for _, filename := range files {
+		docs, err := parseMetricDocsFile(filename)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, docs...)
+	}
+	slices.SortFunc(out, func(a, b MetricDoc) int { return strings.Compare(a.Name, b.Name) })
+	return out, nil
+}
+
+// sourceFiles resolves ParseMetricDocs' path: a directory's non-test Go files
+// in name order, or the one file named.
+func sourceFiles(path string) ([]string, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.IsDir() {
+		return []string{path}, nil
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		files = append(files, filepath.Join(path, name))
+	}
+	return files, nil
+}
+
+// parseMetricDocsFile is ParseMetricDocs for one file, unsorted.
+func parseMetricDocsFile(filename string) ([]MetricDoc, error) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, filename, nil, parser.ParseComments)
 	if err != nil {
@@ -67,7 +119,6 @@ func ParseMetricDocs(filename string) ([]MetricDoc, error) {
 		out = append(out, md)
 		return true
 	})
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
 }
 

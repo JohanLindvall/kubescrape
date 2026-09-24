@@ -1,5 +1,6 @@
-// Package store maintains an in-memory view of pod and container metadata,
-// indexed by container runtime ID and by node name.
+// Package store maintains an in-memory view of pod and container metadata:
+// pod records keyed by UID, indexed by container runtime ID, by node name, by
+// namespace/name and by pod IP.
 //
 // The store is populated from a pod informer (initial LIST, then WATCH
 // events). Lookups for container IDs that are not yet known can block until
@@ -9,8 +10,6 @@
 package store
 
 import (
-	"context"
-	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,152 +19,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/JohanLindvall/kubescrape/internal/peerip"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta/kubeconvert"
 )
-
-// The blocked-lookup cap is a MEMORY budget expressed in waiters.
-//
-// A parked GetContainer is not a map entry. The map entry is the cheapest part
-// of it: what it holds for the whole wait budget is a parked HTTP handler — two
-// goroutines and their stacks, the connection's read and write buffers, the
-// request state (including the parsed header map) and one file descriptor.
-//
-// A count is the right MECHANISM, but only while each waiter costs about the
-// same — and the sender picks part of that cost unless something takes it away.
-// Measured against a real listener with lookups parked on
-// `/v1/containers/{id}?wait=`, as retained HEAP after a GC plus a flat 16 KiB
-// per waiter for the goroutines net/http parks with it. The stack is ALLOWED
-// FOR rather than measured because the runtime pools freed stacks, so
-// MemStats.StackInuse cannot be attributed to one measurement — the same
-// 200-waiter poll reported between 1.1 and 10.5 KB per waiter while its heap
-// figure moved by 532 B (internal/server's parkedStackAllowance carries the
-// derivation; overstating it can only make the assertions stricter):
-//
-//	an agent's actual poll                                   30 KB
-//	the worst shape it now admits, measured                  46 KB
-//	that shape's BOUND: a poll plus one admitted head        47 KB   <- budgeted
-//	a 16 KB URI of %-escapes, with the URI HELD               63 KB
-//	the widest header block, with the whole head HELD        266 KB
-//	the same at net/http's 1 MiB default                >= 4.09 MB
-//
-// The measured worst and the budgeted bound nearly coincide because they are
-// the same case: the worst shape is the one that gets a whole admitted head
-// retained, so the arithmetic and the measurement meet. That is the bound
-// working, not a coincidence.
-//
-// The budgeted row is the ARITHMETIC, not the measurement: the measurement
-// moves several KB run to run and with the toolchain, and what cannot move is
-// that a parked lookup retains an ordinary poll plus, at most, one copy of the
-// head that was admitted.
-//
-// That is the whole reason WaiterCostBytes cannot be derived from anything this
-// package allocates. The bottom three rows are what internal/server had to fix
-// and how: net/http's parse expands a request head by 20 to 30 times, and most
-// of that expansion cannot be counted from the request it hands the handler (it
-// deletes Host/Transfer-Encoding/Trailer from the map, and net/textproto
-// pre-sizes the map from a peek at the LINE count, so the capacity outlives the
-// deletions; and the request LINE is one string that r.Method, r.RequestURI and
-// r.URL.RawPath are all SLICES of, with two more unescaped copies made for a
-// path carrying a %-escape). So the head is RELEASED before the handler parks
-// (internal/server's releaseParkedHead), which makes the parked cost a property
-// of this process rather than of the request.
-// internal/server/waitercost_test.go re-measures it against a real listener and
-// fails if it outgrows WaiterCostBytes.
-//
-// What is left is ONE copy of the wire, which is why the budget can be stated
-// at all: whatever the sender spends its head on, the retained residue is
-// either the request line (which http.conn.lastMethod holds for the life of the
-// connection, out of any handler's reach) or the If-None-Match validator (kept
-// on purpose), and they share the one admission rather than adding to it. That
-// admission is ~16 KB, not the 8 KiB MaxHeaderBytes nor the 12 KiB a fresh
-// connection is held to: a head arriving on a REUSED connection is partly
-// pre-buffered by the previous request's read and never charged (measured
-// 16350 admitted, 16351 refused; internal/server's maxHeaderBytes carries the
-// mechanism, and its waitercost_test.go re-derives the number).
-//
-// The cap then has to be CHOSEN against that cost, and the historical 16384 was
-// not: the shipped chart requests 128Mi for this pod and sets no limit
-// (charts/kubescrape/values.yaml), so 16384 permitted several times the pod's
-// entire request in parked requests alone — node memory pressure and an
-// eviction, which is the outcome the cap exists to prevent, reached by way of
-// the cap itself. So the default is a division:
-//
-//	WaiterBudgetBytes / WaiterCostBytes = 512 waiters
-//
-// What the cap costs when it binds: a LEGITIMATE blocked lookup is one node
-// agent's tailer waiting out the ~1s gap between a container starting and the
-// kubelet posting its ID. On the DEFAULT agent configuration there is at most
-// one of those per node — the tailer resolves on ONE sweep goroutine, and the
-// cadvisor path never waits. The exception is an agent run with
-// `-ingest-metadata-wait` (default 0, which blocks not at all): its ingest
-// handlers wait too, one lookup at a time per push, so that agent can add up to
-// its own `-ingest-max-in-flight` (default 32) blocked lookups on top. So the
-// default binds when hundreds of nodes sit in that window at the same instant —
-// far sooner if the fleet waits on ingest — and what it costs there is bounded
-// and retryable: 503 +
-// Retry-After, counted kubescrape_container_lookups_shed_total, and the agent's
-// metadata backoff re-asks. A few seconds of one file's log shipping, never
-// data.
-//
-// A cluster big enough to reach it has also outgrown the 128Mi this budget is a
-// quarter of — the records in THIS package measured 3.2 KB per pod (20k
-// two-container pods with ordinary labels, annotations and statuses), with the
-// informer's own trimmed copy on top — so raising it is one
-// half of a pair: `-max-blocked-lookups n` on the service, and n x
-// WaiterCostBytes more memory on the pod. That flag, not this constant, is the
-// knob; the constant only says what the DEFAULT pod can afford.
-const (
-	// WaiterCostBytes is what one parked lookup is budgeted at. The worst case
-	// admissible today is 47 KB — an ordinary poll plus one copy of the ~16 KB
-	// head a reused connection admits, whichever term the sender spends it on —
-	// against 30 KB for an ordinary agent poll, both on a keep-alive connection,
-	// which is the shape every agent's net/http.Transport uses and the shape
-	// that admits the most wire (the worst shape MEASURES 46 KB; 47 is the bound
-	// it cannot pass). This covers the worst with the ~1.2x
-	// RSS overhead measured alongside it (RSS is what gets a pod evicted) and
-	// then some. The headroom is deliberately not spent: the worst case was
-	// 51 KB when this number was chosen, and re-dividing the budget on every
-	// measurement would move -max-blocked-lookups' default — which is a
-	// documented operational number — for a memory saving nobody asked for.
-	WaiterCostBytes = 64 << 10
-	// WaiterBudgetBytes is what parked lookups on an unauthenticated route may
-	// occupy in total: a quarter of the 128Mi the chart requests for this pod,
-	// leaving the store, the informer caches and Go's own slack the rest. In
-	// TOTAL means both parking spots — this package's per-ID waiters and
-	// internal/server's readiness wait, which draws on the same cap through
-	// TryPark; a budget covering one of the two would be spent twice.
-	WaiterBudgetBytes = 32 << 20
-	// DefaultMaxWaiters bounds concurrently blocked container lookups — the
-	// waiters here and the readiness parks together — unless
-	// -max-blocked-lookups overrides it.
-	DefaultMaxWaiters = WaiterBudgetBytes / WaiterCostBytes
-)
-
-// maxWaiterIDLen bounds the container-ID strings held as waiter keys
-// (kubemeta.MaxContainerIDLen carries the 64-hex-runtime rationale). Lookups
-// over the bound degrade to a non-blocking miss — never an error, and never a
-// pinned map entry.
-//
-// It bounds LENGTH, which is not the whole of what a key can cost: a short id
-// CUT OUT of a long string (a slice, which in Go keeps the whole backing array
-// alive) pins that string for as long as the waiter lives. Callers that derive
-// an id from request text must copy it, which is what internal/server's
-// handleContainer does before this package ever sees it.
-const maxWaiterIDLen = kubemeta.MaxContainerIDLen
-
-// ErrTooManyWaiters reports that a container lookup was shed because the
-// store already holds the maximum number of blocked lookups. Callers should
-// surface it as a retryable condition (HTTP 503), never as "not found".
-var ErrTooManyWaiters = errors.New("too many blocked container lookups")
-
-// ErrShuttingDown reports that a blocking container lookup was refused because
-// Drain has been called: the process is terminating and the metadata this
-// lookup waits for can no longer arrive. Callers surface it exactly like
-// ErrTooManyWaiters — a retryable 503, never a 404 — because the container may
-// well exist and the next pod behind the Service can answer.
-var ErrShuttingDown = errors.New("store is shutting down")
 
 // Store is safe for concurrent use.
 type Store struct {
@@ -174,7 +30,7 @@ type Store struct {
 
 	// maxWaiters caps concurrently blocked container lookups — the GetContainer
 	// waiters below and the caller's readiness parks (TryPark) together — as a
-	// memory budget expressed in waiters, see DefaultMaxWaiters; SetMaxWaiters
+	// memory budget expressed in waiters, see DefaultMaxWaiters; WithMaxWaiters
 	// overrides it (tests, tuning).
 	maxWaiters int
 
@@ -230,7 +86,7 @@ type Store struct {
 	// pending lists every tombstone that has been stamped and not yet swept, so
 	// a sweep costs what EXPIRED rather than what the store holds. See
 	// stampLocked (the one place a stamp is made, and the invariant that keeps
-	// this list complete) and Sweep.
+	// this list complete) and sweep.
 	pending []pendingExpiry
 
 	// shed counts lookups refused by the waiter cap. Instance state published
@@ -258,15 +114,19 @@ type Store struct {
 	// what is worth seeing is two pods a lookup could legitimately have
 	// confused. Same reason as nameReused for being a counter and not a log.
 	ipContested atomic.Int64
-	// gen is a change token: it advances whenever a mutation lands that could
-	// alter what any read of this store returns. It exists so a caller can
-	// prove a derived answer is still current WITHOUT re-deriving it —
-	// internal/server's node-targets ETag memo is the caller, and before this
-	// existed that memo could only be validated by a wall clock, so a
-	// conforming agent (whose poll interval matches the max-age it was handed)
-	// never hit it and re-paid the whole derivation and marshal on every poll.
+	// gen is the store-wide change token: it advances whenever a mutation
+	// lands that could alter what any read of this store returns. It is not
+	// served on its own. nodeGen — what internal/server's node-targets ETag
+	// memo reads, through NodeGeneration — is MINTED from it, which is what
+	// keeps a node's stamp from ever repeating, and an EMPTY node answers with
+	// it. Change tokens exist so a caller can prove a derived answer is still
+	// current WITHOUT re-deriving it: before them that memo could only be
+	// validated by a wall clock, so a conforming agent (whose poll interval
+	// matches the max-age it was handed) never hit it and re-paid the whole
+	// derivation and marshal on every poll.
 	//
-	// TWO ORDERING RULES, and both directions of getting them wrong are real:
+	// TWO ORDERING RULES, and both directions of getting them wrong are real
+	// (they bind nodeGen too, which is stamped in the same bumpLocked):
 	//
 	//   - The WRITER bumps AFTER the mutation is visible, never before. Bumping
 	//     first lets a reader observe the new token beside the OLD data and
@@ -282,7 +142,25 @@ type Store struct {
 	// not an optimisation but the whole point — client-go re-delivers every
 	// object each resync period, so bumping there would invalidate every memo
 	// in the cluster on a timer and give back exactly what this buys.
+	//
+	// It is STORE-WIDE, which is too coarse to validate the node-targets memo
+	// directly: that derivation reads only PodsOnNode(node), so when the memo
+	// read this token it lapsed every node's memo on a pod event ANYWHERE in the
+	// cluster (a readiness flip, a restart, a Job pod) and on every sweep that
+	// removed a tombstone — the same trap an RV-keyed owner token would be.
+	// Hence nodeGen, the per-node token the memo reads now.
 	gen atomic.Uint64
+	// nodeGen is the per-node change token NodeGeneration serves: for every
+	// node with pods in byNode, the gen value minted by the last mutation that
+	// changed that node's pod set. Stamped from gen (bumpLocked), so a value is
+	// never reused — a node emptied and refilled gets a value larger than any
+	// it had before — and it follows gen's two ordering rules, the stamp landing
+	// under the same write lock as the mutation. An entry exists exactly while
+	// byNode[node] does, so node churn cannot grow it; an EMPTY node answers
+	// with the store-wide gen instead (see NodeGeneration for why that is
+	// sound). sweep never stamps a node: a swept tombstone left byNode in
+	// deletePodLocked, before it was ever a tombstone.
+	nodeGen map[string]uint64
 }
 
 type record struct {
@@ -321,43 +199,33 @@ type containerEntry struct {
 	expireAt time.Time
 }
 
-// pendingExpiry is one stamped tombstone waiting to be swept: a pod record or
-// a container entry.
-//
-// It is a HINT, never the truth. The truth is the expireAt on the record or
-// entry itself, which the sweep re-reads before removing anything: a tombstone
-// can be resurrected (UpsertPod clears the stamp), re-stamped later (a
-// replayed DeletePod), replaced (a restart re-indexes the ID) or already gone
-// (its pod swept it), and each of those simply makes the hint a no-op. The
-// cost of a stale hint is one map probe.
-//
-// isPod says which map to look in, rather than the emptiness of uid or id: a
-// record keyed by an empty UID is degenerate but perfectly representable, and
-// a discriminator that reads it as a container id would leave that record's
-// tombstone in the store forever.
-type pendingExpiry struct {
-	when  time.Time
-	uid   types.UID
-	id    string
-	isPod bool
-}
-
 // New creates a store that retains metadata for deleted pods and replaced
 // container IDs for ttl. A ttl <= 0 disables the tombstone cache.
-func New(ttl time.Duration) *Store {
-	return &Store{
+//
+// Everything tunable is set here (Option) rather than by a setter after
+// construction, so there is no "before the first lookup" contract to keep.
+func New(ttl time.Duration, opts ...Option) *Store {
+	s := &Store{
 		ttl:         ttl,
 		now:         time.Now,
 		maxWaiters:  DefaultMaxWaiters,
 		pods:        make(map[types.UID]*record),
 		byContainer: make(map[string]*containerEntry),
 		byNode:      make(map[string]map[types.UID]*record),
+		nodeGen:     make(map[string]uint64),
 		byPodName:   make(map[string]*record),
 		byPodIP:     make(map[string]*record),
 		ipClaimants: make(map[string]map[string]*record),
 		waiters:     make(map[string][]chan struct{}),
 	}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
+
+// Option tunes a Store at construction (New).
+type Option func(*Store)
 
 // ContainerResult is the outcome of a successful container lookup. Pod.Owners
 // is left nil; the caller resolves the chain from OwnerRefs.
@@ -406,16 +274,22 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 	// resyncNoOp return above is already behind us, so this is a real change;
 	// the write-lock re-check below can still find nothing to do, and the
 	// resulting spare bump costs one rebuild, which is the safe direction.
-	defer s.gen.Add(1)
+	// touched names the nodes whose pod set this upsert changed (the one the
+	// pod left and the one it is on), filled in once they are known.
+	var touched [2]string
+	defer func() { s.bumpLocked(touched[:]...) }()
 
 	rec := s.pods[p.UID]
 	// Re-checked under the write lock, since the probe above dropped its lock:
 	// the informer delivers pod events on one goroutine, so nothing can have
 	// changed in between today, but that is the caller's property and not this
 	// type's.
-	if rec != nil && rec.expireAt.IsZero() && rec.resourceVersion == p.ResourceVersion {
+	if unchangedLocked(rec, p) {
 		return // periodic resync, nothing changed
 	}
+	// A pod the store has never seen carries no evidence of WHEN it acquired
+	// its addresses — see claimOneIPLocked, which is what reads this.
+	firstSighting := rec == nil
 	var oldNode string
 	var oldIPs []string
 	var oldIDs map[string]struct{}
@@ -442,6 +316,7 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 
 	s.indexContainersLocked(rec, p.UID, containers, oldIDs)
 
+	touched = [2]string{oldNode, pod.NodeName}
 	if oldNode != pod.NodeName {
 		s.removeFromNodeLocked(oldNode, p.UID)
 	}
@@ -473,7 +348,7 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 	}
 	s.byPodName[nameKey] = rec
 
-	s.claimPodIPLocked(rec, pod, oldIPs)
+	s.claimPodIPLocked(rec, pod, oldIPs, firstSighting && rec.terminating)
 }
 
 // resyncNoOp reports that this delivery carries a resourceVersion the store
@@ -483,8 +358,21 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 func (s *Store) resyncNoOp(p *corev1.Pod) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rec := s.pods[p.UID]
-	return rec != nil && rec.expireAt.IsZero() && rec.resourceVersion == p.ResourceVersion
+	return unchangedLocked(s.pods[p.UID], p)
+}
+
+// unchangedLocked is the ONE test both halves of UpsertPod's resync
+// short-circuit apply (the read-locked probe and the write-locked re-check):
+// the record is live and already holds this delivery's resourceVersion.
+//
+// An EMPTY resourceVersion is never "unchanged". The informer always sets one,
+// so only a hand-built object (a test fixture, an embedder) lacks it, and for
+// those two empty strings say nothing about the content — believing them
+// silently dropped a re-upsert carrying a new pod IP or container ID.
+// services.Index.Upsert applies the same rule, for the same reason.
+func unchangedLocked(rec *record, p *corev1.Pod) bool {
+	return rec != nil && rec.expireAt.IsZero() &&
+		p.ResourceVersion != "" && rec.resourceVersion == p.ResourceVersion
 }
 
 // indexContainersLocked replaces the record's container-ID index: new IDs are
@@ -497,13 +385,7 @@ func (s *Store) indexContainersLocked(rec *record, uid types.UID, containers map
 		ids[id] = struct{}{}
 		s.byContainer[id] = &containerEntry{podUID: uid, container: c}
 		// Wake exactly the requests blocked on this container ID.
-		if ws := s.waiters[id]; len(ws) > 0 {
-			for _, ch := range ws {
-				close(ch)
-			}
-			s.nWaiters -= len(ws)
-			delete(s.waiters, id)
-		}
+		s.wakeLocked(id)
 	}
 	rec.containerIDs = ids
 	for id := range oldIDs {
@@ -516,315 +398,53 @@ func (s *Store) indexContainersLocked(rec *record, uid types.UID, containers map
 	}
 }
 
-// claimPodIPLocked maintains the live-pod IP index for one upsert: hostNetwork
-// and finished pods never claim, a stale old mapping is dropped (identity-
-// checked), and among the rest the LATER ACQUIRER holds the address — pod IPs
-// recycle, and a stale pod's routine status updates still carry the IP the CNI
-// already handed to someone else. That covers a late-scheduled OLDER pod
-// legitimately taking a freed IP, and a drainer keeping its address until it is
-// actually released (claimOneIPLocked says why the terminating bit orders
-// nothing here).
-func (s *Store) claimPodIPLocked(rec *record, pod kubemeta.Pod, oldIPs []string) {
-	// EVERY address the pod reports. On a dual-stack cluster a connection can
-	// arrive from the family status.podIP does not carry, and indexing only
-	// that one left /v1/self and /v1/pod-ips unresolvable for it — the agent's
-	// self-attribution and the ingest peer-IP fallback silently off, with a 404
-	// indistinguishable from any other.
-	addrs := podAddresses(pod)
-	for _, ip := range addrs {
-		s.claimOneIPLocked(rec, ip, oldIPs)
-	}
-	// Addresses the pod no longer reports are released.
-	for _, old := range oldIPs {
-		if old == "" || containsStr(addrs, old) {
-			continue
-		}
-		s.releaseIPLocked(rec, old)
-	}
-}
-
-// rawIPs is the ONE enumeration of the addresses a pod's status reports:
-// status.podIPs, falling back to the single status.podIP when the list is
-// empty (kubeconvert fills PodIPs today; the backstop covers records built
-// before the field existed). Both podAddresses (claim eligibility) and
-// recordAddresses (release/cleanup) MUST read this same list — a claim taken
-// from an address one enumeration sees and the other does not is never
-// released, the dual-stack leak class deletePodLocked's comment describes.
-//
-// Every address is CANONICALISED, because this is what the index is keyed by
-// while every lookup arrives in peerip's form: /v1/self from the connection's
-// source address, the agent's ingest fallback through metaclient.PodByIP. A
-// kubelet or CNI reporting `::ffff:10.1.2.3`, `FD00::0:7` or a zoned address
-// would otherwise index the pod under a key no lookup can ever form, and both
-// of those paths would 404 for it — indistinguishable from any other miss. The
-// SERVED model keeps the verbatim strings; only the keys are normalised.
-//
-// The copy is made only when an address is NOT already canonical, which on
-// every cluster that spells its addresses the ordinary way is never. This runs
-// on the informer goroutine holding the store's EXCLUSIVE lock — twice per
-// upsert (the record's old addresses and the pod's new ones), again on every
-// delete, and once per claimant a promotion scans — so the allocation it used
-// to make unconditionally was paid by every reader waiting on that lock. The
-// returned slice may therefore ALIAS the pod's own PodIPs and is read-only to
-// callers; podAddresses honours that, and nothing else writes to it.
-func rawIPs(pod kubemeta.Pod) []string {
-	ips := pod.PodIPs
-	if len(ips) == 0 && pod.PodIP != "" {
-		ips = []string{pod.PodIP}
-	}
-	for i, ip := range ips {
-		c := peerip.Canonical(ip)
-		if c == ip {
-			continue
-		}
-		out := make([]string, len(ips))
-		copy(out, ips[:i])
-		out[i] = c
-		for j := i + 1; j < len(ips); j++ {
-			out[j] = peerip.Canonical(ips[j])
-		}
-		return out
-	}
-	return ips
-}
-
-// podAddresses returns the addresses a pod may legitimately be reached at, or
-// nil when it claims none (hostNetwork, finished).
-func podAddresses(pod kubemeta.Pod) []string {
-	// The spec flag is the authoritative signal; the IP comparison stays as a
-	// backstop for records converted before the field existed.
-	if pod.HostNetwork || kubemeta.FinishedPhase(pod.Phase) {
-		return nil
-	}
-	ips := rawIPs(pod)
-	// The host address in the same form the pod addresses are keyed in, or the
-	// comparison below misses whenever the two are spelled differently.
-	host := peerip.Canonical(pod.HostIP)
-	// Nothing to filter is the case every ordinary pod takes, and it returns
-	// rawIPs' slice rather than a copy of it (see rawIPs on why the store's
-	// write lock makes that worth the branch). The copy is built only from the
-	// first address that has to go.
-	for i, ip := range ips {
-		// A hostNetwork pod whose status.hostIP has not been populated yet
-		// would otherwise claim the node address.
-		if ip != "" && ip != host {
-			continue
-		}
-		out := make([]string, 0, len(ips)-1)
-		out = append(out, ips[:i]...)
-		for _, ip := range ips[i+1:] {
-			if ip != "" && ip != host {
-				out = append(out, ip)
-			}
-		}
-		return out
-	}
-	return ips
-}
-
-// recordAddresses returns every address a record ever claimed, including for a
-// pod that has since gone finished or hostNetwork (podAddresses returns none
-// for those, but their claims still have to be cleaned up).
-func recordAddresses(rec *record) []string {
-	return rawIPs(rec.pod)
-}
-
-func containsStr(xs []string, v string) bool {
-	for _, x := range xs {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
-
-// releaseIPLocked drops rec's claim on one address and promotes a survivor.
-func (s *Store) releaseIPLocked(rec *record, ip string) {
-	s.dropClaimantLocked(ip, rec)
-	if s.byPodIP[ip] == rec {
-		delete(s.byPodIP, ip)
-		// A live pod shadowed on that address by the recycle race must be
-		// promoted, or it stays unresolvable until its own next real upsert.
-		s.promoteIPClaimantLocked(ip, rec)
-	}
-}
-
-// claimOneIPLocked applies the claim rules for ONE of a pod's addresses.
-//
-// ACQUISITION ORDER IS THE WHOLE RULE, and the terminating bit deliberately
-// decides nothing on its own. The rule that used to sit above it — "a draining
-// pod yields to a live incumbent" — is entirely SUBSUMED by ipSeq whenever its
-// own justification holds: a pod that keeps reporting an address "the CNI has
-// already handed to someone else" is by construction the EARLIER acquirer, so
-// it loses on ipSeq without any help. The only shapes in which the terminating
-// arms decided anything were the ones their justification does NOT describe,
-// and there they INVERTED the ordering: a live pod that merely re-asserted an
-// address it acquired FIRST took it back from the pod that acquired it later
-// and is now draining — which is not a recycle at all, since an address is not
-// released until the sandbox is torn down. Any status churn on the stale pod
-// (a node-lifecycle condition on a NotReady node, a resurrect after DeletePod)
-// fired it, /v1/pod-ips, /v1/self and every agent peer-IP fallback then carried
-// the stale pod's identity for the drainer's remaining traffic, and the flip
-// did not heal when the drainer was finally deleted (releaseIPLocked promotes
-// only when the leaver still HELD the address) — it stood until some new pod
-// genuinely acquired the address. It was also silent: noteContested excludes
-// every claim in which either side is terminating.
-//
-// The ordinary hand-off still happens, one event later and on real evidence:
-// the drainer's deletion (or its transition to a finished phase) releases the
-// address and promoteIPClaimantLocked hands it to the best surviving claimant.
-//
-// It deliberately takes no kubemeta.Pod: eligibility and precedence come from
-// RECORD state the caller has already established (rec.ipSeq), not from the pod
-// value. Passing the pod invited a later edit to re-derive it here and bypass
-// the ipSeq ordering.
-func (s *Store) claimOneIPLocked(rec *record, ip string, oldIPs []string) {
-	s.addClaimantLocked(ip, rec)
-	if !containsStr(oldIPs, ip) {
-		// This pod ACQUIRED the address now. The sequence orders genuine
-		// acquisitions so a later one beats an earlier one below.
-		s.ipSeq++
-		rec.ipSeq = s.ipSeq
-	}
-	cur := s.byPodIP[ip]
-	switch {
-	case cur == nil || cur == rec:
-		s.byPodIP[ip] = rec
-	case rec.ipSeq > cur.ipSeq:
-		// Last acquisition wins — including a late-scheduled older pod
-		// legitimately taking a freed address, and a live pod taking over from
-		// a drainer that acquired the address before it. noteContested skips
-		// the latter: a hand-off from a terminating holder is the ordinary way
-		// an address changes hands, not a window in which a lookup was wrong.
-		s.noteContested(rec, cur)
-		s.byPodIP[ip] = rec
-	default:
-		// rec is merely RE-ASSERTING an address it already held while a
-		// later pod legitimately took it. Plain last-write-wins let any
-		// unrelated update to a stale pod (a node-lifecycle condition on a
-		// NotReady node, a resurrect after DeletePod, a transient podIP
-		// blip) steal the mapping from the later acquirer and mis-attribute
-		// every peer-IP lookup until that pod finally went away.
-		s.noteContested(rec, cur)
-	}
-}
-
-// promoteIPClaimantLocked re-points byPodIP[ip] at a surviving eligible pod
-// after the current claimant released or lost the IP. Eligibility mirrors
-// claimPodIPLocked, through the same podAddresses helper: live (not
-// tombstoned), running-phase, non-hostNetwork, and holding ip among
-// status.podIPs — the SECONDARY address of a dual-stack pod included. The LATER
-// acquirer wins (same precedence the claim path applies, and for the same
-// reason: a drainer has not released its address until its sandbox is torn
-// down, which is the event that brings the promotion round again).
-//
-// skip is the record that just gave the IP up and must never win it back. It is
-// this function's OWN precondition, not a patch for its caller: the scan is over
-// ipClaimants[ip], and the one caller (releaseIPLocked) drops rec from that map
-// BEFORE calling — so today the branch is never taken, and a test proving it is
-// unreachable would prove nothing about whether it may be deleted.
-//
-// It stays because the alternative is a promotion whose correctness rests on
-// call ORDER, and the outcome of getting that order wrong is silent. None of
-// this scan's other filters would catch the releaser: DeletePod stamps expireAt
-// (the tombstone marker filtered on above) only AFTER the promotion runs, and
-// with -cache-ttl 0 removes the record instead of stamping it at all, so the pod
-// being deleted still reads as live here. It would take its own address back
-// with DeletedAt unset and serve a DELETED pod from GET /v1/pod-ips forever
-// (Sweep never revisits byPodIP), leaking one entry per deleted pod and — when a
-// live pod holds the recycled IP — stealing the mapping from the real owner.
-// TestPromotionNeverReturnsTheAddressToTheRecordThatReleasedIt calls this
-// function directly, with the releaser still in the claimant set, so the
-// exclusion is pinned as a contract rather than as unreachable code.
-func (s *Store) promoteIPClaimantLocked(ip string, skip *record) {
-	var pick *record
-	for _, r := range s.ipClaimants[ip] {
-		if r == skip { // released the IP; never a candidate to re-take it
-			continue
-		}
-		if !r.expireAt.IsZero() { // tombstoned: not live
-			continue
-		}
-		// Eligibility through the SAME helper the claim path uses: it returns
-		// the addresses a pod may legitimately hold and nothing for a
-		// hostNetwork or finished one, so this subsumes the four separate
-		// checks that stood here. They compared the single p.PodIP, which
-		// meant a dual-stack claimant could never be promoted onto its
-		// SECONDARY address — the address then resolved to nothing at all.
-		if !containsStr(podAddresses(r.pod), ip) {
-			continue
-		}
-		if pick == nil || beatsClaimant(pick, r) {
-			pick = r
-		}
-	}
-	if pick != nil {
-		s.byPodIP[ip] = pick
-	}
-}
-
-// beatsClaimant reports whether candidate should displace cur for an address.
-// It is the claim path's precedence (claimOneIPLocked) and must stay identical
-// to it: the LATER acquisition wins, and the terminating bit decides nothing —
-// preferring a live claimant here would promote a pod whose claim the claim
-// path had already ruled stale, i.e. reintroduce on this one path the outcome
-// ipSeq exists to prevent. Promotion once had no ipSeq comparison at all, and
-// the winner between two claimants was map-iteration random.
-func beatsClaimant(cur, candidate *record) bool {
-	return candidate.ipSeq > cur.ipSeq
-}
-
-// addClaimantLocked records that rec currently reports ip.
-func (s *Store) addClaimantLocked(ip string, rec *record) {
-	m := s.ipClaimants[ip]
-	if m == nil {
-		m = make(map[string]*record, 1)
-		s.ipClaimants[ip] = m
-	}
-	m[rec.pod.UID] = rec
-}
-
-// dropClaimantLocked forgets rec's claim on ip, removing the address's entry
-// once nobody reports it (the map must not grow by one key per recycled IP).
-func (s *Store) dropClaimantLocked(ip string, rec *record) {
-	m := s.ipClaimants[ip]
-	if m == nil {
-		return
-	}
-	if cur, ok := m[rec.pod.UID]; ok && cur == rec {
-		delete(m, rec.pod.UID)
-	}
-	if len(m) == 0 {
-		delete(s.ipClaimants, ip)
-	}
-}
-
-// noteContested records that one address was claimed by two records that are
-// both LIVE, whichever of them the precedence rules picked. It is the only
-// shape of the recycle race in which a peer-IP lookup could legitimately have
-// answered with the wrong pod, which is why the terminating hand-offs — the
-// ordinary way an address is released — are excluded.
-func (s *Store) noteContested(rec, cur *record) {
-	if rec.terminating || cur.terminating {
-		return
-	}
-	s.ipContested.Add(1)
-}
-
 // NameReuses counts pods that arrived under a namespace/name a different live
 // UID still held (see the nameReused field). Published through
 // obs.RegisterStoreAnomalies.
 func (s *Store) NameReuses() int64 { return s.nameReused.Load() }
 
-// Generation is the store's change token (see the gen field). A caller holding
-// a value derived from this store re-reads it and, if it is unchanged, knows
-// its answer is still current without re-deriving it. Load it BEFORE reading
-// the data it is meant to describe.
-func (s *Store) Generation() uint64 { return s.gen.Load() }
+// NodeGeneration is the change token for ONE node's pod set — what
+// PodsOnNode(node) returns (see the nodeGen field). A caller holding a value
+// derived from that set re-reads it and, if it is unchanged, knows its answer
+// is still current without re-deriving it. Load it BEFORE reading the data it
+// is meant to describe.
+//
+// A node with no pods answers with the STORE-WIDE token rather than a
+// constant, and that is what keeps the answer sound across a node emptying and
+// refilling: a node's stamp is minted by the mutation that last changed it, so
+// the mutation that EMPTIES it advances gen past every stamp it ever had, and
+// the one that refills it stamps past every gen value an empty read could have
+// returned. A constant (0, say) would equate "empty before a pod arrived" with
+// "empty again after it left", and a memo built across the first transition —
+// token sampled empty, pod read non-empty — would then be served for the second.
+func (s *Store) NodeGeneration(node string) uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if g, ok := s.nodeGen[node]; ok {
+		return g
+	}
+	return s.gen.Load()
+}
 
-// ContestedPodIPs counts pod-IP claims decided between two live pods (see the
-// ipContested field). Published through obs.RegisterStoreAnomalies.
-func (s *Store) ContestedPodIPs() int64 { return s.ipContested.Load() }
+// bumpLocked is the writer half of the change tokens, called with the write
+// lock held and AFTER the mutation (deferred, so before the caller's unlock):
+// it advances the store-wide token and stamps every named node whose pod set
+// the mutation changed with the value just minted. A node the mutation left
+// with no pods loses its entry, which is what bounds nodeGen by the nodes that
+// have pods.
+func (s *Store) bumpLocked(nodes ...string) {
+	g := s.gen.Add(1)
+	for _, n := range nodes {
+		if n == "" {
+			continue
+		}
+		if _, ok := s.byNode[n]; ok {
+			s.nodeGen[n] = g
+		} else {
+			delete(s.nodeGen, n)
+		}
+	}
+}
 
 // cloneOwnerRefs deep-copies owner references: the struct copy alone would
 // alias the informer object's *bool fields (Controller, BlockOwnerDeletion),
@@ -862,7 +482,11 @@ func (s *Store) deletePodLocked(uid types.UID) {
 	if rec == nil {
 		return // nothing changed, so the change token must not move
 	}
-	defer s.gen.Add(1) // after the mutation, before the caller's unlock
+	// After the mutation, before the caller's unlock; the pod's node is the one
+	// whose PodsOnNode answer changes. The name-reuse path in UpsertPod comes
+	// through here too, so the predecessor's node is stamped even when it is
+	// not the node the new pod landed on.
+	defer s.bumpLocked(rec.pod.NodeName)
 	now := s.now()
 	s.removeFromNodeLocked(rec.pod.NodeName, uid)
 	// EVERY address, through the one helper that drops the claim, deletes the
@@ -870,7 +494,7 @@ func (s *Store) deletePodLocked(uid types.UID) {
 	//
 	// Releasing only rec.pod.PodIP from byPodIP left a dual-stack pod's
 	// SECONDARY entry pointing at the deleted record for the process lifetime
-	// (Sweep never revisits byPodIP): the whole kubemeta.Pod stayed reachable,
+	// (sweep never revisits byPodIP): the whole kubemeta.Pod stayed reachable,
 	// and with -cache-ttl 0 — where deletePodLocked returns below WITHOUT
 	// stamping DeletedAt — GetPodByIP's tombstone guard never fired, so a
 	// deleted pod answered /v1/pod-ips and /v1/self on that address forever.
@@ -885,13 +509,7 @@ func (s *Store) deletePodLocked(uid types.UID) {
 	}
 
 	if s.ttl <= 0 {
-		for id := range rec.containerIDs {
-			if e := s.byContainer[id]; e != nil && e.podUID == uid {
-				delete(s.byContainer, id)
-			}
-		}
-		s.dropNameIndexLocked(rec)
-		delete(s.pods, uid)
+		s.removeRecordLocked(rec, uid)
 		return
 	}
 
@@ -917,22 +535,6 @@ func (s *Store) deletePodLocked(uid types.UID) {
 	}
 }
 
-// stampLocked records a tombstone that Sweep must revisit. EVERY assignment to
-// a record's or an entry's expireAt goes through here (there are exactly two
-// callers, deletePodLocked and expireEntryLocked); one that did not would be a
-// tombstone nothing ever reclaims, since the sweep no longer scans the store
-// looking for them.
-//
-// The list is kept in stamp order, which is also expiry order: every stamp is
-// now+ttl for one ttl fixed at construction, and now does not go backwards
-// (time.Now carries a monotonic reading; the injectable test clock only
-// advances). Sweep therefore stops at the first unexpired entry instead of
-// walking the rest. Were that ever violated, the entries behind the head would
-// be swept in a later window rather than leak — a delay, not a loss.
-func (s *Store) stampLocked(p pendingExpiry) {
-	s.pending = append(s.pending, p)
-}
-
 // Stats reports current cache sizes.
 func (s *Store) Stats() (pods, containers int) {
 	s.mu.RLock()
@@ -940,136 +542,23 @@ func (s *Store) Stats() (pods, containers int) {
 	return len(s.pods), len(s.byContainer)
 }
 
-// expired reports whether a tombstone stamp has lapsed. A zero expireAt is
-// the live marker (no tombstone), never "expired at the epoch"; a stamped
-// entry expires strictly AFTER its instant, so an injected test clock sitting
-// exactly on the stamp still resolves. Every expiry decision — the lookups'
-// present-but-unswept checks and Sweep itself — goes through here so they
-// cannot disagree on either edge.
-func expired(expireAt, now time.Time) bool {
-	return !expireAt.IsZero() && now.After(expireAt)
-}
-
-// Sweep removes expired tombstones. It is exported for tests; Run calls it
-// periodically.
-//
-// It walks the PENDING list, not the store. Sweep holds the exclusive write
-// lock, so every container lookup, every pod lookup and every node-targets
-// request waits behind it, and the informer's own upserts queue up too — the
-// cost has to be proportional to what expired. Scanning byContainer and pods
-// instead made it proportional to the whole store whether or not anything was
-// due: at 20k pods a sweep with NOTHING to remove measured 0.77-1.02 ms
-// against 73-99 ns now, and it runs on a ticker of ttl/4 clamped to
-// [5s, 60s] — so a short -cache-ttl paid that every five seconds for nothing.
-// Both figures are indicative; the durable claim is
-// TestSweepCostDoesNotScaleWithTheStore, which measures the SHAPE.
-func (s *Store) Sweep() {
-	now := s.now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	n := 0
-	for ; n < len(s.pending); n++ {
-		p := s.pending[n]
-		if !expired(p.when, now) {
-			break // stamped in expiry order: nothing behind this is due either
-		}
-		if p.isPod {
-			s.sweepPodLocked(p.uid, now)
-		} else {
-			s.sweepContainerLocked(p.id, now)
-		}
-	}
-	if n > 0 {
-		// Something was actually removed. A sweep that finds nothing due — the
-		// common case, on a ticker as short as every five seconds — must leave
-		// the token alone, or the memo it guards would lapse on that ticker
-		// rather than on change.
-		defer s.gen.Add(1)
-	}
-	if n == 0 {
-		return
-	}
-	// Compact rather than reslice. A reslice walks the backing array forward
-	// until its capacity runs out and then reallocates, and in the steady state
-	// of one stamp arriving per sweep that is a fresh array every time.
-	rest := copy(s.pending, s.pending[n:])
-	clear(s.pending[rest:]) // the moved-from tail keeps its strings alive
-	s.pending = s.pending[:rest]
-	if rest == 0 && cap(s.pending) > maxIdlePendingStamps {
-		// A rollout of a 5000-pod deployment stamps three tombstones per pod
-		// and then drains them all inside one TTL. Reusing the array is the
-		// point of compacting, but keeping the PEAK of it for the process
-		// lifetime is not: nothing else in the store is sized by the largest
-		// burst it ever saw.
-		s.pending = nil
-	}
-}
-
-// maxIdlePendingStamps is the largest empty pending array Sweep keeps for
-// reuse: 1024 stamps, ~64 KB, comfortably more than steady-state churn between
-// two ticks and small enough that a burst's high-water mark is not resident
-// forever.
-const maxIdlePendingStamps = 1024
-
-// sweepContainerLocked removes one container entry if the stamp that listed it
-// is still the entry's own and has lapsed. A restart that re-indexed the ID
-// installed a fresh entry with no stamp, and this must not remove that.
-func (s *Store) sweepContainerLocked(id string, now time.Time) {
-	if e := s.byContainer[id]; e != nil && expired(e.expireAt, now) {
-		delete(s.byContainer, id)
-	}
-}
-
-// sweepPodLocked retires one lapsed pod tombstone and every index that still
-// points at it.
-func (s *Store) sweepPodLocked(uid types.UID, now time.Time) {
-	rec := s.pods[uid]
-	if rec == nil || !expired(rec.expireAt, now) {
-		return // already gone, resurrected, or re-stamped by a replayed delete
-	}
+// removeRecordLocked is the ONE teardown of a pod record, shared by the two
+// paths that remove one outright — deletePodLocked with no tombstone cache
+// (-cache-ttl <= 0) and sweepPodLocked retiring a lapsed tombstone: it drops the
+// name index (unless a same-name successor already holds it), deletes the
+// record's OWN container IDs — identity-checked, since a restart or a
+// same-name successor may have re-indexed one under another pod, and never a
+// rescan of byContainer — and removes the record. The three steps carry no
+// ordering dependency on each other. IP claims are the caller's: the delete path
+// releases them (promoting a survivor), the sweep path only forgets them.
+func (s *Store) removeRecordLocked(rec *record, uid types.UID) {
 	s.dropNameIndexLocked(rec)
-	for _, ip := range recordAddresses(rec) {
-		s.dropClaimantLocked(ip, rec)
-	}
-	// The record's OWN container IDs, identity-checked exactly as
-	// deletePodLocked does — never a rescan of byContainer.
 	for id := range rec.containerIDs {
 		if e := s.byContainer[id]; e != nil && e.podUID == uid {
 			delete(s.byContainer, id)
 		}
 	}
 	delete(s.pods, uid)
-}
-
-// Run sweeps expired tombstones until ctx is done.
-func (s *Store) Run(ctx context.Context) {
-	interval := s.ttl / 4
-	if interval < 5*time.Second {
-		interval = 5 * time.Second
-	}
-	if interval > time.Minute {
-		interval = time.Minute
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.Sweep()
-		}
-	}
-}
-
-func (s *Store) expireEntryLocked(id string, e *containerEntry) {
-	if s.ttl <= 0 {
-		delete(s.byContainer, id)
-		return
-	}
-	e.expireAt = s.now().Add(s.ttl)
-	s.stampLocked(pendingExpiry{when: e.expireAt, id: id})
 }
 
 // dropNameIndexLocked removes rec from the name index unless a newer pod

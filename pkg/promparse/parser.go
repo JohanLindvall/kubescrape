@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // MetricType is the declared type of a metric family (# TYPE line).
@@ -58,7 +59,13 @@ const (
 	RoleGauge SampleRole = iota
 	// RoleCounter covers counter samples (with or without _total suffix).
 	RoleCounter
-	// RoleHistogramBucket is a histogram's _bucket series (one per le).
+	// RoleHistogramBucket is a histogram's _bucket series (one per le). A sample
+	// named after a histogram FAMILY itself (the bare `lat` of `# TYPE lat
+	// histogram`, which neither exposition format defines) is classified here
+	// too, with Name == Family — never as a gauge that would claim the family's
+	// name — so a consumer can refuse it: a real bucket series is always
+	// `<family>_bucket`. The summary sibling, RoleSummaryQuantile, carries the
+	// family name by definition.
 	RoleHistogramBucket
 	// RoleHistogramSum is a histogram's _sum series.
 	RoleHistogramSum
@@ -150,18 +157,50 @@ const maxTypeBytes = 1 << 20
 
 // Interning bounds: metric and label names are low-cardinality and repeat on
 // nearly every line; label values (namespace, pod, le, code, ...) repeat
-// heavily in Kubernetes-style expositions. Both tables live for one scrape.
-// A name/value longer than its length cap or arriving after the table is full
-// is allocated normally, so pathological inputs degrade to the non-interned
-// cost instead of growing memory.
+// heavily in Kubernetes-style expositions. Exemplar label values (trace and
+// span IDs) never repeat and are not interned. A name/value longer than its
+// length cap or arriving after the table is full is allocated normally, so
+// pathological inputs degrade to the non-interned cost instead of growing
+// memory.
+//
+// The tables do NOT live for one scrape: a pooled parser keeps them WARM across
+// parses on purpose (the same names repeat every scrape), and Get clears one
+// only once it passes HALF of either bound. So what a table may retain between
+// scrapes is half its bound, per pooled parser, for as long as the pool keeps
+// the parser — which is why each is bounded in BYTES and not only in entries.
+// The value table's bytes follow from its two caps (8192 x 128 B, 1 MiB); the
+// name table's did not (100,000 x 256 B is ~25 MiB, measured 29.5 MiB retained
+// after one scrape of 99,990 distinct 256-byte names), so it carries its own
+// byte budget, maxInternedNameBytes — the same 1 MiB every other
+// per-exposition table in this package and in its callers is held to.
 const (
 	maxInternedNames   = MaxTrackedFamilies
 	maxInternedNameLen = 256
+	// maxInternedNameBytes bounds the text the name table retains. Past it a
+	// new name is allocated normally, exactly like one over the length cap.
+	maxInternedNameBytes = 1 << 20
 	// MaxInternedValues bounds the label-value intern table; exported for the
 	// same reason as MaxTrackedFamilies.
 	MaxInternedValues   = 8192
 	maxInternedValueLen = 128
 )
+
+// maxLongCacheBytes bounds the text the positional last-seen caches (lastKV,
+// exLastKV) may hold in names and values too LONG to intern. Everything the
+// caches hold at intern size is bounded by position count x length cap; a long
+// string is bounded only by the line, and a slot keeps its string until a later
+// line reaches that position again. An exposition whose lines carry a
+// DECREASING label count therefore left one near-MaxLineBytes value behind at
+// every position — measured 127 MiB retained from a 126 MiB body of 128
+// malformed lines, and up to MaxLabelsPerSample x MaxLineBytes (~4 GiB) in
+// principle, with no sample, budget or counter ever moving.
+//
+// A long value is still worth caching when it repeats on consecutive lines (a
+// systemd-driver cadvisor `id` is ~190 bytes and repeats across a container's
+// device and operation rows), so it is cached WITHIN this budget rather than
+// never: past it a long string is simply not remembered, which costs that
+// line the allocation an uncached long value always costs and nothing else.
+const maxLongCacheBytes = 64 << 10
 
 // MaxLabelsPerSample bounds the label count of ONE sample line. The
 // duplicate-name check in parseLabels is a linear scan over the labels seen so
@@ -183,14 +222,32 @@ const (
 // land on.
 const MaxLabelsPerSample = 4096
 
-// maxLabelsPerSample is the internal spelling used below.
-const maxLabelsPerSample = MaxLabelsPerSample
-
-// maxMetaBytes bounds the "# HELP"/"# UNIT" text retained for one exposition.
+// MaxMetaBytes bounds the "# HELP"/"# UNIT" text retained for one exposition.
 // The meta table is per-exposition like the TYPE table, but its VALUES are free
 // text (a whole line each), which MaxTrackedFamilies alone would not bound —
-// past the budget later families simply carry no description.
-const maxMetaBytes = 1 << 20
+// past the budget later families simply carry no description. Exported so the
+// protobuf front in internal/agent/promscrape, which has no table but stamps
+// the same text on every point it emits, applies the same per-exposition
+// budget and the two fronts describe one target alike.
+const MaxMetaBytes = 1 << 20
+
+// maxMetaBytes is the internal spelling used below.
+const maxMetaBytes = MaxMetaBytes
+
+// MaxExemplarLabelSetRunes is the OpenMetrics bound on one exemplar's label
+// set: "the combined length of the label names and values of an Exemplar's
+// LabelSet MUST NOT exceed 128 UTF-8 character code points". It is Prometheus's
+// exemplar.ExemplarMaxLabelSetLength, which its exemplar storage enforces, so an
+// exemplar past it is one no Prometheus-compatible backend keeps. Counted in
+// RUNES, never bytes: a byte bound would refuse spec-valid non-ASCII sets.
+//
+// An exemplar over it is refused (counted by MalformedExemplars) and its sample
+// kept, like any other unusable exemplar. The bound is also what keeps an
+// exemplar CHEAP downstream: every accepted label becomes an OTLP attribute
+// written by an insert that probes the map linearly, so a label COUNT bounded
+// only by MaxLabelsPerSample made that write quadratic. Exported because the
+// protobuf front applies the same rule.
+const MaxExemplarLabelSetRunes = 128
 
 // familyMeta is one family's HELP text and UNIT.
 type familyMeta struct{ help, unit string }
@@ -210,7 +267,11 @@ type Parser struct {
 	// typeBytes is the retained key text of the TYPE table; see maxTypeBytes.
 	typeBytes int
 	names     map[string]string // interned metric/label names
-	values    map[string]string // interned label values
+	// nameBytes is the retained text of the name table; see
+	// maxInternedNameBytes. It moves with the table: charged on insert, zeroed
+	// wherever the table is cleared.
+	nameBytes int
+	values    map[string]string // interned sample label values (never exemplar ones)
 	// metas holds each family's HELP/UNIT, recorded once per family from its
 	// comment lines and stamped on every sample of it via lastClass below.
 	// metaBytes is the retained text budget; see maxMetaBytes.
@@ -220,26 +281,36 @@ type Parser struct {
 	// the family's HELP/UNIT) by metric name: consecutive lines share a name
 	// and names are interned, so the repeat check is normally a pointer
 	// comparison — it replaces classify's map probe and suffix walks as well as
-	// the meta lookup. Any TYPE/HELP/UNIT line invalidates it.
+	// the meta lookup. A TYPE/HELP/UNIT line that CHANGES a table invalidates
+	// it; an unchanged redeclaration does not.
 	lastClass   classified
 	lastClassOK bool
 	// Consecutive lines of a family are near-identical: lastMetric and the
 	// per-position lastKV short-circuit the intern-map probes with a plain
 	// memcmp (string(b) == s does not allocate), which is ~5x cheaper.
 	// Exemplar labels have their own positional cache (exLastKV) so
-	// exemplar-bearing lines do not evict the sample-label entries.
+	// exemplar-bearing lines do not evict the sample-label entries, and their
+	// VALUES are never interned, so they do not evict the sample values from
+	// the shared table either (see parseLabels).
 	lastMetric string
 	lastKV     []lastKV
 	exLastKV   []lastKV
-	labels     []Label // reused between lines
-	exLabels   []Label // reused between lines
-	exemplar   Exemplar
-	scratch    []byte // for lines spanning bufio reads
-	eof        bool   // saw "# EOF"
-	// badExemplars counts this parse's unparseable exemplar suffixes. It is
-	// deliberately NOT folded into the malformed count: those samples were
-	// emitted (finishSample keeps them), so a reader of the two numbers can
-	// tell a target with broken exemplars from one losing data.
+	// longCacheBytes is what lastKV and exLastKV currently hold in strings too
+	// long to intern; see maxLongCacheBytes and cacheString.
+	longCacheBytes int
+	// labels and exLabels are reused between lines, and are CLEARED before each
+	// reuse rather than only resliced: an entry past the current line's length
+	// still references the string an earlier, longer line put there.
+	labels   []Label
+	exLabels []Label
+	exemplar Exemplar
+	scratch  []byte // for lines spanning bufio reads
+	eof      bool   // saw "# EOF"
+	// badExemplars counts this parse's unparseable (or refused, see
+	// MaxExemplarLabelSetRunes) exemplar suffixes. It is deliberately NOT
+	// folded into the malformed count: those samples were emitted (finishSample
+	// keeps them), so a reader of the two numbers can tell a target with broken
+	// exemplars from one losing data.
 	badExemplars int
 	// detail breaks this parse's malformed count down by the four reasons that
 	// are diagnosable from where they are noticed (see MalformedDetail).
@@ -260,8 +331,9 @@ type Parser struct {
 // parser internals rather than anything an operator can act on.
 type MalformedDetail struct {
 	// OverLongLines is lines dropped for exceeding Options.MaxLineBytes. The
-	// remedy is -scrape-max-line-bytes, or an exporter emitting a single
-	// enormous line.
+	// remedy is the EXPORTER, which is emitting a single enormous line (a
+	// runaway label value, a missing newline); a caller may also raise
+	// Options.MaxLineBytes, at the cost of that much memory per parse.
 	OverLongLines int
 	// TruncatedLines is the partial line left by a body that ended mid-stream
 	// (a read error other than a clean EOF). It means the SCRAPE was cut, so
@@ -271,7 +343,7 @@ type MalformedDetail struct {
 	// Prometheus rejects the whole scrape for this; this parser drops the line
 	// (see parseLabels), so a nonzero count is a target bug that costs series.
 	DuplicateLabels int
-	// TooManyLabels is sample lines dropped for exceeding maxLabelsPerSample.
+	// TooManyLabels is sample lines dropped for exceeding MaxLabelsPerSample.
 	TooManyLabels int
 }
 
@@ -324,9 +396,10 @@ func New(opts Options) *Parser {
 
 // parserPool recycles parsers (and their bufio readers) across parses: the
 // interned name/value tables stay warm — the same names repeat every scrape —
-// and the 64KiB read buffer stops being per-scrape garbage. The TYPE table is
-// cleared per scrape (its semantics are per-exposition); the intern tables are
-// only cleared once they near their caps, bounding retention.
+// and the 64KiB read buffer stops being per-scrape garbage. The TYPE and
+// HELP/UNIT tables are cleared per parse (their semantics are per-exposition);
+// the intern tables are only cleared once they pass half of a bound, which is
+// what bounds their retention.
 var parserPool = sync.Pool{New: func() any {
 	return &Pooled{
 		p:      New(Options{}),
@@ -339,7 +412,8 @@ const parseBufSize = 64 * 1024
 // Pooled is a parser taken from the shared pool: its intern tables stay warm
 // across parses (the same names repeat every scrape) and it carries a reusable
 // read buffer, so a large scrape parses in a handful of allocations. Obtain
-// one with Get, use it for a single Parse, and return it with Put.
+// one with Get and return it with Put. Each Parse is one exposition, exactly as
+// Parser.Parse is; a caller normally makes one.
 type Pooled struct {
 	p      *Parser
 	reader *bufio.Reader
@@ -349,40 +423,89 @@ type Pooled struct {
 // when the parse is done; the parser must not be used afterwards.
 func Get(opts Options) *Pooled {
 	pp := parserPool.Get().(*Pooled)
+	pp.reset(opts)
+	return pp
+}
+
+// reset is Get's half of a pool round trip, apart from the pool itself: tests
+// drive release+reset on ONE *Pooled to exercise exactly what a recycled parser
+// goes through, which a Put followed by a Get cannot promise (the pool may hand
+// back a fresh parser, and under -race it drops one Put in four on purpose).
+func (pp *Pooled) reset(opts Options) {
 	p := pp.p
 	p.maxLineBytes = normLineBytes(opts.MaxLineBytes)
 	p.openMetrics = opts.OpenMetrics
 	p.exemplars = opts.OpenMetrics && opts.Exemplars
-	p.eof = false
-	p.lastMetric = ""
-	p.lastKV = p.lastKV[:0]
-	p.exLastKV = p.exLastKV[:0]
-	p.resetMeta()
-	p.resetTypes() // family types are per-exposition
-	if len(p.names) >= maxInternedNames/2 {
+	p.releaseLineRefs()
+	// The per-exposition tables (TYPE, HELP/UNIT, the EOF flag) are reset by
+	// every parse, in parseFrom; only the warm intern tables are decided here.
+	if len(p.names) >= maxInternedNames/2 || p.nameBytes >= maxInternedNameBytes/2 {
 		clear(p.names)
+		p.nameBytes = 0
 	}
 	if len(p.values) >= MaxInternedValues/2 {
 		clear(p.values)
 	}
-	return pp
 }
 
 // Put returns a pooled parser for reuse.
 func Put(pp *Pooled) {
-	pp.reader.Reset(nil) // drop the response body reference
+	pp.release()
 	parserPool.Put(pp)
 }
 
+// release is Put's half of a pool round trip; see reset.
+func (pp *Pooled) release() {
+	pp.reader.Reset(nil) // drop the response body reference
+	// And every string the last scrape left behind: a parser can sit in the
+	// pool for as long as the GC leaves it there, and nothing of a finished
+	// parse needs to outlive it except the intern tables (the reuse buffers
+	// keep their capacity, not the strings they referenced). That is the
+	// per-line state AND the per-exposition TYPE and HELP/UNIT tables, up to a
+	// MiB of text each, which the next parse would clear anyway — parseFrom's
+	// second clear then finds an empty map and costs nothing.
+	pp.p.releaseLineRefs()
+	pp.p.resetTypes()
+	pp.p.resetMeta()
+}
+
+// releaseLineRefs empties the per-line reuse state — the positional caches, the
+// label buffers, the last metric name, the classification memo and the exemplar
+// scratch — dropping every string reference in them, and releases the
+// long-cache charge with them.
+// clear, never a bare reslice: a [:0] keeps its backing array's strings alive
+// (see Parser.labels). Each buffer is cleared across its whole CAPACITY, not
+// just its length, so this does not depend on every per-line reuse site having
+// cleared before it resliced — once per scrape, over at most a few thousand
+// entries.
+func (p *Parser) releaseLineRefs() {
+	p.lastMetric = ""
+	// The memo's name and family alias the last line's metric name, which is
+	// not interned past maxInternedNameLen and may be up to MaxLineBytes long,
+	// and its help/unit alias the meta table's text.
+	p.lastClass, p.lastClassOK = classified{}, false
+	clear(p.lastKV[:cap(p.lastKV)])
+	p.lastKV = p.lastKV[:0]
+	clear(p.exLastKV[:cap(p.exLastKV)])
+	p.exLastKV = p.exLastKV[:0]
+	p.longCacheBytes = 0
+	clear(p.labels[:cap(p.labels)])
+	p.labels = p.labels[:0]
+	clear(p.exLabels[:cap(p.exLabels)])
+	p.exLabels = p.exLabels[:0]
+	p.exemplar = Exemplar{}
+}
+
 // Parse reads the exposition from r through the pooled reader, invoking emit
-// for every sample (see Parser.Parse).
+// for every sample (see Parser.Parse — including its per-exposition reset, so a
+// second call is a second exposition and a previous "# EOF" does not end it).
 func (pp *Pooled) Parse(r io.Reader, emit func(Sample) error) (int, error) {
 	pp.reader.Reset(r)
 	return pp.p.parseFrom(pp.reader, emit)
 }
 
-// MalformedExemplars reports the last parse's unparseable exemplar suffixes
-// (see Parser.MalformedExemplars). Read it before Put: the next user of the
+// MalformedExemplars reports the last parse's unparseable or refused exemplar
+// suffixes (see Parser.MalformedExemplars). Read it before Put: the next user of the
 // pooled parser resets the count.
 func (pp *Pooled) MalformedExemplars() int { return pp.p.MalformedExemplars() }
 
@@ -406,8 +529,9 @@ func (p *Parser) internName(b []byte) string {
 		return s
 	}
 	s := string(b)
-	if len(p.names) < maxInternedNames {
+	if len(p.names) < maxInternedNames && p.nameBytes+len(s) <= maxInternedNameBytes {
 		p.names[s] = s
+		p.nameBytes += len(s)
 	}
 	return s
 }
@@ -458,23 +582,15 @@ func trimSeparator(b []byte) []byte {
 // skipped, counted and reported; a malformed count with a nil error means a
 // partially usable scrape.
 func (p *Parser) Parse(r io.Reader, emit func(Sample) error) (malformed int, err error) {
-	// Each Parse is one exposition: clear the previous one's terminal state
-	// and family classifications. Without this a reused non-pooled parser
-	// silently truncated its second exposition after one sample (a stale
-	// `# EOF` flag) and carried stale TYPE roles across expositions — Get()
-	// resets the pooled path, but New()+Parse+Parse is a legal use of the
-	// public API and must not corrupt quietly.
-	p.eof = false
-	p.resetTypes()
-	p.resetMeta()
 	return p.parseFrom(bufio.NewReaderSize(r, parseBufSize), emit)
 }
 
 // MalformedExemplars reports how many exemplar suffixes of the last parse were
-// unparseable. Their samples were emitted intact, so this is a count of lost
-// ANNOTATIONS and never of lost data — it belongs on its own counter, not on
-// the caller's malformed-sample one. It is 0 unless Options.Exemplars asked for
-// exemplars: a parser that is not attaching them does not parse them either.
+// unparseable or refused (a label set over MaxExemplarLabelSetRunes). Their
+// samples were emitted intact, so this is a count of lost ANNOTATIONS and never
+// of lost data — it belongs on its own counter, not on the caller's
+// malformed-sample one. It is 0 unless Options.Exemplars asked for exemplars: a
+// parser that is not attaching them does not parse them either.
 func (p *Parser) MalformedExemplars() int { return p.badExemplars }
 
 // MalformedDetail reports which causes the last parse's malformed count can be
@@ -485,8 +601,8 @@ func (p *Parser) MalformedDetail() MalformedDetail { return p.detail }
 // resetTypes drops the previous exposition's TYPE declarations together with
 // the byte charge that bounds them. The two must move as one: a charge left
 // standing over a cleared table would refuse to type the NEXT exposition's
-// families, so it lives here rather than beside each of the two calls that
-// clear the table (which is how the pooled path and Parse would drift).
+// families, so it lives here rather than beside the call that clears the table
+// (parseFrom's per-exposition reset, the one both entry points run).
 func (p *Parser) resetTypes() {
 	clear(p.types)
 	p.typeBytes = 0
@@ -502,9 +618,19 @@ func (p *Parser) resetMeta() {
 }
 
 func (p *Parser) parseFrom(br *bufio.Reader, emit func(Sample) error) (malformed int, err error) {
-	// Per-parse statistics, reset here rather than in Parse: the pooled path
-	// enters through parseFrom directly, and a count carried over from the
-	// previous scrape would be charged to this target.
+	// Each parse is one exposition: clear the previous one's terminal state,
+	// family classifications and statistics. HERE, the one function both entry
+	// points (Parser.Parse and Pooled.Parse) run, and nowhere else — the reset
+	// used to live in Parse and in Get, so a second Pooled.Parse on one parser
+	// skipped it and a stale `# EOF` silently ended the new exposition after
+	// its first sample, while New()+Parse+Parse (a legal use of the public API)
+	// only worked because Parse had its own copy. A count carried over from
+	// the previous parse would likewise be charged to this target. (Put also
+	// empties the two tables, but only to release their text while pooled;
+	// no parse relies on that.)
+	p.eof = false
+	p.resetTypes()
+	p.resetMeta()
 	p.badExemplars = 0
 	p.detail = MalformedDetail{}
 	for {
@@ -652,10 +778,29 @@ func (p *Parser) parseComment(line []byte) bool {
 	case string(directive) == "HELP":
 		// The remainder of the line is free text (spaces included), escaped
 		// for backslash and newline.
-		family, rest, ok := familyToken(rest)
-		if ok {
-			p.setMeta(family, unescapeHelp(trimSeparator(rest)), "")
+		bare, family, rest, ok := familyTokenRaw(rest)
+		if !ok {
+			break
 		}
+		text := trimSeparator(rest)
+		if len(text) == 0 {
+			break // declares nothing (setMeta ignores an empty pair)
+		}
+		// An unchanged redeclaration — exporters that repeat a family's HELP
+		// before every sample exist — is recognised BEFORE the family name and
+		// the text are materialised, so it costs two memcmps and no allocation.
+		// setMeta would return early for it anyway; this only skips the copies
+		// it would have been handed. An escaped text takes the slow path (its
+		// bytes are not its value).
+		if bare != nil && bytes.IndexByte(text, '\\') < 0 {
+			if m, seen := p.metas[string(bare)]; seen && m.help == string(text) {
+				break
+			}
+		}
+		if bare != nil {
+			family = string(bare)
+		}
+		p.setMeta(family, unescapeHelp(text), "")
 	case string(directive) == "UNIT":
 		// OpenMetrics only, one token. Carried VERBATIM into the OTLP unit:
 		// the exposition is the only authority on what its values measure, and
@@ -667,10 +812,30 @@ func (p *Parser) parseComment(line []byte) bool {
 			p.setMeta(family, "", string(unit))
 		}
 	case string(directive) == "TYPE":
-		family, rest, ok := familyToken(rest)
+		bare, family, rest, ok := familyTokenRaw(rest)
 		typ, rest := nextField(rest)
 		if !ok || len(typ) == 0 || len(skipSpaceTab(rest)) != 0 {
 			return false // malformed TYPE: counted, not silently ignored
+		}
+		t := metricTypeOf(typ)
+		var old MetricType
+		var seen bool
+		if bare != nil {
+			old, seen = p.types[string(bare)] // keyed lookup: no allocation
+		} else {
+			old, seen = p.types[family]
+		}
+		if seen && old == t {
+			// An unchanged redeclaration — exporters that repeat a family's TYPE
+			// before every one of its samples exist — changes no classify()
+			// answer, so it must neither copy the name nor invalidate the
+			// per-name memo: an unconditional invalidation re-ran classify's map
+			// probe and suffix walks for every sample of such a family, the
+			// cost setMeta already refuses for a repeated HELP.
+			return true
+		}
+		if bare != nil {
+			family = string(bare)
 		}
 		// The charge is per NEW key and never per line: exporters that repeat a
 		// family's TYPE before every one of its samples exist, and charging them
@@ -678,52 +843,71 @@ func (p *Parser) parseComment(line []byte) bool {
 		// leave the rest of the exposition untyped. A map assignment to an
 		// existing key keeps the ORIGINAL key string, so the first charge is
 		// exactly what stays retained.
-		if _, seen := p.types[family]; !seen {
+		if !seen {
 			if len(p.types) >= MaxTrackedFamilies || p.typeBytes+len(family) > maxTypeBytes {
 				return true // over the table bound: a deliberate cap, not malformed
 			}
 			p.typeBytes += len(family)
 		}
-		var t MetricType
-		switch string(typ) {
-		case "counter":
-			t = TypeCounter
-		case "gauge":
-			t = TypeGauge
-		case "histogram":
-			t = TypeHistogram
-		case "summary":
-			t = TypeSummary
-		default:
-			t = TypeUntyped
-		}
 		p.types[family] = t
-		p.lastClassOK = false // the memo may hold the family just (re)declared
+		p.lastClassOK = false // the memo may hold the family just retyped
 	}
 	return true
+}
+
+// metricTypeOf maps a TYPE line's type token; anything unrecognised is
+// untyped, as in Prometheus.
+func metricTypeOf(typ []byte) MetricType {
+	switch string(typ) {
+	case "counter":
+		return TypeCounter
+	case "gauge":
+		return TypeGauge
+	case "histogram":
+		return TypeHistogram
+	case "summary":
+		return TypeSummary
+	default:
+		return TypeUntyped
+	}
 }
 
 // familyToken reads a family-name token after a TYPE/HELP/UNIT directive: the
 // Prometheus 3 quoted form ("my.metric" — escaped, may contain any UTF-8
 // including spaces) or a bare field. The UNESCAPED name is the table key, so
-// it matches the names quoted sample lines produce. Cold path (one call per
-// comment line), so the string materialization costs nothing that matters.
+// it matches the names quoted sample lines produce. It materialises the name
+// on every call, which is only right on a path that stores it every time: the
+// TYPE and HELP arms, which an exporter may repeat before every sample, go
+// through familyTokenRaw and copy the name only when the table changes.
 //
 // A token past maxFamilyNameBytes is refused rather than returned: it would be
 // RETAINED for the whole exposition as a TYPE-table key (or charged to the meta
 // budget), and the bare arm checks the length before materializing the string
 // so an absurd name is not even copied once.
 func familyToken(rest []byte) (string, []byte, bool) {
+	bare, name, rem, ok := familyTokenRaw(rest)
+	if ok && bare != nil {
+		name = string(bare)
+	}
+	return name, rem, ok
+}
+
+// familyTokenRaw is familyToken without materialising a BARE name: that is
+// returned as bare, a view into the line valid until the next one, so a caller
+// can probe a table with m[string(bare)] — which does not allocate — and copy
+// the name only when it actually stores it. A quoted name is decoded eagerly
+// (the cold path) and returned in name, with bare nil.
+func familyTokenRaw(rest []byte) (bare []byte, name string, rem []byte, ok bool) {
 	rest = skipSpaceTab(rest)
 	if len(rest) > 0 && rest[0] == '"' {
 		fam, rem, ok := parseQuotedSlow(rest[1:])
-		return fam, rem, ok && fam != "" && len(fam) <= maxFamilyNameBytes
+		return nil, fam, rem, ok && fam != "" && len(fam) <= maxFamilyNameBytes
 	}
 	tok, rem := nextField(rest)
 	if len(tok) == 0 || len(tok) > maxFamilyNameBytes {
-		return "", rem, false
+		return nil, "", rem, false
 	}
-	return string(tok), rem, true
+	return tok, "", rem, true
 }
 
 // setMeta records a family's HELP text or UNIT (the empty string leaves the
@@ -794,23 +978,34 @@ func unescapeHelp(b []byte) string {
 	sb.Grow(len(b))
 	sb.Write(b[:i])
 	for ; i < len(b); i++ {
+		// A trailing lone backslash is kept as text: HELP is free text, so
+		// there is nothing to fail (parseQuotedSlow fails the value instead).
 		if b[i] != '\\' || i+1 >= len(b) {
 			sb.WriteByte(b[i])
 			continue
 		}
 		i++
-		switch b[i] {
-		case 'n':
-			sb.WriteByte('\n')
-		case '\\', '"':
-			sb.WriteByte(b[i])
-		default:
-			// Unknown escape: kept verbatim, as parseQuotedSlow does.
-			sb.WriteByte('\\')
-			sb.WriteByte(b[i])
-		}
+		writeUnescaped(&sb, b[i])
 	}
 	return sb.String()
+}
+
+// writeUnescaped writes the decoding of the escape sequence `\c` — the ONE
+// escape table both the HELP text (unescapeHelp) and a quoted label value
+// (parseQuotedSlow) decode through, so the two cannot disagree: \n, \\ and \"
+// decode, and any other escape is kept verbatim, backslash included. What each
+// caller does with a backslash that ends its input differs on purpose and stays
+// at the caller.
+func writeUnescaped(sb *strings.Builder, c byte) {
+	switch c {
+	case 'n':
+		sb.WriteByte('\n')
+	case '\\', '"':
+		sb.WriteByte(c)
+	default:
+		sb.WriteByte('\\')
+		sb.WriteByte(c)
+	}
 }
 
 // classified is one metric name's resolved role, family and family metadata.
@@ -848,6 +1043,12 @@ func (p *Parser) classify(name string) (SampleRole, string) {
 		case TypeSummary:
 			// Quantile series carry the family name itself.
 			return RoleSummaryQuantile, name
+		case TypeHistogram:
+			// No histogram series carries the bare family name. Classified as
+			// the family's own (see RoleHistogramBucket) rather than as a gauge
+			// named like it: a gauge claims the OTLP name first and every
+			// histogram point of the family then collides and is dropped.
+			return RoleHistogramBucket, name
 		default:
 			return RoleGauge, name
 		}
@@ -924,11 +1125,12 @@ func (p *Parser) parseSample(line []byte) (Sample, bool) {
 		rest = skipSpaceTab(rest)
 	}
 
-	// Labels.
+	// Labels. Cleared, not just resliced: see Parser.labels.
+	clear(p.labels)
 	p.labels = p.labels[:0]
 	if len(rest) > 0 && rest[0] == '{' {
 		var ok bool
-		rest, ok = p.parseLabels(rest[1:], &p.labels, &p.lastKV, &p.detail)
+		rest, ok = p.parseLabels(rest[1:], &p.labels, &p.lastKV, &p.detail, true)
 		if !ok {
 			return s, false
 		}
@@ -965,7 +1167,7 @@ func (p *Parser) parseQuotedNameSample(line []byte) (Sample, bool) {
 	if len(rest) == 0 || rest[0] != '"' {
 		return s, false
 	}
-	name, rem, ok := p.parseQuoted(rest[1:], nil)
+	name, rem, ok := p.parseQuoted(rest[1:], nil, true)
 	if !ok || name == "" {
 		return s, false
 	}
@@ -977,8 +1179,9 @@ func (p *Parser) parseQuotedNameSample(line []byte) (Sample, bool) {
 	if len(rem) > 0 && rem[0] == ',' {
 		rem = rem[1:]
 	}
+	clear(p.labels) // see Parser.labels
 	p.labels = p.labels[:0]
-	rem, ok = p.parseLabels(rem, &p.labels, &p.lastKV, &p.detail)
+	rem, ok = p.parseLabels(rem, &p.labels, &p.lastKV, &p.detail, true)
 	if !ok {
 		return s, false
 	}
@@ -1026,7 +1229,7 @@ func (p *Parser) finishSample(s *Sample, rest []byte) bool {
 		// target whose exemplars are syntactically broken is indistinguishable
 		// from one that emits none. The count is only reachable with the flag
 		// on, which is what keeps the flag-off path free of parseExemplar's
-		// trace-id interning.
+		// per-exemplar allocations.
 		if p.exemplars {
 			if ex, ok := p.parseExemplar(rest[1:]); ok {
 				s.Exemplar = ex
@@ -1045,9 +1248,13 @@ func (p *Parser) parseExemplar(rest []byte) (*Exemplar, bool) {
 	if len(rest) == 0 || rest[0] != '{' {
 		return nil, false
 	}
+	clear(p.exLabels) // see Parser.labels
 	p.exLabels = p.exLabels[:0]
-	rest, ok := p.parseLabels(rest[1:], &p.exLabels, &p.exLastKV, nil)
+	rest, ok := p.parseLabels(rest[1:], &p.exLabels, &p.exLastKV, nil, false)
 	if !ok {
+		return nil, false
+	}
+	if !exemplarLabelsFit(p.exLabels) {
 		return nil, false
 	}
 	p.exemplar = Exemplar{Labels: p.exLabels}
@@ -1065,6 +1272,19 @@ func (p *Parser) parseExemplar(rest []byte) (*Exemplar, bool) {
 	return &p.exemplar, true
 }
 
+// exemplarLabelsFit applies MaxExemplarLabelSetRunes, stopping at the first
+// label that crosses it.
+func exemplarLabelsFit(labels []Label) bool {
+	runes := 0
+	for _, l := range labels {
+		runes += utf8.RuneCountInString(l.Name) + utf8.RuneCountInString(l.Value)
+		if runes > MaxExemplarLabelSetRunes {
+			return false
+		}
+	}
+	return true
+}
+
 // goOnlyFloatSyntax reports whether a token uses float syntax that Go accepts
 // and the Prometheus exposition format does not.
 //
@@ -1078,7 +1298,7 @@ func (p *Parser) parseExemplar(rest []byte) (*Exemplar, bool) {
 // "NaN", "+Inf" and "-Inf" are legal exposition values and are unaffected: they
 // contain neither an underscore nor an x.
 func goOnlyFloatSyntax(tok []byte) bool {
-	for i := 0; i < len(tok); i++ {
+	for i := range tok {
 		switch tok[i] {
 		case '_', 'x', 'X':
 			return true
@@ -1089,36 +1309,26 @@ func goOnlyFloatSyntax(tok []byte) bool {
 
 // parseFloatToken reads one whitespace-delimited float.
 func (p *Parser) parseFloatToken(rest []byte) (float64, []byte, bool) {
-	rest = skipSpaceTab(rest)
-	i := 0
-	for i < len(rest) && rest[i] != ' ' && rest[i] != '\t' {
-		i++
-	}
-	if i == 0 || goOnlyFloatSyntax(rest[:i]) {
+	tok, rest := nextField(rest)
+	if len(tok) == 0 || goOnlyFloatSyntax(tok) {
 		return 0, nil, false
 	}
-	v, err := strconv.ParseFloat(string(rest[:i]), 64)
+	v, err := strconv.ParseFloat(string(tok), 64)
 	if err != nil {
 		return 0, nil, false
 	}
-	return v, rest[i:], true
+	return v, rest, true
 }
 
 // parseTimestampToken reads one timestamp token: integer milliseconds in the
 // classic format, (possibly fractional) seconds in OpenMetrics. Returns
 // milliseconds.
 func (p *Parser) parseTimestampToken(rest []byte) (int64, []byte, bool) {
-	i := 0
-	for i < len(rest) && rest[i] != ' ' && rest[i] != '\t' {
-		i++
-	}
-	if i == 0 {
+	raw, rest := nextField(rest)
+	if len(raw) == 0 || goOnlyFloatSyntax(raw) {
 		return 0, nil, false
 	}
-	if goOnlyFloatSyntax(rest[:i]) {
-		return 0, nil, false
-	}
-	tok := string(rest[:i])
+	tok := string(raw)
 	if p.openMetrics {
 		f, err := strconv.ParseFloat(tok, 64)
 		if err != nil || math.IsNaN(f) || f*1000 < math.MinInt64 || f*1000 >= math.MaxInt64 {
@@ -1127,13 +1337,13 @@ func (p *Parser) parseTimestampToken(rest []byte) (int64, []byte, bool) {
 			// garbage; reject both like Prometheus. The bound check covers ±Inf.
 			return 0, nil, false
 		}
-		return int64(f * 1000), rest[i:], true
+		return int64(f * 1000), rest, true
 	}
 	ts, err := strconv.ParseInt(tok, 10, 64)
 	if err != nil {
 		return 0, nil, false
 	}
-	return ts, rest[i:], true
+	return ts, rest, true
 }
 
 // parseLabels parses the label pairs after '{' into dst and returns the
@@ -1148,7 +1358,15 @@ func (p *Parser) parseTimestampToken(rest []byte) (int64, []byte, bool) {
 // the shared struct from here made the sum of MalformedDetail's fields exceed
 // the malformed total it is documented never to exceed, and made the operator's
 // line read `malformed=1 duplicateLabels=5000` for a scrape that lost one line.
-func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV, detail *MalformedDetail) ([]byte, bool) {
+//
+// internValues is false for the EXEMPLAR block too: an exemplar's values are
+// trace and span IDs, which never repeat, so interning them only filled the
+// value table the sample labels share — a pooled parser clears that table at
+// Get once it is half full, so every exemplar-bearing scrape pushed the next
+// borrower's warm sample values out, and one carrying more IDs than the table
+// holds filled it mid-parse, after which every later sample value allocated on
+// every occurrence. Names stay interned: exemplar label NAMES repeat.
+func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV, detail *MalformedDetail, internValues bool) ([]byte, bool) {
 	for {
 		rest = skipSpaceTab(rest)
 		if len(rest) == 0 {
@@ -1169,7 +1387,7 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV, detail 
 		// deliberately skips the positional cache.
 		var name string
 		if rest[0] == '"' {
-			v, rem, qok := p.parseQuoted(rest[1:], nil)
+			v, rem, qok := p.parseQuoted(rest[1:], nil, true)
 			if !qok || v == "" {
 				return nil, false
 			}
@@ -1191,7 +1409,7 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV, detail 
 					name = last.name
 				} else {
 					name = p.internName(rest[:i])
-					last.name = name
+					p.cacheString(&last.name, name, maxInternedNameLen)
 				}
 			}
 			rest = skipSpaceTab(rest[i:])
@@ -1203,7 +1421,7 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV, detail 
 		if len(rest) == 0 || rest[0] != '"' {
 			return nil, false
 		}
-		value, rem, ok := p.parseQuoted(rest[1:], last)
+		value, rem, ok := p.parseQuoted(rest[1:], last, internValues)
 		if !ok {
 			return nil, false
 		}
@@ -1223,8 +1441,8 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV, detail 
 		// allocates.
 		// A pathological label count turns the dedupe scan below quadratic and
 		// is uninterruptible by the scrape timeout; drop the line as malformed
-		// past the ceiling (see maxLabelsPerSample) before the scan runs again.
-		if len(*dst) >= maxLabelsPerSample {
+		// past the ceiling (see MaxLabelsPerSample) before the scan runs again.
+		if len(*dst) >= MaxLabelsPerSample {
 			if detail != nil {
 				detail.TooManyLabels++
 			}
@@ -1250,11 +1468,16 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV, detail 
 // returning the value and the remainder after the closing quote. The common
 // escape-free case checks the previous line's value at this position (a
 // memcmp) before interning, so a repeated value costs neither a hash nor an
-// allocation. last may be nil (exemplar labels).
-func (p *Parser) parseQuoted(rest []byte, last *lastKV) (string, []byte, bool) {
+// allocation. last is nil for a quoted NAME (the metric name of the quoted-name
+// form, or a quoted label name), which skips the positional cache. intern is
+// false for exemplar values (see parseLabels): a positional-cache miss then
+// copies the value instead of entering it in the shared intern table.
+func (p *Parser) parseQuoted(rest []byte, last *lastKV, intern bool) (string, []byte, bool) {
 	// Fast path: SIMD-scan for the closing quote; any backslash before it
-	// (including one escaping a quote) routes to the slow path.
-	i := bytes.IndexByte(rest, '"')
+	// (including one escaping a quote) routes to the slow path. IndexByte on
+	// purpose, not bytes.Cut: this is the per-label hot path the allocation
+	// budget pins, and the index serves three slices below.
+	i := bytes.IndexByte(rest, '"') //nolint:modernize // see above
 	if i < 0 {
 		return "", nil, false
 	}
@@ -1264,11 +1487,35 @@ func (p *Parser) parseQuoted(rest []byte, last *lastKV) (string, []byte, bool) {
 	if last != nil && string(rest[:i]) == last.value {
 		return last.value, rest[i+1:], true
 	}
-	v := p.internValue(rest[:i])
+	var v string
+	if intern {
+		v = p.internValue(rest[:i])
+	} else {
+		v = string(rest[:i])
+	}
 	if last != nil {
-		last.value = v
+		p.cacheString(&last.value, v, maxInternedValueLen)
 	}
 	return v, rest[i+1:], true
+}
+
+// cacheString stores s in one positional-cache slot. A string longer than
+// internable (the intern table's own length cap for that kind) is charged to
+// maxLongCacheBytes and, past it, not remembered at all — the slot is emptied
+// rather than left holding its previous long string, whose charge is released
+// either way. Only a cache MISS reaches this, so it costs the hit path nothing.
+func (p *Parser) cacheString(slot *string, s string, internable int) {
+	if old := *slot; len(old) > internable {
+		p.longCacheBytes -= len(old)
+	}
+	if len(s) > internable {
+		if p.longCacheBytes+len(s) > maxLongCacheBytes {
+			*slot = ""
+			return
+		}
+		p.longCacheBytes += len(s)
+	}
+	*slot = s
 }
 
 func parseQuotedSlow(rest []byte) (string, []byte, bool) {
@@ -1280,17 +1527,9 @@ func parseQuotedSlow(rest []byte) (string, []byte, bool) {
 		case '\\':
 			i++
 			if i >= len(rest) {
-				return "", nil, false
+				return "", nil, false // an unterminated escape is an unterminated value
 			}
-			switch rest[i] {
-			case 'n':
-				sb.WriteByte('\n')
-			case '\\', '"':
-				sb.WriteByte(rest[i])
-			default:
-				sb.WriteByte('\\')
-				sb.WriteByte(rest[i])
-			}
+			writeUnescaped(&sb, rest[i])
 		default:
 			sb.WriteByte(rest[i])
 		}

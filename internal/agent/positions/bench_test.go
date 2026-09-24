@@ -1,7 +1,6 @@
 package positions
 
 import (
-	"encoding/json"
 	"fmt"
 	"maps"
 	"path/filepath"
@@ -117,17 +116,49 @@ func BenchmarkSetLogsUnchanged(b *testing.B) {
 }
 
 // BenchmarkMarshal isolates the encode from the I/O, so a change to either can
-// be attributed.
+// be attributed: logs-changed is what every tailer save pays (the log section
+// re-marshalled), cursor-only what a journald commit pays (the cached section
+// reused — see Store.encode).
 func BenchmarkMarshal(b *testing.B) {
+	for _, n := range []int{100, 3000} {
+		for _, logsChanged := range []bool{true, false} {
+			name := strconv.Itoa(n) + "/cursor-only"
+			if logsChanged {
+				name = strconv.Itoa(n) + "/logs-changed"
+			}
+			b.Run(name, func(b *testing.B) {
+				s, m, _ := benchStore(b, n)
+				if err := s.SetLogs(m); err != nil {
+					b.Fatal(err)
+				}
+				s.doc.JournalCursor = "s=0123456789abcdef;i=42"
+				b.ReportAllocs()
+				for b.Loop() {
+					s.logsDirty = logsChanged
+					if _, err := s.encode(); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkSetJournalCursor is one journald cursor commit — once per settled
+// batch, every -journald-flush-interval — beside a tailer's worth of log
+// positions: a changed cursor, so the save writes.
+func BenchmarkSetJournalCursor(b *testing.B) {
 	for _, n := range []int{100, 3000} {
 		b.Run(strconv.Itoa(n), func(b *testing.B) {
 			s, m, _ := benchStore(b, n)
 			if err := s.SetLogs(m); err != nil {
 				b.Fatal(err)
 			}
+			i := 0
 			b.ReportAllocs()
 			for b.Loop() {
-				if _, err := json.Marshal(&s.doc); err != nil {
+				i++
+				if err := s.SetJournalCursor("s=0123456789abcdef;i=" + strconv.Itoa(i)); err != nil {
 					b.Fatal(err)
 				}
 			}

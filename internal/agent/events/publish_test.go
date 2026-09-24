@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 
@@ -116,9 +117,11 @@ func dumpedSeries() map[point]bool {
 
 // The published set must cover every counter the package OWNS, or the next one
 // added silently reintroduces the absent-vs-zero hole. The obs.Event* prefix is
-// the ownership rule: those are the "Kubernetes events" block in obs.go.
-// Deliberately not the shared counters this package also bumps
-// (obs.LogExportFailures, whose zero belongs to whichever producer is running).
+// the ownership rule: those are the "Kubernetes events" block in
+// internal/obs/metrics_singletons.go.
+// Deliberately not the shared counters the log chain bumps on this package's
+// behalf (obs.LogRulesDropped, obs.LogScrubbed and the like), whose zero
+// belongs to whichever producer is running.
 func TestEveryEventCounterIsPublished(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -187,10 +190,5 @@ func TestEventTypeLabelsAreComplete(t *testing.T) {
 }
 
 func contains(list []string, v string) bool {
-	for _, s := range list {
-		if s == v {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(list, v)
 }

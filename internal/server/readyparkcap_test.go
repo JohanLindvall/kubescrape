@@ -29,8 +29,7 @@ func TestLookupsParkedOnTheInitialSyncSpendTheBlockedLookupBudget(t *testing.T) 
 	const capacity = 4
 	const over = 6
 
-	st := store.New(time.Minute)
-	st.SetMaxWaiters(capacity)
+	st := store.New(time.Minute, store.WithMaxWaiters(capacity))
 	api := New(Config{
 		Store:    st,
 		Services: services.NewIndex(),
@@ -65,11 +64,9 @@ func TestLookupsParkedOnTheInitialSyncSpendTheBlockedLookupBudget(t *testing.T) 
 	// at the end.
 	var wg sync.WaitGroup
 	for i := range capacity {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_ = get(strings.Repeat(string(rune('a'+i)), 64))
-		}()
+		})
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for api.readyParked.Load() < capacity {
@@ -122,8 +119,7 @@ func TestLookupsParkedOnTheInitialSyncSpendTheBlockedLookupBudget(t *testing.T) 
 // every later lookup for the life of the process — the caches sync, the parks
 // drain, and the cap stays spent.
 func TestReadinessParksReturnTheirSlot(t *testing.T) {
-	st := store.New(time.Minute)
-	st.SetMaxWaiters(1)
+	st := store.New(time.Minute, store.WithMaxWaiters(1))
 	// Resolvable, so once the caches "sync" the lookup is ANSWERED rather than
 	// parking again in the store: what is under test is the slot the readiness
 	// park took, and a second park would hold one legitimately.

@@ -8,6 +8,7 @@ package owners
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -49,8 +50,9 @@ type ownerKindRow struct {
 	follow bool
 }
 
-// ownerKinds is the ONE table behind kindGVR, followable and the owner half
-// of AllGVRs — the three used to be parallel structures a new kind had to be
+// ownerKinds is the ONE table behind ownerRow (which decides both the cache a
+// reference is read from and whether its own owners are followed) and the owner
+// half of AllGVRs — those used to be parallel structures a new kind had to be
 // added to separately. Adding an owner kind is one row here, plus BOTH shipped
 // ClusterRoles — deploy/kubernetes.yaml and charts/kubescrape/templates/service.yaml
 // — and internal/agent/attrs's kindTable, whose test cross-checks AllGVRs.
@@ -181,6 +183,12 @@ const ownersCapWarnEvery = 5 * time.Minute
 // whoever registers them calls Bump on every event, and whoever holds a derived
 // answer compares Generation.
 //
+// NODE metadata is deliberately NOT fed into it (cmd/kubescrape's
+// ownerTokenFor), although NodeGVR is in AllGVRs: the one consumer is the
+// node-targets memo, no targets derivation reads Node metadata, and Node churn
+// would otherwise lapse every node's memo for nothing. A future consumer that
+// derives from Resolver.Node needs its own token, or that exclusion lifted.
+//
 // It is a separate type rather than a field on Resolver because the informers
 // are registered before the Resolver that reads their listers exists, and the
 // counter has to be in hand at registration time. A nil *Changes reports
@@ -257,7 +265,7 @@ func NewFromListers(listers map[schema.GroupVersionResource]cache.GenericLister)
 }
 
 // The reason label values of kubescrape_owner_resolve_failures_total. They are
-// spelled once here because obs.go's help text enumerates them for the
+// spelled once here because obs's help text enumerates them for the
 // operator, and a value that exists in only one of the two places is a
 // dashboard filter that matches nothing.
 const (
@@ -280,13 +288,18 @@ const (
 //
 // The kind label comes from the GVR, never from the reference, so the metric's
 // cardinality is bounded by AllGVRs however exotic a pod's ownerReferences are.
+// (The two reference-level reasons, decided before any cache is read —
+// owners_capped and bad_api_version — take knownKind's bound instead: an
+// ownerKinds kind or "unknown".)
 func (r *Resolver) report(gvr schema.GroupVersionResource, namespace, name, reason string, err error) {
 	r.reportObj(gvrKind(gvr), namespace, name, reason, err)
 }
 
 // reportObj is report with the kind already resolved, for the one caller whose
 // failure happens BEFORE a GVR exists (an ownerReference whose apiVersion does
-// not parse).
+// not parse). That caller passes knownKind(ref.Kind), so the label stays bounded
+// — by ownerKinds plus "unknown" rather than by AllGVRs — and owners_capped,
+// counted in Resolve without reaching here, takes the same bound.
 func (r *Resolver) reportObj(kind, namespace, name, reason string, err error) {
 	obs.OwnerResolveFailures.WithLabelValues(kind, reason).Inc()
 
@@ -376,48 +389,62 @@ func gvrKind(gvr schema.GroupVersionResource) string {
 // what the caller puts on kubemeta.Pod.OwnersOmitted so a truncated chain
 // cannot read as a complete one.
 //
-// Once the cap is reached the walk SHORT-CIRCUITS: a further reference is still
-// deduplicated by UID (so a pod naming one owner ten times spends one slot, not
-// ten) and is counted, but only as reason="owners_capped" — no lister read, no
-// resolve-failure reason of its own, and no recursion into its parents. That is
-// deliberate and it is what the cap is FOR: the legitimate maximum is two
-// references (one controller plus the one parent this resolver follows), so a
-// pod past the bound is already pathological and the cheapest correct answer is
-// to stop looking. Read the counter accordingly — a burst of owners_capped is
-// one pod's shape, and it SUBSTITUTES for whatever not_found/lister_error those
-// references would otherwise have reported rather than adding to it.
+// Once the cap is reached the walk SHORT-CIRCUITS: a further reference is
+// deduplicated against the chain already SERVED (so a pod naming one of its
+// served owners again costs nothing) and is counted, but only as
+// reason="owners_capped" — no lister read, no resolve-failure reason of its own,
+// and no recursion into its parents. That is deliberate and it is what the cap
+// is FOR: the legitimate maximum is two references (one controller plus the one
+// parent this resolver follows), so a pod past the bound is already
+// pathological, and the refused tail must not grow any state either — it is
+// NOT added to the dedup set, and its count is tallied per kind and bumped once
+// per kind after the walk. Recording every refused UID made the cap bound the
+// served chain but not the WORK: a pod with N distinct references cost O(N) map
+// growth plus N counter-key allocations on every resolution, on unauthenticated
+// per-request routes and in every node-targets derivation (measured: 15,000
+// refs, 15,058 allocations; now a constant). The price is that a refused tail
+// REPEATING a UID counts each repeat, so omitted, OwnersOmitted and the counter
+// are an UPPER bound on the distinct owners refused — exact for any tail that
+// does not repeat itself. Read the counter accordingly — a burst of
+// owners_capped is one pod's shape, and it SUBSTITUTES for whatever
+// not_found/lister_error those references would otherwise have reported rather
+// than adding to it.
 func (r *Resolver) Resolve(namespace string, refs []metav1.OwnerReference) ([]kubemeta.Owner, int) {
 	if len(refs) == 0 {
 		return nil, 0
 	}
 	capacity := min(len(refs)+1, MaxOwners)
 	out := make([]kubemeta.Owner, 0, capacity)
-	seen := make(map[string]struct{}, len(refs)+1)
+	// Only SERVED owners are ever inserted, so the set is bounded by the chain.
+	seen := make(map[string]struct{}, capacity)
 	omitted := 0
-	var add func(ref metav1.OwnerReference, follow bool)
-	add = func(ref metav1.OwnerReference, follow bool) {
+	// capped tallies refused references by knownKind — at most one entry per
+	// watched kind plus "unknown", so a slice beats a map.
+	var capped []kindCount
+	// top marks one of the pod's OWN references: only those have their parents
+	// followed (a row's follow flag), so the chain is at most one level deeper.
+	var add func(ref metav1.OwnerReference, top bool)
+	add = func(ref metav1.OwnerReference, top bool) {
 		if _, ok := seen[string(ref.UID)]; ok {
 			return
 		}
-		seen[string(ref.UID)] = struct{}{}
 		if len(out) >= MaxOwners {
 			// Counted per REFUSED reference (the kind label is knownKind's, so
-			// a hostile CRD kind cannot mint a label value), logged once per
-			// resolution below: a pod naming thousands of owners must not cost
-			// thousands of log lines, and must not spend the keyed throttle
+			// a hostile CRD kind cannot mint a label value) but bumped once per
+			// kind after the walk, and logged once per resolution below: a pod
+			// naming thousands of owners must not cost thousands of counter
+			// lookups or log lines, and must not spend the keyed throttle
 			// tables that the RBAC-shaped warnings depend on.
-			obs.OwnerResolveFailures.WithLabelValues(knownKind(ref.Kind), reasonOwnersCapped).Inc()
+			capped = tally(capped, knownKind(ref.Kind))
 			omitted++
 			return
 		}
-		owner := kubemeta.Owner{
-			APIVersion: ref.APIVersion,
-			Kind:       ref.Kind,
-			Name:       ref.Name,
-			UID:        string(ref.UID),
-			Controller: ref.Controller != nil && *ref.Controller,
-		}
-		if gvr, ok := r.kindGVR(ref); ok {
+		seen[string(ref.UID)] = struct{}{}
+		owner := servedRefOf(ref).owner()
+		// The row is resolved ONCE per reference, through the one reporting
+		// lookup: it names the cache to read and whether to follow the parents.
+		if row := r.ownerRow(ref); row != nil {
+			gvr := row.gvr
 			// The cache is keyed by namespace+name; cross-check the UID so a
 			// deleted-and-recreated owner with the same name (new UID) does
 			// not lend its labels/annotations/parents to the old reference
@@ -431,10 +458,15 @@ func (r *Resolver) Resolve(namespace string, refs []metav1.OwnerReference) ([]ku
 				// apart when a chain silently loses its metadata.
 				r.report(gvr, namespace, ref.Name, reasonUIDMismatch, nil)
 			} else if m != nil {
-				owner.Labels, owner.Annotations = kubemeta.CopyMeta(m.Labels, m.Annotations)
+				// CopyOwnerMeta, not CopyMeta: an owner's LABELS are bounded too
+				// (nothing selects on them, and they ride every pod naming it).
+				owner.Labels, owner.Annotations = kubemeta.CopyOwnerMeta(m.Labels, m.Annotations)
 				r.countAnnotationsOmitted(gvrKind(gvr), owner.Annotations)
+				if kubemeta.LabelsOmitted(owner.Annotations) {
+					obs.MetadataLabelsOmitted.WithLabelValues(gvrKind(gvr)).Inc()
+				}
 				out = append(out, owner)
-				if follow {
+				if top && row.follow {
 					for _, parent := range m.OwnerReferences {
 						add(parent, false)
 					}
@@ -445,12 +477,32 @@ func (r *Resolver) Resolve(namespace string, refs []metav1.OwnerReference) ([]ku
 		out = append(out, owner)
 	}
 	for _, ref := range refs {
-		add(ref, followable(ref))
+		add(ref, true)
+	}
+	for _, c := range capped {
+		obs.OwnerResolveFailures.WithLabelValues(c.kind, reasonOwnersCapped).Add(float64(c.n))
 	}
 	if omitted > 0 {
 		r.reportOwnersCapped(namespace, refs, len(out), omitted)
 	}
 	return out, omitted
+}
+
+// kindCount is one kind's tally of references the MaxOwners cap refused.
+type kindCount struct {
+	kind string
+	n    int
+}
+
+// tally adds one refusal of kind to counts.
+func tally(counts []kindCount, kind string) []kindCount {
+	for i := range counts {
+		if counts[i].kind == kind {
+			counts[i].n++
+			return counts
+		}
+	}
+	return append(counts, kindCount{kind: kind, n: 1})
 }
 
 // reportOwnersCapped names the MaxOwners refusal once per resolution, through
@@ -533,32 +585,73 @@ func ownerKind(ref metav1.OwnerReference) (*ownerKindRow, error) {
 	return nil, nil
 }
 
-// kindGVR maps an owner reference to the resource whose metadata informer
-// caches it, for kinds the service watches.
-//
-// It is a METHOD, and the only reporting caller of ownerKind, because Resolve
-// calls it exactly once per reference — followable's own lookup stays silent,
-// or a malformed apiVersion on a top-level reference would be counted twice.
-func (r *Resolver) kindGVR(ref metav1.OwnerReference) (schema.GroupVersionResource, bool) {
+// ownerRow resolves an owner reference to its ownerKinds row — the resource
+// whose metadata informer caches it, and whether its own owners belong in the
+// chain (ReplicaSet -> Deployment, Job -> CronJob) — or nil for a kind the
+// service does not watch. It is the reporting face of ownerKind: an apiVersion
+// that does not parse is counted as bad_api_version here, and Resolve calls it
+// exactly once per reference, so one malformed reference is one count.
+func (r *Resolver) ownerRow(ref metav1.OwnerReference) *ownerKindRow {
 	k, err := ownerKind(ref)
 	if err != nil {
 		// The kind label is knownKind's, not the reference's: ownerReferences
 		// name arbitrary CRD kinds, and a hostile or merely creative one must
 		// not mint an unbounded label value on a metric.
 		r.reportObj(knownKind(ref.Kind), "", ref.Name, reasonBadAPIVersion, err)
-		return schema.GroupVersionResource{}, false
+		return nil
 	}
-	if k == nil {
-		return schema.GroupVersionResource{}, false
-	}
-	return k.gvr, true
+	return k
 }
 
-// followable reports whether ref's own owners belong in the chain
-// (ReplicaSet -> Deployment, Job -> CronJob).
-func followable(ref metav1.OwnerReference) bool {
-	k, _ := ownerKind(ref)
-	return k != nil && k.follow
+// servedRef is the projection of an owner reference that Resolve SERVES: the
+// scalar fields of a kubemeta.Owner, with Controller dereferenced. It is the ONE
+// statement of that list — Resolve builds every served Owner from it, and
+// SameServedRefs compares through it — so the owner change token cannot drift
+// from what a response shows. APIVersion is in it for two reasons, not one: it
+// is served verbatim, and it decides ownerRow's match, i.e. whether a reference
+// is enriched at all and whether its parents are followed.
+type servedRef struct {
+	apiVersion, kind, name, uid string
+	controller                  bool
+}
+
+func servedRefOf(ref metav1.OwnerReference) servedRef {
+	return servedRef{
+		apiVersion: ref.APIVersion,
+		kind:       ref.Kind,
+		name:       ref.Name,
+		uid:        string(ref.UID),
+		controller: ref.Controller != nil && *ref.Controller,
+	}
+}
+
+// owner is the served Owner for the reference, before any cached metadata is
+// attached.
+func (s servedRef) owner() kubemeta.Owner {
+	return kubemeta.Owner{
+		APIVersion: s.apiVersion,
+		Kind:       s.kind,
+		Name:       s.name,
+		UID:        s.uid,
+		Controller: s.controller,
+	}
+}
+
+// SameServedRefs reports whether two owner-reference lists are identical on
+// exactly the fields Resolve serves (servedRef), in ORDER — the emitted chain
+// is in the references' own order, so reordering them reorders the response
+// and its ETag. BlockOwnerDeletion is deliberately not compared: nothing serves
+// it, so a garbage-collector rewrite of it must not invalidate the node-targets
+// memos. Controller is dereferenced rather than pointer-compared, since informer
+// deliveries do not share the *bool.
+//
+// It is what cmd/kubescrape's owner change handler compares a cached owner's
+// references with, because Resolve FOLLOWS those references to append a pod's
+// grandparent: a change here is a change in every dependent pod's chain.
+func SameServedRefs(a, b []metav1.OwnerReference) bool {
+	return slices.EqualFunc(a, b, func(x, y metav1.OwnerReference) bool {
+		return servedRefOf(x) == servedRefOf(y)
+	})
 }
 
 // knownKind bounds a reference-supplied Kind to the set this package watches,

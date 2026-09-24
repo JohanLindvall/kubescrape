@@ -30,23 +30,42 @@ package transform
 // leave the payload half-transformed, which is fine precisely because the
 // promise says nobody looks at it again.
 //
-// Who hands off (each verified against its failure path, not assumed):
+// Handing off says nothing about the RECORDS, only the object, and the
+// transform_dropped counter needs the other half too. It counts a batch's
+// drops once its records are SETTLED: on an ack, or on a failure that is FINAL
+// for them. Consumed(ctx) — a Handoff that also promises no retry will run the
+// script over these records again, because the attempt consumed their source
+// or the next attempt renders NEW points — is what licenses counting on a
+// failed forward. A plain Handoff does not: the ingest sender retransmits the
+// same records, and the log-metrics set re-renders a failed chunk's retained
+// samples at their original timestamps, so counting their failures counted one
+// drop once per attempt. Forgetting the mark under-counts, which is the safe
+// side: an over-count grows with the length of an outage.
+//
+// Who hands off (each verified against its failure path, not assumed; the
+// Consumed ones say so):
 //
 //   - agent/promscrape — every chunk export and the health export: take()
 //     resets the batcher, exportFailed latches so even salvage never re-sends,
-//     the next scrape cycle rebuilds from a fresh scrape.
+//     the next scrape cycle rebuilds from a fresh scrape. Consumed.
 //   - agent/cumagg (Store.Export, which spanmetrics AND servicegraph ride):
 //     Render is fresh pdata per export; a failed send leaves series in
-//     Rendered and the next export renders again.
+//     Rendered and the next export renders again — a new point, at a new
+//     timestamp. Consumed.
 //   - agent/otlpingest — the logs and metrics forwards (both transports): a
 //     failed forward goes back to the pushing SDK as a status, the decoded
-//     pdata is dropped, and the retry re-decodes retransmitted bytes.
+//     pdata is dropped, and the retry re-decodes retransmitted bytes. NOT
+//     Consumed: those bytes are the same records, and the script runs over
+//     them again.
 //   - internal/metrics (the Registry and DynamicMetricSet) — marked at the
 //     agent's CALL SITES in cmd/kubescrape-agent, because the package cannot
 //     import this one (transform → obs → metrics is already an import chain):
 //     both render fresh pdata per export, and the set's failed-chunk retention
 //     (export.go's retain) keeps raw SAMPLES that the next export re-renders —
 //     never the pdata subtree, so a transformed payload cannot re-enter here.
+//     The Registry's marks are Consumed (a failed export re-arms its series,
+//     and the next one renders new points); the set's are NOT, because its
+//     retained samples come back as the SAME points.
 //   - agent/cgroupstats (Sampler.Run's export loop and FinalExport) — marked at
 //     the agent's call sites for the same reason internal/metrics is: the mark
 //     belongs where the retry policy is known. Its failure path, checked rather
@@ -60,6 +79,7 @@ package transform
 //     re-enters the seam, so the promise's substance holds — but a marker that
 //     reads back at all is exactly what this list exists to have looked at, and
 //     the honest repair is to take the count BEFORE the export, not to unmark.
+//     Consumed: the windows it rendered are gone.
 //
 // Who must NOT hand off, and keeps the copy:
 //
@@ -71,7 +91,10 @@ package transform
 //   - agent/tailer — its retry loop re-sends the same batch, so it cannot
 //     mark; instead it applies the transform ITSELF, once per just-built
 //     batch, via Wrapper.TransformLogs, and exports through Wrapper.Inner()
-//     (the chain below the transform layer).
+//     (the chain below the transform layer). TransformLogs reports the drops
+//     rather than counting them: the tailer counts them when the batch's
+//     offsets commit, because a failed flush rewinds and the re-read runs the
+//     script over the same records again.
 
 import "context"
 
@@ -95,11 +118,39 @@ func Handoff(ctx context.Context) context.Context {
 	return context.WithValue(ctx, handoffKey{}, true)
 }
 
-// HandedOff reports whether ctx was marked by Handoff.
+// HandedOff reports whether ctx was marked by Handoff (or Consumed).
 func HandedOff(ctx context.Context) bool {
 	if ctx == nil {
 		return false
 	}
 	v, _ := ctx.Value(handoffKey{}).(bool)
+	return v
+}
+
+// consumedKey is the context key for the Consumed marker.
+type consumedKey struct{}
+
+// Consumed is Handoff plus a promise about the RECORDS: a failed attempt is
+// final for them — no retry offers them to the script again, because the
+// attempt consumed their source (a take()n chunk, a window reset as it was
+// read) or because the next attempt renders NEW points rather than these. The
+// Wrapper then counts a failed forward's drops, which would otherwise be
+// counted nowhere. A producer whose retry brings the same records back — an
+// ingest sender's retransmission, a retained sample re-rendered at its own
+// timestamp — marks Handoff alone, or its drops count once per attempt.
+func Consumed(ctx context.Context) context.Context {
+	ctx = Handoff(ctx)
+	if IsConsumed(ctx) {
+		return ctx
+	}
+	return context.WithValue(ctx, consumedKey{}, true)
+}
+
+// IsConsumed reports whether ctx was marked by Consumed.
+func IsConsumed(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(consumedKey{}).(bool)
 	return v
 }

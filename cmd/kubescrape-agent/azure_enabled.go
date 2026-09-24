@@ -21,14 +21,22 @@ const azureBuilt = true
 const gateAzure = "azure-eventhub"
 
 // validateAzureFlags checks the -azure-* flag surface, before anything is
-// acquired. Here rather than in run() because it needs the azurediag package,
-// which a build without the `azure` tag does not link.
+// acquired (checkFlagChoices, so -check-config and a real start alike). In the
+// tagged file rather than beside its caller because it needs the azurediag
+// package, which a build without the `azure` tag does not link.
 func validateAzureFlags() error {
 	if err := azurediag.ValidateStartMode(*azureStart); err != nil {
 		return err
 	}
 	if *azureOn && *azureNamespace == "" && *azureConnFile == "" {
 		return errors.New("-azure-diagnostics is set but neither -azure-eventhub-namespace nor -azure-eventhub-connection-string-file is")
+	}
+	// kgo refuses an empty group only when the consumer opens, i.e. after a
+	// rollout; ResolveSources applies the same check.
+	if *azureOn {
+		if err := azurediag.ValidateGroup(*azureGroup); err != nil {
+			return err
+		}
 	}
 	// The SHAPE half of the multi-source rules, so -check-config catches it.
 	// The rest of ResolveSources reads the connection-string files, which a
@@ -69,14 +77,14 @@ func (p *pipelines) startAzure(ctx context.Context) error {
 		reader := azurediag.New(azurediag.Config{
 			Kafka:        kafka,
 			MetricPrefix: *azurePrefix,
-			Enrich:       *enrichOn,
-			Scrub:        p.scrub,
-			LogAttrs:     p.logAttrs,
-			Rules:        p.journalRules, // the same logs.rules chain
-			LogMetrics:   p.logMetrics,
-			Attrs:        p.attrBuilders.Ingest,
-			Exporter:     p.out,
-			Logger:       p.log,
+			Chain:        p.logChain(),
+			// The INGEST attribute pipeline (there is no Azure-specific
+			// one), like -events: resourceAttributes.pipelines.ingest
+			// governs every Azure resource, and a pipelines.logs override
+			// does not reach it (see startEvents).
+			Attrs:    p.attrBuilders.Ingest,
+			Exporter: p.out,
+			Logger:   p.log,
 			// A gate per source, named for what it consumes: one hub nobody
 			// may read keeps /readyz honest AND says which one, instead of
 			// being masked by a sibling that polled first.

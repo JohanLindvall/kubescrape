@@ -82,7 +82,7 @@ func TestHTTPGzipLevelIsPerDestination(t *testing.T) {
 
 	ld := plog.NewLogs()
 	lrs := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords()
-	for i := 0; i < 400; i++ {
+	for range 400 {
 		lrs.AppendEmpty().Body().SetStr(strings.Repeat("compress me ", 20) + "unique-suffix")
 	}
 

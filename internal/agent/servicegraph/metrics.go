@@ -108,13 +108,34 @@ const (
 // ARRIVES while spanmetrics tests its configured list once.
 var builtinLabels = cumagg.NewBuiltins(labelClient, labelServer, labelConnectionType, labelVirtualNode)
 
+// keyScratchBytes sizes RecordAt's per-call stack buffer for the series key. A
+// key that outgrows it is re-allocated on the heap on EVERY completed request,
+// not once — and inside the pairing store's mutex, since RecordAt runs there —
+// so it must hold the key the built-in labels alone can produce at the
+// truncation limit: a client and a server name of cumagg.MaxLabelBytes each,
+// each behind a two-byte length prefix, plus the longest connection type and
+// virtual-node spelling. It was 256, which one long service name overran. The
+// rest is headroom for short configured dimensions; a dimension carrying a
+// long value can still overrun it, which only a deployment that configured
+// dimensions can incur. builtinKeyMax is the floor, enforced at compile time
+// below.
+const (
+	keyScratchBytes = 640
+	builtinKeyMax   = 2*(2+cumagg.MaxLabelBytes) +
+		(1 + len(ConnectionMessagingSystem)) + (1 + len(virtualNodeServer))
+)
+
+// A keyScratchBytes below builtinKeyMax fails to compile (a negative array
+// length).
+var _ [keyScratchBytes - builtinKeyMax]struct{}
+
 // Exporter sends one OTLP metrics payload; satisfied by otlpexport.Client.
 type Exporter = cumagg.Exporter
 
 // Registry aggregates completed edges into the Tempo-compatible cumulative
 // series above and renders them to OTLP on an interval. It implements the
-// store's edge sink (`Record(Edge)`) and is safe for concurrent Record from the
-// ingest goroutines.
+// store's edge sink (`RecordAt(Edge, time.Time)`) and is safe for concurrent
+// RecordAt from the ingest goroutines.
 //
 // It is a self-contained aggregator rather than metrics.Registry for the same
 // reason agent/spanmetrics is: the shared registry has no way to express a
@@ -127,98 +148,41 @@ type Exporter = cumagg.Exporter
 type Registry struct {
 	bounds    []float64 // histogram bounds, ascending, seconds
 	exemplars bool
-	now       func() time.Time
+	// exemplarKeep is SetExemplarKeep's predicate (nil keeps every exemplar).
+	// Guarded by the store's mutex: Record reads it inside the hold it already
+	// takes, so the setter is safe at any time, not only before the first edge.
+	exemplarKeep func(pcommon.TraceID) bool
+	now          func() time.Time
 
 	store *cumagg.Store[*edgeSeries]
 
-	// renderMu serializes renders so snap can be REUSED across them. Renders
-	// come from one goroutine in production (Run's loop, then its final export),
-	// but Export is exported and tests call it directly, and two renders sharing
-	// one scratch buffer would be a data race on it. Lock order is renderMu
-	// before the store's mutex; nothing ever takes renderMu while holding it.
+	// renderMu serializes renders so snaps can be REUSED across them. Exports
+	// DO overlap in production — cmd/kubescrape-agent's shutdown path makes a
+	// final Export beside the one Run makes on its detached context — and those
+	// are serialized by cumagg.Store's exportGate, which holds for the whole
+	// render+send+mark. renderMu is the scratch's own lock, and it is what
+	// covers a render that does not go through Export (render, the store's
+	// Render — tests call both directly): two renders sharing one scratch
+	// buffer would be a data race on it. Lock order is renderMu before the
+	// store's mutex; nothing ever takes renderMu while holding it.
 	renderMu sync.Mutex
-	// snap is the render scratch: the series' values copied out under the store
-	// lock so the pdata payload can be built WITHOUT it. Reused because it is
-	// otherwise tens of megabytes of garbage per export at the cardinality cap.
-	// snapPtrs is the series order that copy walks, taken in one cheap pass so
-	// the copy itself can release and retake the mutex between chunks.
-	snap     []edgeSnapshot
-	snapPtrs []*edgeSeries
-	// snapSmall counts consecutive renders that used far less of the scratch than
-	// it can hold. See snapOversized.
-	snapSmall int
+	// snaps is the render scratch: the series' values copied out under the
+	// store lock, in chunks, so the pdata payload can be built WITHOUT it
+	// (cumagg.Snapshotter). Reused because it is otherwise tens of megabytes of
+	// garbage per export at the cardinality cap.
+	snaps cumagg.Snapshotter[*edgeSeries, edgeSnapshot]
 }
-
-// The render scratch shrinks when it has been much larger than the live series
-// count for several renders running: a burst to the cardinality cap otherwise
-// sizes it to that peak for the process' life, and the eviction that reclaimed
-// the series reclaims nothing here. The hysteresis is the point — the
-// alternative to a stable scratch is two slice allocations per series per
-// export, which is what it exists to avoid — so a workload that merely
-// oscillates keeps its capacity, and only one that has genuinely shrunk pays a
-// single reallocation.
-const (
-	snapShrinkFactor = 4 // shrink at under a quarter occupancy
-	snapShrinkRuns   = 3 // ... sustained for this many renders
-	snapShrinkFloor  = 64
-)
-
-// snapOversized reports whether the scratch has been oversized long enough to be
-// worth rebuilding, and keeps the run length that decides it.
-func (r *Registry) snapOversized(n int) bool {
-	if cap(r.snap) <= snapShrinkFloor || n*snapShrinkFactor >= cap(r.snap) {
-		r.snapSmall = 0
-		return false
-	}
-	r.snapSmall++
-	return r.snapSmall >= snapShrinkRuns
-}
-
-// snapChunk is how many series one snapshot lock-hold copies. It trades the
-// number of acquisitions (cheap, uncontended most of the time) against the
-// length of one stall on the receive path, which is what actually hurts: at the
-// 20k cardinality cap the whole copy is ~5 ms, and this makes the longest hold
-// about a fortieth of that.
-const snapChunk = 512
 
 // edgeSnapshot is one series' state as of the instant the render read it. The
 // label slice is ALIASED (it is built once at admission and never mutated); the
-// bucket and exemplar slices are COPIES, because Record writes them under the
-// mutex the render has just let go of.
+// two histograms are COPIES, because Record writes them under the mutex the
+// render has just let go of.
 type edgeSnapshot struct {
 	labels         []edgeLabel
 	requests       uint64
 	failed         uint64
 	start          time.Time
-	client, server histSnapshot
-}
-
-type histSnapshot struct {
-	present bool // the side was observed at all (buckets != nil)
-	count   uint64
-	sum     float64
-	buckets []uint64
-	// ex holds only the exemplars that are SET, in bucket order — which is
-	// exactly what putHist renders, and typically one or two per side per
-	// interval rather than one slot per bucket. Copying the full per-bucket
-	// array instead put ~34 MB of memcpy under the series mutex at the
-	// cardinality cap, which is the stall this snapshot exists to remove.
-	ex []cumagg.Exemplar
-}
-
-// copyFrom copies one side's aggregate, reusing this snapshot's slices. The
-// caller holds the store lock: everything read here is written by Record under
-// it.
-func (h *histSnapshot) copyFrom(src *histAgg) {
-	h.present = src.buckets != nil
-	h.count, h.sum = src.count, src.sum
-	h.buckets = append(h.buckets[:0], src.buckets...)
-	h.ex = h.ex[:0]
-	for i := range src.ex {
-		if src.ex[i].Set {
-			h.ex = append(h.ex, src.ex[i])
-		}
-	}
+	client, server cumagg.HistSnap
 }
 
 // edgeSeries is one (client, server, connection_type, dimensions...) tuple's
@@ -232,52 +196,21 @@ type edgeSeries struct {
 	labels   []edgeLabel // rendered attribute set, built once when the series is admitted
 	requests uint64
 	failed   uint64
-	client   histAgg
-	server   histAgg
+	// client and server are the two sides' own latency histograms. A side
+	// stays unobserved (nil buckets, see cumagg.Hist) until it is first seen: a
+	// virtual-node edge never has a server half.
+	client cumagg.Hist
+	server cumagg.Hist
 }
 
 // resetExemplars is the store's after-delivery hook: BOTH sides, and only once
 // the payload carrying them was acked (a failed send keeps them for the retry).
 func (s *edgeSeries) resetExemplars() {
-	cumagg.ClearExemplars(s.client.ex)
-	cumagg.ClearExemplars(s.server.ex)
+	s.client.ClearExemplars()
+	s.server.ClearExemplars()
 }
 
 type edgeLabel struct{ name, value string }
-
-// histAgg is one side's latency histogram. buckets stays nil until that side is
-// first observed: a virtual-node edge never has a server half, and rendering a
-// zero-count point for it would put a latency series on the graph for a
-// measurement nobody took.
-type histAgg struct {
-	count   uint64
-	sum     float64
-	buckets []uint64 // len(bounds)+1 once observed
-	// ex holds at most one exemplar per bucket — the latest observed since the
-	// last DELIVERED export — and stays nil until one is recorded (exemplars
-	// off, or an edge whose spans carried no trace id).
-	ex []cumagg.Exemplar
-}
-
-// observe folds one measurement in and returns its bucket, so the caller can
-// attach an exemplar to that same bucket without walking the bounds twice.
-func (h *histAgg) observe(bounds []float64, v float64) int {
-	if h.buckets == nil {
-		h.buckets = make([]uint64, len(bounds)+1)
-	}
-	h.count++
-	h.sum += v
-	idx := cumagg.BucketIndex(bounds, v)
-	h.buckets[idx]++
-	return idx
-}
-
-// setExemplar keeps this sample as the bucket's exemplar (cumagg.RecordExemplar
-// holds the one-per-bucket, latest-wins and skip-without-a-trace-id rules; both
-// aggregators' exemplars mean the same thing).
-func (h *histAgg) setExemplar(idx, nbuckets int, v float64, ts pcommon.Timestamp, tid pcommon.TraceID, sid pcommon.SpanID) {
-	h.ex = cumagg.RecordExemplar(h.ex, nbuckets, idx, v, ts, tid, sid)
-}
 
 // clock reads the injectable now through the Registry, so a test that replaces
 // r.now after NewRegistry is also replacing the clock the store exports on.
@@ -296,24 +229,21 @@ func NewRegistry(cfg Config, log *slog.Logger) *Registry {
 	if cfg.Exemplars != nil {
 		ex = *cfg.Exemplars
 	}
-	// An unparseable staleAfter falls back to the default; Config.Validate is
-	// what reports it (and -check-config runs that), so New never refuses to
-	// aggregate. "0" resolves to 0 here, which is the disable branch in
+	// An invalid staleAfter falls back to the default, and says so
+	// (cumagg.ResolveStaleAfter — one arm for both aggregators, which had
+	// written it twice). "0" resolves to 0 here, which is the disable branch in
 	// cumagg's eviction.
-	//
-	// The fallback is not SILENT, for the reason the sibling aggregator's
-	// identical arm already gives: a start that has somehow got past Validate
-	// must not then apply a different eviction policy with nothing to grep for
-	// — with eviction off the cardinality cap becomes the one-way latch
-	// cumagg.ParseStaleAfter exists to prevent. The two arms were written
-	// differently, which is exactly the drift this package pair keeps
-	// producing.
-	stale, err := cfg.staleAfter()
-	if err != nil {
-		log.Warn("serviceGraph.staleAfter is unparseable; using the default eviction age",
-			"error", err, "staleAfter", stale)
-	}
+	stale := cumagg.ResolveStaleAfter(staleAfterField, cfg.StaleAfter, DefaultStaleAfter, log)
 	r := &Registry{bounds: bounds, exemplars: ex, now: time.Now}
+	nb := len(bounds) + 1
+	r.snaps = cumagg.Snapshotter[*edgeSeries, edgeSnapshot]{
+		CopyLocked: copyEdgeSeries,
+		Fit: func(e *edgeSnapshot) {
+			e.client.Fit(nb)
+			e.server.Fit(nb)
+		},
+		Release: func(e *edgeSnapshot) { e.labels = nil },
+	}
 	r.store = cumagg.NewStore(cumagg.Options[*edgeSeries]{
 		Scope:          scopeName,
 		Name:           "service-graph metrics",
@@ -333,10 +263,47 @@ func NewRegistry(cfg Config, log *slog.Logger) *Registry {
 	return r
 }
 
-// Record aggregates one completed edge. Called from the pairing store, which
-// runs on the ingest goroutines.
-func (r *Registry) Record(e Edge) {
-	now := r.now()
+// SetExemplarKeep installs the predicate asked, per completed edge, whether its
+// trace will be EXPORTED; an edge it refuses records no exemplar (it is still
+// counted — the graph is the whole traffic). nil removes it.
+//
+// An exemplar is a link to a trace, and this aggregator sits ABOVE the trace
+// tier's samplers so it can count every request: without the predicate a
+// traceSampling probability of p left about 1-p of both duration histograms'
+// exemplars naming a trace that was never shipped. The tier wires the head
+// sampler's trace-level decision (tracesample.Sampler.TraceKept) — trace-level
+// because an Edge carries no span status or duration, so a trace whose error
+// fragments the guard rails rescued reads as dropped: the safe direction, a
+// missing link rather than a dead one. The tail sampler's verdict cannot be
+// predicted here, so under tailSampling an exemplar can still name a trace it
+// dropped.
+//
+// A setter rather than a Config field because the tier builds this Registry
+// before the sampler that answers the question. It takes the series lock, so
+// it is safe at any time. The predicate runs inside that lock on every
+// completed request: it must be cheap and must not allocate
+// (TestRecordIsAllocationFree).
+func (r *Registry) SetExemplarKeep(keep func(pcommon.TraceID) bool) {
+	r.store.Lock()
+	r.exemplarKeep = keep
+	r.store.Unlock()
+}
+
+// Record aggregates one hand-built edge at the Registry's own clock. The pairing
+// store does not call it: it calls RecordAt with the clock it already holds.
+func (r *Registry) Record(e Edge) { r.RecordAt(e, r.now()) }
+
+// RecordAt aggregates one completed edge observed at now. Called from the
+// pairing store, which runs on the ingest goroutines.
+//
+// now is the pairing pass's own clock read — the batch time Consume took, or
+// the sweep's — and not a fresh one. This runs INSIDE the pairing store's mutex
+// (upsert/sweep -> emit -> RecordAt), once per completed request, so a clock
+// read here was a syscall-priced stall (a quarter of Record's cost, measured)
+// paid while every concurrent Consume on the shard waited; and it measured
+// nothing the batch time does not: both are "the shard's clock at pairing
+// time", the one the exemplar timestamp below is defined as.
+func (r *Registry) RecordAt(e Edge, now time.Time) {
 
 	// e.Dimensions arrives in an order that is already a function of the SET
 	// (see joinDims), so the key is built by walking it — no scratch, no sort.
@@ -358,7 +325,7 @@ func (r *Registry) Record(e Edge) {
 	client := cumagg.Trunc(e.ClientService)
 	server := cumagg.Trunc(e.ServerService)
 
-	var keyScratch [256]byte
+	var keyScratch [keyScratchBytes]byte // see keyScratchBytes: a spill costs every call
 	key := keyScratch[:0]
 	key = cumagg.AppendKeyPart(key, client)
 	key = cumagg.AppendKeyPart(key, server)
@@ -396,16 +363,19 @@ func (r *Registry) Record(e Edge) {
 	// Wait behind the request.
 	nb := len(r.bounds) + 1
 	ts := pcommon.NewTimestampFromTime(now)
+	ex := r.exemplars && (r.exemplarKeep == nil || r.exemplarKeep(e.TraceID))
 	if e.HaveClient {
-		i := s.client.observe(r.bounds, e.ClientSeconds)
-		if r.exemplars {
-			s.client.setExemplar(i, nb, e.ClientSeconds, ts, e.TraceID, e.ClientSpanID)
+		i := cumagg.BucketIndex(r.bounds, e.ClientSeconds)
+		s.client.Observe(i, nb, e.ClientSeconds)
+		if ex {
+			s.client.SetExemplar(i, nb, e.ClientSeconds, ts, e.TraceID, e.ClientSpanID)
 		}
 	}
 	if e.HaveServer {
-		i := s.server.observe(r.bounds, e.ServerSeconds)
-		if r.exemplars {
-			s.server.setExemplar(i, nb, e.ServerSeconds, ts, e.TraceID, e.ServerSpanID)
+		i := cumagg.BucketIndex(r.bounds, e.ServerSeconds)
+		s.server.Observe(i, nb, e.ServerSeconds)
+		if ex {
+			s.server.SetExemplar(i, nb, e.ServerSeconds, ts, e.TraceID, e.ServerSpanID)
 		}
 	}
 	r.store.ObservedLocked(s, now)
@@ -447,117 +417,33 @@ func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resourc
 	return r.store.Export(ctx, exp, res)
 }
 
-func (r *Registry) render(res pcommon.Resource, now time.Time) pmetric.Metrics {
-	return r.store.Render(res, now)
-}
-
-// growSnap makes the render scratch big enough for n series, with each entry's
-// bucket and exemplar slices already allocated, so the copy under the mutex is
-// pure memmove. Called without the store lock; the scratch belongs to renderMu.
-func (r *Registry) growSnap(n int) {
-	switch {
-	case cap(r.snap) < n:
-		grown := make([]edgeSnapshot, n)
-		copy(grown, r.snap)
-		r.snap = grown
-		r.snapSmall = 0
-	case r.snapOversized(n):
-		// Start over at the live size. Keeping the tail costs its two arrays per
-		// side per slot — 2*(len(bounds)+1) exemplars at 48 B each dominates —
-		// which measured 24.3 MB still reachable after one burst to the 20000
-		// cardinality cap and a mass stale eviction that left ONE series. The
-		// scratch is worth having for the steady state, not for the peak the
-		// process once saw.
-		r.snap = make([]edgeSnapshot, n, max(snapShrinkFloor, 2*n))
-		r.snapSmall = 0
-	default:
-		// The tail past n keeps its bucket and exemplar CAPACITY — reusing that
-		// is what the scratch is for — but must NOT keep its labels: those alias
-		// the label sets of series this render does not cover, so a burst up to
-		// the cardinality cap followed by mass stale eviction would pin every one
-		// of them (a slice plus its retained <= 256 B strings, tens of MB at the
-		// cap) for the process' life. Same reason snapshot clears snapPtrs.
-		whole := r.snap[:cap(r.snap)] // slots an earlier, larger render filled
-		for i := n; i < len(whole); i++ {
-			whole[i].labels = nil
-		}
-		r.snap = r.snap[:n]
-	}
-	nb := len(r.bounds) + 1
-	for i := range r.snap {
-		e := &r.snap[i]
-		if cap(e.client.buckets) < nb {
-			e.client.buckets = make([]uint64, 0, nb)
-			e.client.ex = make([]cumagg.Exemplar, 0, nb)
-		}
-		if cap(e.server.buckets) < nb {
-			e.server.buckets = make([]uint64, 0, nb)
-			e.server.ex = make([]cumagg.Exemplar, 0, nb)
-		}
-	}
-}
-
-// snapshot copies every series' current values out under the store mutex and
-// marks them rendered. It is the ONLY part of a render that holds it.
-//
-// The build below used to run under it, and that is a receive-path stall, not
-// just a slow export: Record is called by the pairing store from INSIDE its own
-// mutex (store.upsert -> emit -> sink.Record), so every millisecond this lock is
-// held is a millisecond in which no shard goroutine can Consume a span. At the
-// cardinality cap the payload build is tens of milliseconds, once per export
-// interval, and the whole of it used to land on the ingest path: a 46.7 ms
-// Record stall inside a 46.7 ms render, now 1.6 ms
-// (TestRenderDoesNotStallRecord).
-func (r *Registry) snapshot(now time.Time) []edgeSnapshot {
-	// Hold 1: evict and take the series POINTERS in ONE walk (the two used to be
-	// two passes inside this hold, which visited every series twice for
-	// nothing). One pointer write each, so this is the cheapest pass that can
-	// exist over a map — and it is the only one a render cannot chunk, because
-	// a slice can be walked across lock releases and a map cannot.
-	r.store.Lock()
-	ptrs := r.store.LivePointersLocked(r.snapPtrs[:0], now)
-	r.snapPtrs = ptrs
-	r.store.Unlock()
-
-	// Sizing (and, on the first render, two slice allocations per series) stays
-	// outside the lock; later renders reuse the whole scratch.
-	r.growSnap(len(ptrs))
-	snap := r.snap
-
-	// Holds 2..n: the values, in chunks. A series' fields are written by Record
-	// under the mutex, so the copy has to hold it — but only for a chunk at a
-	// time, which bounds one stall at a few hundred microseconds instead of the
-	// whole cardinality cap. A Record landing between chunks is free to run and
-	// puts that series back in cumagg.Observed, exactly as one landing between
-	// the render and the delivery mark always could.
-	for start := 0; start < len(ptrs); start += snapChunk {
-		end := min(start+snapChunk, len(ptrs))
-		r.store.Lock()
-		for i := start; i < end; i++ {
-			s := ptrs[i]
-			r.store.MarkRenderedLocked(s)
-			e := &snap[i]
-			e.labels = s.labels
-			e.requests, e.failed, e.start = s.requests, s.failed, s.Start
-			e.client.copyFrom(&s.client)
-			e.server.copyFrom(&s.server)
-		}
-		r.store.Unlock()
-	}
-	// Series ADMITTED during the walk are simply not in this payload; their
-	// cumulative values ride the next one.
-	clear(ptrs) // do not pin evicted series until the next render
-	return snap[:len(ptrs)]
+// copyEdgeSeries is the snapshot's per-series copy (cumagg.Snapshotter's
+// CopyLocked): under the store lock, the series already marked rendered.
+func copyEdgeSeries(e *edgeSnapshot, s *edgeSeries) {
+	e.labels = s.labels
+	e.requests, e.failed, e.start = s.requests, s.failed, s.Start
+	e.client.CopyFrom(&s.client)
+	e.server.CopyFrom(&s.server)
 }
 
 // renderEdges is the store's Render callback: it writes the four Tempo metrics
 // for every live series. It takes renderMu (never held while the store's mutex
 // is) because the snapshot scratch is reused across renders.
+//
+// Only the snapshot (cumagg.Snapshotter.Take) holds the store's mutex, in
+// chunks; the build below runs without it, and that is a receive-path matter,
+// not just a slow export: RecordAt is called by the pairing store from INSIDE
+// its own mutex (store.upsert -> emit -> sink.RecordAt), so every millisecond
+// the series lock is held is a millisecond in which no shard goroutine can
+// Consume a span. At the cardinality cap the payload build is tens of
+// milliseconds, once per export interval, and the whole of it used to land on
+// the ingest path: a 46.7 ms Record stall inside a 46.7 ms render, now 1.6 ms
+// (TestRenderDoesNotStallRecord).
 func (r *Registry) renderEdges(sm pmetric.ScopeMetrics, now time.Time) {
 	r.renderMu.Lock()
 	defer r.renderMu.Unlock()
 
-	snap := r.snapshot(now)
+	snap := r.snaps.Take(r.store, now)
 	if len(snap) == 0 {
 		return
 	}
@@ -567,8 +453,8 @@ func (r *Registry) renderEdges(sm pmetric.ScopeMetrics, now time.Time) {
 	// map happened to yield first.
 	var anyClient, anyServer bool
 	for i := range snap {
-		anyClient = anyClient || snap[i].client.present
-		anyServer = anyServer || snap[i].server.present
+		anyClient = anyClient || snap[i].client.Present
+		anyServer = anyServer || snap[i].server.Present
 		if anyClient && anyServer {
 			break
 		}
@@ -612,10 +498,10 @@ func (r *Registry) renderEdges(sm pmetric.ScopeMetrics, now time.Time) {
 		fp.SetTimestamp(ts)
 		fp.SetIntValue(int64(s.failed))
 
-		if s.server.present {
+		if s.server.Present {
 			putHist(server.AppendEmpty(), s.labels, &s.server, r.bounds, start, ts)
 		}
-		if s.client.present {
+		if s.client.Present {
 			putHist(client.AppendEmpty(), s.labels, &s.client, r.bounds, start, ts)
 		}
 	}
@@ -632,19 +518,12 @@ func putLabels(a pcommon.Map, labels []edgeLabel) {
 	}
 }
 
-func putHist(p pmetric.HistogramDataPoint, labels []edgeLabel, h *histSnapshot, bounds []float64, start, ts pcommon.Timestamp) {
+// putHist writes one side's histogram point. Its exemplars are one per occupied
+// bucket, in bucket order — the snapshot already dropped the unset slots — and
+// their id is THIS side's own span (see Edge.ClientSpanID), so the evidence
+// attached to a latency explains the latency it is attached to rather than the
+// other half of the request.
+func putHist(p pmetric.HistogramDataPoint, labels []edgeLabel, h *cumagg.HistSnap, bounds []float64, start, ts pcommon.Timestamp) {
 	putLabels(p.Attributes(), labels)
-	p.SetStartTimestamp(start)
-	p.SetTimestamp(ts)
-	p.SetCount(h.count)
-	p.SetSum(h.sum)
-	p.ExplicitBounds().FromRaw(bounds)
-	p.BucketCounts().FromRaw(h.buckets)
-	// One exemplar per occupied bucket, in bucket order — the snapshot already
-	// dropped the unset slots. The id is THIS side's own span (see
-	// Edge.ClientSpanID), so the evidence attached to a latency explains the
-	// latency it is attached to rather than the other half of the request.
-	for i := range h.ex {
-		cumagg.PutExemplar(p.Exemplars(), h.ex[i])
-	}
+	cumagg.PutHistPoint(p, h, bounds, start, ts)
 }

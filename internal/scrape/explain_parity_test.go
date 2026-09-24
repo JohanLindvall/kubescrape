@@ -3,8 +3,10 @@ package scrape
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/services"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 // The explain functions MUST give the same verdict as the derivation they
@@ -52,8 +54,8 @@ func TestExplainPodPortsParityOnDegenerateAnnotations(t *testing.T) {
 		ann  *string
 	}{
 		{"absent", nil},
-		{"blank", strptr(" ")},
-		{"tabs", strptr(" \t ")},
+		{"blank", new(" ")},
+		{"tabs", new(" \t ")},
 	} {
 		pod := basePod()
 		if tc.ann != nil {
@@ -100,7 +102,7 @@ func TestExplainServicePortsParityOnDegenerateAnnotations(t *testing.T) {
 		ann  *string
 	}{
 		{"absent", nil},
-		{"blank", strptr(" ")},
+		{"blank", new(" ")},
 	} {
 		svc := baseService()
 		if tc.ann != nil {
@@ -164,4 +166,65 @@ func TestExplainServicePortsParityOnSharedPodPort(t *testing.T) {
 	}
 }
 
-func strptr(s string) *string { return &s }
+// A pod that is not Scrapeable yields NO target through either annotation door
+// — PodTargets and ServiceTargets return nil before resolving a port — so the
+// mirrors must claim none either. They mirrored only the port arithmetic and
+// left this gate to the server, which patched it back in; the gate is the
+// mirrors' own now, beside the path ceiling they already shared with the
+// derivation. An entry that would resolve says the POD is excluded; one that
+// resolves to nothing keeps its own, sharper note.
+func TestExplainPortsOfAnExcludedPodClaimNoPort(t *testing.T) {
+	now := time.Now()
+	for _, ex := range []struct {
+		name  string
+		apply func(*kubemeta.Pod)
+	}{
+		{"terminating", func(p *kubemeta.Pod) { p.DeletionTimestamp = &now }},
+		{"no IP", func(p *kubemeta.Pod) { p.PodIP = "" }},
+		{"finished", func(p *kubemeta.Pod) { p.Phase = "Failed" }},
+		{"deleted", func(p *kubemeta.Pod) { p.DeletedAt = &now }},
+	} {
+		for _, ann := range []*string{nil, new("metrics, nope")} {
+			pod := basePod()
+			svc := baseService()
+			if ann != nil {
+				pod.Annotations[AnnotationPort] = *ann
+				svc.Annotations[AnnotationPort] = *ann
+			}
+			// The same doors on a scrapeable pod resolve, so the retraction is
+			// what the assertions below observe — not a door that was broken.
+			podV, _ := ExplainPodPorts(pod)
+			svcV, _ := ExplainServicePorts(pod, svc)
+			if resolvedPorts(podV) == 0 || resolvedPorts(svcV) == 0 {
+				t.Fatalf("%s/%v: fixture resolves nothing on a scrapeable pod: %+v / %+v", ex.name, ann != nil, podV, svcV)
+			}
+			ex.apply(&pod)
+			if Scrapeable(pod) {
+				t.Fatalf("%s: fixture is still scrapeable", ex.name)
+			}
+			if ts := PodTargets(pod); ts != nil {
+				t.Fatalf("%s: PodTargets served %+v", ex.name, ts)
+			}
+			if ts := ServiceTargets(pod, svc); ts != nil {
+				t.Fatalf("%s: ServiceTargets served %+v", ex.name, ts)
+			}
+			for door, verdicts := range map[string][]PortVerdict{
+				"pod":     func() []PortVerdict { v, _ := ExplainPodPorts(pod); return v }(),
+				"service": func() []PortVerdict { v, _ := ExplainServicePorts(pod, svc); return v }(),
+			} {
+				if got := resolvedPorts(verdicts); got != 0 {
+					t.Errorf("%s/%s: explain claims %d resolving ports on a pod the derivation serves nothing: %+v", ex.name, door, got, verdicts)
+				}
+				for _, v := range verdicts {
+					want := "excluded from scraping"
+					if v.Entry == "nope" {
+						want = "resolves to nothing" // its own note, not the pod-level one
+					}
+					if !strings.Contains(v.Note, want) {
+						t.Errorf("%s/%s: entry %q note %q, want it to contain %q", ex.name, door, v.Entry, v.Note, want)
+					}
+				}
+			}
+		}
+	}
+}

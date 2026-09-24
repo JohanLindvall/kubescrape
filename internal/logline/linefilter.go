@@ -10,8 +10,9 @@ import (
 // LineRule is one ordered keep/drop rule over log lines (the `rules` list of
 // the logs config). Selectors use the same DSL and key resolution as the
 // log-metrics `match`/`matchRegexp`: keys resolve against the caller's lookup
-// (record and resource attributes; the tailer adds the synthetic
-// `__severity__`) with the line's own JSON/logfmt fields as fallback, and
+// (record and resource attributes, plus the synthetic `__severity__` —
+// logchain.Resolver.RuleFn supplies it for every log producer and for the
+// ingest path alike) with the line's own JSON/logfmt fields as fallback, and
 // `__line__` matches the whole raw line.
 type LineRule struct {
 	// Action is "keep" or "drop".
@@ -23,8 +24,11 @@ type LineRule struct {
 	// may spell a literal backslash or double quote as \\ and \".
 	Match       []string `json:"match,omitempty"`
 	MatchRegexp []string `json:"matchRegexp,omitempty"`
-	// Sample, on a keep rule, keeps only this fraction of the matching lines
-	// (deterministic: every round(1/sample)-th line), dropping the rest.
+	// Sample, on a keep rule, keeps only this fraction of the matching lines,
+	// dropping the rest: deterministic and exact to 1e-9 over each run of 1e9
+	// matching lines, spread evenly rather than bunched (0.75 keeps three of
+	// every four; a reciprocal like 0.1 keeps the first line and every tenth
+	// after it).
 	Sample float64 `json:"sample,omitempty"`
 }
 
@@ -37,10 +41,31 @@ type LineFilter struct {
 }
 
 type lineFilterRule struct {
-	match  *Selectors
-	drop   bool
-	every  uint64 // keep 1 in every (0 = all)
+	match *Selectors
+	drop  bool
+	// keep is Sample in units of sampleDen: of every sampleDen matching lines
+	// numbered k = 0, 1, ..., line k is kept iff (k*keep) mod sampleDen < keep —
+	// exactly keep of them, evenly spaced (see sampled). 0 = no sampling.
+	keep   uint64
 	picked atomic.Uint64
+}
+
+// sampleDen is the resolution of Sample: one part in a billion, the floor
+// NewLineFilter admits. k*keep stays below 1e18, inside uint64.
+const sampleDen = 1_000_000_000
+
+// sampled reports whether the rule's next matching line is inside its sample.
+//
+// It used to keep every round(1/sample)-th line, which is exact only for
+// reciprocals and silently wrong everywhere else — measured over 10k lines,
+// 0.7, 0.75 and 0.9 kept 100%, 0.6 and 0.66 kept 50%, 0.4 kept 33% — while the
+// documentation promised "this fraction". This keeps exactly Sample of every
+// sampleDen matching lines. For a reciprocal whose period divides sampleDen
+// (0.5, 0.25, 0.1, …) it keeps the very lines the old rule kept — the first,
+// then every Nth — so an existing configuration does not churn.
+func (r *lineFilterRule) sampled() bool {
+	k := (r.picked.Add(1) - 1) % sampleDen
+	return k*r.keep%sampleDen < r.keep
 }
 
 // filterCtx is the pooled per-line evaluation state, mirroring addContext:
@@ -81,13 +106,14 @@ func NewLineFilter(rules []LineRule) (*LineFilter, error) {
 			if cr.drop {
 				return nil, fmt.Errorf("logs rule %d: sample is only valid on keep rules", i)
 			}
-			// The 1e-9 floor keeps 1/sample within uint64 (a pathological
-			// 1e-20 would overflow the float→uint64 conversion into an
-			// implementation-defined counter).
+			// The 1e-9 floor is the resolution sampled() works at (sampleDen):
+			// anything finer would round to keeping nothing.
 			if r.Sample < 1e-9 || r.Sample > 1 {
 				return nil, fmt.Errorf("logs rule %d: sample %v (want 1e-9 <= sample <= 1)", i, r.Sample)
 			}
-			cr.every = uint64(math.Round(1 / r.Sample))
+			if keep := uint64(math.Round(r.Sample * sampleDen)); keep < sampleDen {
+				cr.keep = max(keep, 1) // sample == 1 keeps everything: no sampling at all
+			}
 		}
 		if len(r.Match) == 0 && len(r.MatchRegexp) == 0 {
 			return nil, fmt.Errorf("logs rule %d: empty match would apply to every line; use an explicit __line__ selector instead", i)
@@ -128,8 +154,8 @@ func (f *LineFilter) Keep(lookup func(string) string, line string) bool {
 			continue
 		}
 		keep = !r.drop
-		if keep && r.every > 1 {
-			keep = (r.picked.Add(1)-1)%r.every == 0
+		if keep && r.keep > 0 {
+			keep = r.sampled()
 		}
 		break
 	}

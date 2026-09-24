@@ -31,11 +31,10 @@ import (
 // keeps apart from the drained one so that "a rolling update must not page like
 // an abuse event".
 func TestNonBlockingLookupsDoNotSpendTheReadinessParkBudget(t *testing.T) {
-	st := store.New(time.Minute)
+	st := store.New(time.Minute, store.WithMaxWaiters(1))
 	// One slot, held below by a genuine blocking lookup: the cap is what makes
 	// a stolen slot observable. Everything asserted here is about the wait=0
 	// request, which must never be looking at this budget at all.
-	st.SetMaxWaiters(1)
 	api := New(Config{
 		Store:    st,
 		Services: services.NewIndex(),
@@ -60,15 +59,13 @@ func TestNonBlockingLookupsDoNotSpendTheReadinessParkBudget(t *testing.T) {
 	// The genuine blocking lookup: it parks on the readiness gate and holds the
 	// only slot until Drain answers it.
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		resp, err := client.Get(srv.URL + "/v1/containers/" + strings.Repeat("b", 64) + "?wait=30s")
 		if err == nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
 		}
-	}()
+	})
 	deadline := time.Now().Add(10 * time.Second)
 	for api.readyParked.Load() == 0 {
 		if time.Now().After(deadline) {
@@ -114,8 +111,7 @@ func TestNonBlockingLookupsDoNotSpendTheReadinessParkBudget(t *testing.T) {
 // caches ARE synced: with the cap full it is answered normally, because
 // waitReady returns before any of this.
 func TestNonBlockingLookupIsUnaffectedOnceSynced(t *testing.T) {
-	st := store.New(time.Minute)
-	st.SetMaxWaiters(1)
+	st := store.New(time.Minute, store.WithMaxWaiters(1))
 	ready := make(chan struct{})
 	close(ready)
 	api := New(Config{

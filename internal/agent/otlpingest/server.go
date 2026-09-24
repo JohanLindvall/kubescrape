@@ -2,14 +2,11 @@ package otlpingest
 
 import (
 	"context"
-	"errors"
 	"log/slog"
+	"math"
 	"net/http"
-	"strconv"
 	"sync/atomic"
 	"time"
-
-	"github.com/JohanLindvall/kubescrape/internal/obs"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -18,14 +15,9 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
-	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	grpcpeer "google.golang.org/grpc/peer"
-	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
@@ -124,6 +116,19 @@ type ServerConfig struct {
 	// RejectTraces' marker: this package must not know route's or transform's
 	// spellings. The zero value strips nothing.
 	ReservedAttrs ReservedAttrs
+	// Scrub redacts sensitive values from every pushed log body — every string
+	// leaf of a structured one (scrub.go) — as the FIRST per-record step of the
+	// log chain, before the lift, enrichment, log-metrics and the rules read
+	// it, and whatever the body's size: enrichment copies body slices
+	// (exception attributes) that must not carry secrets, and the metric/rule
+	// chain matches against the same scrubbed view. nil scrubs nothing. The
+	// producers' chain takes the same scrubber (logchain.Config.Scrub).
+	Scrub *logscrub.Scrubber
+	// EnrichLines parses each pushed log record's body for a timestamp,
+	// severity, trace/span IDs and structured fields (-enrich, the same flag
+	// the tailer's line enrichment reads), filling only fields the sender left
+	// unset — over the chain's one bounded rendering of the body (logchain.go).
+	EnrichLines bool
 	// Rules is the global logs.rules keep/drop/sample chain, applied to
 	// INGESTED log records after enrichment (so __severity__ selects on the
 	// enriched severity) — the same chain, same semantics, as the tailer,
@@ -142,7 +147,8 @@ type ServerConfig struct {
 	// deliberately NOT. A producer applies those by GROUPING records into a
 	// resource that carries them, and an ingested record already lives in the
 	// sender's own grouping — writing them onto the shared resource would
-	// stamp one record's lifted values onto every other record beside it. They
+	// stamp one record's lifted values onto every other record beside it.
+	//
 	// The RESOURCE half still RESOLVES for metric labels and rule keys
 	// (Resolver.SetLifted takes exactly that slice — logchain.go), which is
 	// where the divergence was actually visible. The SCOPE half is dropped on
@@ -170,7 +176,8 @@ type ServerConfig struct {
 	// counterpart here — and it is a real memory grant on an unauthenticated
 	// listener: the tap reserves exactly this much per push, and the byte
 	// budget scales with it (NewServer) so a single legal push always fits.
-	// The HTTP body cap is unaffected (maxIngestBody, already 16 MiB).
+	// The HTTP body cap is unaffected (maxIngestBody, already 16 MiB). Values
+	// past what gRPC can frame (4 GiB - 1) are clamped to it.
 	MaxRecvBytes int
 	// Ready is called once every configured listener is BOUND (not once
 	// something has been received). It is what a readiness gate hangs on: a
@@ -204,10 +211,14 @@ type Server struct {
 	// admit.go). Tests lower its limit to exercise the refusal.
 	buffer *byteBudget
 	// decoded bounds what those bytes inflate INTO — the structural half of
-	// the decoded pdata, charged after the unmarshal and released with the
-	// handler (admit.go). Neither of the other two bounds covers it: a count
-	// cannot bound a size, and 30 wire bytes can mint a ResourceLogs.
+	// the decoded pdata, estimated from the wire bytes and charged BEFORE the
+	// unmarshal, released with the handler (admit.go, decodedsize.go). Neither
+	// of the other two bounds covers it: a count cannot bound a size, and 30
+	// wire bytes can mint a ResourceLogs.
 	decoded *byteBudget
+	// claims hands a gRPC push's decoded charge from the codec, which takes it,
+	// to the interceptor, which releases it or answers its refusal.
+	claims decodedClaims
 	// decodedWarns throttles the one line worth saying about it: a single
 	// push whose structure alone exceeds the whole budget can never be
 	// admitted, and an operator would otherwise read the resulting stream of
@@ -222,6 +233,10 @@ type Server struct {
 	// grpcMaxRecv is the resolved MaxRecvBytes: the per-message gRPC cap and
 	// the tap's per-push reservation.
 	grpcMaxRecv int
+	// stampPeer records, once, whether the enricher reads the connection's peer
+	// address (its opt-in peer-IP fallback); both transports stamp the address
+	// onto the request context only then (peer.go says what the stamp costs).
+	stampPeer bool
 	// body reads one HTTP request body against that budget and this receiver's
 	// cap. The same reader serves the trace tier's internal listener with a
 	// different cap and no budget (httpbody.go).
@@ -244,7 +259,8 @@ type Server struct {
 	// instrumentation bug shipped on every push, and the count rides the line.
 	emptyMetricWarns logdedupe.Throttle
 	// chainSkipWarns throttles the ingested-log-chain skip line, per reason
-	// (logchain.go). Keyed: three bounds, three different sender-side fixes.
+	// (logchain.go). Keyed: four bounds, four different sender-side fixes, and
+	// sized from chainSkipReasons so no reason can be crowded out.
 	chainSkipWarns *logdedupe.Table
 	// shedWarns throttles the admission-bound shedding line, per bound
 	// (noteShed). Keyed rather than keyless because the three bounds are three
@@ -267,14 +283,18 @@ func NewServer(cfg ServerConfig) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	n := cfg.MaxInFlight
-	if n <= 0 {
-		n = defaultMaxInFlight
-	}
-	recv := cfg.MaxRecvBytes
-	if recv <= 0 {
-		recv = maxIngestGRPCMessage
-	}
+	n := EffectiveMaxInFlight(cfg.MaxInFlight)
+	// EffectiveMaxRecvBytes: the default when unset, then clamped to the
+	// largest message gRPC can FRAME (a uint32 length prefix), before
+	// anything is derived from it. A larger value authorises nothing a
+	// sender could deliver, and it is what kept the arithmetic below honest: at
+	// math.MaxInt the 4x budget wrapped negative and was ignored (the buffer
+	// stayed at its 64 MiB floor while each tap reserved MaxInt, so a
+	// reservation with ANY bytes already held wrapped `used` negative and was
+	// admitted — the budget off), and past MaxInt/8 the decoded limit went
+	// negative and refused every push. reserveWindowFor guards its own
+	// multiply; these did not.
+	recv := EffectiveMaxRecvBytes(cfg.MaxRecvBytes)
 	// The budget must scale with the reservation size: at the fixed
 	// 4x-maxIngestBody it holds sixteen default-size gRPC reservations, but a
 	// raised MaxRecvBytes past maxIngestBody would leave room for fewer than
@@ -288,140 +308,18 @@ func NewServer(cfg ServerConfig) *Server {
 		inFlight:      make(chan struct{}, n),
 		maxInFlight:   n,
 		grpcMaxRecv:   recv,
+		stampPeer:     cfg.Enricher.usesPeerIP(),
 		buffer:        &byteBudget{limit: budget},
 		decoded:       &byteBudget{limit: decodedBudgetFactor * budget},
 		reserveWindow: reserveWindowFor(recv),
 		reservedWarns: logdedupe.New(len(cfg.ReservedAttrs.Resource)+len(cfg.ReservedAttrs.Element)+
 			len(cfg.ReservedAttrs.Identity), reservedWarnEvery),
-		shedWarns:      logdedupe.New(3, shedWarnEvery),      // one key per admission bound
-		chainSkipWarns: logdedupe.New(3, chainSkipWarnEvery), // one key per chain-skip reason
-		forwardWarns:   logdedupe.New(3, forwardWarnEvery),   // one key per signal
+		shedWarns:      logdedupe.New(3, shedWarnEvery), // one key per admission bound
+		chainSkipWarns: logdedupe.New(len(chainSkipReasons), chainSkipWarnEvery),
+		forwardWarns:   logdedupe.New(3, forwardWarnEvery), // one key per signal
 	}
-	s.body = newBodyReader(maxIngestBody, s.buffer, log)
+	s.body = newIngestBodyReader(maxIngestBody, s.buffer, log)
 	return s
-}
-
-// acquire takes an in-flight slot without waiting. A sender that is refused
-// gets a RETRYABLE answer (429 / ResourceExhausted): the payload is intact and
-// the sender owns the retry — far better than accepting it and running the
-// node out of memory, or queueing it and turning back-pressure into latency
-// the sender cannot see.
-func (s *Server) acquire() bool {
-	select {
-	case s.inFlight <- struct{}{}:
-		return true
-	default:
-		obs.IngestRejected.WithLabelValues(shedInFlight).Inc()
-		return false
-	}
-}
-
-func (s *Server) release() { <-s.inFlight }
-
-// chargeDecoded reserves a push's estimated decoded structure, reporting
-// whether it fits. A refusal is the same event as a full byte budget or a full
-// slot table — obs.IngestRejected, answered retryably by both transports — with
-// one addition: a push too big for the WHOLE budget is a sender that must batch
-// smaller, and no amount of back-pressure will teach it that, so it gets a line.
-func (s *Server) chargeDecoded(n int64) bool {
-	if n <= 0 || s.decoded.reserve(n) {
-		return true
-	}
-	obs.IngestRejected.WithLabelValues(shedDecoded).Inc()
-	if n > s.decoded.limit && s.decodedWarns.Allow(decodedWarnEvery) {
-		s.log.Warn("ingest: refused a push whose decoded structure alone exceeds the receiver's whole "+
-			"decoded budget; every retry of it will be refused too — the sender must batch smaller",
-			"estimatedBytes", n, "budgetBytes", s.decoded.limit)
-	}
-	return false
-}
-
-// decodedWarnEvery paces that line: a sender batching this large batches this
-// large on every push.
-const decodedWarnEvery = time.Minute
-
-// limitUnary applies the COUNT bound to gRPC pushes and hands the pre-decode
-// reservation over to it.
-//
-// The ORDER is load-bearing and it used to be the other way round. The message
-// is already decoded by the time this runs, so the pre-decode reservation is
-// the only thing accounting for it; releasing that first and only then asking
-// for a slot left a window in which the payload was charged to NOTHING, and a
-// refused push released a reservation it had already given up — so a peer could
-// hold as many decoded messages resident as it could open streams, bounded by
-// the count alone. Take the slot first, then hand the accounting over.
-//
-// What is deliberately NOT here is the DECODED-STRUCTURE charge, and its
-// absence is the correction of a bound that measured zero in production for as
-// long as it existed. grpc-go hands an interceptor the message its GENERATED
-// handler decoded into; for pdata that is *pdata/internal.ExportLogsServiceRequest
-// (and its two siblings), because the public plogotlp.ExportRequest wrapper is
-// constructed one layer further in, by rawLogsServer.Export. The type is in
-// pdata's internal/, so NO type switch here can name it — the charge that sat
-// here matched nothing, reserved nothing, and left a decoded gRPC payload
-// bounded by this count alone, which admit.go's header says in as many words a
-// count cannot do. It is taken in the three Export methods below, where the
-// typed request exists.
-func (s *Server) limitUnary(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-	if !s.acquire() {
-		s.noteShed(shedInFlight, grpcPeerAddr(ctx))
-		return nil, exhaustedStatus("too many concurrent pushes; retry")
-	}
-	defer s.release()
-	// The slot is held: the reservation tapAdmit took for the read has done its
-	// job and the message buffer itself is already freed by the codec.
-	releaseReservation(ctx)
-	return handler(ctx, req)
-}
-
-// chargeDecodedGRPC charges one gRPC push's estimated decoded structure and
-// returns the release, which the caller defers so EVERY exit — refusal from a
-// downstream guard, a failed forward, an early ack — gives the budget back.
-//
-// The refusal is the retryable ResourceExhausted + RetryInfo that the HTTP arm
-// spells 429 + Retry-After (exhaustedStatus): one condition, one answer,
-// whichever transport a sender used. Bare ResourceExhausted reads as PERMANENT
-// to conformant senders, and a shed that loses data is worse than the OOM it
-// prevents.
-func (s *Server) chargeDecodedGRPC(ctx context.Context, n int64) (func(), error) {
-	if !s.chargeDecoded(n) {
-		s.noteShed(shedDecoded, grpcPeerAddr(ctx))
-		return nil, exhaustedStatus(errDecodedBudget.Error())
-	}
-	return func() { s.decoded.release(n) }, nil
-}
-
-// tooDeepWarnEvery paces the wire-shape refusal warning: a sender emitting a
-// body this deep emits it on every push, and one line names the condition.
-const tooDeepWarnEvery = time.Minute
-
-// noteTooDeep reports a payload refused for its nesting on the gRPC arm. It
-// counts into the same series as the HTTP door's refusals
-// (obs.IngestBodyRejected{reason="too_deep"}) because it is the same event —
-// an application push refused at a listener nothing authenticates — reached
-// through the other transport; the HTTP arm's own counting happens in
-// BodyReader.noteRejected.
-func (s *Server) noteTooDeep() {
-	obs.IngestBodyRejected.WithLabelValues(reasonTooDeep).Inc()
-	if s.tooDeepWarns.Allow(tooDeepWarnEvery) {
-		s.log.Warn("ingest: refused a gRPC push whose payload nests deeper than the decoder may recurse; "+
-			"decoding it costs unbounded goroutine stack, so the shape is refused before the decode",
-			"maxDepth", maxNestingDepth)
-	}
-}
-
-// exhaustedStatus builds the gRPC refusal. ResourceExhausted ALONE reads as
-// PERMANENT to conformant senders — the OTLP spec makes it retryable only with
-// RetryInfo attached, and both the OTel SDK and the Collector drop the batch
-// without it. A shed that loses the data is worse than the OOM it prevents, so
-// the hint rides along, mirroring the HTTP arm's Retry-After: 1.
-func exhaustedStatus(msg string) error {
-	st, err := status.New(codes.ResourceExhausted, msg).
-		WithDetails(&errdetails.RetryInfo{RetryDelay: durationpb.New(time.Second)})
-	if err != nil {
-		return status.Error(codes.ResourceExhausted, msg)
-	}
-	return st.Err()
 }
 
 // Run serves until ctx is cancelled, then shuts both listeners down. The
@@ -432,7 +330,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	if s.cfg.GRPCAddr != "" {
 		l.GRPCAddr = s.cfg.GRPCAddr
-		l.GRPC = grpc.NewServer(
+		l.GRPC = grpc.NewServer(append([]grpc.ServerOption{
 			KeepaliveOption(),
 			// What each of these actually bounds, since they are easy to
 			// over-credit:
@@ -449,11 +347,12 @@ func (s *Server) Run(ctx context.Context) error {
 			//     transports. It runs in the unary interceptor, i.e. AFTER
 			//     grpc-go has decoded the message, so it does not bound the
 			//     decode itself.
-			//   - The tap (tapAdmit, admit.go) is what bounds the decode: it
+			//   - The tap (tapAdmit, grpcadmit.go) is what bounds the decode: it
 			//     runs on the HEADERS frame, before grpc-go reads the message,
 			//     and reserves MaxRecvMsgSize from the server-wide byte budget
-			//     for at most grpcReserveWindow — a peer that sends no message
-			//     loses the reservation and the stream with it.
+			//     for at most the decode window (reserveWindowFor) — a peer
+			//     that does not finish its message inside it loses the
+			//     reservation and the stream with it.
 			//     That closes the gap the previous three left — unbounded
 			//     concurrent BUFFERING — and it can carry the RetryInfo a shed
 			//     needs, because writeEarlyAbort forwards a status' details.
@@ -463,14 +362,14 @@ func (s *Server) Run(ctx context.Context) error {
 			// tap runs, at a 16 MiB default (MaxHeaderListSizeOption).
 			MaxHeaderListSizeOption(),
 			grpc.MaxConcurrentStreams(uint32(s.maxInFlight)),
-			grpc.InTapHandle(s.tapAdmit),
-			grpc.UnaryInterceptor(s.limitUnary),
-			// And this is what bounds the DECODE ITSELF (depth.go): the
-			// message is unmarshalled before the interceptor runs, so a
-			// payload's nesting — which costs unbounded goroutine stack — can
-			// only be refused from inside the codec.
-			NestingGuardOption(s.noteTooDeep),
-		)
+			// And admissionOptions is the tap, the interceptor, the codec —
+			// what bounds the DECODE ITSELF (depth.go): the message is
+			// unmarshalled before the interceptor runs, so a payload's nesting,
+			// which costs unbounded goroutine stack, can only be refused from
+			// inside the codec, and so can what it inflates into (the
+			// decoded-structure charge, decodedClaims) — and the stats handler
+			// that returns a charge whose RPC never reached the interceptor.
+		}, s.admissionOptions()...)...)
 		if s.cfg.Exporter != nil {
 			plogotlp.RegisterGRPCServer(l.GRPC, &logsGRPC{s: s})
 			pmetricotlp.RegisterGRPCServer(l.GRPC, &metricsGRPC{s: s})
@@ -493,50 +392,6 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	return l.Run(ctx)
-}
-
-// --- gRPC ---
-
-// grpcExport is the shared shape of the three gRPC Export wrappers: stamp the
-// connection's peer address into ctx (the enricher's peer-IP fallback reads
-// it), run the signal's enrich-and-forward step, and map a failure onto a
-// status the sender's SDK retries correctly (grpcForwardCode) carrying the
-// fixed text an unauthenticated sender is entitled to (forwardFailureText).
-// The detail goes to the log (noteForwardFailure).
-func (s *Server) grpcExport(ctx context.Context, signal string, forward func(ctx context.Context) error) error {
-	pctx := grpcPeerCtx(ctx)
-	err := forward(pctx)
-	if err == nil {
-		return nil
-	}
-	// This receiver's OWN refusal keeps its words (receiveRefusal); only a
-	// forward failure — whose text is the collector's — is redacted.
-	if inner, ok := receiveRefused(err); ok {
-		return grpcForwardStatus(inner)
-	}
-	return redactedForwardStatus(err, s.noteForwardFailure(signal, grpcPeerAddr(ctx), err))
-}
-
-type logsGRPC struct {
-	plogotlp.UnimplementedGRPCServer
-	s *Server
-}
-
-func (g *logsGRPC) Export(ctx context.Context, req plogotlp.ExportRequest) (plogotlp.ExportResponse, error) {
-	// The decoded structure is charged HERE rather than in limitUnary, which
-	// cannot see the typed request at all (see there), and it is held for the
-	// whole enrich-and-forward step exactly as the HTTP arm holds it for the
-	// whole handler: the payload stays resident until the collector acks.
-	release, err := g.s.chargeDecodedGRPC(ctx, decodedLogsSize(req.Logs()))
-	if err != nil {
-		return plogotlp.ExportResponse{}, err
-	}
-	defer release()
-	err = g.s.grpcExport(ctx, "logs", func(ctx context.Context) error { return g.s.forwardLogs(ctx, req.Logs()) })
-	if err != nil {
-		return plogotlp.ExportResponse{}, err
-	}
-	return plogotlp.NewExportResponse(), nil
 }
 
 // forwardLogs is the enrich-and-forward step for a decoded logs push, shared
@@ -571,6 +426,7 @@ func (g *logsGRPC) Export(ctx context.Context, req plogotlp.ExportRequest) (plog
 func (s *Server) forwardLogs(ctx context.Context, ld plog.Logs) error {
 	s.sanitizeLogs(ld)
 	s.admitLogs(ld)
+	s.dedupeLogResources(ld)
 	s.cfg.Enricher.EnrichLogs(ctx, ld)
 	cc, forward := s.applyLogChain(ld)
 	if !forward {
@@ -618,180 +474,6 @@ func (s *Server) forwardTraces(ctx context.Context, td ptrace.Traces) error {
 	return s.cfg.Traces.ExportTraces(ctx, td)
 }
 
-type metricsGRPC struct {
-	pmetricotlp.UnimplementedGRPCServer
-	s *Server
-}
-
-func (g *metricsGRPC) Export(ctx context.Context, req pmetricotlp.ExportRequest) (pmetricotlp.ExportResponse, error) {
-	// Charged here for the same reason as the logs arm, and estimated BEFORE
-	// pruning: the point-less metrics emptymetrics.go removes are resident by
-	// the time it runs.
-	release, err := g.s.chargeDecodedGRPC(ctx, decodedMetricsSize(req.Metrics()))
-	if err != nil {
-		return pmetricotlp.ExportResponse{}, err
-	}
-	defer release()
-	err = g.s.grpcExport(ctx, "metrics", func(ctx context.Context) error { return g.s.forwardMetrics(ctx, req.Metrics()) })
-	if err != nil {
-		return pmetricotlp.ExportResponse{}, err
-	}
-	return pmetricotlp.NewExportResponse(), nil
-}
-
-// retryableStatus reports whether a sender's SDK will retry a batch that came
-// back with this status, per the OTLP specification's list.
-func retryableStatus(st *status.Status) bool {
-	switch st.Code() {
-	case codes.Canceled, codes.DeadlineExceeded, codes.Aborted,
-		codes.OutOfRange, codes.Unavailable, codes.DataLoss:
-		return true
-	case codes.ResourceExhausted:
-		// Retryable ONLY when it carries RetryInfo — the same rule this
-		// receiver honours when IT sheds a push (see exhaustedStatus). Without
-		// the detail both the OTel SDK and the Collector drop the batch, so a
-		// bare ResourceExhausted relayed verbatim is a silent data loss; it
-		// gets rewritten to Unavailable below instead.
-		for _, d := range st.Details() {
-			if _, ok := d.(*errdetails.RetryInfo); ok {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// grpcForwardStatus maps a forwarding failure onto a gRPC status the sender's
-// SDK retries correctly. A bare error would surface as codes.Unknown —
-// NON-retryable per the OTLP spec — making senders permanently drop batches on
-// transient conditions (a full disk buffer, an upstream 5xx).
-//
-// Permanence is classified by otlpexport.IsPermanent, the single source of
-// truth, and that classification has to come FIRST. Passing an upstream status
-// through on sight — which is what this used to do — made IsPermanent dead code
-// for the DEFAULT gRPC upstream, because virtually every failure from it is a
-// status error. So an upstream Unauthenticated/PermissionDenied (a collector
-// token mid-rotation) or Internal reached the pushing application, which reads
-// all three as NON-retryable and drops the batch — while IsPermanent
-// deliberately classifies auth failures and 404 as TRANSIENT, and the HTTP arm
-// of this same receiver answered 503 for the identical error. One receiver, two
-// answers, and the wrong one lost data.
-//
-// An upstream status is still preserved where it is genuinely more informative
-// than Unavailable, but only when the sender will also read it as retryable —
-// otherwise the code is rewritten rather than relayed.
-func grpcForwardStatus(err error) error {
-	code := grpcForwardCode(err)
-	// Already the answer this function would build (the trace tier's receive
-	// guard returns exactly this): relay it verbatim. Re-wrapping rendered the
-	// sender `code = InvalidArgument desc = rpc error: code = InvalidArgument
-	// desc = …`, burying the reason it needs one nesting deep inside the field
-	// it reads first — and for a retryable upstream status it would also drop
-	// the details, of which RetryInfo is load-bearing (see retryableStatus).
-	if st, ok := status.FromError(err); ok && st.Code() == code {
-		return err
-	}
-	return status.Error(code, err.Error())
-}
-
-// grpcForwardCode is grpcForwardStatus' classification on its own, so the
-// redacting arm (redactedForwardStatus) cannot drift from the relaying one.
-//
-// Only definitive upstream rejections become InvalidArgument (do not retry).
-// Everything else — diskqueue.ErrFull back-pressure, upstream 5xx, 401/403/404
-// windows, timeouts, unclassified failures — is retryable: the receiver is a
-// proxy, and the sender retrying is the safe default. An upstream status keeps
-// its own code where that is genuinely more informative than Unavailable, but
-// only when the sender will also read it as retryable.
-func grpcForwardCode(err error) codes.Code {
-	if otlpexport.IsPermanent(err) {
-		return codes.InvalidArgument
-	}
-	if st, ok := status.FromError(err); ok && retryableStatus(st) {
-		return st.Code()
-	}
-	return codes.Unavailable
-}
-
-// forwardFailureText is the whole of what an application-facing listener tells
-// a sender about a failed forward: the classification, and nothing else.
-//
-// What it replaces is the error's own rendering, and that was a disclosure on a
-// listener with no credentials. The text named the collector — net/http renders
-// a failed POST as `Post "https://otel-collector.monitoring:4318/v1/logs": dial
-// tcp 10.96.4.7:4318: connect: connection refused`, i.e. host, port, path and
-// resolved address — quoted the collector's own response BODY verbatim
-// (otlpexport.HTTPStatusError), and, with routing configured, flattened EVERY
-// tenant destination's error onto one line (route's partialFailure), so a
-// single push from any pod that could reach the port enumerated the fleet's
-// downstream topology. None of it is actionable by a sender: the only thing it
-// can do with a forward failure is honour the status, which the status already
-// says. The detail goes to the operator's side of the door instead
-// (Server.noteForwardFailure).
-func forwardFailureText(err error) string {
-	if otlpexport.IsPermanent(err) {
-		return "the payload was rejected downstream; retrying it will not help"
-	}
-	return "could not forward the payload; retry"
-}
-
-// redactedForwardStatus is grpcForwardStatus with the sender-facing message
-// replaced by forwardFailureText's fixed one.
-//
-// It rebuilds from the status PROTO rather than through status.Error so the
-// details survive: retryableStatus relays an upstream ResourceExhausted only
-// because it carries RetryInfo, and both the OTel SDK and the Collector drop a
-// batch on a bare one — so a redaction that dropped the detail would answer a
-// retryable condition with a status the sender treats as permanent, which is
-// the one way this change could lose data. status.Status.Proto already returns
-// a clone, so the message is ours to overwrite.
-func redactedForwardStatus(err error, msg string) error {
-	code := grpcForwardCode(err)
-	if st, ok := status.FromError(err); ok && st.Code() == code {
-		p := st.Proto()
-		p.Message = msg
-		return status.ErrorProto(p)
-	}
-	return status.Error(code, msg)
-}
-
-// forwardWarnEvery paces the forward-failure narration. A collector that cannot
-// be reached is a STATE, and every sender on the node pushes into it, so the
-// useful information is one line per signal per window rather than one per
-// push. The exporter's own destination-health report (otlpexport/report.go)
-// narrates the same outage from the sending side; this line exists because the
-// detail it carries — which tenant destination failed, what the collector
-// actually said — is the detail forwardFailureText no longer gives the sender,
-// and it must not simply vanish.
-const forwardWarnEvery = time.Minute
-
-// noteForwardFailure keeps a failed forward's detail on the operator's side of
-// the door and returns the fixed text the sender gets instead.
-func (s *Server) noteForwardFailure(signal, peer string, err error) string {
-	if allow, _ := s.forwardWarns.Allow(signal); allow {
-		s.log.Warn("ingest: forwarding a pushed payload failed; the sender is answered a status and no detail, so the detail is here",
-			"signal", signal,
-			"peer", peer,
-			"outcome", forwardOutcome(err),
-			"error", err)
-	}
-	return forwardFailureText(err)
-}
-
-// forwardOutcome labels the failure the way obs.Exports does, so the log line
-// and the export counters read the same way.
-func forwardOutcome(err error) string {
-	if otlpexport.IsPermanent(err) {
-		return "permanent"
-	}
-	return "transient"
-}
-
-type tracesGRPC struct {
-	ptraceotlp.UnimplementedGRPCServer
-	s *Server
-}
-
 // rejectTraces consults the receive-path guard (ServerConfig.RejectTraces). It
 // is the FIRST step of both trace handlers and the last one that may run before
 // EnrichTraces: a payload this refuses must cost no metadata lookup and move no
@@ -806,294 +488,12 @@ func (s *Server) rejectTraces(ctx context.Context, td ptrace.Traces) error {
 	return nil
 }
 
-// receiveRefusal marks an error the RECEIVE-path guard produced
-// (ServerConfig.RejectTraces) rather than the forward, so the two can be
-// answered differently — which they must be.
-//
-// A FORWARD failure's text belongs to the collector: the endpoint it names, the
-// address it resolved to, the body it answered with, and with routing on every
-// tenant destination's error. None of that is the sender's business and all of
-// it is disclosure on a listener with no credentials, so forwardFailureText
-// replaces it.
-//
-// A RECEIVE refusal is kubescrape's OWN sentence about the payload in front of
-// it. The tier's loop guard is the case that exists today: it names the
-// re-shard marker and nothing else, the sender that trips it is a misconfigured
-// kubescrape hop pointed at an application port, and the marker's name is the
-// only thing that tells an operator which hop to fix. So it is relayed verbatim
-// — which also means a guard OWNS what its text says to an unauthenticated
-// sender, and must not put a destination in it.
-//
-// The wrapper never reaches a classifier: receiveRefused unwraps before anything
-// calls otlpexport.IsPermanent or status.FromError, so marking a refusal cannot
-// change how it is graded.
-type receiveRefusal struct{ err error }
-
-func (r receiveRefusal) Error() string { return r.err.Error() }
-func (r receiveRefusal) Unwrap() error { return r.err }
-
-// receiveRefused returns the wrapped guard error, if that is what this is.
-func receiveRefused(err error) (error, bool) {
-	var r receiveRefusal
-	if errors.As(err, &r) {
-		return r.err, true
-	}
-	return nil, false
-}
-
-func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (ptraceotlp.ExportResponse, error) {
-	// Charged here for the same reason as the logs arm — including for a
-	// payload RejectTraces will refuse: the spans are already decoded and
-	// resident when the guard runs.
-	release, err := g.s.chargeDecodedGRPC(ctx, decodedTracesSize(req.Traces()))
-	if err != nil {
-		return ptraceotlp.ExportResponse{}, err
-	}
-	defer release()
-	err = g.s.grpcExport(ctx, "traces", func(ctx context.Context) error { return g.s.forwardTraces(ctx, req.Traces()) })
-	if err != nil {
-		return ptraceotlp.ExportResponse{}, err
-	}
-	return ptraceotlp.NewExportResponse(), nil
-}
-
-// --- HTTP (OTLP/HTTP protobuf) ---
-
-// servePush is the ONE body of the three HTTP push handlers; they differ only
-// in the codec (unmarshal) and the enrich-and-forward step (handle). The
-// sequence is load-bearing and its steps are ordered deliberately:
-//
-//  1. Read the body (BodyReader: media type, gzip, caps, byte budget) —
-//     failures answer through WriteBodyError: 413 over either cap, 415 on the
-//     media type, 429 + Retry-After when the byte budget is full, 503 for an
-//     upload that ENDED rather than arrived (a killed pod, a rolled
-//     deployment, the server's own ReadTimeout — retryable, and deliberately
-//     not 400 or 408; see BodyErrorStatus), 400 for everything else.
-//  2. The charge is released when the HANDLER returns, not when the read
-//     ends: the body stays alive through enrichment and the forward, so
-//     releasing earlier would leave the bytes resident and unaccounted.
-//  3. The in-flight slot is acquired AFTER the read: holding a slot across
-//     the upload let 32 trickled 16 MiB bodies shed every other sender on
-//     the node for a ReadTimeout (60s) — no credentials required, on an
-//     unauthenticated listener, which is the threat the bound exists for.
-//     What bounds the read itself is the byte budget the body was charged
-//     against (admit.go), not this slot. The gRPC arm is naturally on this
-//     side of the decode. A refusal is RETRYABLE by design (429 +
-//     Retry-After: 1): the sender still holds the payload.
-//  4. A payload that does not unmarshal is 400 — permanent; retrying a
-//     malformed batch can never succeed.
-//  5. The DECODED payload is charged its own budget, held for the rest of the
-//     handler exactly as the raw body's charge is: the raw bytes bound what
-//     arrives, not what it inflates into, and 30 wire bytes can mint a
-//     ResourceLogs (admit.go). Over it, 429 + Retry-After, like the byte
-//     budget — the sender still holds an intact payload.
-//  6. A forward failure maps through HTTPForwardStatus (permanent 400 vs
-//     retryable 503), and success answers with the OTLP proto response.
-func (s *Server) servePush(w http.ResponseWriter, r *http.Request,
-	signal string,
-	// decode unmarshals the body and returns the ESTIMATED decoded structure
-	// (decodedLogsSize and its siblings), which only the caller knows the
-	// signal of.
-	decode func(body []byte) (int64, error),
-	handle func(ctx context.Context) (ProtoMarshaler, error),
-) {
-	body, charged, err := s.body.Read(r)
-	if err != nil {
-		// The door's own refusals (media type, caps, a truncated upload) are
-		// counted AND warned inside the reader, per reason. The byte BUDGET is
-		// not one of those — it is this receiver protecting itself rather than
-		// the request being wrong — so it is narrated here, on the arm that
-		// still holds the request and can name the sender.
-		if errors.Is(err, errBufferBudget) {
-			s.noteShed(shedBuffer, r.RemoteAddr)
-		}
-		WriteBodyError(w, err)
-		return
-	}
-	defer s.body.Release(charged)
-	if !s.acquire() {
-		s.noteShed(shedInFlight, r.RemoteAddr)
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "too many concurrent pushes", http.StatusTooManyRequests)
-		return
-	}
-	defer s.release()
-	decoded, err := decode(body)
-	if err != nil {
-		// The same door as the read above, and the same reason label: a body
-		// that arrived intact and is not OTLP. This was answered and counted by
-		// NOTHING while the seam three lines up owned a reason literally called
-		// "malformed" — the likelier of the two ways to be wrong was the
-		// invisible one.
-		s.body.noteMalformed(r, err)
-		http.Error(w, "malformed OTLP "+signal+" payload", http.StatusBadRequest)
-		return
-	}
-	if !s.chargeDecoded(decoded) {
-		s.noteShed(shedDecoded, r.RemoteAddr)
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, errDecodedBudget.Error(), http.StatusTooManyRequests)
-		return
-	}
-	defer s.decoded.release(decoded)
-	resp, err := handle(withPeerIP(r.Context(), r.RemoteAddr))
-	if err != nil {
-		// This receiver's own receive-path refusal keeps its words; a FORWARD
-		// failure does not (see forwardFailureText — its text named the
-		// collector, quoted its response body and, with routing on, enumerated
-		// every tenant destination, to whoever could reach an unauthenticated
-		// port). noteForwardFailure keeps that detail in the log.
-		if inner, ok := receiveRefused(err); ok {
-			http.Error(w, inner.Error(), HTTPForwardStatus(inner))
-			return
-		}
-		http.Error(w, s.noteForwardFailure(signal, r.RemoteAddr, err), HTTPForwardStatus(err))
-		return
-	}
-	WriteProto(w, resp)
-}
-
-func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
-	req := plogotlp.NewExportRequest()
-	decode := func(body []byte) (int64, error) {
-		if err := req.UnmarshalProto(body); err != nil {
-			return 0, err
-		}
-		return decodedLogsSize(req.Logs()), nil
-	}
-	s.servePush(w, r, "logs", decode, func(ctx context.Context) (ProtoMarshaler, error) {
-		if err := s.forwardLogs(ctx, req.Logs()); err != nil {
-			return nil, err
-		}
-		return plogotlp.NewExportResponse(), nil
-	})
-}
-
-func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
-	req := pmetricotlp.NewExportRequest()
-	decode := func(body []byte) (int64, error) {
-		if err := req.UnmarshalProto(body); err != nil {
-			return 0, err
-		}
-		return decodedMetricsSize(req.Metrics()), nil
-	}
-	s.servePush(w, r, "metrics", decode, func(ctx context.Context) (ProtoMarshaler, error) {
-		if err := s.forwardMetrics(ctx, req.Metrics()); err != nil {
-			return nil, err
-		}
-		return pmetricotlp.NewExportResponse(), nil
-	})
-}
-
-func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
-	req := ptraceotlp.NewExportRequest()
-	decode := func(body []byte) (int64, error) {
-		if err := req.UnmarshalProto(body); err != nil {
-			return 0, err
-		}
-		return decodedTracesSize(req.Traces()), nil
-	}
-	s.servePush(w, r, "traces", decode, func(ctx context.Context) (ProtoMarshaler, error) {
-		if err := s.forwardTraces(ctx, req.Traces()); err != nil {
-			return nil, err
-		}
-		return ptraceotlp.NewExportResponse(), nil
-	})
-}
-
 const maxIngestBody = 16 << 20 // 16 MiB per request
 
 // maxIngestGRPCMessage caps ONE decoded gRPC message (grpc-go's own default,
 // stated here because the tap reserves exactly this much per push).
 const maxIngestGRPCMessage = 4 << 20
 
-// --- shedding: the CONTEXT half of obs.IngestRejected ---
-
-// The three admission bounds, as throttle keys and as the `reason` on the line.
-// They are the counter's three causes, spelled the same way, because "the
-// receiver is shedding" has three different fixes: too many senders at once,
-// too many raw bytes resident, or too much structure inflated out of them.
-const (
-	shedInFlight = "in_flight"
-	shedBuffer   = "buffer_bytes"
-	shedDecoded  = "decoded_bytes"
-)
-
-// shedWarnEvery paces the shedding line. A receiver at a bound stays at it for
-// as long as the load lasts, and every refused push would otherwise produce a
-// line — on an UNAUTHENTICATED listener, i.e. a log volume a stranger chooses.
-const shedWarnEvery = time.Minute
-
-// noteShed narrates a push refused by an admission bound. The COUNT is taken at
-// each bound (obs.IngestRejected, whose per-bound comments argue for it); this
-// is the half a counter cannot carry — which bound bound, what its limit is,
-// which flag moves it, and who was pushing.
-//
-// It matters because the refusal is INVISIBLE to everything except the sender:
-// the answer is retryable by design (429 + Retry-After / ResourceExhausted +
-// RetryInfo), so a well-behaved SDK simply retries and the operator sees
-// telemetry arriving late, or not at all, with nothing in this process's log
-// saying it refused anything. That was true of all three bounds.
-//
-// peer is empty where the transport cannot supply one. The gRPC pre-decode tap
-// is the real case: grpc-go runs it before the peer reaches the stream context
-// (server.go's peer.NewContext happens per RPC, after the tap) and tap.Info
-// carries no address, so the one refusal taken before any decode is also the
-// one that cannot name its sender. An empty key is omitted rather than logged
-// blank.
-func (s *Server) noteShed(reason, peer string) {
-	if allow, _ := s.shedWarns.Allow(reason); !allow {
-		return
-	}
-	args := []any{"reason", reason}
-	var limit int64
-	switch reason {
-	case shedInFlight:
-		limit = int64(s.maxInFlight)
-		args = append(args, "limit", limit, "flag", "-ingest-max-in-flight")
-	case shedBuffer:
-		limit = s.buffer.limit
-		args = append(args, "limitBytes", limit)
-		args = append(args, s.budgetSourceArgs()...)
-	case shedDecoded:
-		limit = s.decoded.limit
-		args = append(args, "limitBytes", limit)
-		args = append(args, s.budgetSourceArgs()...)
-	}
-	if peer != "" {
-		args = append(args, "peer", peer)
-	}
-	s.log.Warn("ingest: shedding pushes at an admission bound; senders are answered retryably and keep their "+
-		"payloads, so telemetry arrives late or not at all while this lasts", args...)
-}
-
-// budgetSourceArgs says where the byte budget that just bound came FROM, which
-// is not the same question as which flag exists. Both budgets derive from
-// max(maxBufferBytes, 4 x MaxRecvBytes) (NewServer), so at the default 4 MiB
-// receive cap the built-in floor is what binds and
-// -ingest-grpc-max-recv-bytes moves NOTHING until it is set above
-// maxBufferBytes/4. Naming the flag unconditionally — which this line used to
-// do — sends an operator to raise a value that cannot change the limit they
-// are reading in the same record, and the only evidence that it did nothing is
-// the shedding continuing.
-func (s *Server) budgetSourceArgs() []any {
-	if 4*int64(s.grpcMaxRecv) > int64(maxBufferBytes) {
-		return []any{"flag", "-ingest-grpc-max-recv-bytes", "recvBytes", s.grpcMaxRecv}
-	}
-	return []any{
-		"recvBytes", s.grpcMaxRecv,
-		"floorBytes", int64(maxBufferBytes),
-		"note", "the budget is at its built-in floor; -ingest-grpc-max-recv-bytes raises it only once set above " +
-			strconv.Itoa(maxBufferBytes/4) + " bytes, so shrink the senders' batches instead",
-	}
-}
-
-// grpcPeerAddr is the sender's address for a REFUSAL line. It is called only on
-// a refusal: p.Addr.String() allocates, and the admitted path must not pay for
-// a string nothing reads.
-func grpcPeerAddr(ctx context.Context) string {
-	if p, ok := grpcpeer.FromContext(ctx); ok && p.Addr != nil {
-		return p.Addr.String()
-	}
-	return ""
-}
+// maxGRPCFrameBytes is the largest message gRPC's framing can carry: its length
+// prefix is a uint32. NewServer clamps ServerConfig.MaxRecvBytes to it.
+const maxGRPCFrameBytes = math.MaxUint32

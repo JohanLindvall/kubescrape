@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net"
 	"slices"
 	"strings"
 	"sync"
@@ -72,9 +73,31 @@ func TestIngestGatesReadinessOnItsListeners(t *testing.T) {
 
 	// An address that cannot be bound: the gate must hold /readyz down rather
 	// than let the rollout proceed.
-	p, stop := start(t, "127.0.0.1:70000", "")
+	//
+	// A REAL EADDRINUSE (a port this test holds), and the assertion only once
+	// the bind has demonstrably FAILED — p.fatal recorded the listener's error.
+	// Asserting straight after startIngest returned read the gate before the
+	// spawned goroutine had tried to bind at all, so it held on every run
+	// however Ready was ordered against the bind: a listener that fired Ready
+	// BEFORE binding passed this test, and nothing else in the repo pins "a
+	// failed bind never marks the agent ready".
+	held, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Close() }()
+	p, stop := start(t, held.Addr().String(), "")
+	for deadline := time.Now().Add(5 * time.Second); p.fatalErr.Load() == nil; {
+		if time.Now().After(deadline) {
+			stop()
+			t.Fatalf("binding the held address %s never failed; the refusal half of this test cannot be exercised", held.Addr())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if !slices.Contains(p.ready.pending(), gateIngest) {
-		t.Fatalf("pending = %v with an unbindable listener; want %q", p.ready.pending(), gateIngest)
+		stop()
+		t.Fatalf("pending = %v after the ingest listener failed to bind (%v); want %q: a rolling update would advance past a node whose receiver is a void",
+			p.ready.pending(), *p.fatalErr.Load(), gateIngest)
 	}
 	stop()
 

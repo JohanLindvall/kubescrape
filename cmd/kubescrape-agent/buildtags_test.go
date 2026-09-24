@@ -25,12 +25,17 @@ func TestExcludedPipelinesRefusedByValidateConfig(t *testing.T) {
 			old := *p.on
 			defer func() { *p.on = old }()
 			*p.on = true
+			// An enabled Azure consumer also needs something to consume from,
+			// which validateAzureFlags checks inside validateConfig too; that is
+			// its own requirement, not what this test is about, so satisfy it.
+			// The flag exists in every build, like every pipeline flag.
+			oldNS := *azureNamespace
+			defer func() { *azureNamespace = oldNS }()
+			*azureNamespace = "example.servicebus.windows.net"
 
 			err := validateConfig(agentConfig{}, "")
 			if p.built {
-				// This build HAS the pipeline: the flag must be accepted (the
-				// -azure-* flags have their own requirements, checked by
-				// validateAzureFlags, not here).
+				// This build HAS the pipeline: the flag must be accepted.
 				if err != nil {
 					t.Fatalf("-%s rejected in a build that contains the %s: %v", p.flag, p.what, err)
 				}

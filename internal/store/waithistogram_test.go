@@ -44,7 +44,9 @@ func TestParkedLookupsAreObservedByOutcome(t *testing.T) {
 		_, ok, _ := s.GetContainer(ctx, "wanted1")
 		got <- ok
 	}()
-	time.Sleep(50 * time.Millisecond)
+	// Parked for certain: a lookup still on its fast path when the upsert lands
+	// is a warm hit, which is never observed, and the count below would read 0.
+	waitForCount(t, s, 1)
 	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "wanted1"}))
 	if !<-got {
 		t.Fatal("the parked lookup was not answered")

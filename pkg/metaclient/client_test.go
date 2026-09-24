@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -93,7 +95,7 @@ func TestClient304DoesNotClobberNewerEntry(t *testing.T) {
 			// Simulate the race: while this revalidation is in flight (the
 			// client lock is released), a concurrent goroutine stores a newer
 			// 200 entry under the same key.
-			key := cacheKey("http://" + r.Host + r.URL.Path)
+			key := "http://" + r.Host + r.URL.Path
 			c.mu.Lock()
 			c.cache[key] = cacheEntry{
 				decoded: &kubemeta.Pod{Name: "web-v2", UID: "u1"},
@@ -110,7 +112,7 @@ func TestClient304DoesNotClobberNewerEntry(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	c.base = srv.URL
-	key := cacheKey(c.base + "/v1/pod-uids/u1")
+	key := c.base + "/v1/pod-uids/u1"
 
 	ctx := context.Background()
 	if p, err := c.PodByUID(ctx, "u1"); err != nil || p.Name != "web-v1" {
@@ -135,9 +137,9 @@ func TestClient304DoesNotClobberNewerEntry(t *testing.T) {
 }
 
 func TestClientCacheIgnoresWaitParam(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		atomic.AddInt32(&hits, 1)
+		hits.Add(1)
 		w.Header().Set("Cache-Control", "max-age=60")
 		w.Header().Set("ETag", `"v1"`)
 		w.Header().Set("Content-Type", "application/json")
@@ -157,7 +159,7 @@ func TestClientCacheIgnoresWaitParam(t *testing.T) {
 	if _, err := c.Container(ctx, "cafe01", 0); err != nil {
 		t.Fatal(err)
 	}
-	if n := atomic.LoadInt32(&hits); n != 1 {
+	if n := hits.Load(); n != 1 {
 		t.Fatalf("server hits = %d; want 1 (wait param must not fragment the cache)", n)
 	}
 }
@@ -209,9 +211,9 @@ func TestContainerRefusesWaitAtOrPastTimeout(t *testing.T) {
 func TestNoStoreNoCacheNeverCached(t *testing.T) {
 	for _, cc := range []string{"no-store, max-age=60", "max-age=60, no-cache", "private, no-store"} {
 		t.Run(cc, func(t *testing.T) {
-			var hits int32
+			var hits atomic.Int32
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				atomic.AddInt32(&hits, 1)
+				hits.Add(1)
 				w.Header().Set("Cache-Control", cc)
 				w.Header().Set("ETag", `"v1"`)
 				w.Header().Set("Content-Type", "application/json")
@@ -219,12 +221,12 @@ func TestNoStoreNoCacheNeverCached(t *testing.T) {
 			}))
 			t.Cleanup(srv.Close)
 			c := New(Config{Base: srv.URL, Timeout: 5 * time.Second})
-			for i := 0; i < 2; i++ {
+			for i := range 2 {
 				if p, err := c.PodByUID(context.Background(), "u1"); err != nil || p.Name != "web" {
 					t.Fatalf("lookup %d: pod=%+v err=%v", i, p, err)
 				}
 			}
-			if n := atomic.LoadInt32(&hits); n != 2 {
+			if n := hits.Load(); n != 2 {
 				t.Fatalf("hits = %d, want 2 (%q must not be cached)", n, cc)
 			}
 		})
@@ -232,9 +234,9 @@ func TestNoStoreNoCacheNeverCached(t *testing.T) {
 }
 
 func TestClientDoesNotCacheWithoutHeaders(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		atomic.AddInt32(&hits, 1)
+		hits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"name":"web"}`))
 	}))
@@ -244,7 +246,7 @@ func TestClientDoesNotCacheWithoutHeaders(t *testing.T) {
 	ctx := context.Background()
 	_, _ = c.PodByUID(ctx, "u1")
 	_, _ = c.PodByUID(ctx, "u1")
-	if n := atomic.LoadInt32(&hits); n != 2 {
+	if n := hits.Load(); n != 2 {
 		t.Fatalf("server hits = %d; want 2 (no cache headers = no caching)", n)
 	}
 }
@@ -307,7 +309,7 @@ func TestCacheEviction(t *testing.T) {
 	defer srv.Close()
 
 	c := New(Config{Base: srv.URL, Timeout: time.Second})
-	for i := 0; i < maxCacheEntries+100; i++ {
+	for i := range maxCacheEntries + 100 {
 		if _, err := c.PodByUID(context.Background(), fmt.Sprintf("uid-%d", i)); err != nil {
 			t.Fatal(err)
 		}
@@ -392,37 +394,82 @@ func TestCacheHitShallowCopyIsolation(t *testing.T) {
 	}
 }
 
-func BenchmarkCacheKeyWait(b *testing.B) {
-	b.ReportAllocs()
-	for b.Loop() {
-		if cacheKey("http://x/v1/containers/abcdef0123?wait=2s") != "http://x/v1/containers/abcdef0123" {
-			b.Fatal("bad key")
-		}
+// The flip side of the shallow copy, pinned so that moving to deep copies is a
+// decision rather than an accident: two hits share ONE Labels map and one
+// NodeTargets backing array with the cache. That sharing is the documented
+// read-only contract (see the package doc) — a caller that writes into either
+// corrupts every later lookup, and the hit path's allocation budget
+// (TestCacheHitAllocationBudget) is what copying would cost.
+func TestCacheHitsShareMapsAndSlicesWithTheCache(t *testing.T) {
+	s := newSrv(t)
+	s.maxAge = "3600"
+	s.body = `{"name":"web","uid":"u1","labels":{"app":"web"},"targets":[{"url":"http://a"},{"url":"http://b"}]}`
+	c := New(Config{Base: s.URL, Timeout: 5 * time.Second})
+	ctx := context.Background()
+
+	p1, err := c.PodByUID(ctx, "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := c.PodByUID(ctx, "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p1 == p2 {
+		t.Fatal("two lookups returned the same *Pod: the struct must be the caller's own")
+	}
+	if reflect.ValueOf(p1.Labels).UnsafePointer() != reflect.ValueOf(p2.Labels).UnsafePointer() {
+		t.Error("two hits returned different Labels maps: the hit path now deep-copies — update the " +
+			"package doc's read-only contract and TestCacheHitAllocationBudget together with it")
+	}
+
+	t1, err := c.NodeTargets(ctx, "n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t2, err := c.NodeTargets(ctx, "n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(t1) != 2 || len(t2) != 2 {
+		t.Fatalf("targets = %d, %d; want 2 each", len(t1), len(t2))
+	}
+	if &t1[0] != &t2[0] {
+		t.Error("two NodeTargets hits returned different backing arrays: the hit path now copies — " +
+			"update the NodeTargets doc and the package doc with it")
+	}
+	if n := s.hits.Load(); n != 2 {
+		t.Errorf("server hits = %d, want 2 (one per URL): the second lookups must be cache hits", n)
 	}
 }
 
 // Concurrent lookups of the same STALE URL each issue their own conditional
-// GET — there is deliberately no single-flight. This test documents that
-// behavior (the requests are cheap 304s; the trade-off is noted in the audit
-// rather than fixed here). If single-flighting is ever added, flip the
-// assertion.
+// GET — there is deliberately no single-flight (the requests are cheap 304s;
+// the trade-off is noted in the audit rather than fixed here). This test PINS
+// that behaviour deterministically: the handler holds every revalidation until
+// all n have arrived, so exactly n conditional GETs reach the service. If
+// single-flighting is ever added, the barrier never fills, the test fails
+// loudly on its timeout, and the assertion is the one to flip.
 func TestConcurrentRevalidationNoSingleFlight(t *testing.T) {
-	var hits int32
-	var inflight, maxInflight int32
+	const n = 8
+	var hits, arrived, timedOut atomic.Int32
+	all := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&hits, 1)
-		cur := atomic.AddInt32(&inflight, 1)
-		for {
-			old := atomic.LoadInt32(&maxInflight)
-			if cur <= old || atomic.CompareAndSwapInt32(&maxInflight, old, cur) {
-				break
-			}
-		}
-		time.Sleep(20 * time.Millisecond) // widen the herd window
-		atomic.AddInt32(&inflight, -1)
+		hits.Add(1)
 		w.Header().Set("Cache-Control", "max-age=60")
 		w.Header().Set("ETag", `"v1"`)
 		if r.Header.Get("If-None-Match") == `"v1"` {
+			// The barrier: nothing answers until every revalidation is in
+			// flight at once. NewTransport sets no MaxConnsPerHost, so n
+			// concurrent connections are allowed.
+			if arrived.Add(1) == n {
+				close(all)
+			}
+			select {
+			case <-all:
+			case <-time.After(2 * time.Second):
+				timedOut.Add(1)
+			}
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
@@ -444,27 +491,26 @@ func TestConcurrentRevalidationNoSingleFlight(t *testing.T) {
 	now = base.Add(2 * time.Minute) // entry is now stale
 	mu.Unlock()
 
-	const n = 8
 	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if _, err := c.PodByUID(context.Background(), "u1"); err != nil {
-				t.Error(err)
+	for range n {
+		wg.Go(func() {
+			if p, err := c.PodByUID(context.Background(), "u1"); err != nil || p.Name != "web" {
+				t.Errorf("revalidating lookup: pod=%+v err=%v", p, err)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
-	// 1 initial fetch + up to n concurrent revalidations. All must succeed and
-	// every revalidation is correct (304 against the same ETag); the herd is a
-	// documented efficiency gap, not a correctness bug.
-	got := atomic.LoadInt32(&hits)
-	if got < 2 || got > n+1 {
-		t.Fatalf("hits = %d; want between 2 and %d", got, n+1)
+	if k := timedOut.Load(); k != 0 {
+		t.Fatalf("%d revalidations waited out the barrier: only %d of %d concurrent lookups reached the "+
+			"service — single-flight was added, so flip this test", k, arrived.Load(), n)
 	}
-	t.Logf("stale revalidation herd: %d requests (max %d in flight) for one stale entry", got-1, atomic.LoadInt32(&maxInflight))
+	// 1 initial fetch + exactly n concurrent revalidations, every one a
+	// correct 304 against the same ETag: the herd is a documented efficiency
+	// gap, not a correctness bug.
+	if got := hits.Load(); got != n+1 {
+		t.Fatalf("hits = %d; want %d (one populate + one revalidation per concurrent lookup)", got, n+1)
+	}
 }
 
 // The Observe hook must be optional (nil) on every outcome path, including
@@ -485,41 +531,70 @@ func TestObserveNilSafe(t *testing.T) {
 // fallback, where a hostNetwork or non-pod sender pushing at a high rate
 // re-queries /v1/pod-ips/{ip} for every single resource it ever pushes.
 func TestNotFoundIsNotCached(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		atomic.AddInt32(&hits, 1)
+		hits.Add(1)
 		http.Error(w, "no live pod", http.StatusNotFound)
 	}))
 	t.Cleanup(srv.Close)
 
 	c := New(Config{Base: srv.URL, Timeout: time.Second})
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if _, err := c.PodByIP(context.Background(), "10.0.0.9"); !IsNotFound(err) {
 			t.Fatalf("err = %v; want 404", err)
 		}
 	}
-	if got := atomic.LoadInt32(&hits); got != 3 {
+	if got := hits.Load(); got != 3 {
 		t.Fatalf("hits = %d, want 3 (negative results are not cached)", got)
 	}
 }
 
-func TestAudit_CacheKeyStripsOnlyWait(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"http://h/v1/containers/a?wait=5s", "http://h/v1/containers/a"},
-		{"http://h/v1/containers/a?wait=1s", "http://h/v1/containers/a"},
-		{"http://h/v1/containers/a", "http://h/v1/containers/a"},
-		{"http://h/v1/pods/ns/p?x=1&wait=2s", "http://h/v1/pods/ns/p?x=1"},
-		{"http://h/v1/pods/ns/p?b=2&a=1", "http://h/v1/pods/ns/p?a=1&b=2"}, // normalized order
-		{"http://h/v1/pods/ns/p?a=1&b=2", "http://h/v1/pods/ns/p?a=1&b=2"},
-	}
-	for _, tc := range cases {
-		if got := cacheKey(tc.in); got != tc.want {
-			t.Errorf("cacheKey(%q) = %q, want %q", tc.in, got, tc.want)
+// The container endpoint's wait is part of the REQUEST, never of the cache
+// key: every request carries it — a zero wait included, spelled ?wait=0s,
+// because a lookup naming no wait gets the service's own -wait-timeout — while
+// lookups differing only in their wait share one entry, so a stale one is
+// REVALIDATED under the new wait rather than fetched again from scratch.
+func TestContainerWaitIsSentButNotKeyed(t *testing.T) {
+	var mu sync.Mutex
+	var queries, conds []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		queries = append(queries, r.URL.RawQuery)
+		conds = append(conds, r.Header.Get("If-None-Match"))
+		mu.Unlock()
+		w.Header().Set("Cache-Control", "max-age=10")
+		w.Header().Set("ETag", `"v1"`)
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
 		}
+		_, _ = w.Write([]byte(`{"containerId":"abc","container":{"name":"c"},"pod":{"name":"p","namespace":"ns"}}`))
+	}))
+	t.Cleanup(srv.Close)
+	c := New(Config{Base: srv.URL, Timeout: 5 * time.Second})
+	now := time.Now()
+	c.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	if _, err := c.Container(ctx, "abc", 0); err != nil {
+		t.Fatal(err)
 	}
-	// Two container lookups differing only in ?wait= must share one cache entry.
-	if cacheKey("http://h/v1/containers/a?wait=5s") != cacheKey("http://h/v1/containers/a?wait=250ms") {
-		t.Error("?wait= fragments the cache")
+	if _, err := c.Container(ctx, "abc", 2*time.Second); err != nil { // a fresh hit: no request
+		t.Fatal(err)
+	}
+	now = now.Add(11 * time.Second)
+	if _, err := c.Container(ctx, "abc", 250*time.Millisecond); err != nil { // stale: revalidated
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"wait=0s", "wait=250ms"}; !slices.Equal(queries, want) {
+		t.Fatalf("queries = %q, want %q: the wait must be sent on every request and only there", queries, want)
+	}
+	if want := []string{"", `"v1"`}; !slices.Equal(conds, want) {
+		t.Fatalf("If-None-Match = %q, want %q: a lookup under a different wait must revalidate the "+
+			"one cached entry, not fetch a second one", conds, want)
 	}
 }
 
@@ -614,7 +689,7 @@ func TestAudit_ETagWithoutMaxAge(t *testing.T) {
 	s.etag, s.maxAge = `"v1"`, "" // ETag but no max-age
 	c := New(Config{Base: s.URL, Timeout: 5 * time.Second})
 	ctx := context.Background()
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if _, err := c.PodByName(ctx, "ns", "p"); err != nil {
 			t.Fatal(err)
 		}
@@ -682,8 +757,9 @@ func as(err error, target **StatusError) bool {
 	return ok
 }
 
-// TestAudit_BodyChangesUnderSameETag: the server rotates the body but keeps the
-// ETag; the client must keep serving the cached body (correct HTTP semantics).
+// A changed ETag replaces the cached body: once the entry goes stale, the
+// revalidation carries the OLD ETag, the service answers 200 with a new one,
+// and both that lookup and every later hit serve the NEW body.
 func TestAudit_ETagChangeRefetches(t *testing.T) {
 	s := newSrv(t)
 	s.etag, s.maxAge = `"v1"`, "10"
@@ -728,10 +804,8 @@ func TestAudit_ConcurrentSameURL(t *testing.T) {
 	const n = 64
 	var wg sync.WaitGroup
 	start := make(chan struct{})
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range n {
+		wg.Go(func() {
 			<-start
 			pod, err := c.PodByName(context.Background(), "ns", "p")
 			if err != nil {
@@ -741,7 +815,7 @@ func TestAudit_ConcurrentSameURL(t *testing.T) {
 			if pod.Name != "p" {
 				t.Errorf("pod = %+v", pod)
 			}
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()
@@ -757,12 +831,12 @@ func TestAudit_ConcurrentMixedURLsRace(t *testing.T) {
 	s.etag, s.maxAge = `"v1"`, "1"
 	c := New(Config{Base: s.URL, Timeout: 5 * time.Second})
 	var wg sync.WaitGroup
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			ctx := context.Background()
-			for j := 0; j < 20; j++ {
+			for j := range 20 {
 				switch j % 4 {
 				case 0:
 					_, _ = c.Container(ctx, fmt.Sprintf("containerd://c%d", i%4), time.Second)
@@ -893,7 +967,7 @@ func TestCacheTypeMismatchRefetches(t *testing.T) {
 	u := c.base + "/v1/pods/ns/web"
 
 	var first kubemeta.Pod
-	if err := c.getJSON(ctx, u, &first); err != nil {
+	if err := c.get(ctx, u, request{}, &first); err != nil {
 		t.Fatal(err)
 	}
 	if n := s.hits.Load(); n != 1 {
@@ -904,7 +978,7 @@ func TestCacheTypeMismatchRefetches(t *testing.T) {
 	var other struct {
 		Name string `json:"name"`
 	}
-	if err := c.getJSON(ctx, u, &other); err != nil {
+	if err := c.get(ctx, u, request{}, &other); err != nil {
 		t.Fatal(err)
 	}
 	if other.Name != "web" {
@@ -924,7 +998,7 @@ func TestCacheTypeMismatchRefetches(t *testing.T) {
 	var again struct {
 		Name string `json:"name"`
 	}
-	if err := c.getJSON(ctx, u, &again); err != nil {
+	if err := c.get(ctx, u, request{}, &again); err != nil {
 		t.Fatal(err)
 	}
 	if n := s.hits.Load(); n != 2 || again.Name != "web" {
@@ -947,7 +1021,7 @@ func TestSweepKeepsStaleEntriesForRevalidation(t *testing.T) {
 
 	// Three reads at a 1m cadence: each is stale (10s TTL), so each is a
 	// conditional GET the server answers 304 — never a full re-fetch.
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		now = now.Add(time.Minute)
 		if p, err := c.PodByUID(ctx, "u1"); err != nil || p.Name != "web" {
 			t.Fatalf("read %d: pod=%v err=%v", i, p, err)

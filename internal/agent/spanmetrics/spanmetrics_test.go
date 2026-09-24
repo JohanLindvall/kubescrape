@@ -2,6 +2,8 @@ package spanmetrics
 
 import (
 	"context"
+	"encoding/binary"
+	"fmt"
 	"runtime"
 	"strings"
 	"sync"
@@ -14,6 +16,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/cumagg"
+	"github.com/JohanLindvall/kubescrape/internal/agent/tracehash"
+	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -124,19 +128,19 @@ func TestGeneratorCallsAndDuration(t *testing.T) {
 	if calls.Type() != pmetric.MetricTypeSum || !calls.Sum().IsMonotonic() {
 		t.Fatalf("calls is not a monotonic sum: %v", calls.Type())
 	}
-	// Two series: (Ok) with 2 calls, (Error) with 1.
+	// Two series: (OK) with 2 calls, (ERROR) with 1.
 	byStatus := map[string]float64{}
 	dps := dp(calls)
 	for i := 0; i < dps.Len(); i++ {
 		d := dps.At(i)
 		if attr(d.Attributes(), "service.name") != "checkout" || attr(d.Attributes(), "span.name") != "GET /" ||
-			attr(d.Attributes(), "span.kind") != "Server" {
+			attr(d.Attributes(), "span.kind") != "SPAN_KIND_SERVER" {
 			t.Fatalf("unexpected dimensions: %v", d.Attributes().AsRaw())
 		}
 		byStatus[attr(d.Attributes(), "status.code")] += numberVal(d)
 	}
-	if byStatus["Ok"] != 2 || byStatus["Error"] != 1 {
-		t.Fatalf("calls by status = %v, want Ok:2 Error:1", byStatus)
+	if byStatus["STATUS_CODE_OK"] != 2 || byStatus["STATUS_CODE_ERROR"] != 1 {
+		t.Fatalf("calls by status = %v, want STATUS_CODE_OK:2 STATUS_CODE_ERROR:1", byStatus)
 	}
 
 	dur, ok := exp.find("traces.span.metrics.duration")
@@ -161,6 +165,53 @@ func TestGeneratorCallsAndDuration(t *testing.T) {
 	}
 }
 
+// span.kind and status.code take the OTLP proto enum spelling — what the OTel
+// Collector's spanmetrics connector and Tempo's metrics-generator both write,
+// and what Jaeger SPM and every connector-shaped dashboard select on. pdata's
+// String() spells them "Server" / "Error", which matched none of them.
+func TestSpanKindAndStatusUseTheProtoEnumSpelling(t *testing.T) {
+	kinds := map[ptrace.SpanKind]string{
+		ptrace.SpanKindUnspecified: "SPAN_KIND_UNSPECIFIED",
+		ptrace.SpanKindInternal:    "SPAN_KIND_INTERNAL",
+		ptrace.SpanKindServer:      "SPAN_KIND_SERVER",
+		ptrace.SpanKindClient:      "SPAN_KIND_CLIENT",
+		ptrace.SpanKindProducer:    "SPAN_KIND_PRODUCER",
+		ptrace.SpanKindConsumer:    "SPAN_KIND_CONSUMER",
+		ptrace.SpanKind(99):        "",
+		ptrace.SpanKind(-1):        "",
+	}
+	for k, want := range kinds {
+		if got := kindStr(k); got != want {
+			t.Errorf("kindStr(%d) = %q, want %q", k, got, want)
+		}
+	}
+	codes := map[ptrace.StatusCode]string{
+		ptrace.StatusCodeUnset: "STATUS_CODE_UNSET",
+		ptrace.StatusCodeOk:    "STATUS_CODE_OK",
+		ptrace.StatusCodeError: "STATUS_CODE_ERROR",
+		ptrace.StatusCode(7):   "",
+		ptrace.StatusCode(-1):  "",
+	}
+	for c, want := range codes {
+		if got := statusStr(c); got != want {
+			t.Errorf("statusStr(%d) = %q, want %q", c, got, want)
+		}
+	}
+
+	// And through the render: the label is the spelling, on every metric.
+	g := New(Config{})
+	g.Consume(traces("checkout", spanSpec{name: "q", kind: ptrace.SpanKindConsumer, status: ptrace.StatusCodeUnset, dur: 0.01}))
+	exp := &capExporter{}
+	if err := g.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	dur, _ := exp.find("traces.span.metrics.duration")
+	a := dur.Histogram().DataPoints().At(0).Attributes()
+	if attr(a, "span.kind") != "SPAN_KIND_CONSUMER" || attr(a, "status.code") != "STATUS_CODE_UNSET" {
+		t.Fatalf("duration labels = %v, want the proto enum spellings", a.AsRaw())
+	}
+}
+
 func numberVal(d pmetric.NumberDataPoint) float64 {
 	if d.ValueType() == pmetric.NumberDataPointValueTypeInt {
 		return float64(d.IntValue())
@@ -182,6 +233,45 @@ func TestExtraDimensions(t *testing.T) {
 	d := dp(calls).At(0)
 	if got := attr(d.Attributes(), "http.request.method"); got != "POST" {
 		t.Fatalf("extra dimension http.request.method = %q, want POST", got)
+	}
+}
+
+// An Int dimension keys its series from the attribute VALUE (formatted into the
+// stack key) while dims() renders the label from its string; the two must still
+// be one function of the attribute. The same status spelled as an Int on one
+// span, as a Str on another and as a resource-level Int behind an empty span
+// attribute on a third renders ONE label, so it must be ONE series — and a
+// different status a second one.
+func TestIntDimensionKeysTheSeriesItRenders(t *testing.T) {
+	const dim = "http.response.status_code"
+	g := New(Config{Dimensions: []string{dim}})
+	one := func(set func(span, res pcommon.Map)) ptrace.Traces {
+		td := traces("api", spanSpec{name: "handle", kind: ptrace.SpanKindServer, status: ptrace.StatusCodeUnset, dur: 0.01})
+		rs := td.ResourceSpans().At(0)
+		set(rs.ScopeSpans().At(0).Spans().At(0).Attributes(), rs.Resource().Attributes())
+		return td
+	}
+	g.Consume(one(func(span, _ pcommon.Map) { span.PutInt(dim, 200) }))
+	g.Consume(one(func(span, _ pcommon.Map) { span.PutStr(dim, "200") }))
+	g.Consume(one(func(span, res pcommon.Map) { span.PutStr(dim, ""); res.PutInt(dim, 200) }))
+	g.Consume(one(func(span, _ pcommon.Map) { span.PutInt(dim, 8080) }))
+
+	exp := &capExporter{}
+	if err := g.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	calls, _ := exp.find("traces.span.metrics.calls")
+	got := map[string]float64{}
+	for i := 0; i < dp(calls).Len(); i++ {
+		d := dp(calls).At(i)
+		label := attr(d.Attributes(), dim)
+		if _, dup := got[label]; dup {
+			t.Fatalf("two series render %s=%q: the key is finer than the label", dim, label)
+		}
+		got[label] = numberVal(d)
+	}
+	if got["200"] != 3 || got["8080"] != 1 || len(got) != 2 {
+		t.Fatalf("calls by %s = %v, want map[200:3 8080:1]", dim, got)
 	}
 }
 
@@ -254,14 +344,12 @@ func TestTapConsumesAndForwards(t *testing.T) {
 func TestConcurrentConsume(t *testing.T) {
 	g := New(Config{})
 	var wg sync.WaitGroup
-	for w := 0; w < 8; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < 500; i++ {
+	for range 8 {
+		wg.Go(func() {
+			for range 500 {
 				g.Consume(traces("svc", spanSpec{name: "op", kind: ptrace.SpanKindServer, status: ptrace.StatusCodeOk, dur: 0.002}))
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	exp := &capExporter{}
@@ -318,6 +406,36 @@ func TestSizeCounter(t *testing.T) {
 	}
 }
 
+// The size counter says it totals span bytes, and the largest attributes a span
+// carries are the COMPOSITE ones — semconv's captured headers are string[] — so
+// a slice or map attribute must be sized by what it holds, not charged a flat 8
+// bytes like a scalar.
+func TestSizeCounterCountsSliceAndMapAttributeContents(t *testing.T) {
+	td := traces("svc", spanSpec{name: "op", kind: ptrace.SpanKindServer, status: ptrace.StatusCodeOk, dur: 0.01})
+	span := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+	header := strings.Repeat("h", 1024)
+	span.Attributes().PutEmptySlice("http.request.header.cookie").AppendEmpty().SetStr(header)
+	inner := span.Attributes().PutEmptyMap("app.request")
+	inner.PutStr("body", strings.Repeat("b", 512))
+
+	g := New(Config{})
+	g.Consume(td)
+	exp := &capExporter{}
+	if err := g.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	size, ok := exp.find("traces.span.metrics.size")
+	if !ok {
+		t.Fatal("size metric not exported")
+	}
+	want := int64(len("op") + 24 +
+		len("http.request.header.cookie") + len(header) +
+		len("app.request") + len("body") + 512)
+	if got := size.Sum().DataPoints().At(0).IntValue(); got != want {
+		t.Fatalf("size = %d, want %d: a composite attribute must be sized by its contents", got, want)
+	}
+}
+
 func TestExemplarsOnDuration(t *testing.T) {
 	g := New(Config{})
 	g.Consume(traces("svc", spanSpec{
@@ -348,6 +466,85 @@ func TestExemplarsOnDuration(t *testing.T) {
 	if n := dur2.Histogram().DataPoints().At(0).Exemplars().Len(); n != 0 {
 		t.Fatalf("exemplars after reset = %d, want 0", n)
 	}
+}
+
+// The generator sits ABOVE the trace tier's head sampler so it counts every
+// span, but an exemplar is a link to a trace: one naming a trace the sampler
+// dropped resolves to nothing. Measured before ExemplarKeep existed: at
+// probability 0.1, 1800 of 2000 exemplars named a trace that was never
+// exported. The wiring is the tier's (cmd/kubescrape-agent's buildOwnerChain):
+// the sampler's own per-span decision, so the spans its guard rails rescue —
+// which DO ship — still anchor exemplars.
+func TestExemplarsNameOnlyExportedTraces(t *testing.T) {
+	for _, keepErrors := range []bool{false, true} {
+		sink := &traceSink{}
+		sampler := tracesample.New(tracesample.Config{Probability: 0.1, KeepErrors: &keepErrors}, sink)
+		g := New(Config{ExemplarKeep: sampler.SpanKept})
+		tap := g.Tap(sampler)
+
+		var exemplars, dropped, rescued int
+		for i := range 2000 {
+			var tid pcommon.TraceID
+			binary.BigEndian.PutUint64(tid[:8], uint64(i)*0x9E3779B97F4A7C15)
+			binary.BigEndian.PutUint64(tid[8:], uint64(i)+1)
+			status := ptrace.StatusCodeOk
+			if i%5 == 0 {
+				status = ptrace.StatusCodeError
+			}
+			sink.shipped = map[pcommon.TraceID]bool{}
+			if err := tap.ExportTraces(context.Background(), traces("svc", spanSpec{
+				name: "op", kind: ptrace.SpanKindServer, status: status, dur: 0.03,
+				traceID: tid, spanID: sid1,
+			})); err != nil {
+				t.Fatal(err)
+			}
+			exp := &capExporter{}
+			if err := g.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
+				t.Fatal(err)
+			}
+			dur, _ := exp.find("traces.span.metrics.duration")
+			exs := dur.Histogram().DataPoints().At(0).Exemplars()
+			if !sink.shipped[tid] {
+				dropped++
+			}
+			for j := 0; j < exs.Len(); j++ {
+				exemplars++
+				got := exs.At(j).TraceID()
+				if !sink.shipped[got] {
+					t.Fatalf("keepErrors=%v push %d: an exemplar names trace %v, which the sampler did not export", keepErrors, i, got)
+				}
+				if status == ptrace.StatusCodeError && !tracehash.Keep(got, tracehash.Threshold(0.1)) {
+					rescued++
+				}
+			}
+		}
+		if exemplars == 0 || dropped == 0 {
+			t.Fatalf("keepErrors=%v: %d exemplars, %d sampled-away traces: the fixture exercises neither side", keepErrors, exemplars, dropped)
+		}
+		if keepErrors && rescued == 0 {
+			t.Errorf("keepErrors=true: no exemplar on an error span the guard rail rescued, though those spans ship")
+		}
+		if !keepErrors && rescued != 0 {
+			t.Errorf("keepErrors=false: %d exemplars on error spans the probability dropped", rescued)
+		}
+	}
+}
+
+// traceSink records which traces reached it.
+type traceSink struct{ shipped map[pcommon.TraceID]bool }
+
+func (s *traceSink) ExportTraces(_ context.Context, td ptrace.Traces) error {
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		sss := rss.At(i).ScopeSpans()
+		for j := 0; j < sss.Len(); j++ {
+			spans := sss.At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				s.shipped[spans.At(k).TraceID()] = true
+			}
+		}
+	}
+	return nil
 }
 
 type failExporter struct{}
@@ -663,13 +860,13 @@ func TestStaleSeriesSurviveFailedExport(t *testing.T) {
 }
 
 // The series key must be built from the SAME truncated values the data points
-// render. Keyed on the raw ones, two spans differing only past maxDimBytes
+// render. Keyed on the raw ones, two spans differing only past cumagg.MaxLabelBytes
 // occupied two series that rendered byte-identical attribute sets — duplicate
 // points in one export, which downstream reads as a conflict rather than as
 // extra detail — and the key retained in the map was as long as the sender
 // cared to make span.name, leaking past the bound truncation exists to impose.
 func TestSeriesKeyTruncatesLikeTheRenderedDimensions(t *testing.T) {
-	prefix := strings.Repeat("a", maxDimBytes)
+	prefix := strings.Repeat("a", cumagg.MaxLabelBytes)
 	exp := &capExporter{}
 	g := New(Config{Dimensions: []string{"db.statement"}})
 
@@ -684,9 +881,9 @@ func TestSeriesKeyTruncatesLikeTheRenderedDimensions(t *testing.T) {
 		t.Fatalf("series = %d, want 1: spans that render identically must share one series", n)
 	}
 	g.store.Range(func(k string, _ *spanSeries) bool {
-		// 6 parts at most maxDimBytes each, plus the length prefixes; the
+		// 6 parts at most cumagg.MaxLabelBytes each, plus the length prefixes; the
 		// untruncated key grew with whatever the sender sent.
-		if max := len(g.names) * (maxDimBytes + 8); len(k) > max {
+		if max := len(g.names) * (cumagg.MaxLabelBytes + 8); len(k) > max {
 			t.Errorf("series key is %d bytes, want <= %d: untruncated values are retained in the map", len(k), max)
 		}
 		return true
@@ -707,16 +904,16 @@ func TestSeriesKeyTruncatesLikeTheRenderedDimensions(t *testing.T) {
 		t.Errorf("calls = %d, want 2: both spans belong to the one rendered series", got)
 	}
 	if got := attr(dps.At(0).Attributes(), "span.name"); got != prefix {
-		t.Errorf("span.name = %q (%d bytes), want the %d-byte truncation", got, len(got), maxDimBytes)
+		t.Errorf("span.name = %q (%d bytes), want the %d-byte truncation", got, len(got), cumagg.MaxLabelBytes)
 	}
 	if got := attr(dps.At(0).Attributes(), "db.statement"); got != prefix {
-		t.Errorf("db.statement = %q (%d bytes), want the %d-byte truncation", got, len(got), maxDimBytes)
+		t.Errorf("db.statement = %q (%d bytes), want the %d-byte truncation", got, len(got), cumagg.MaxLabelBytes)
 	}
 }
 
 // Truncating a Go string is a RESLICE: it keeps the whole original alive. The
 // dimension values a series retains therefore have to be cut with a copy, or
-// maxDimBytes bounds nothing — a sender controlling span.name pins its full
+// cumagg.MaxLabelBytes bounds nothing — a sender controlling span.name pins its full
 // length per series for staleAfter, which is the exact scenario the constant's
 // comment says it prevents. (The key observe builds may still reslice: the map
 // copies it on insert.)
@@ -734,8 +931,8 @@ func TestTruncatedDimensionDoesNotRetainTheSenderString(t *testing.T) {
 	}
 	g.store.Range(func(_ string, s *spanSeries) bool {
 		got := s.dims[1] // span.name
-		if len(got) != maxDimBytes {
-			t.Fatalf("retained span.name is %d bytes, want %d", len(got), maxDimBytes)
+		if len(got) != cumagg.MaxLabelBytes {
+			t.Fatalf("retained span.name is %d bytes, want %d", len(got), cumagg.MaxLabelBytes)
 		}
 		if unsafe.StringData(got) == unsafe.StringData(name) {
 			t.Fatalf("the retained %d-byte label still points into the %d-byte span name: "+
@@ -756,7 +953,7 @@ func TestTruncatedDimensionsDoNotAccumulateHeap(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
-	for i := 0; i < series; i++ {
+	for i := range series {
 		name := strings.Repeat(string(rune('a'+i)), huge)
 		g.Consume(traces("checkout", spanSpec{
 			name: name, kind: ptrace.SpanKindServer, status: ptrace.StatusCodeOk,
@@ -774,5 +971,53 @@ func TestTruncatedDimensionsDoNotAccumulateHeap(t *testing.T) {
 	if max := int64(huge); retained > max {
 		t.Errorf("retained %d bytes, want well under one span name (%d): the truncation pins its source",
 			retained, max)
+	}
+}
+
+// The render scratch is reused across renders, and a smaller render must not
+// leave the DIMENSIONS of series it no longer covers in the tail: a burst to
+// the cardinality cap followed by mass stale eviction would otherwise pin every
+// one of those value sets for the process' life. The mechanism is
+// cumagg.Snapshotter's and cumagg tests it against a harness, but WHICH field
+// of the element aliases a series is this generator's to say, through the
+// Release it passes — so this goes through New: a Release that stopped
+// clearing spanSnapshot.dims passes every cumagg test.
+func TestRenderScratchDoesNotPinTheDimensionsOfEvictedSeries(t *testing.T) {
+	// 64 is cumagg's shrink floor: a scratch no larger is never rebuilt, so the
+	// smaller render below keeps its tail and takes the Release branch. The
+	// bucket-capacity check fails loudly if that ever stops being true, rather
+	// than letting a rebuilt (and therefore empty) tail pass vacuously.
+	const peak = 64
+	g := New(Config{MaxCardinality: peak + 8, StaleAfter: "1m"})
+	now := time.Unix(1_700_000_000, 0)
+	g.now = func() time.Time { return now }
+	for i := range peak {
+		g.Consume(span(fmt.Sprintf("op-%03d", i)))
+	}
+	if err := g.Export(context.Background(), &capExporter{}, pcommon.NewResource()); err != nil {
+		t.Fatal(err) // renders every series and marks them delivered
+	}
+
+	// The whole burst goes stale; the next render covers one series.
+	now = now.Add(10 * time.Minute)
+	g.Consume(span("op-new"))
+
+	g.renderMu.Lock() // the scratch's own lock, exactly as renderRED takes it
+	defer g.renderMu.Unlock()
+	snap := g.snaps.Take(g.store, now)
+	if len(snap) != 1 {
+		t.Fatalf("the render covers %d series after the eviction, want 1", len(snap))
+	}
+	whole := snap[:cap(snap)] // Take hands back the scratch itself, capacity included
+	if len(whole) < peak {
+		t.Fatalf("the scratch holds %d slots: the test no longer exercises its tail", len(whole))
+	}
+	for i := len(snap); i < len(whole); i++ {
+		if cap(whole[i].dur.Buckets) == 0 {
+			t.Fatalf("scratch slot %d lost its bucket array: the scratch was rebuilt, so this no longer exercises Release", i)
+		}
+		if whole[i].dims != nil {
+			t.Fatalf("scratch slot %d (past the %d live series) still pins an evicted series' dimensions %q", i, len(snap), whole[i].dims)
+		}
 	}
 }

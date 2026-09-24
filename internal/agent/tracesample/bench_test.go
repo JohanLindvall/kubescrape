@@ -84,11 +84,11 @@ func benchPayload(traces, perTrace int) ptrace.Traces {
 	ss.Scope().SetName("go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp")
 	ss.Scope().SetVersion("0.58.0")
 	n := 0
-	for t := 0; t < traces; t++ {
+	for t := range traces {
 		var tid pcommon.TraceID
 		tid[0], tid[1] = byte(t>>8), byte(t)
 		tid[15] = 0xaa
-		for p := 0; p < perTrace; p++ {
+		for range perTrace {
 			benchSpan(ss.Spans().AppendEmpty(), tid, n)
 			n++
 		}

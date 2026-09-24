@@ -17,11 +17,12 @@ GOFLAGS := -trimpath
 #             franz-go packages, in every DaemonSet image, for a feature that
 #             only ever runs in the one-replica singleton Deployment.
 #   events    the Kubernetes events reader and its leader election, which are
-#             the ONLY reason the agent links k8s.io/client-go — 926 -> 470
-#             dependency packages (k8s.io/ + sigs.k8s.io/ 412 -> 8) and MORE
-#             THAN HALF the shipped binary (59.16 MB -> 26.27 MB, -55.6%), on
-#             every node, for a pipeline that (like azure) only ever runs in
-#             the one-replica singleton Deployment.
+#             the ONLY reason the agent links k8s.io/client-go — almost all of
+#             its k8s.io/ + sigs.k8s.io/ dependency packages and MORE THAN HALF
+#             the stripped agent binary (cmd/kubescrape-agent/buildtags.go
+#             carries the dated measurement), on every node, for a pipeline
+#             that (like azure) only ever runs in the one-replica singleton
+#             Deployment.
 #
 #   make build                 # all three, i.e. today's binaries
 #   make build TAGS=azure,events   # no journald: CGO_ENABLED=0, static agent
@@ -53,7 +54,7 @@ GOLANGCI_LINT_VERSION := v2.13.2
 # gets replaced.
 GOLANGCI_LINT         := hack/bin/golangci-lint
 
-.PHONY: all build test vet fmt fmt-check tidy lint run image image-static verify-tags helm-lint check cluster-up cluster-down e2e chaos clean
+.PHONY: all build test race vet vulncheck fmt fmt-check tidy lint run image image-static verify-tags helm-lint check cluster-up cluster-down e2e chaos clean
 
 all: build
 
@@ -67,10 +68,10 @@ all: build
 # as "the whole local CI story" while a whole file went uncompiled: the DEFAULT
 # tag set is vetted, linted and TESTED, and EVERY variant's stubs are COMPILED
 # (verify-tags, below). What CI adds on top is the tag-less variant's TEST run
-# (`make build test TAGS=`) and `CGO_ENABLED=1 go test -race` over the
-# concurrency-touching packages — the latter already documented as a separate
-# manual step in AGENTS.md. `make e2e` needs docker/kind and is deliberately
-# separate from both.
+# (`make build test TAGS=`), `make race` — the WHOLE tree under the race
+# detector, default tags — `make vulncheck`, and a build of both images with
+# each binary started inside its base. `make e2e` needs docker/kind and is
+# deliberately separate from both.
 check: fmt-check vet lint helm-lint test verify-tags
 
 # Local build: unstripped, so delve/gdb work. The release IMAGE strips with
@@ -87,8 +88,26 @@ build:
 test:
 	go test $(TAGFLAGS) ./...
 
+# The whole tree under the race detector, with the shipped tags. The WHOLE tree
+# and not a hand-picked list: CI's list named six packages and skipped the ones
+# whose lock discipline was most recently reworked into chunked, lock-releasing
+# passes (cumagg, servicegraph, spanmetrics, tailbuffer) or lock-dropped reads
+# (bearer), plus otlpexport, the tailer and the server — and their stall tests
+# can only catch a data race when the detector is on. The allocation-budget and
+# pool-identity tests skip themselves under -race (internal/testrace), so
+# nothing has to be excluded by hand. cgo is required by the detector itself.
+race:
+	CGO_ENABLED=1 go test -race $(TAGFLAGS) ./...
+
 vet:
 	go vet $(TAGFLAGS) ./...
+
+# The reachable-advisory scan behind go.mod's toolchain floor (AGENTS.md), over
+# the TAGS set — the shipped pipelines' dependencies, not the stubs'. It needs
+# the network (it fetches govulncheck and the vulnerability database), so it is
+# a CI job and a pre-bump check rather than part of `make check`.
+vulncheck:
+	go run golang.org/x/vuln/cmd/govulncheck@latest $(TAGFLAGS) ./...
 
 fmt:
 	gofmt -w .
@@ -123,16 +142,20 @@ $(GOLANGCI_LINT):
 #
 # The LAST command — the tag-less `go build ./cmd/kubescrape-agent` at the foot
 # of the recipe — is not about linking at all: it is the only step of `make
-# check` that TYPE-CHECKS the stubs. (It was the third until the client-go guard
-# was inserted above it; count from the bottom, not the top.) `-tags azure` compiles journald_disabled.go
-# (its `!journald` constraint holds), but the franz-go half is a `go list -deps`,
-# which resolves imports WITHOUT type-checking, so azure_disabled.go — the repo's
-# only `//go:build !azure` file — was compiled by no step of `make check` at all:
-# a broken edit to it passed fmt-check, vet, lint and the whole test suite (its
-# own build constraint excludes it under the default tags) and failed in CI's
-# `make build test TAGS=`. A tag-less build compiles BOTH stubs, needs no cgo and
-# no libsystemd, and costs a few seconds. Do not "simplify" it away as redundant
-# with the -tags azure build above: they cover different files.
+# check` that TYPE-CHECKS two of the three stubs. (It was the third until the
+# client-go guard was inserted above it; count from the bottom, not the top.)
+# The first command, `-tags azure,events`, compiles journald_disabled.go (its
+# `!journald` constraint holds) and nothing else of the three; the franz-go and
+# client-go halves are `go list -deps`, which resolves imports WITHOUT
+# type-checking; and fmt-check, vet, lint and test all run the DEFAULT tags,
+# whose constraints exclude every stub. So azure_disabled.go (`//go:build
+# !azure`) and events_disabled.go (`//go:build !events`) are compiled by no
+# other step of `make check`: a broken edit to either passes the whole suite and
+# fails only in CI's `make build test TAGS=`. The tag-less build compiles all
+# three stubs (journald_disabled.go, azure_disabled.go, events_disabled.go),
+# needs no cgo and no libsystemd, and costs a few seconds. Do not "simplify" it
+# away as redundant with the -tags azure,events build above: they cover
+# different files.
 verify-tags:
 	CGO_ENABLED=0 go build $(GOFLAGS) -tags azure,events -o /dev/null ./cmd/kubescrape-agent
 	@n=$$(go list -deps -tags journald,events ./cmd/kubescrape-agent | grep -c franz-go || true); \
@@ -145,19 +168,37 @@ verify-tags:
 run: build
 	./bin/$(BINARY)
 
+# The Dockerfile follows TAGS the way `build`'s CGO_ENABLED does (AGENT_CGO):
+# with journald the default Dockerfile (cgo agent, distroless/base plus
+# libsystemd and its .so files), without it Dockerfile.static — a TAGS without
+# journald used to build the cgo-free agent onto distroless/base anyway,
+# shipping libsystemd for nothing. The TAG is NOT suffixed here: hack/e2e.sh
+# runs `make image IMAGE=… TAG=…` and then loads exactly $IMAGE:$TAG, so a
+# `make e2e TAGS=azure,events` (TAGS reaches this sub-make through the
+# environment) must produce that name or e2e silently tests a stale image.
+# Each Dockerfile still decides the same thing for itself, because a direct
+# `docker build` never sees this variable.
 image:
-	docker build --build-arg TAGS=$(TAGS) -t $(IMAGE):$(TAG) .
+	docker build -f $(if $(filter 1,$(AGENT_CGO)),Dockerfile,Dockerfile.static) --build-arg TAGS=$(TAGS) -t $(IMAGE):$(TAG) .
 
 # Static variant: no journald, hence no cgo, hence no libsystemd — so both
 # binaries fit distroless/static instead of distroless/base + seven .so files.
 # The Azure consumer is kept (it is cgo-free); pass TAGS_STATIC= to drop it too.
+# It is `image` with TAGS_STATIC and a `-static` tag suffix, so `make image
+# image-static` builds both without the two names colliding.
 #
 # TAGS_STATIC, not TAGS: this target deliberately does not read TAGS, because
 # TAGS defaults to journald,azure,events and journald is the whole reason the
 # static image cannot exist. The comment used to say `TAGS=`, which silently did
 # nothing and left franz-go in the image the operator was trying to slim.
+#
+# A TAGS_STATIC carrying journald is REFUSED here, before delegating: `image`
+# follows journald to the cgo Dockerfile, so it would build the distroless/base
+# image and tag it `-static`, and Dockerfile.static's own refusal would never
+# run. (No commas in the message: they would split the $(if) arguments.)
 image-static:
-	docker build -f Dockerfile.static --build-arg TAGS=$(TAGS_STATIC) -t $(IMAGE):$(TAG)-static .
+	$(if $(findstring journald,$(TAGS_STATIC)),$(error image-static cannot carry journald (TAGS_STATIC=$(TAGS_STATIC)): it needs cgo and libsystemd; build that image with make image))
+	$(MAKE) image TAGS=$(TAGS_STATIC) TAG=$(TAG)-static
 
 # Three-node kind test cluster (see hack/).
 cluster-up:
@@ -167,7 +208,9 @@ cluster-down:
 	./hack/cluster-down.sh
 
 # End-to-end smoke test: build the image, load it into the kind cluster
-# (created if absent), deploy the shipped manifests plus the debug collector,
+# (created if absent), deploy the shipped deploy/kubernetes.yaml and
+# deploy/agent.yaml (not events.yaml or servicegraph.yaml) plus the debug
+# collector,
 # and assert the pipeline works — readiness gates clear, targets are
 # discovered, the store answers, telemetry reaches the collector, and the
 # protobuf scrape path converts a real native histogram (hack/nhexporter). The

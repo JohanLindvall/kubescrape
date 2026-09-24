@@ -55,12 +55,29 @@ const (
 	maxScanDirs = 8192
 )
 
-// containerDir is one discovered container cgroup.
-type containerDir struct {
-	id     string // 64-hex runtime container id
-	podUID string
-	path   string
+// cgroupRef is one discovered container cgroup: the identity its path parses
+// to, the path, and the length of the path's basename. A listing produces them,
+// and the pending and tracked sets carry the same value forward (embedded), so
+// the three cannot disagree about which fields make up a container's identity.
+type cgroupRef struct {
+	id      string // 64-hex runtime container id
+	podUID  string
+	dir     string
+	baseLen int // len(filepath.Base(dir)); see improvedBy
 }
+
+// improvedBy reports whether d names the same container at a BETTER path than
+// r: a strictly shorter basename. It is the one statement of the CRI-O
+// preference, which three places apply — a pass's own listing (scan.walkPods),
+// the pending set and the tracked set (reconcile):
+//
+// CRI-O parks crio-conmon-<id>.scope, the supervisor's cgroup, beside the
+// container's own crio-<id>.scope under the same id, and the container's own
+// scope always has the shorter basename (the helper's is the same name with an
+// infix). Shortest-wins is therefore the right answer AND deterministic across
+// passes. The path itself need not be compared: an equal path has an equal
+// basename.
+func (r *cgroupRef) improvedBy(d cgroupRef) bool { return d.baseLen < r.baseLen }
 
 // discover re-reads the container set, reconciles it against what is tracked,
 // and resolves the identity of anything new. It runs on the DISCOVERY
@@ -81,6 +98,22 @@ func (s *Sampler) discover(ctx context.Context, now time.Time) {
 	s.warnIfExportingNothing()
 }
 
+// discoverLoop re-reads the container set and resolves identities. It is its
+// own goroutine because a pass makes metadata lookups, bounded only by
+// resolveBudget — see the Sampler doc.
+func (s *Sampler) discoverLoop(ctx context.Context) {
+	t := time.NewTicker(s.discoverEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.discover(ctx, s.now())
+		}
+	}
+}
+
 // walk lists the container cgroups under the root, reporting whether the
 // listing was COMPLETE.
 //
@@ -91,7 +124,7 @@ func (s *Sampler) discover(ctx context.Context, now time.Time) {
 // whenever a pod slice could not be read). It is the same rule the tailer
 // applies to its checkpoint pruning: a failed listing proves nothing, so prune
 // on a SUCCEEDED one only.
-func (s *Sampler) walk() (found []containerDir, complete, ok bool) {
+func (s *Sampler) walk() (found []cgroupRef, complete, ok bool) {
 	found, complete, err := discoverContainers(s.root)
 	if err != nil {
 		// The ROOT itself: nothing was discovered and nothing will be exported.
@@ -123,14 +156,13 @@ func (s *Sampler) walk() (found []containerDir, complete, ok bool) {
 }
 
 // reconcile brings the tracked and pending sets in line with one listing.
-func (s *Sampler) reconcile(found []containerDir, complete bool) {
+func (s *Sampler) reconcile(found []cgroupRef, complete bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	clear(s.seen)
 	for _, d := range found {
 		s.seen[d.id] = struct{}{}
-		base := len(filepath.Base(d.path))
 		if c, ok := s.tracked[d.id]; ok {
 			// A GONE container is never re-pointed. Its descriptors are
 			// already released and it is holding one thing only — the window
@@ -141,14 +173,14 @@ func (s *Sampler) reconcile(found []containerDir, complete bool) {
 			// too_short counter that is supposed to be evidence about
 			// short-lived containers. c.gone is never cleared, so the entry
 			// simply waits for the export that retires it.
-			if !c.gone && d.path != c.dir && base < c.baseLen {
-				s.repointLocked(c, d, base)
+			if !c.gone && c.improvedBy(d) {
+				s.repointLocked(c, d)
 			}
 			continue
 		}
 		if p, ok := s.pending[d.id]; ok {
-			if d.path != p.dir && base < p.baseLen {
-				p.dir, p.baseLen = d.path, base
+			if p.improvedBy(d) {
+				p.dir, p.baseLen = d.dir, d.baseLen
 			}
 			continue
 		}
@@ -166,9 +198,7 @@ func (s *Sampler) reconcile(found []containerDir, complete bool) {
 			}
 			continue
 		}
-		s.pending[d.id] = &pendingContainer{
-			id: d.id, podUID: d.podUID, dir: d.path, baseLen: base,
-		}
+		s.pending[d.id] = &pendingContainer{cgroupRef: d}
 	}
 
 	if complete {
@@ -222,21 +252,29 @@ func (s *Sampler) reconcile(found []containerDir, complete bool) {
 // different cgroup. Keeping them would fold the supervisor's numbers into the
 // container's distribution and, worse, derive one enormous rate across the
 // switch from two unrelated counters.
-func (s *Sampler) repointLocked(c *container, d containerDir, base int) {
-	s.log.Info("cgroup sampler re-pointed a container at a better cgroup path (a supervisor scope carrying the same container id was seen first)",
-		"container", c.id, "from", c.dir, "to", d.path)
-	fds, err := openCgroupFDs(d.path)
+//
+// The line is written only once the re-point HAS happened. It used to precede
+// the open, so a better path that could not be opened was announced as adopted
+// while the container went on sampling the supervisor — and since the better
+// path stays listed, reconcile re-enters here every pass and the false line
+// repeated once per discovery cycle. The failure arm says nothing beyond the
+// open-error counter, the same rule track's open-failure arm follows.
+func (s *Sampler) repointLocked(c *container, d cgroupRef) {
+	fds, err := openCgroupFDs(d.dir)
 	if err != nil {
 		obs.CgroupOpenErrors.Inc()
 		return // keep what we have; the next pass retries
 	}
+	from := c.dir
 	c.release()
 	c.fds, c.open = fds, true
-	c.dir, c.baseLen = d.path, base
+	c.dir, c.baseLen = d.dir, d.baseLen
 	c.cpu.reset()
 	c.mem.reset()
 	c.heldCPU, c.heldMem = held{}, held{}
 	c.havePrev = false
+	s.log.Info("cgroup sampler re-pointed a container at a better cgroup path (a supervisor scope carrying the same container id was seen first)",
+		"id", c.id, "from", from, "to", d.dir)
 }
 
 // resolvePending asks the resolver for the identity of every cgroup that does
@@ -359,12 +397,22 @@ func (s *Sampler) track(id string, now time.Time) {
 	// so counting it here refuses a real container a descriptor budget nobody
 	// is holding. Same rule, same reason, as maxContainers' own doc gives for
 	// taking pending entries back out of this cap.
-	if s.liveTrackedLocked() >= s.maxTracked {
+	if live, _ := s.countsLocked(); live >= s.maxTracked {
 		s.c.cappedTracked.Inc()
 		if !s.cappedFDs {
 			s.cappedFDs = true
 			s.log.Warn("cgroup sampler is at its container cap; further containers are resolved but not sampled",
 				"cap", s.maxTracked, "root", s.root)
+		}
+		// A given-up entry (quarantined, or abandoned on 404s) is due only
+		// when its own clock says so, and this attempt spent that clock:
+		// leaving nextTry in the past made dueLocked true on EVERY later pass,
+		// one lookup per discovery cycle for an entry the give-up exists to ask
+		// about rarely. reconsiderEvery rather than abandonRetryEvery, because
+		// the refusal says nothing about this cgroup — a slot can free up long
+		// before ten minutes pass. A live entry keeps its every-pass retry.
+		if p.gaveUp {
+			p.nextTry = now.Add(reconsiderEvery)
 		}
 		return
 	}
@@ -376,15 +424,26 @@ func (s *Sampler) track(id string, now time.Time) {
 	if err != nil {
 		// The container went away between the listing and the open, or its
 		// controllers are not enabled on this cgroup. Not worth a line per
-		// cycle; it stays pending and the next pass retries.
+		// cycle; it stays pending and the next pass retries. What IS kept is
+		// the evidence: the entry is marked as resolved-but-unreadable and the
+		// error is remembered, so the nothing-is-sampled warning can say the
+		// files would not open instead of blaming the metadata service for
+		// containers that resolved perfectly well (warnIfExportingNothing).
 		obs.CgroupOpenErrors.Inc()
+		p.unreadable = true
+		s.lastOpenErr = err
+		// And a given-up entry is re-armed on its slow clock: this was the one
+		// retry abandonRetryEvery allows, and without the re-arm nextTry stays
+		// in the past, so the entry is looked up and re-opened on every pass —
+		// the "three failing reads out of every ten minutes instead of forever"
+		// the quarantine promises, broken by its own retry.
+		if p.gaveUp {
+			p.nextTry = now.Add(abandonRetryEvery)
+		}
 		return
 	}
 	delete(s.pending, id)
-	s.tracked[id] = &container{
-		id: id, podUID: p.podUID, dir: p.dir, baseLen: p.baseLen,
-		fds: fds, open: true,
-	}
+	s.tracked[id] = &container{cgroupRef: p.cgroupRef, fds: fds, open: true}
 	s.publishCountsLocked()
 }
 
@@ -423,6 +482,9 @@ func (s *Sampler) resolveFailed(id string, now time.Time, answered bool) {
 		return
 	}
 	p.lastTry = now
+	// The latest attempt did not resolve, so whatever an earlier one learned
+	// about the cgroup's FILES is no longer the reason it is not sampled.
+	p.unreadable = false
 	if !answered {
 		// The service is the problem, not this cgroup. Keep whatever the
 		// grace-period clock had (an outage in the middle of a run of 404s does
@@ -444,7 +506,7 @@ func (s *Sampler) resolveFailed(id string, now time.Time, answered bool) {
 		p.gaveUp = true
 		s.c.unresolvedAbandoned.Inc()
 		s.log.Debug("cgroup sampler gave up resolving a container cgroup; it is not exported (one per pod is expected — the sandbox/pause cgroup appears in no pod's containerStatuses)",
-			"cgroup", p.dir, "podUID", p.podUID, "retryIn", abandonRetryEvery)
+			"dir", p.dir, "uid", p.podUID, "backoff", abandonRetryEvery)
 	}
 	if p.gaveUp {
 		p.nextTry = now.Add(abandonRetryEvery)
@@ -453,7 +515,7 @@ func (s *Sampler) resolveFailed(id string, now time.Time, answered bool) {
 
 // discoverContainers walks root and returns every container cgroup under it,
 // plus whether the listing was complete (see Sampler.walk).
-func discoverContainers(root string) ([]containerDir, bool, error) {
+func discoverContainers(root string) ([]cgroupRef, bool, error) {
 	sc := &scan{root: root, budget: maxScanDirs, byID: map[string]int{}, complete: true,
 		buf: make([]byte, dirBufBytes)}
 	roots, err := sc.kubepodsRoots()
@@ -475,14 +537,13 @@ func discoverContainers(root string) ([]containerDir, bool, error) {
 type scan struct {
 	root   string
 	budget int
-	out    []containerDir
+	out    []cgroupRef
 	// byID is what makes a helper scope parked beside a container (CRI-O's
 	// crio-conmon-<id>.scope, an immediate child of the pod slice whose last
 	// dash-separated component is the very same container id) not become a
 	// SECOND entry for one container — which would export two resources with
-	// identical identity in one payload. The container's own scope always has
-	// the shorter basename, the helper's being the same name with an infix, so
-	// the shortest wins and the choice is deterministic across passes.
+	// identical identity in one payload. Which of the two is kept is
+	// cgroupRef.improvedBy's call.
 	byID     map[string]int
 	complete bool
 	// buf is the getdents64 scratch shared by every directory of the pass; see
@@ -511,14 +572,15 @@ func (sc *scan) walkPods(dir string, depth int) {
 		// (/sys/fs/cgroup) are not part of the kubelet's naming.
 		podUID, cid, isContainer := cgroupid.Parse(rel)
 		if isContainer {
+			ref := cgroupRef{id: cid, podUID: podUID, dir: p, baseLen: len(name)}
 			if j, ok := sc.byID[cid]; ok {
-				if len(name) < len(filepath.Base(sc.out[j].path)) {
-					sc.out[j] = containerDir{id: cid, podUID: podUID, path: p}
+				if sc.out[j].improvedBy(ref) {
+					sc.out[j] = ref
 				}
 				continue
 			}
 			sc.byID[cid] = len(sc.out)
-			sc.out = append(sc.out, containerDir{id: cid, podUID: podUID, path: p})
+			sc.out = append(sc.out, ref)
 			// A container scope has no container children.
 			continue
 		}

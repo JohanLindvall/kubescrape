@@ -45,6 +45,10 @@ type targetsFixture struct {
 	// reaches each pod through all of them — the shape that must dedup without
 	// being reported as a shadowed monitor.
 	sharedSelector bool
+	// otherNodeChurn has benchTargets update a pod on ANOTHER node between
+	// polls (outside the timer): ordinary cluster pod churn, which must not
+	// cost this node's memo anything.
+	otherNodeChurn bool
 }
 
 func (f targetsFixture) build(t testing.TB) *Server {
@@ -158,8 +162,22 @@ func benchTargets(b *testing.B, f targetsFixture, conditional bool, advance time
 	}
 	builds := s.targetBuilds.Load()
 	n := 0
+	var churn *corev1.Pod
+	if f.otherNodeChurn {
+		churn = &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "churn", Namespace: "prod", UID: "churn-uid"},
+			Spec:       corev1.PodSpec{NodeName: "node2"},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.9.0.1"},
+		}
+	}
 	b.ReportAllocs()
 	for b.Loop() {
+		if churn != nil {
+			b.StopTimer()
+			churn.ResourceVersion = strconv.Itoa(n + 1)
+			s.store.UpsertPod(churn)
+			b.StartTimer()
+		}
 		now = now.Add(advance)
 		req, _ := http.NewRequest(http.MethodGet, url, nil)
 		if conditional {
@@ -220,6 +238,12 @@ func BenchmarkNodeTargetsRevalidation(b *testing.B) {
 	f := targetsFixture{pods: 110, cacheTTL: 10 * time.Second}
 	b.Run("memo_hit", func(b *testing.B) { benchTargets(b, f, true, 0) })
 	b.Run("agent_cadence", func(b *testing.B) { benchTargets(b, f, true, 30*time.Second) })
+	// A pod on ANOTHER node changes before every poll: the store-wide token
+	// made this arm a full derivation per poll (derivations/op 1.000); the
+	// per-node one keeps it a memo hit.
+	churn := f
+	churn.otherNodeChurn = true
+	b.Run("agent_cadence_other_node_churn", func(b *testing.B) { benchTargets(b, churn, true, 30*time.Second) })
 }
 
 // BenchmarkEntityTag measures the ETag digest directly. It runs over the FULL

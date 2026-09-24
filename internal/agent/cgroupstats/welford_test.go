@@ -96,8 +96,8 @@ func TestWelfordBeatsNaiveOnLargeMean(t *testing.T) {
 	// A container pinned near 1e9 "cores" is not realistic; the magnitude is
 	// what makes the failure reproducible in one test rather than statistically.
 	// The same effect at a realistic 2.0 cores costs precision in the last
-	// digits instead of all of them, which is exactly as wrong and much harder
-	// to write an assertion about.
+	// digits instead of all of them (welford.go carries the measured figures),
+	// which is much harder to write an assertion about.
 	const base = 1e9
 	xs := make([]float64, 0, 8)
 	for _, d := range []float64{-3, -2, -1, 0, 0, 1, 2, 3} {

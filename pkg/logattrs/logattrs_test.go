@@ -6,10 +6,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unsafe"
 
 	ljson "github.com/JohanLindvall/lightning/pkg/json"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"sigs.k8s.io/yaml"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 func mustExtractor(t *testing.T, rules ...Rule) *Extractor {
@@ -47,7 +50,8 @@ func TestExtractJSON(t *testing.T) {
 	}
 	// status is an INTEGRAL JSON number, so it decodes as int64 (float64 cannot
 	// hold a 64-bit id exactly); ratio keeps float64. Either way apply.Put
-	// stores a whole number with PutInt, so the exported attribute is the same.
+	// stores a whole number inside ±2^53 with PutInt, so the exported
+	// attribute is the same.
 	if got["level"] != "warn" || got["status"] != int64(503) || got["cached"] != true || got["ratio"] != 0.5 {
 		t.Errorf("log = %+v", got)
 	}
@@ -230,6 +234,71 @@ func TestExtractDoesNotPinTheLine(t *testing.T) {
 	}
 }
 
+// A logfmt value with nothing to decode ALIASES the line, as the JSON arm's
+// escape-free strings do; only a quoted value carrying an escape is copied.
+// The logfmt arm used to copy every value (string(val)), under a comment
+// saying the common path cost "no copy".
+func TestExtractLogfmtAliasesValuesWithNothingToDecode(t *testing.T) {
+	t.Parallel()
+	e := mustExtractor(t,
+		Rule{Key: "tenant", Target: TargetResource},
+		Rule{Key: "msg"}, Rule{Key: "path"}, Rule{Key: "q"})
+	line := `tenant=acme msg="served request" path=C:\logs\app.log q="a \"b\""`
+	base := uintptr(unsafe.Pointer(unsafe.StringData(line)))
+	inLine := func(s string) bool {
+		p := uintptr(unsafe.Pointer(unsafe.StringData(s)))
+		return p >= base && p < base+uintptr(len(line))
+	}
+	r := e.Extract(line)
+	got := map[string]string{}
+	for _, a := range append(append([]Attr(nil), r.Resource...), r.Log...) {
+		got[a.Key] = a.Val.(string)
+	}
+	for key, want := range map[string]string{
+		"tenant": "acme", "msg": "served request", "path": `C:\logs\app.log`,
+	} {
+		if got[key] != want {
+			t.Errorf("%s = %q, want %q", key, got[key], want)
+		}
+		if !inLine(got[key]) {
+			t.Errorf("%s was copied; a value with nothing to decode must alias the line", key)
+		}
+	}
+	if want := `a "b"`; got["q"] != want {
+		t.Errorf("q = %q, want the decoded %q", got["q"], want)
+	}
+	if inLine(got["q"]) {
+		t.Error("q aliases the line, but its escapes had to be decoded into new memory")
+	}
+}
+
+// ...and the pooled scratch must not keep the last line alive through those
+// aliases once Extract returns.
+func TestExtractLogfmtReleasesTheLineOnRelease(t *testing.T) {
+	t.Parallel()
+	e := mustExtractor(t, Rule{Key: "msg"})
+	sc := &scratch{vals: []string{"view into a line"}, found: []bool{true}}
+	e.release(sc)
+	if sc.vals[0] != "" {
+		t.Fatalf("a released scratch still holds %q", sc.vals[0])
+	}
+}
+
+// The benchmark reports it; this enforces it. Four allocations: the two Result
+// slices and the two string values boxed into Attr.Val.
+func TestExtractLogfmtAllocationBudget(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("the race detector changes escape analysis and adds bookkeeping allocations")
+	}
+	e := mustExtractor(t,
+		Rule{Key: "trace_id", Attribute: "trace.id", Target: TargetLog},
+		Rule{Key: "tenant", Attribute: "tenant.id", Target: TargetResource})
+	line := `level=info tenant=acme trace_id=abc123 msg="served request" dur_ms=12.5`
+	if got := testing.AllocsPerRun(200, func() { e.Extract(line) }); got > 4 {
+		t.Fatalf("Extract of a logfmt line costs %v allocations, want <= 4", got)
+	}
+}
+
 func BenchmarkExtractJSON(b *testing.B) {
 	e, err := New(&Config{Rules: []Rule{
 		{Key: "trace_id", Attribute: "trace.id", Target: "log"},
@@ -294,7 +363,8 @@ func TestKeyDistinguishesInt64Values(t *testing.T) {
 	}
 	// int64 must not alias the STRING form of the same digits — but a WHOLE
 	// float64 must key identically to the int64, because Put stores both with
-	// PutInt: key identity follows stored identity, or {"shard":2} and
+	// PutInt (inside ±2^53, storedAsInt): key identity follows stored
+	// identity, or {"shard":2} and
 	// {"shard":2.0} split into two ResourceLogs whose exported resources are
 	// byte-identical (a duplicate resource per payload for an emitter mixing
 	// spellings).

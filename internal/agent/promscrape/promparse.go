@@ -2,16 +2,16 @@ package promscrape
 
 import "github.com/JohanLindvall/kubescrape/pkg/promparse"
 
-// Sample is pkg/promparse's sample, and Label, Exemplar and MetricType are its
+// Sample is pkg/promparse's sample, and SampleRole, Label and Exemplar are its
 // siblings: the exposition parser lives there (it is useful on its own — a
 // constant-memory Prometheus text/OpenMetrics parser), and the aliases keep the
 // scrape pipeline reading in its own vocabulary rather than qualifying every
 // Sample and Label.
 type (
 	Sample     = promparse.Sample
+	SampleRole = promparse.SampleRole
 	Label      = promparse.Label
 	Exemplar   = promparse.Exemplar
-	MetricType = promparse.MetricType
 )
 
 // The parser's sample roles and memo bounds, aliased for the same reason.
@@ -33,12 +33,17 @@ const (
 	// The per-sample label ceiling, shared with the text parser so BOTH fronts
 	// bound the same quadratic dedupe scan. See promparse.MaxLabelsPerSample.
 	maxLabelsPerSample = promparse.MaxLabelsPerSample
+
+	// The OpenMetrics exemplar label-set bound and the per-exposition HELP/UNIT
+	// budget, shared with the text parser. The protobuf front applies the same
+	// exemplar bound, and charges the HELP/UNIT budget the way the text parser
+	// does so both fronts describe the same families (protoMetaBudget, which
+	// names the one shape where they still differ).
+	maxExemplarLabelSetRunes = promparse.MaxExemplarLabelSetRunes
+	maxMetaBytes             = promparse.MaxMetaBytes
 )
 
 // ErrTooManySamples is returned when a scrape exceeds its sample budget.
 var ErrTooManySamples = promparse.ErrTooManySamples
 
-var (
-	newParser    = promparse.New
-	copyExemplar = promparse.CopyExemplar
-)
+var copyExemplar = promparse.CopyExemplar

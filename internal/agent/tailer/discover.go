@@ -1,181 +1,22 @@
 package tailer
 
-// File discovery and change notification: source scanning, checkpoint
-// seeding for newly discovered files, and the fsnotify watch plumbing over
-// the symlink dir and resolved target dirs.
+// File discovery: source scanning, the claim decision per globbed path,
+// skip reporting, and checkpoint seeding for newly discovered files. The
+// fsnotify watch plumbing over the symlink dir and resolved target dirs is
+// watch.go's.
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
-	"path"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/fsnotify/fsnotify"
 )
-
-// handleEvent processes one fsnotify event; it reports whether a dirty sweep
-// should be scheduled.
-func (t *Tailer) handleEvent(ev fsnotify.Event) bool {
-	dir := filepath.Dir(ev.Name)
-	if _, isScanDir := t.scanDirs[dir]; isScanDir {
-		// A file (or symlink) appeared/disappeared in a discovery directory:
-		// rediscover immediately. A recreated symlink names an already-tracked
-		// path — mark that file dirty too, or a RETARGETED link (new target
-		// dir, no events from the old one ever again) waits a full poll
-		// interval before the rotation is even noticed.
-		if ev.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
-			if f, ok := t.files[ev.Name]; ok {
-				f.dirty = true
-			}
-			t.scanDir(nil, false)
-			return true
-		}
-		// The log file may live directly in the watched directory (no symlink
-		// indirection): treat writes like target-dir events.
-		if f, ok := t.files[ev.Name]; ok && ev.Op&fsnotify.Write != 0 {
-			f.dirty = true
-			return true
-		}
-		return false
-	}
-	// A write/create in a watched target directory: mark the files tailing
-	// that directory (rotation creates a new file there, too).
-	dirty := false
-	for f := range t.byTargetDir[dir] {
-		f.dirty = true
-		dirty = true
-	}
-	return dirty
-}
-
-// retryScanWatches (re-)registers every discovery-directory watch on every
-// discovery pass — UNCONDITIONALLY, never skipping dirs it believes watched.
-// The kernel auto-removes an inotify watch when the watched directory itself
-// is deleted, moved or unmounted, and fsnotify drops it from its bookkeeping
-// without any event this side could key an invalidation on (the event's Name
-// is the dir itself, so handleEvent attributes it to the parent). A skip list
-// therefore turned one dir recreation into a permanent degradation to poll
-// cadence — under which sub-poll-interval rename rotations lose segments.
-// Add is idempotent on a live watch, so the steady state is one cheap
-// inotify_add_watch per dir per pass; watchedScan remains only to log
-// transitions once and to gate the startup "nothing watched" warning.
-// Failures stay at Debug — the startup Warn already named the directory once.
-func (t *Tailer) retryScanWatches() {
-	if t.watcher == nil {
-		return
-	}
-	for dir := range t.scanDirs {
-		if err := t.watcher.Add(dir); err != nil {
-			delete(t.watchedScan, dir)
-			t.log.Debug("watching log directory still failing", "dir", dir, "error", err)
-			continue
-		}
-		if _, ok := t.watchedScan[dir]; !ok {
-			t.watchedScan[dir] = struct{}{}
-			t.log.Info("log directory watch established", "dir", dir)
-		}
-	}
-}
-
-// watchTarget resolves the file's log directory, caches it on the file and
-// registers it with the watcher.
-func (t *Tailer) watchTarget(f *file) {
-	target, err := filepath.EvalSymlinks(f.path)
-	if err != nil {
-		return // next open retries; any existing watch stays
-	}
-	dir := filepath.Dir(target)
-	// Cache the RESOLVED DIRECTORY unconditionally, before anything that can
-	// fail or return: findRotated locates a rotated segment's file by name in
-	// it, and by the time that runs the live path is frequently gone (a
-	// container GC'd after a CrashLoop restart takes the /var/log/containers
-	// symlink while its rotated files remain), so its EvalSymlinks fallback
-	// fails. Leaving targetDir empty for the file's whole life declared
-	// still-on-disk segments unrecoverable — counted obs.LogPrefixLost and
-	// retired. The nil-watcher branch was fixed for exactly that, and the
-	// watcher.Add FAILURE below reinstated the same state for as long as the
-	// failure lasts: a node that has exhausted fs.inotify.max_user_watches
-	// fails every Add, so EVERY newly opened file kept targetDir empty.
-	//
-	// Hence the cache is separate from f.watchedDir, which names the directory
-	// this file holds a watch REFERENCE on. They are usually equal; when the
-	// Add fails they are not, and conflating them would make the short-circuit
-	// below skip the retry the next open exists to make.
-	f.targetDir = dir
-	if t.watcher == nil {
-		// releaseDir/unwatchTarget are refcount no-ops without a watcher, so
-		// the cache costs nothing else.
-		return
-	}
-	if dir == f.watchedDir {
-		return // unchanged (the common case for every reopen)
-	}
-	// Acquire the new directory's watch BEFORE releasing the old one: a
-	// rotation that retargets the symlink must never leave a window with no
-	// OS watch, or a second rotation inside one poll interval goes unseen
-	// and its segment is lost.
-	if t.watchRefs[dir] == 0 {
-		if err := t.watcher.Add(dir); err != nil {
-			// The file keeps whatever watch it already held (if any) and
-			// degrades to the poll cadence for this one; the next open retries.
-			t.log.Debug("watching log target directory", "dir", dir, "error", err)
-			return
-		}
-	}
-	t.watchRefs[dir]++
-	if t.byTargetDir == nil {
-		t.byTargetDir = make(map[string]map[*file]struct{})
-	}
-	set := t.byTargetDir[dir]
-	if set == nil {
-		set = make(map[*file]struct{})
-		t.byTargetDir[dir] = set
-	}
-	set[f] = struct{}{}
-	old := f.watchedDir
-	f.watchedDir = dir
-	t.releaseDir(f, old) // release the previous dir (refcounted; "" is a no-op)
-}
-
-// unwatchTarget releases the file's directory watch.
-func (t *Tailer) unwatchTarget(f *file) {
-	t.releaseDir(f, f.watchedDir)
-	f.watchedDir = ""
-	f.targetDir = ""
-}
-
-// releaseDir drops one reference on a watched target directory and removes
-// f from its dirty-marking index.
-func (t *Tailer) releaseDir(f *file, dir string) {
-	if t.watcher == nil || dir == "" {
-		return
-	}
-	if t.watchRefs[dir]--; t.watchRefs[dir] <= 0 {
-		delete(t.watchRefs, dir)
-		// Never remove the watch on a discovery directory: those are watched
-		// unconditionally from Run and both discovery and same-dir tailing
-		// depend on their events. Under a rotation storm every file sharing
-		// the dir can be momentarily unregistered (between reopen and the
-		// next sweep's ensureOpen); dropping the OS watch then silences all
-		// events until a poll tick re-adds it — and the resulting event gap
-		// widens the unregistered windows, cascading into whole rotated
-		// segments being lost.
-		if _, isScanDir := t.scanDirs[dir]; !isScanDir {
-			_ = t.watcher.Remove(dir)
-		}
-	}
-	if set := t.byTargetDir[dir]; set != nil {
-		delete(set, f)
-		if len(set) == 0 {
-			delete(t.byTargetDir, dir)
-		}
-	}
-}
 
 // parseFileName extracts the container ID and namespace from a
 // <pod>_<namespace>_<container>-<containerID>.log name.
@@ -252,7 +93,18 @@ type scanSets struct {
 	// than folded into it because skipped's value is the metric label value
 	// AND the change-detection key: an errno that changes while the reason
 	// does not must not re-log.
-	detail map[string]string
+	detail map[string]skipFailure
+}
+
+// skipFailure is the error behind a failure skip, CLASSIFIED when it is
+// recorded — while the typed error is still in hand — rather than re-derived
+// later from its text.
+type skipFailure struct {
+	msg string
+	// vanished marks an ENOENT: a rename rotation caught between the readdir
+	// and the stat. Benign and constant on a busy node, so it is counted
+	// (the metric enumerates any unstattable path) but never warned about.
+	vanished bool
 }
 
 // skip records why this path is not being tracked. Last writer wins: sources
@@ -272,9 +124,9 @@ func (s *scanSets) skip(path, reason string) {
 func (s *scanSets) skipErr(path, reason string, err error) {
 	s.skip(path, reason)
 	if s.detail == nil {
-		s.detail = make(map[string]string)
+		s.detail = make(map[string]skipFailure)
 	}
-	s.detail[path] = err.Error()
+	s.detail[path] = skipFailure{msg: err.Error(), vanished: errors.Is(err, os.ErrNotExist)}
 }
 
 // Discovery skip reasons. They are metric LABEL VALUES
@@ -457,7 +309,7 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 // by one keyless throttle naming a single example plus how many others share
 // the pass, because a wrongly-mounted log directory fails every file in it at
 // once and the remedy is the same for all of them.
-func (t *Tailer) reportSkips(skipped, detail map[string]string, listingOK bool) {
+func (t *Tailer) reportSkips(skipped map[string]string, detail map[string]skipFailure, listingOK bool) {
 	if !listingOK {
 		// A failed glob proves nothing about the paths it did not list, and
 		// FORGETTING one is what makes it count again — so a directory
@@ -486,10 +338,10 @@ func (t *Tailer) reportSkips(skipped, detail map[string]string, listingOK bool) 
 			continue
 		}
 		obs.LogFilesSkipped.WithLabelValues(reason).Inc()
-		if reason == skipStatError && !strings.Contains(detail[path], "no such file or directory") {
+		if reason == skipStatError && !detail[path].vanished {
 			statErrs++
 			if statErrPath == "" {
-				statErrPath, statErrMsg = path, detail[path]
+				statErrPath, statErrMsg = path, detail[path].msg
 			}
 		}
 		if debug {
@@ -527,21 +379,6 @@ func (t *Tailer) tooOld(st os.FileInfo, path string, cutoff time.Duration) bool 
 	}
 	_, hasCheckpoint := t.checkpoints[path]
 	return !hasCheckpoint
-}
-
-// deniesNamespace is the DENY half of compiledSource.wantNamespace (sources.go)
-// on its own: the source's excludeNamespaces globs, without the allowlist.
-// claimPath needs the two apart because they have opposite claim semantics — a
-// deny claims the file so no later source can resurrect it, an allowlist miss
-// leaves it for one. Patterns are validated at startup (ValidateSources), so a
-// path.Match error here cannot happen and reads as "no match".
-func (s *compiledSource) deniesNamespace(ns string) bool {
-	for _, pat := range s.excludeNamespaces {
-		if ok, _ := path.Match(pat, ns); ok {
-			return true
-		}
-	}
-	return false
 }
 
 // claimPath decides one globbed path's fate for its source: skip (non-regular
@@ -604,15 +441,16 @@ func (t *Tailer) claimPath(src *compiledSource, path string, sets *scanSets) boo
 			sets.skip(path, skipExcludedNS)
 			return false
 		}
-		if ok && !src.wantNamespace(namespace) {
+		if ok && !src.allowsNamespace(namespace) {
 			// An allowlist MISS is the opposite of a prohibition: this SOURCE
 			// does not want the namespace, but a later one may. Deliberately
 			// NOT claimed — "prod through source A, the rest through source B"
 			// is the allowlist's most obvious use, and claiming here made
 			// source B collect nothing. (Routing is what `namespaces` is for;
 			// `excludeNamespaces` denies, and denying cannot be undone by a
-			// later source. wantNamespace merges both, so testing it alone
-			// silently took the deny half along and lost the guard above.)
+			// later source. A merged predicate tested alone here once took the
+			// deny half along and lost the guard above — hence the two
+			// halves.)
 			//
 			// Reported anyway: an allowlist that matches nothing looks
 			// exactly like a source that is working, and a typo'd namespace
@@ -742,6 +580,9 @@ func (t *Tailer) initFile(f *file) {
 		// mismatch onto some other file.
 		if !f.compressed && f.inode != 0 {
 			if st, err := os.Stat(f.path); err == nil && inodeOf(st) != f.inode {
+				// Handled like any rotation this process observed live, so
+				// counted like one (kubescrape_log_rotations_total).
+				obs.LogRotations.Inc()
 				f.segSeq++
 				f.segments = append(f.segments, &segment{
 					id:        f.segSeq,

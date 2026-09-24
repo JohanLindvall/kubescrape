@@ -140,9 +140,16 @@ func NewFailureReporter(log *slog.Logger, what string, attrs ...any) *FailureRep
 // in-flight send at once, and a "the collector is failing" line emitted while
 // the process is on its way out is a false alarm on the one line an operator
 // reads most carefully. It is still counted (the caller's counter runs first) —
-// only the narrative skips it.
+// only the narrative skips it. Both spellings count as cancelled, because the
+// default protocol never produces the bare sentinel: grpc-go reports a cancelled RPC as
+// status codes.Canceled, which errors.Is(err, context.Canceled) does not match
+// (a status error has no Unwrap). Matching only the bare sentinel let every
+// gRPC shutdown with an export in flight — and every unbuffered ingest forward
+// whose sender gave up mid-send, since those forward on the RPC's own context
+// — log a failure transition and then a recovery, for a healthy collector.
+// The predicate is cancelled(), below.
 func (r *FailureReporter) Note(signal string, err error) {
-	if err != nil && errors.Is(err, context.Canceled) {
+	if cancelled(err) {
 		return
 	}
 	if err != nil && IsPermanent(err) {
@@ -214,6 +221,13 @@ func (r *FailureReporter) Note(signal string, err error) {
 	}
 }
 
+// cancelled reports whether err is a cancelled export, in either spelling:
+// the context's own sentinel (the HTTP arm, the drain's waits) or the gRPC
+// status grpc-go returns for a cancelled RPC.
+func cancelled(err error) bool {
+	return err != nil && (errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled)
+}
+
 // noteRejected reports a PERMANENTLY rejected payload: throttled per signal,
 // with the count and span of what was dropped since the previous line, and
 // touching no destination state.
@@ -254,21 +268,10 @@ func (r *FailureReporter) noteRejected(signal string, err error) {
 	r.log.Warn(r.what+" rejected this telemetry outright; it is dropped rather than retried", args...)
 }
 
-// Class is how an export failure is classified for the payload's sake:
-// "permanent" means the collector rejected THIS payload and retrying it cannot
-// help (the producer drops it, or the disk buffer eventually does), "transient"
-// means it is coming back. It is IsPermanent's answer, named — the same
-// classification every producer's retry path already takes, made visible so an
-// operator does not have to infer it from a drop counter.
-func Class(err error) string {
-	if err == nil {
-		return "ok"
-	}
-	if IsPermanent(err) {
-		return "permanent"
-	}
-	return "transient"
-}
+// note404 is the hint for a 404, on either protocol: over gRPC it arrives as
+// the Unimplemented grpc-go synthesizes from a non-gRPC 404 (grpcHTTP404),
+// and it is the same condition with the same remedy.
+const note404 = "the endpoint answered 404 (no such path); check the endpoint's base URL, and over gRPC whether an ingress or proxy in front of the collector lacks a route for it (retried, in case a rollout is reprogramming its routes)"
 
 // Diagnose names the likeliest cause of an export failure, for the `note` key.
 //
@@ -281,15 +284,14 @@ func Diagnose(err error) string {
 	if err == nil {
 		return ""
 	}
-	var he *HTTPStatusError
-	if errors.As(err, &he) {
+	if he, ok := errors.AsType[*HTTPStatusError](err); ok {
 		switch {
 		case he.Code == 401 || he.Code == 403:
 			return "the receiver rejected the credentials; check the bearer token file this destination presents (-otlp-bearer-token-file on the default chain; a route, a per-signal export override and the trace tier's shard hop each name their own) and any static headers. The payload is retried, so fixing the credential recovers it"
 		case he.Code == 404:
-			return "the collector has no such path; check the endpoint's base URL (retried, in case a rollout is reprogramming its routes)"
+			return note404
 		case he.Code == 413:
-			return "the collector's body limit is smaller than what is being sent; lower -otlp-max-send-bytes or raise the receiver's limit"
+			return "the collector's body limit is smaller than what is being sent; lower the agent's -otlp-max-send-bytes or raise the receiver's limit"
 		case he.Code == 415:
 			return "the collector refused the media type; this client sends application/x-protobuf, so the endpoint is probably not an OTLP/HTTP receiver"
 		case he.Code == 429 || he.Code == 503:
@@ -304,11 +306,17 @@ func Diagnose(err error) string {
 	if st, ok := status.FromError(err); ok && st.Code() != codes.Unknown {
 		switch st.Code() {
 		case codes.Unimplemented:
+			if grpcHTTP404(st) {
+				// Not the collector's verdict: something in front of it answered
+				// a plain HTTP 404 (an ingress or proxy that is not gRPC-aware),
+				// and grpc-go spelled that as Unimplemented. See grpcHTTP404.
+				return note404
+			}
 			return "the collector does not serve this signal on this endpoint; check that the receiver has a pipeline for it"
 		case codes.Unauthenticated, codes.PermissionDenied:
 			return "the receiver rejected the credentials; check the bearer token file this destination presents (-otlp-bearer-token-file on the default chain; a route, a per-signal export override and the trace tier's shard hop each name their own) and any static headers"
 		case codes.ResourceExhausted:
-			return "the collector refused the payload for its size or its own back-pressure; lower -otlp-max-send-bytes if this persists"
+			return "the collector refused the payload for its size or its own back-pressure; lower the agent's -otlp-max-send-bytes if this persists"
 		case codes.DeadlineExceeded:
 			return "the export did not finish inside -otlp-timeout; the collector is slow, unreachable, or the payload is too large for the link"
 		}
@@ -329,8 +337,21 @@ func Diagnose(err error) string {
 	case strings.Contains(msg, "first record does not look like a TLS handshake"),
 		strings.Contains(msg, "server gave HTTP response to HTTPS client"):
 		return "the endpoint speaks plaintext but this client is using TLS; set -otlp-insecure for gRPC, or an http:// endpoint for OTLP/HTTP"
+	// The opposite direction: a PLAINTEXT gRPC client whose first read of the
+	// HTTP/2 server preface failed. Two arms, because the cheap hint for one is
+	// wrong for the other and a wrong hint costs more than a missing one.
+	case strings.Contains(msg, "error reading server preface") && strings.Contains(msg, "looked like an HTTP/1.1 header"):
+		// What answered is an HTTP/1.1 server — typically an OTLP/HTTP port.
+		return "the endpoint speaks HTTP/1.1, not gRPC; it is probably an OTLP/HTTP port (4318): use the collector's gRPC port, or protocol http"
+	case strings.Contains(msg, "error reading server preface"):
+		// EOF or a reset: a TLS listener aborting a plaintext client looks
+		// exactly like this, but so does a gRPC server closing early — hence
+		// hedged. An own-endpoint route or export override INHERITS the
+		// plaintext decision, and -otlp-insecure defaults to true, so a TLS
+		// backend named without `insecure: false` lands here.
+		return "the endpoint did not answer as a plaintext gRPC server; if it serves TLS, set insecure: false on this destination (-otlp-insecure defaults to true, and a route or export override inherits it)"
 	case strings.Contains(msg, "x509:"), strings.Contains(msg, "tls:"), strings.Contains(msg, "certificate"):
-		return "TLS could not be established; check -otlp-ca-file, the certificate's names, or -otlp-insecure-skip-verify to confirm that is the cause"
+		return "TLS could not be established; check the CA bundle this destination verifies with (-otlp-tls-ca-file on the default chain, caFile on a route or export override), the certificate's names, or set -otlp-tls-insecure-skip-verify (insecureSkipVerify on a route or override) to confirm that is the cause"
 	case strings.Contains(msg, "i/o timeout"), strings.Contains(msg, "context deadline exceeded"):
 		return "the endpoint did not answer inside -otlp-timeout; check network policy and that the port is the collector's OTLP port"
 	}

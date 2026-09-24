@@ -50,14 +50,12 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		}
 		t.stopPipeline(ctx, f)
 		t.closeArchive(f)
-		f.committed = 0
+		// A new incarnation, whose fresh tail id makes batched entries with
+		// OLD-stream positions resolve to nothing at commit: the replaced
+		// content is gone and, with no segment recorded for it, its id is dead.
+		f.beginIncarnation(0)
 		f.inode, f.fp = 0, fingerprint{}
 		f.archiveDone, f.archiveEOF = false, false
-		// A fresh tail id makes batched entries with OLD-stream positions
-		// resolve to nothing at commit: the replaced content is gone and its
-		// id is dead.
-		f.newTail()
-		f.restartAt(0)
 		t.newPipeline(f)
 	}
 	// A paused (rate-limited) file first retries its retained pending bytes —
@@ -246,6 +244,10 @@ func (t *Tailer) openArchive(f *file) error {
 	inode := inodeOf(st)
 	// A replaced file (different inode or head fingerprint) restarts at zero.
 	if f.identityChanged(inode, fh) {
+		// A rotation handled, like its readArchive sibling (archiveReplaced)
+		// and every plain-file arm: kubescrape_log_rotations_total says
+		// "rotations and truncations handled", and this door is one.
+		obs.LogRotations.Inc()
 		// The reset below abandons the old stream's [committed, end)
 		// remainder — its offsets are decompressed positions that mean
 		// nothing in the replacement — so it is a loss unless everything had
@@ -267,11 +269,13 @@ func (t *Tailer) openArchive(f *file) error {
 		// Withheld highs name decompressed positions in the stream that is
 		// gone. This arm reuses the tail id (there is nothing to record a
 		// segment for — the old stream's offsets mean nothing in the
-		// replacement), so a surviving high would commit the NEW archive past
-		// bytes it never exported, exactly as it did on the rewind path. The
-		// fd-release gate (committed >= fedEnd, nothing pending) means the map
-		// is empty by the time an archive can reach here at all; the clear is
-		// what keeps that an invariant rather than a coincidence.
+		// replacement — and, unlike the doors beginIncarnation serves, nothing
+		// can still be live under the old id), so a surviving high would
+		// commit the NEW archive past bytes it never exported, exactly as it
+		// did on the rewind path. The fd-release gate (committed >= fedEnd,
+		// nothing pending) means the map is empty by the time an archive can
+		// reach here at all; the clear is what keeps that an invariant rather
+		// than a coincidence.
 		f.exportedHighs = nil
 		// The old identity is spent with the reset. Kept, it re-fired this
 		// arm — and the count — on the NEXT replacement whenever this open
@@ -366,7 +370,13 @@ func (t *Tailer) drainArchive(ctx context.Context, f *file) bool {
 			}
 			return true // nothing left that a drain could reach: settle
 		}
-		if f.archiveEOF || f.committed >= f.readPos && f.archiveDone {
+		// archiveEOF alone: archiveDone cannot hold here without it. It is set
+		// only by finishArchive (beside archiveEOF) and by openArchive's
+		// non-gzip quarantine (which never adopts the fd, so f.f stays nil),
+		// and every path that clears archiveEOF clears archiveDone with it
+		// save a fresh open, which runs with archiveDone already false. The
+		// old `|| committed >= readPos && archiveDone` was unreachable.
+		if f.archiveEOF {
 			return true // everything fed; only its flush is pending
 		}
 		if err := t.openArchive(f); err != nil {

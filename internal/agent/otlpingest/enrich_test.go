@@ -9,10 +9,12 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -63,6 +65,49 @@ func newMeta() *fakeMeta {
 
 func newEnricher(m MetadataSource, mode MetricsMode) *Enricher {
 	return NewEnricher(Config{Meta: m, MetricsMode: mode})
+}
+
+// Enrichment is LINEAR in the resolved pod's label count and the sender's
+// resource width. The merge used to Put the built attributes one key at a
+// time, each Put scanning the sender's resource — O(|built| x (|dst|+|built|))
+// — and both sides are tenant-authored: a pod's labels are bounded only by the
+// API server's object size, and the merge runs once per resource of every
+// push, inside the handler's in-flight slot. A few thousand resources naming a
+// many-labelled pod held that slot for minutes. Coarse on purpose: the linear
+// merge does this in tens of milliseconds, the quadratic one in tens of
+// seconds.
+func TestEnrichmentIsLinearInThePodsLabelCount(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("the race detector multiplies every map operation's cost")
+	}
+	const labels, resources = 20_000, 3
+	pod := kubemeta.Pod{Name: "web-1", Namespace: "default", UID: "pod-uid-1", NodeName: "node1",
+		Labels: make(map[string]string, labels)}
+	for i := range labels {
+		pod.Labels[fmt.Sprintf("label-%d", i)] = "v"
+	}
+	meta := &fakeMeta{containers: map[string]*kubemeta.ContainerMetadata{
+		"cafe01": {Container: kubemeta.Container{Name: "app", ID: "containerd://cafe01"}, Pod: pod},
+	}}
+	ld := plog.NewLogs()
+	for range resources {
+		rl := ld.ResourceLogs().AppendEmpty()
+		rl.Resource().Attributes().PutStr("container.id", "cafe01")
+		rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
+	}
+	start := time.Now()
+	newEnricher(meta, MetricsAuto).EnrichLogs(context.Background(), ld)
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("enriching %d resources naming a pod with %d labels took %v: the merge is quadratic again",
+			resources, labels, d)
+	}
+	a := ld.ResourceLogs().At(resources - 1).Resource().Attributes()
+	if a.Len() < labels {
+		t.Fatalf("the enriched resource carries %d attributes, want at least the %d labels", a.Len(), labels)
+	}
+	if v, _ := a.Get("k8s.namespace.name"); v.Str() != "default" {
+		t.Errorf("k8s.namespace.name = %q after the bulk merge, want the resolved default", v.Str())
+	}
 }
 
 func TestEnrichLogsByContainerID(t *testing.T) {
@@ -122,6 +167,64 @@ func TestEnrichKeepsSenderDescriptionAndOwnsResolvedIdentity(t *testing.T) {
 	}
 }
 
+// Only the lookup key the resolution was made BY is the sender's to keep. When
+// container.id resolved, a k8s.pod.uid beside it is a claim this receiver can
+// check against the pod it just read — and one naming a DIFFERENT pod used to
+// survive, shipping one resource that named two pods (the resolved name and
+// namespace beside a foreign uid). The same rule on the split path's
+// sender-own group, where the resource's own id is the lookup input.
+func TestOnlyTheResolvingLookupKeyIsExemptFromTheResolvedIdentity(t *testing.T) {
+	t.Run("logs", func(t *testing.T) {
+		ld := plog.NewLogs()
+		rl := ld.ResourceLogs().AppendEmpty()
+		a := rl.Resource().Attributes()
+		a.PutStr("container.id", "cafe01")
+		a.PutStr("k8s.pod.uid", "victim-uid-9")
+		rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+
+		newEnricher(newMeta(), MetricsAuto).EnrichLogs(context.Background(), ld)
+
+		if v, _ := a.Get("k8s.pod.uid"); v.Str() != "pod-uid-1" {
+			t.Errorf("k8s.pod.uid = %q, want the resolved pod-uid-1: container.id resolved, so the uid is "+
+				"not the lookup input and a mismatched one is a claim to correct", v.Str())
+		}
+		if v, _ := a.Get("container.id"); v.Str() != "cafe01" {
+			t.Errorf("container.id = %q, want the sender's cafe01 verbatim: it IS the lookup input", v.Str())
+		}
+	})
+	t.Run("split", func(t *testing.T) {
+		md := gaugeMetrics(map[string]string{"container.id": "cafe01", "k8s.pod.uid": "victim-uid-9"},
+			map[string]any{"path": "/a"})
+		out := newEnricher(newMeta(), MetricsDatapoint).EnrichMetrics(context.Background(), md)
+		a := out.ResourceMetrics().At(0).Resource().Attributes()
+		if v, _ := a.Get("k8s.pod.uid"); v.Str() != "pod-uid-1" {
+			t.Errorf("k8s.pod.uid = %q, want the resolved pod-uid-1", v.Str())
+		}
+		if v, _ := a.Get("container.id"); v.Str() != "cafe01" {
+			t.Errorf("container.id = %q, want the sender's cafe01 verbatim", v.Str())
+		}
+	})
+	// The other direction: a pod-uid resolution keeps the sender's uid (its
+	// input), and a container.id it could not resolve is left alone — a pod
+	// build names no container to correct it with.
+	t.Run("pod uid resolved", func(t *testing.T) {
+		ld := plog.NewLogs()
+		rl := ld.ResourceLogs().AppendEmpty()
+		a := rl.Resource().Attributes()
+		a.PutStr("container.id", "stale")
+		a.PutStr("k8s.pod.uid", "pod-uid-2")
+		rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+
+		newEnricher(newMeta(), MetricsAuto).EnrichLogs(context.Background(), ld)
+
+		for k, want := range map[string]string{"k8s.pod.uid": "pod-uid-2", "container.id": "stale", "k8s.pod.name": "web-2"} {
+			if v, _ := a.Get(k); v.Str() != want {
+				t.Errorf("%s = %q, want %q", k, v.Str(), want)
+			}
+		}
+	})
+}
+
 func TestEnrichLogsUnresolvedUntouched(t *testing.T) {
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()
@@ -141,10 +244,11 @@ func TestEnrichLogsLineEnrichment(t *testing.T) {
 	lr.Body().SetStr(`{"level":"error","@t":"2026-01-02T03:04:05Z","msg":"boom"}`)
 
 	// Line enrichment runs in the server's applyLogChain (one bounded body
-	// render shared with log-metrics and the rules), after EnrichLogs' scrub.
+	// render shared with log-metrics and the rules), after the chain's scrub.
 	s := NewServer(ServerConfig{
-		Enricher: NewEnricher(Config{Meta: newMeta(), EnrichLines: true}),
-		Exporter: &captureExporter{},
+		Enricher:    NewEnricher(Config{Meta: newMeta()}),
+		EnrichLines: true,
+		Exporter:    &captureExporter{},
 	})
 	s.cfg.Enricher.EnrichLogs(context.Background(), ld)
 	s.applyLogChain(ld)
@@ -164,8 +268,9 @@ func TestEnrichLogsLineEnrichmentRespectsSender(t *testing.T) {
 	lr.Body().SetStr(`{"level":"error","msg":"boom"}`)
 
 	s := NewServer(ServerConfig{
-		Enricher: NewEnricher(Config{Meta: newMeta(), EnrichLines: true}),
-		Exporter: &captureExporter{},
+		Enricher:    NewEnricher(Config{Meta: newMeta()}),
+		EnrichLines: true,
+		Exporter:    &captureExporter{},
 	})
 	s.cfg.Enricher.EnrichLogs(context.Background(), ld)
 	s.applyLogChain(ld)
@@ -270,14 +375,14 @@ func TestEnrichMetricsAutoUsesResourceWhenPresent(t *testing.T) {
 // `CGO_ENABLED=1 go test -race` to check for data races; without -race it still
 // surfaces panics, deadlocks, or corrupted output.
 func TestEnricherConcurrent(t *testing.T) {
-	e := NewEnricher(Config{Meta: newMeta(), MetricsMode: MetricsAuto, EnrichLines: true})
+	e := NewEnricher(Config{Meta: newMeta(), MetricsMode: MetricsAuto})
 	const workers = 32
 	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			for i := 0; i < 50; i++ {
+			for range 50 {
 				ld := plog.NewLogs()
 				rl := ld.ResourceLogs().AppendEmpty()
 				rl.Resource().Attributes().PutStr("container.id", "cafe01")
@@ -352,13 +457,13 @@ func (c *countingMeta) Container(ctx context.Context, id string, wait time.Durat
 func TestEnrichLogsMemoizesPerRequest(t *testing.T) {
 	meta := &countingMeta{fakeMeta: newMeta()}
 	ld := plog.NewLogs()
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		rl := ld.ResourceLogs().AppendEmpty()
 		rl.Resource().Attributes().PutStr("container.id", "cafe01")
 		rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
 	}
 	newEnricher(meta, MetricsAuto).EnrichLogs(context.Background(), ld)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		a := ld.ResourceLogs().At(i).Resource().Attributes()
 		if v, _ := a.Get("k8s.pod.name"); v.Str() != "web-1" {
 			t.Errorf("resource %d not enriched: %q", i, v.Str())
@@ -505,6 +610,59 @@ func TestSplitCountsUnresolved(t *testing.T) {
 	}
 }
 
+// forwardScrubbed pushes ld through the receiver's real log path with only the
+// scrubber configured (no line enrichment, rules, metrics or lifts) and returns
+// once it has been forwarded; the records are scrubbed in place.
+func forwardScrubbed(t *testing.T, scrub *logscrub.Scrubber, ld plog.Logs) {
+	t.Helper()
+	exp := &captureExporter{}
+	s := NewServer(ServerConfig{Enricher: NewEnricher(Config{Meta: &fakeMeta{}}), Scrub: scrub, Exporter: exp})
+	if err := s.forwardLogs(context.Background(), ld); err != nil {
+		t.Fatal(err)
+	}
+	if len(exp.logs) != 1 {
+		t.Fatalf("the push was not forwarded (%d exports)", len(exp.logs))
+	}
+}
+
+// Scrubbing is the chain's FIRST per-record step and is unconditional: it runs
+// whatever else is configured, and on a body of any size — the chain's size
+// bound (maxChainBodyBytes) limits what the lift, enrichment, metrics and
+// rules READ, never what is redacted before the record is forwarded.
+func TestScrubRedactsEveryBodyWhateverTheChainConfiguration(t *testing.T) {
+	scrub, err := logscrub.New(logscrub.Config{Builtin: []string{"defaults"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		enrich bool
+	}{{"scrub only", false}, {"scrub with line enrichment", true}} {
+		for _, size := range []int{64, maxChainBodyBytes + 1} {
+			ld := plog.NewLogs()
+			lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+			lr.Body().SetStr(strings.Repeat("x", size) + " password=hunter2")
+			exp := &captureExporter{}
+			s := NewServer(ServerConfig{
+				Enricher:    NewEnricher(Config{Meta: &fakeMeta{}}),
+				Scrub:       scrub,
+				EnrichLines: tc.enrich,
+				Exporter:    exp,
+			})
+			if err := s.forwardLogs(context.Background(), ld); err != nil {
+				t.Fatal(err)
+			}
+			if len(exp.logs) != 1 {
+				t.Fatalf("%s, %d-byte body: not forwarded", tc.name, size)
+			}
+			got := exp.logs[0].ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().Str()
+			if strings.Contains(got, "hunter2") {
+				t.Errorf("%s, %d-byte body: the secret was forwarded unredacted", tc.name, size)
+			}
+		}
+	}
+}
+
 // A structured body — what the OTel logging SDKs and the collector's
 // json_parser emit — must be redacted like a raw line. Scrubbing only string
 // bodies meant the identical message was scrubbed on the tailer path and
@@ -514,8 +672,6 @@ func TestScrubStructuredLogBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := NewEnricher(Config{Scrub: scrub, Meta: &fakeMeta{}})
-
 	ld := plog.NewLogs()
 	lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
 	body := lr.Body().SetEmptyMap()
@@ -537,7 +693,7 @@ func TestScrubStructuredLogBody(t *testing.T) {
 	list := body.PutEmptySlice("args")
 	list.AppendEmpty().SetStr("--verbose")
 
-	e.EnrichLogs(context.Background(), ld)
+	forwardScrubbed(t, scrub, ld)
 
 	got := lr.Body().Map()
 	for _, tc := range []struct{ path, want string }{
@@ -629,15 +785,13 @@ func TestScrubStructuredBodyWithPlainReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := NewEnricher(Config{Scrub: scrub, Meta: &fakeMeta{}})
-
 	ld := plog.NewLogs()
 	lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
 	body := lr.Body().SetEmptyMap()
 	body.PutStr("ssn", "123-45-6789")
 	body.PutStr("note", "no secret here")
 
-	e.EnrichLogs(context.Background(), ld)
+	forwardScrubbed(t, scrub, ld)
 
 	got, _ := lr.Body().Map().Get("ssn")
 	if strings.Contains(got.Str(), "123-45-6789") {
@@ -709,7 +863,7 @@ func TestPeerRejectIsResolvedOncePerRequest(t *testing.T) {
 		PeerReject:     func(*kubemeta.Pod) bool { calls++; return true },
 	})
 	ld := plog.NewLogs()
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
 	}
 	enr.EnrichLogs(withPeerIP(context.Background(), "10.1.2.3:41234"), ld)
@@ -822,9 +976,9 @@ func TestAutoModeKeepsTheSendersOwnIdentity(t *testing.T) {
 }
 
 // The split path must count a REJECTED peer attribution exactly as the
-// resource path does. The ""-group's accounting was an open-coded copy of
-// applyMetadata's that counted peer_ip and unresolved but nothing on a
-// rejection — behind a comment claiming another site counted it — so
+// resource path does. The ""-group's accounting was an open-coded copy of the
+// resource path's (now enrichAttrs) that counted peer_ip and unresolved but
+// nothing on a rejection — behind a comment claiming another site counted it — so
 // -ingest-metrics-mode=datapoint (and any auto push demoted to split)
 // under-reported the one counter Config.PeerReject's doc promises. Both sites
 // now share one helper (peerFallback).
@@ -1013,5 +1167,194 @@ func TestStolenLookupIDStillResolvesTheVictimsNamespace(t *testing.T) {
 		t.Fatalf("k8s.namespace.name = %q (present=%v), want %q — the documented residual changed; "+
 			"update SenderIdentityStrip's lookup-key bullet, the AGENTS.md ingest bullet and the "+
 			"kubescrape_ingest_identity_stripped_total help text to match", v.Str(), ok, "payments")
+	}
+}
+
+// scrubBody's contract is EVERY string leaf of a body, and a secret nested past
+// the walk's depth bound used to ship in clear, uncounted: the bound was a flat
+// 8, far inside what the wire guard admits. It is derived from that guard now,
+// so the deepest leaf a PUSHED body can carry is scrubbed — pinned here both
+// in-process (maps, three wire levels each) and over the wire at the exact
+// limit (arrays, the cheapest nesting at two).
+func TestDeepStructuredBodyIsScrubbed(t *testing.T) {
+	scrub, err := logscrub.New(logscrub.Config{Builtin: []string{"defaults"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, depth := range []int{9, (maxNestingDepth - 5) / 3} {
+		ld := plog.NewLogs()
+		lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+		m := lr.Body().SetEmptyMap()
+		for i := 1; i < depth; i++ {
+			m = m.PutEmptyMap("n")
+		}
+		m.PutStr("password", "hunter2") // the leaf sits at scrub depth `depth`
+		forwardScrubbed(t, scrub, ld)
+		if s := lr.Body().AsString(); strings.Contains(s, "hunter2") {
+			t.Errorf("map depth %d: the secret survived the scrub: %.120s…", depth, s)
+		}
+	}
+
+	// Over the wire: the deepest array chain the guard admits must decode, and
+	// its leaf must be scrubbed; one level more must be refused at the door.
+	leaf := protoField(nil, 1, []byte("password=hunter2")) // AnyValue{string_value}
+	deepest := (maxNestingDepth - 5) / 2
+	if err := checkNesting(logsRequestAround(nestedAnyValue(deepest+1, leaf))); err == nil {
+		t.Fatalf("the wire guard admits a leaf at scrub depth %d; maxBodyScrubDepth no longer covers it", deepest+1)
+	}
+	body := logsRequestAround(nestedAnyValue(deepest, leaf))
+	if err := checkNesting(body); err != nil {
+		t.Fatalf("the wire guard refuses a leaf at scrub depth %d: %v", deepest, err)
+	}
+	req := plogotlp.NewExportRequest()
+	if err := req.UnmarshalProto(body); err != nil {
+		t.Fatal(err)
+	}
+	forwardScrubbed(t, scrub, req.Logs())
+	v := req.Logs().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body()
+	for range deepest {
+		v = v.Slice().At(0)
+	}
+	if strings.Contains(v.Str(), "hunter2") {
+		t.Errorf("a leaf at scrub depth %d — admitted by the wire guard — was not scrubbed: %q", deepest, v.Str())
+	}
+}
+
+// waitGatedMeta resolves a container id only on a WAITED lookup — the metadata
+// service's answer for an id the kubelet posts a moment after the push arrives
+// — while pod uids resolve either way.
+type waitGatedMeta struct{ *fakeMeta }
+
+func (m waitGatedMeta) Container(ctx context.Context, id string, wait time.Duration) (*kubemeta.ContainerMetadata, error) {
+	if wait <= 0 {
+		return nil, fmt.Errorf("container %s not yet posted", id)
+	}
+	return m.fakeMeta.Container(ctx, id, wait)
+}
+
+// One payload is attributed by the SAME id whatever the metrics mode. A sender
+// carrying both a container id and a pod uid gets container grain when the
+// container id resolves — and "resolves" must be one question. Resource
+// enrichment asked the waited attribution lookup while the split path asked a
+// wait-free probe, so with -ingest-metadata-wait set, a container id the
+// kubelet had not posted yet named the container in resource and auto mode and
+// only the POD in datapoint mode: a different service.instance.id, no container
+// name, for the identical push (resolvableToken is now the one chooser).
+func TestTokenChoiceIsModeIndependent(t *testing.T) {
+	base := newMeta()
+	base.pods["pod-uid-1"] = &base.containers["cafe01"].Pod
+	meta := waitGatedMeta{base}
+	both := map[string]string{"container.id": "cafe01", "k8s.pod.uid": "pod-uid-1"}
+
+	identity := func(a map[string]any) string {
+		return fmt.Sprintf("service.instance.id=%v k8s.container.name=%v", a["service.instance.id"], a["k8s.container.name"])
+	}
+	const want = "service.instance.id=containerd://cafe01 k8s.container.name=app"
+
+	for _, mode := range []MetricsMode{MetricsResource, MetricsDatapoint, MetricsAuto} {
+		e := NewEnricher(Config{Meta: meta, MetricsMode: mode, Wait: 50 * time.Millisecond})
+		// Both ids on the RESOURCE (every mode) and on the POINT (the split
+		// path's per-point choice) must pick the same object.
+		for _, shape := range []struct {
+			name     string
+			res, dpt map[string]string
+		}{
+			{"resource ids", both, map[string]string{"path": "/a"}},
+			{"point ids", nil, both},
+		} {
+			if shape.res == nil && mode == MetricsResource {
+				continue // resource mode reads no point id (auto demotes this shape to the split)
+			}
+			out := e.EnrichMetrics(context.Background(), gaugeWith(shape.res, shape.dpt))
+			if n := out.ResourceMetrics().Len(); n != 1 {
+				t.Fatalf("%s/%s: %d resources, want 1", mode, shape.name, n)
+			}
+			if got := identity(resAttrsOf(out)); got != want {
+				t.Errorf("%s/%s: %s, want %s", mode, shape.name, got, want)
+			}
+		}
+	}
+
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	for k, v := range both {
+		rl.Resource().Attributes().PutStr(k, v)
+	}
+	NewEnricher(Config{Meta: meta, Wait: 50 * time.Millisecond}).EnrichLogs(context.Background(), ld)
+	if got := identity(rl.Resource().Attributes().AsRaw()); got != want {
+		t.Errorf("logs: %s, want %s", got, want)
+	}
+}
+
+// A resource carrying BOTH a container ID and a pod UID resolves via the
+// container ID (documented in Config: container keys are checked first — a
+// container ID names the exact incarnation, a pod UID does not).
+func TestBothContainerIDAndPodUIDPrefersContainer(t *testing.T) {
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("k8s.pod.uid", "pod-uid-2") // would resolve web-2
+	rl.Resource().Attributes().PutStr("container.id", "cafe01")   // resolves web-1 + container
+	rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+
+	newEnricher(newMeta(), MetricsAuto).EnrichLogs(context.Background(), ld)
+
+	a := rl.Resource().Attributes()
+	if v, _ := a.Get("k8s.pod.name"); v.Str() != "web-1" {
+		t.Errorf("k8s.pod.name = %q; container ID must take precedence over pod UID", v.Str())
+	}
+	if v, ok := a.Get("k8s.container.name"); !ok || v.Str() != "app" {
+		t.Errorf("k8s.container.name = %q ok=%v; container-level enrichment lost", v.Str(), ok)
+	}
+}
+
+// When the container ID is present but unresolvable (stale/garbage), the
+// enricher falls back to a resolvable pod UID the sender also provided:
+// container is still preferred when it resolves (see the precedence test
+// above), but a dead container ID must not veto pod-level enrichment.
+func TestUnresolvableContainerIDFallsBackToUID(t *testing.T) {
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("container.id", "unknown")
+	rl.Resource().Attributes().PutStr("k8s.pod.uid", "pod-uid-2")
+	rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+
+	newEnricher(newMeta(), MetricsAuto).EnrichLogs(context.Background(), ld)
+	a := rl.Resource().Attributes()
+	if v, ok := a.Get("k8s.pod.name"); !ok || v.Str() != "web-2" {
+		t.Errorf("k8s.pod.name = %q ok=%v; expected UID fallback to web-2 after a container-ID miss", v.Str(), ok)
+	}
+	// A stale container ID must not leave a container name behind.
+	if _, ok := a.Get("k8s.container.name"); ok {
+		t.Error("gained a container name from an unresolvable container ID")
+	}
+}
+
+// An ordinary sender that labels its own data points with its own container id
+// must stay on the resource path in auto mode: the split path overwrites the
+// sender's resource attributes with the derived ones, so demoting it changed
+// service.name — the Prometheus job — for every app that adds such a label.
+func TestAutoModeKeepsSelfLabelledSenderOnResourcePath(t *testing.T) {
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	ra := rm.Resource().Attributes()
+	ra.PutStr("service.name", "checkout")
+	ra.PutStr("container.id", "cafe01")
+	g := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	g.SetName("http_requests")
+	dp := g.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp.SetIntValue(1)
+	dp.Attributes().PutStr("container.id", "cafe01") // its OWN id, not a foreign object's
+
+	out := newEnricher(newMeta(), MetricsAuto).EnrichMetrics(context.Background(), md)
+
+	if n := out.ResourceMetrics().Len(); n != 1 {
+		t.Fatalf("ResourceMetrics = %d; want 1 — the sender was regrouped by the splitter", n)
+	}
+	a := out.ResourceMetrics().At(0).Resource().Attributes()
+	if v, _ := a.Get("service.name"); v.Str() != "checkout" {
+		t.Errorf("service.name = %q; want checkout — the sender is authoritative about itself", v.Str())
+	}
+	if v, _ := a.Get("k8s.pod.name"); v.Str() != "web-1" {
+		t.Errorf("k8s.pod.name = %q; want web-1 — the resource path still enriches", v.Str())
 	}
 }

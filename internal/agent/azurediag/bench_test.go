@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
@@ -32,7 +33,7 @@ func benchArmID(i, resources int) string {
 func benchLogEnvelope(records, resources int) []byte {
 	var sb strings.Builder
 	sb.WriteString(`{"records":[`)
-	for i := 0; i < records; i++ {
+	for i := range records {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
@@ -53,7 +54,7 @@ var benchMetricNames = [5]string{"cpu_percent", "dtu_consumption_percent", "stor
 func benchMetricEnvelope(records, resources int) []byte {
 	var sb strings.Builder
 	sb.WriteString(`{"records":[`)
-	for i := 0; i < records; i++ {
+	for i := range records {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
@@ -175,7 +176,7 @@ func BenchmarkConvertLogs(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		run(b, New(Config{Enrich: true, Scrub: scrub, LogAttrs: extractor, Rules: rules}))
+		run(b, New(Config{Chain: logchain.Config{Enrich: true, Scrub: scrub, LogAttrs: extractor, Rules: rules}}))
 	})
 }
 

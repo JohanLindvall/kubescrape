@@ -50,12 +50,12 @@ func TestCopySizeEstimateBoundsRealMemory(t *testing.T) {
 			a.PutStr("container.id", strings.Repeat("a", 64))
 		}},
 		{"many short attributes", func(a pcommon.Map) {
-			for i := 0; i < 200; i++ {
+			for i := range 200 {
 				a.PutStr(fmt.Sprintf("k%d", i), "v")
 			}
 		}},
 		{"many int attributes", func(a pcommon.Map) {
-			for i := 0; i < 200; i++ {
+			for i := range 200 {
 				a.PutInt(fmt.Sprintf("k%d", i), int64(i))
 			}
 		}},

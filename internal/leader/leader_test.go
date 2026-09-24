@@ -90,12 +90,20 @@ func TestRunsWorkAndStopsOnCancel(t *testing.T) {
 func TestWorkThatIgnoresContextIsReported(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
-	cfg := testConfig(func(context.Context) { <-release })
+	started := make(chan struct{})
+	cfg := testConfig(func(context.Context) { close(started); <-release })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, cfg) }()
-	time.Sleep(300 * time.Millisecond) // let it acquire
+	// Cancel once the work is RUNNING, never after a guessed delay: cancelled
+	// before the lease is acquired, Run correctly returns nil (there is no
+	// worker to wait for), and the test would fail for the machine's load.
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("never acquired the lease")
+	}
 	cancel()
 
 	select {
@@ -115,8 +123,8 @@ func TestNeverLedReportsNoLoss(t *testing.T) {
 	client := fake.NewSimpleClientset(&coordinationv1.Lease{
 		ObjectMeta: metav1.ObjectMeta{Name: "kubescrape-cluster-leader", Namespace: "monitoring"},
 		Spec: coordinationv1.LeaseSpec{
-			HolderIdentity:       ptr("pod-b"),
-			LeaseDurationSeconds: ptr(int32(3600)),
+			HolderIdentity:       new("pod-b"),
+			LeaseDurationSeconds: new(int32(3600)),
 			RenewTime:            &metav1.MicroTime{Time: time.Now()},
 			AcquireTime:          &metav1.MicroTime{Time: time.Now()},
 		},
@@ -141,7 +149,18 @@ func TestNeverLedReportsNoLoss(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, cfg) }()
-	time.Sleep(400 * time.Millisecond)
+	// Cancel once the elector has demonstrably competed — two lease GETs are a
+	// refused acquire attempt and its retry — never after a guessed delay: a
+	// cancel landing before Run reaches le.Run satisfies every assertion below
+	// without client-go's deferred OnStoppedLeading, the report this test
+	// polices, ever having fired.
+	deadline := time.Now().Add(10 * time.Second)
+	for leaseGets(client) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("the elector never tried to acquire the lease")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	cancel()
 	select {
 	case <-done:
@@ -326,7 +345,16 @@ func (f *fakeLock) RecordEvent(string)                                          
 func (f *fakeLock) Identity() string                                                { return f.identity }
 func (f *fakeLock) Describe() string                                                { return "fake" }
 
-func ptr[T any](v T) *T { return &v }
+// leaseGets counts the lease reads the elector has issued against client.
+func leaseGets(client *fake.Clientset) int {
+	n := 0
+	for _, a := range client.Actions() {
+		if a.GetVerb() == "get" && a.GetResource().Resource == "leases" {
+			n++
+		}
+	}
+	return n
+}
 
 // Configuration errors surface instead of panicking (which RunOrDie would do).
 func TestConfigValidation(t *testing.T) {

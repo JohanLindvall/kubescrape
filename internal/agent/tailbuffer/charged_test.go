@@ -173,7 +173,7 @@ func TestOnlyLiveVerdictEvictionsAreCounted(t *testing.T) {
 func TestDecisionCacheStaysBounded(t *testing.T) {
 	now := time.Unix(1700000000, 0)
 	c := newDecisionCache(8, time.Minute)
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		c.put(traceID(uint64(i)), i%2 == 0, 1, now.Add(time.Duration(i)*time.Millisecond))
 	}
 	if c.len() > 8 {
@@ -195,7 +195,7 @@ func TestDecisionCacheFIFODoesNotGrowUnbounded(t *testing.T) {
 	id[0] = 1
 	// Re-decide the SAME few traces far more often than the cap, so the map
 	// stays tiny and evict never runs.
-	for i := 0; i < 100000; i++ {
+	for i := range 100000 {
 		id[1] = byte(i % 8)
 		c.put(id, true, 1, now)
 	}

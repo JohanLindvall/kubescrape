@@ -9,11 +9,17 @@ package cumagg
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
 func capturedLog() (*slog.Logger, func() string) {
@@ -31,7 +37,7 @@ func TestCapPressureIsReportedOncePerWindow(t *testing.T) {
 	h := newHarness(1, 0) // cap 1, eviction disabled
 
 	h.observe("a")
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		if h.observe("b") {
 			t.Fatal("the cap admitted a second series")
 		}
@@ -99,7 +105,7 @@ func TestSuppressedCyclesAccumulateIntoTheLineTheyAreCountedFor(t *testing.T) {
 
 	// Cycles 2..6 are inside the same capWarnEvery window and emit nothing.
 	// Their refusals must survive to the next line that does.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		h.observe("b")
 		h.store.reportCapPressure(log)
 	}
@@ -146,5 +152,113 @@ func TestAQuietCycleDoesNotSpendTheThrottleSlot(t *testing.T) {
 	// refusal, not a vacuous line the quiet cycle spent the slot on.
 	if !strings.Contains(out, "dropped=1") {
 		t.Errorf("the quiet cycle logged in place of the refusal:\n%s", out)
+	}
+}
+
+// A non-positive export interval cannot reach time.NewTicker (it panics), so
+// Run substitutes a minute — and the substitution must be said: every startup
+// line prints the flag's value, so a silent fallback leaves the process
+// describing an interval it does not use.
+func TestNonPositiveRunIntervalFallbackIsWarned(t *testing.T) {
+	for _, iv := range []time.Duration{0, -time.Second} {
+		log, dump := capturedLog()
+		h := newHarness(10, 0)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // Run's final export, then return
+		h.store.Run(ctx, h, iv, pcommon.NewResource(), log)
+		out := dump()
+		if !strings.Contains(out, "exporting every minute instead") || !strings.Contains(out, `aggregate="test metrics"`) {
+			t.Errorf("interval %v: the fallback was silent:\n%s", iv, out)
+		}
+	}
+
+	log, dump := capturedLog()
+	h := newHarness(10, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.store.Run(ctx, h, time.Minute, pcommon.NewResource(), log)
+	if out := dump(); strings.Contains(out, "exporting every minute instead") {
+		t.Errorf("a positive interval warned:\n%s", out)
+	}
+}
+
+// A constructor's staleAfter fallback is one arm for both aggregators, and its
+// line must not contradict its own error: a NEGATIVE value parses fine and is
+// refused all the same, so the line says "invalid" — "unparseable" sent the
+// reader looking for a typo. A valid value, "0" (disable) included, is silent.
+func TestResolveStaleAfterWarnsOnEveryRefusalAndOnlyThen(t *testing.T) {
+	for _, bad := range []string{"-15m", "quarter hour"} {
+		log, dump := capturedLog()
+		if got := ResolveStaleAfter("traceMetrics.staleAfter", bad, 15*time.Minute, log); got != 15*time.Minute {
+			t.Errorf("%q resolved to %v, want the default", bad, got)
+		}
+		out := dump()
+		if !strings.Contains(out, "traceMetrics.staleAfter is invalid; using the default eviction age") {
+			t.Errorf("%q: the fallback line is missing or names no field:\n%s", bad, out)
+		}
+		if !strings.Contains(out, "staleAfter=15m0s") {
+			t.Errorf("%q: the line does not say what is used instead:\n%s", bad, out)
+		}
+	}
+	for _, good := range []string{"", "0", "5m"} {
+		log, dump := capturedLog()
+		ResolveStaleAfter("serviceGraph.staleAfter", good, time.Minute, log)
+		if out := dump(); out != "" {
+			t.Errorf("a valid staleAfter %q logged:\n%s", good, out)
+		}
+	}
+}
+
+// flakyExporter fails its first n exports, then accepts.
+type flakyExporter struct {
+	n        int32
+	attempts atomic.Int32
+	accepted atomic.Int32
+}
+
+func (f *flakyExporter) ExportMetrics(context.Context, pmetric.Metrics) error {
+	if f.attempts.Add(1) <= f.n {
+		return errors.New("collector unavailable")
+	}
+	f.accepted.Add(1)
+	return nil
+}
+
+// A collector outage is narrated as a RUN: one Warn when it starts, the
+// attempts inside the restatement interval at Debug, and one Info when it
+// ends carrying what it cost. It used to be a Warn on every tick for the whole
+// outage and a recovery line that could not say how long it had lasted.
+func TestRunNarratesAnExportOutageAsARun(t *testing.T) {
+	log, dump := capturedLog()
+	h := newHarness(10, 0)
+	h.observe("a")
+	exp := &flakyExporter{n: 3}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.store.Run(ctx, exp, time.Millisecond, pcommon.NewResource(), log)
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for exp.accepted.Load() == 0 {
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatalf("no export was accepted within the deadline (%d attempts)", exp.attempts.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	out := dump()
+	if n := strings.Count(out, `level=WARN msg="exporting cumulative metrics failed`); n != 1 {
+		t.Errorf("an outage of 3 failed exports warned %d times, want 1 (the repeats are Debug):\n%s", n, out)
+	}
+	if n := strings.Count(out, `level=DEBUG msg="exporting cumulative metrics failed"`); n != 2 {
+		t.Errorf("the repeats inside the restatement interval logged %d Debug lines, want 2:\n%s", n, out)
+	}
+	if n := strings.Count(out, "cumulative-metrics export recovered"); n != 1 || !strings.Contains(out, "failures=3") {
+		t.Errorf("want one recovery line carrying failures=3, got %d:\n%s", n, out)
 	}
 }

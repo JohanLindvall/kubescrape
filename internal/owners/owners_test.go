@@ -127,7 +127,7 @@ func TestResolveDirectOwnerWorkloadLabels(t *testing.T) {
 	}
 
 	// The kinds must also be WATCHED, or the listers backing the resolver are
-	// empty in production no matter what kindGVR maps.
+	// empty in production no matter what ownerRow maps.
 	for _, gvr := range []schema.GroupVersionResource{StatefulSetGVR, DaemonSetGVR} {
 		if !slices.Contains(AllGVRs, gvr) {
 			t.Errorf("%s missing from AllGVRs: no informer would populate its cache", gvr.Resource)
@@ -215,5 +215,58 @@ func TestResolveUIDMismatchKeepsRefIdentity(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %+v\nwant %+v (new object's labels must not attach to the old UID)", got, want)
+	}
+}
+
+// SameServedRefs is what the owner change token compares a cached owner's
+// references with (cmd/kubescrape's ownerChangeHandler), and it is only sound
+// while it agrees with Resolve: a difference it cannot see must be one Resolve
+// does not serve, or the node-targets memo 304s a chain that changed. Each case
+// edits ONE field of a ReplicaSet's reference to its Deployment — the reference
+// Resolve FOLLOWS — and requires the two answers to agree. BlockOwnerDeletion
+// and a re-allocated Controller pointer are the edits neither may notice.
+func TestSameServedRefsAgreesWithWhatResolveServes(t *testing.T) {
+	yes, no := true, false
+	base := metav1.OwnerReference{APIVersion: "apps/v1", Kind: "Deployment", Name: "web", UID: "dep-uid", Controller: &yes}
+	resolveVia := func(parent metav1.OwnerReference) []kubemeta.Owner {
+		team := map[string]string{"team": "core"}
+		r := fakeResolver(map[string]*metav1.PartialObjectMetadata{
+			"replicasets/default/web-abc": obj("rs-uid", nil, parent),
+			"deployments/default/web":     obj("dep-uid", team),
+			"deployments/default/api":     obj("dep-uid", team),
+			"statefulsets/default/web":    obj("dep-uid", team),
+		})
+		got, _ := r.Resolve("default", []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "web-abc", UID: "rs-uid", Controller: &yes,
+		}})
+		return got
+	}
+	for _, tc := range []struct {
+		name   string
+		edit   func(*metav1.OwnerReference)
+		served bool // whether Resolve's answer changes
+	}{
+		{"nothing", func(*metav1.OwnerReference) {}, false},
+		{"blockOwnerDeletion", func(r *metav1.OwnerReference) { r.BlockOwnerDeletion = &yes }, false},
+		{"controller pointer re-allocated", func(r *metav1.OwnerReference) { c := true; r.Controller = &c }, false},
+		{"apiVersion to an unwatched group", func(r *metav1.OwnerReference) { r.APIVersion = "example.com/v1" }, true},
+		{"apiVersion within the group", func(r *metav1.OwnerReference) { r.APIVersion = "apps/v1beta2" }, true},
+		{"kind", func(r *metav1.OwnerReference) { r.Kind = "StatefulSet" }, true},
+		{"name", func(r *metav1.OwnerReference) { r.Name = "api" }, true},
+		{"uid", func(r *metav1.OwnerReference) { r.UID = "dep-uid-2" }, true},
+		{"controller", func(r *metav1.OwnerReference) { r.Controller = &no }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			edited := base
+			tc.edit(&edited)
+			served := !reflect.DeepEqual(resolveVia(base), resolveVia(edited))
+			if served != tc.served {
+				t.Fatalf("fixture: editing %s changed Resolve's answer = %v, want %v", tc.name, served, tc.served)
+			}
+			if same := SameServedRefs([]metav1.OwnerReference{base}, []metav1.OwnerReference{edited}); same == served {
+				t.Errorf("SameServedRefs = %v after editing %s, but Resolve's answer changed = %v: "+
+					"the change token and the served chain disagree", same, tc.name, served)
+			}
+		})
 	}
 }

@@ -40,21 +40,21 @@ var (
 	reportedEndpointFields = map[string]any{
 		"oauth2":                   json.RawMessage(`{"clientId":{}}`),
 		"bearerTokenFile":          "/var/run/token",
-		"followRedirects":          ptr(true),
-		"enableHttp2":              ptr(true),
-		"honorTimestamps":          ptr(true),
-		"trackTimestampsStaleness": ptr(true),
+		"followRedirects":          new(true),
+		"enableHttp2":              new(true),
+		"honorTimestamps":          new(true),
+		"trackTimestampsStaleness": new(true),
 		"proxyUrl":                 "http://proxy:3128",
 		"noProxy":                  "10.0.0.0/8",
-		"proxyFromEnvironment":     ptr(true),
+		"proxyFromEnvironment":     new(true),
 		"proxyConnectHeader":       json.RawMessage(`{"Proxy-Authorization":[{"name":"s","key":"k"}]}`),
 		"params":                   json.RawMessage(`{"module":["http_2xx"]}`),
-		"honorLabels":              ptr(true),
+		"honorLabels":              new(true),
 		"relabelings":              json.RawMessage(`[{"action":"replace"}]`),
 		// The one whose DEFAULT (true) agrees with scrape.Scrapeable: only an
 		// explicit false is a partial application.
-		"filterRunning":        ptr(false),
-		"portNumber":           ptr(int32(9090)),
+		"filterRunning":        new(false),
+		"portNumber":           new(int32(9090)),
 		"tlsConfig.minVersion": "TLS13",
 		"tlsConfig.maxVersion": "TLS13",
 		"tlsConfig.caFile":     "/etc/prometheus/secrets/ca.crt",
@@ -67,12 +67,12 @@ var (
 	}
 	// reportedSpecFields are the monitor-level guard rails, same contract.
 	reportedSpecFields = map[string]any{
-		"sampleLimit":                    ptr(uint64(10000)),
-		"targetLimit":                    ptr(uint64(5)),
-		"labelLimit":                     ptr(uint64(30)),
-		"labelNameLengthLimit":           ptr(uint64(64)),
-		"labelValueLengthLimit":          ptr(uint64(128)),
-		"keepDroppedTargets":             ptr(uint64(100)),
+		"sampleLimit":                    new(uint64(10000)),
+		"targetLimit":                    new(uint64(5)),
+		"labelLimit":                     new(uint64(30)),
+		"labelNameLengthLimit":           new(uint64(64)),
+		"labelValueLengthLimit":          new(uint64(128)),
+		"keepDroppedTargets":             new(uint64(100)),
 		"jobLabel":                       "app",
 		"targetLabels":                   []string{"team"},
 		"podTargetLabels":                []string{"team"},
@@ -82,24 +82,22 @@ var (
 		"scrapeProtocols":                []string{"PrometheusText0.0.4"},
 		"fallbackScrapeProtocol":         "PrometheusText0.0.4",
 		"selectorMechanism":              "RelabelConfig",
-		"nativeHistogramBucketLimit":     ptr(uint64(160)),
+		"nativeHistogramBucketLimit":     new(uint64(160)),
 		"nativeHistogramMinBucketFactor": json.RawMessage(`"1.1"`),
-		"convertClassicHistogramsToNHCB": ptr(true),
-		"scrapeClassicHistograms":        ptr(true),
+		"convertClassicHistogramsToNHCB": new(true),
+		"scrapeClassicHistograms":        new(true),
 	}
 )
 
-func ptr[T any](v T) *T { return &v }
-
 func TestEveryParsedEndpointFieldIsInterpretedOrReported(t *testing.T) {
 	classified := append(slices.Clone(interpretedEndpointFields), keys(reportedEndpointFields)...)
-	assertClassified(t, "endpointSpec", jsonFields(reflect.TypeOf(endpointSpec{}), ""), classified)
+	assertClassified(t, "endpointSpec", jsonFields(reflect.TypeFor[endpointSpec](), ""), classified)
 
 	for name, value := range reportedEndpointFields {
 		t.Run(name, func(t *testing.T) {
 			var ep endpointSpec
 			setField(t, reflect.ValueOf(&ep).Elem(), name, value)
-			if got := ep.ignoredFields(); !slices.Contains(got, name) {
+			if got := ep.ignoredFields(nil); !slices.Contains(got, name) {
 				t.Errorf("%s set alone is not reported: ignoredFields = %v", name, got)
 			}
 		})
@@ -112,20 +110,20 @@ func TestEveryParsedEndpointFieldIsInterpretedOrReported(t *testing.T) {
 		var ep endpointSpec
 		switch name {
 		case "targetPort":
-			ep.TargetPort = ptr(intstr.FromInt32(9090))
+			ep.TargetPort = new(intstr.FromInt32(9090))
 		case "tlsConfig", "basicAuth", "authorization", "bearerTokenSecret", "metricRelabelings":
 			continue // struct arms: their own sub-fields are classified above
 		default:
 			setField(t, reflect.ValueOf(&ep).Elem(), name, "x")
 		}
-		if got := ep.ignoredFields(); slices.Contains(got, name) {
+		if got := ep.ignoredFields(nil); slices.Contains(got, name) {
 			t.Errorf("%s is interpreted but reported as ignored: %v", name, got)
 		}
 	}
 }
 
 func TestEveryParsedSpecFieldIsReported(t *testing.T) {
-	assertClassified(t, "specLimits", jsonFields(reflect.TypeOf(specLimits{}), ""), keys(reportedSpecFields))
+	assertClassified(t, "specLimits", jsonFields(reflect.TypeFor[specLimits](), ""), keys(reportedSpecFields))
 
 	for name, value := range reportedSpecFields {
 		t.Run(name, func(t *testing.T) {
@@ -162,8 +160,7 @@ func assertClassified(t *testing.T, what string, parsed, classified []string) {
 // through the inline embedding (smSpec's specLimits).
 func jsonFields(t reflect.Type, prefix string) []string {
 	var out []string
-	for i := range t.NumField() {
-		f := t.Field(i)
+	for f := range t.Fields() {
 		tag, _, _ := strings.Cut(f.Tag.Get("json"), ",")
 		if tag == "" || tag == "-" {
 			continue

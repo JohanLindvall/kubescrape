@@ -163,13 +163,13 @@ func TestUIServes(t *testing.T) {
 	}
 }
 
-// The subscriber cap: the port is unauthenticated and each stream costs a
-// render per export on the exporting goroutine, so streams past the cap are
+// The subscriber cap: each stream costs a render per export on the exporting
+// goroutine, whoever is authorised to open it, so streams past the cap are
 // refused with 503 — and a closed one frees the slot.
 func TestSubscriberCap(t *testing.T) {
 	tap := New(&fakeInner{})
 	var unsubs []func()
-	for i := 0; i < maxSubscribers; i++ {
+	for i := range maxSubscribers {
 		sub, unsub := tap.subscribe(sigAll, nil, 100)
 		if sub == nil {
 			t.Fatalf("subscriber %d refused under the cap", i)
@@ -213,7 +213,7 @@ func TestQueueIsByteBounded(t *testing.T) {
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()
 	rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr(big)
-	for i := 0; i < 64; i++ {
+	for range 64 {
 		_ = tap.ExportLogs(context.Background(), ld)
 	}
 	if sub.dropped.Load() == 0 {
@@ -244,9 +244,7 @@ func TestConcurrentOffersRaceSubscriberChurn(t *testing.T) {
 	// With pinned held, four churners are one more than maxSubscribers, so
 	// cap refusals race the offers too.
 	for range 4 {
-		churn.Add(1)
-		go func() {
-			defer churn.Done()
+		churn.Go(func() {
 			for {
 				select {
 				case <-stop:
@@ -264,16 +262,14 @@ func TestConcurrentOffersRaceSubscriberChurn(t *testing.T) {
 				}
 				unsub()
 			}
-		}()
+		})
 	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		var wg sync.WaitGroup
 		for range exporters {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				ld := logsWithNamespaces("team-a", "team-b")
 				for range exportsEach {
 					if err := tap.ExportLogs(context.Background(), ld); err != nil {
@@ -281,7 +277,7 @@ func TestConcurrentOffersRaceSubscriberChurn(t *testing.T) {
 						return
 					}
 				}
-			}()
+			})
 		}
 		wg.Wait()
 	}()

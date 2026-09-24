@@ -27,14 +27,20 @@ func restoreFlags(t *testing.T) {
 		listen, metrics, pprof, namespaces, tokenFile string
 		monitors, auth                                bool
 		resync, probe, wait, cache, meta              time.Duration
+		otlpEndpoint, otlpProtocol                    string
+		selfMetrics                                   time.Duration
+		otlpHeaders                                   map[string]string
 	}{*listen, *metricsListen, *pprofListen, *monitorNamespaces, *scrapeAuthTokenFile,
-		*monitorsOn, *scrapeAuthOn, *resync, *apiserverProbeInterval, *maxWait, *cacheTTL, *metaCacheTTL}
+		*monitorsOn, *scrapeAuthOn, *resync, *apiserverProbeInterval, *maxWait, *cacheTTL, *metaCacheTTL,
+		*otlpEndpoint, *otlpProtocol, *selfMetricsIntv, otlpHeaders.m}
 	t.Cleanup(func() {
 		*listen, *metricsListen, *pprofListen = old.listen, old.metrics, old.pprof
 		*monitorNamespaces, *scrapeAuthTokenFile = old.namespaces, old.tokenFile
 		*monitorsOn, *scrapeAuthOn = old.monitors, old.auth
 		*resync, *apiserverProbeInterval = old.resync, old.probe
 		*maxWait, *cacheTTL, *metaCacheTTL = old.wait, old.cache, old.meta
+		*otlpEndpoint, *otlpProtocol, *selfMetricsIntv = old.otlpEndpoint, old.otlpProtocol, old.selfMetrics
+		otlpHeaders.m = old.otlpHeaders
 	})
 }
 
@@ -61,6 +67,14 @@ func TestValidateConfigRefusesWhatARealStartCannotHonour(t *testing.T) {
 		{"empty listen", func() { *listen = "" }, "-listen is empty"},
 		{"unparseable listener", func() { *pprofListen = "nonsense" }, "-pprof-listen"},
 		{"two listeners on one address", func() { *metricsListen = *listen }, "address already in use"},
+		// One socket spelled two ways: a raw-string comparison passed both.
+		{"wildcard beside a bare port", func() { *listen, *metricsListen = ":9090", "0.0.0.0:9090" }, "-metrics-listen"},
+		{"zero-padded port", func() { *metricsListen, *pprofListen = ":9090", ":09090" }, "-pprof-listen"},
+		// The self-metrics exporter's transport: a real start refuses both at
+		// "creating OTLP exporter", which the dry run returned before reaching.
+		{"otlp protocol typo", func() { *otlpProtocol = "grcp" }, `protocol "grcp"`},
+		{"otlp header the transport owns", func() { otlpHeaders.m = map[string]string{"Content-Type": "x"} }, `header "Content-Type"`},
+		{"otlp endpoint empty", func() { *otlpEndpoint = "" }, "no endpoint"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			restoreFlags(t)
@@ -92,6 +106,13 @@ func TestValidateConfigAcceptsTheShippedShapes(t *testing.T) {
 			*scrapeAuthTokenFile = "/var/run/secrets/kubescrape/scrape-auth-token"
 		}},
 		{"observability listeners disabled", func() { *metricsListen, *pprofListen = "", "" }},
+		// With the push off no exporter is built and the service needs no OTLP
+		// endpoint at all, so -otlp-* values nothing reads are not a verdict on
+		// the configuration.
+		{"otlp flags unread with the push off", func() {
+			*selfMetricsIntv = 0
+			*otlpProtocol, *otlpEndpoint = "grcp", ""
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			restoreFlags(t)
@@ -137,6 +158,8 @@ func TestCheckConfigExitStatus(t *testing.T) {
 		{"scrape auth without a token file", []string{"-scrape-auth-secrets"}, true, "-scrape-auth-token-file"},
 		{"monitor namespace glob", []string{"-monitor-namespaces=kube-*"}, true, "EXACT namespace list"},
 		{"negative resync", []string{"-resync=-1s"}, true, "-resync"},
+		{"otlp protocol typo", []string{"-otlp-protocol=grcp"}, true, `protocol "grcp"`},
+		{"otlp header the transport owns", []string{"-otlp-header", "Content-Type=x"}, true, `header "Content-Type"`},
 		{"nothing typed", nil, false, "config is valid"},
 		{"the summary is printed", nil, false, "effective configuration"},
 		// No kubeconfig on this machine is not a verdict on the CONFIG: the

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -138,15 +139,19 @@ func TestEveryTenantSuppliedEndpointStringIsBounded(t *testing.T) {
 	}
 	v := reflect.ValueOf(&e).Elem()
 	typ := v.Type()
-	for i := range typ.NumField() {
-		f := typ.Field(i)
-		if f.Type.Kind() != reflect.String {
+	// VisibleFields, not NumField: the auth/TLS strings are PROMOTED from the
+	// embedded kubemeta.ScrapeAuth, and a top-level walk would silently stop
+	// covering them — the credential refs among them.
+	walked := 0
+	for _, f := range reflect.VisibleFields(typ) {
+		if f.Anonymous || f.Type.Kind() != reflect.String {
 			continue
 		}
+		walked++
 		if _, ok := exempt[f.Name]; ok {
 			continue
 		}
-		if _, ok := bounded[v.Field(i).Addr().Pointer()]; !ok {
+		if _, ok := bounded[v.FieldByIndex(f.Index).Addr().Pointer()]; !ok {
 			t.Errorf("Endpoint.%s is tenant-supplied and stamped onto every target the endpoint resolves to, "+
 				"but boundedFields does not hold it to a ceiling: add it there (or to this test's exempt list "+
 				"with the reason its size cannot reach a target)", f.Name)
@@ -156,6 +161,11 @@ func TestEveryTenantSuppliedEndpointStringIsBounded(t *testing.T) {
 		if _, ok := typ.FieldByName(name); !ok {
 			t.Errorf("exempt names %q, which is no longer an Endpoint field", name)
 		}
+	}
+	// The embedded group is walked, not skipped: its ten fields include nine
+	// strings, and a walk that reached none of them would pass vacuously.
+	if _, ok := typ.FieldByName("AuthCredentials"); !ok || walked < len(e.boundedFields())+len(exempt) {
+		t.Errorf("walked %d string fields; the promoted auth/TLS strings were not reached", walked)
 	}
 }
 
@@ -264,6 +274,92 @@ func TestAPodMonitorsEndpointListIsBoundedToo(t *testing.T) {
 	}
 }
 
+// The cap must bind BEFORE the typed decode, or it bounds what is retained but
+// not what each delivery costs: FromUnstructured over a 100,000-endpoint CR
+// measured ~216 ms, 37 MB and ~100k allocations per Parse, to keep 128 of
+// them. With the raw list cut first the decode is ~400 allocations whatever
+// the list's length, which is what the ceiling below pins — 20,000 endpoints
+// cost ~20,000 allocations when the cut ran after the decode. Both kinds share
+// the skeleton, so both are measured.
+//
+// The fixture's elements all alias ONE map, which keeps building it cheap;
+// the decode cannot tell.
+func TestAMonitorsEndpointListIsCutBeforeTheDecode(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("allocation budgets are meaningless under -race")
+	}
+	const n = 20_000
+	for _, kind := range []string{"ServiceMonitor", "PodMonitor"} {
+		t.Run(kind, func(t *testing.T) {
+			ep := map[string]any{"port": "metrics"}
+			raw := make([]any, n)
+			for i := range raw {
+				raw[i] = ep
+			}
+			u := crObject(kind, "tenant", "bomb", "1", map[string]any{
+				"selector":          map[string]any{},
+				"namespaceSelector": map[string]any{"any": true},
+				endpointsKey(kind):  raw,
+			})
+			parse := func() []Endpoint {
+				if kind == "PodMonitor" {
+					m, err := ParsePodMonitor(u)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return m.Endpoints
+				}
+				m, err := Parse(u)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return m.Endpoints
+			}
+			eps := parse()
+			if len(eps) != maxEndpointsPerMonitor {
+				t.Fatalf("kept %d endpoints, want %d", len(eps), maxEndpointsPerMonitor)
+			}
+			if ig := IgnoredFields(eps); !slices.Contains(ig, endpointsKey(kind)+cappedSuffix) {
+				t.Errorf("the pre-decode cut is not reported: %v", ig)
+			}
+			// The object is the informer's cache entry: the cut must not
+			// write through to it.
+			if got, _, _ := unstructured.NestedSlice(u.Object, "spec", endpointsKey(kind)); len(got) != n {
+				t.Errorf("Parse shortened the informer's own endpoint list to %d entries", len(got))
+			}
+			const ceiling = 1000
+			if allocs := testing.AllocsPerRun(5, func() { _ = parse() }); allocs > ceiling {
+				t.Errorf("parsing a %d-endpoint %s allocates %.0f times, want <= %d: the "+
+					"endpoint list is being decoded whole before the cap cuts it", n, kind, allocs, ceiling)
+			}
+		})
+	}
+}
+
+// A consequence of cutting before the decode, pinned so it is a decision: a
+// malformed element in the REFUSED tail is never decoded, so it cannot fail the
+// monitor — the kept prefix is served, and the list is reported capped. The
+// tail is refused either way; failing the parse would also drop the prefix.
+func TestAMalformedEndpointPastTheCapDoesNotRejectTheMonitor(t *testing.T) {
+	raw := make([]any, 0, maxEndpointsPerMonitor+1)
+	for i := range maxEndpointsPerMonitor {
+		raw = append(raw, map[string]any{"port": "p" + strconv.Itoa(i)})
+	}
+	raw = append(raw, map[string]any{"port": map[string]any{"not": "a string"}})
+	m, err := Parse(crObject("ServiceMonitor", "tenant", "sm", "1", map[string]any{
+		"selector": map[string]any{}, "endpoints": raw,
+	}))
+	if err != nil {
+		t.Fatalf("a malformed endpoint in the refused tail rejected the whole monitor: %v", err)
+	}
+	if len(m.Endpoints) != maxEndpointsPerMonitor {
+		t.Fatalf("kept %d endpoints, want %d", len(m.Endpoints), maxEndpointsPerMonitor)
+	}
+	if ig := IgnoredFields(m.Endpoints); !slices.Contains(ig, "endpoints"+cappedSuffix) {
+		t.Errorf("the cut is not reported: %v", ig)
+	}
+}
+
 // A monitor of an ordinary size is untouched and reports nothing: the ceiling
 // is on the pathological, and a spurious "(capped)" entry would be a warning
 // per upsert about a monitor that is entirely honoured.
@@ -284,5 +380,96 @@ func TestAnOrdinaryEndpointListIsNotCapped(t *testing.T) {
 	}
 	if ig := IgnoredFields(m.Endpoints); len(ig) != 0 {
 		t.Errorf("an ordinary monitor reports %v", ig)
+	}
+}
+
+// selectorMonitor builds a monitor of the given kind around a selector and a
+// namespaceSelector, with one ordinary endpoint.
+func selectorMonitor(kind string, selector, nsSelector map[string]any) *unstructured.Unstructured {
+	return crObject(kind, "tenant", "sel", "", map[string]any{
+		"selector":          selector,
+		"namespaceSelector": nsSelector,
+		endpointsKey(kind):  []any{map[string]any{"port": "http"}},
+	})
+}
+
+// parseKind parses u with the kind's parser, reporting only the error.
+func parseKind(kind string, u *unstructured.Unstructured) error {
+	if kind == "PodMonitor" {
+		_, err := ParsePodMonitor(u)
+		return err
+	}
+	_, err := Parse(u)
+	return err
+}
+
+// THE ATTACK, one door over from the endpoint list: a monitor's two SELECTORS
+// are tenant-authored and neither is bounded upstream (no maxItems in the CRD;
+// apimachinery validates each key and value but not the count). Measured: a
+// ~1.4 MiB CR of ~25,000 `DoesNotExist` requirements parsed without error and
+// cost 744 µs per Selector.Matches — per Service in the server's
+// monitor→services rebuild under its lock, and per pod in every PodMonitor
+// node-targets derivation — while a 150,000-entry matchNames list was retained
+// whole and scanned per pod.
+//
+// The MONITOR is refused, never trimmed: dropping a requirement WIDENS what it
+// selects, the opposite of the endpoint cap's fail-safe.
+//
+// Reverse-patch check: removing the checkSelectorBounds call accepts all three
+// bombs and this fails.
+func TestAMonitorsSelectorsAreBoundedAtTheParseDoor(t *testing.T) {
+	requirements := make([]any, 0, 25000)
+	for i := range 25000 {
+		requirements = append(requirements, map[string]any{
+			"key": "k" + strconv.Itoa(i) + ".example.com/l", "operator": "DoesNotExist",
+		})
+	}
+	values := make([]any, 0, maxSelectorValues+1)
+	for i := range maxSelectorValues + 1 {
+		values = append(values, "v"+strconv.Itoa(i))
+	}
+	names := make([]any, 0, maxSelectorNamespaces+1)
+	for i := range maxSelectorNamespaces + 1 {
+		names = append(names, "ns"+strconv.Itoa(i))
+	}
+	bombs := map[string]struct{ selector, nsSelector map[string]any }{
+		"requirements": {map[string]any{"matchExpressions": requirements}, map[string]any{"any": true}},
+		"values": {map[string]any{"matchExpressions": []any{
+			map[string]any{"key": "app", "operator": "NotIn", "values": values},
+		}}, map[string]any{"any": true}},
+		"matchNames":      {map[string]any{}, map[string]any{"matchNames": names}},
+		"matchName bytes": {map[string]any{}, map[string]any{"matchNames": []any{strings.Repeat("n", 1<<20)}}},
+	}
+	for _, kind := range []string{"ServiceMonitor", "PodMonitor"} {
+		for name, b := range bombs {
+			t.Run(kind+"/"+name, func(t *testing.T) {
+				if err := parseKind(kind, selectorMonitor(kind, b.selector, b.nsSelector)); err == nil {
+					t.Errorf("the %s bomb was accepted; the monitor must be refused", name)
+				}
+			})
+		}
+	}
+}
+
+// …and the ceilings are far above anything real: a kube-prometheus-stack
+// shaped selector, a platform monitor's namespace list and a set-based
+// expression all parse.
+func TestOrdinaryMonitorSelectorsParse(t *testing.T) {
+	names := make([]any, 0, 40)
+	for i := range 40 {
+		names = append(names, "team-"+strconv.Itoa(i))
+	}
+	for _, kind := range []string{"ServiceMonitor", "PodMonitor"} {
+		u := selectorMonitor(kind, map[string]any{
+			"matchLabels": map[string]any{
+				"app.kubernetes.io/name": "kube-state-metrics", "app.kubernetes.io/instance": "kps", "release": "kps",
+			},
+			"matchExpressions": []any{
+				map[string]any{"key": "tier", "operator": "In", "values": []any{"backend", "frontend"}},
+			},
+		}, map[string]any{"matchNames": names})
+		if err := parseKind(kind, u); err != nil {
+			t.Errorf("%s: an ordinary selector was refused: %v", kind, err)
+		}
 	}
 }

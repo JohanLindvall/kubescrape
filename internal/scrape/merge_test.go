@@ -16,6 +16,11 @@ func mergeHeld(monitor string, ep servicemonitors.Endpoint) kubemeta.ScrapeTarge
 	return t
 }
 
+// bearerEndpoint is an endpoint whose only declaration is a bearer-token ref.
+func bearerEndpoint(ref string) *servicemonitors.Endpoint {
+	return &servicemonitors.Endpoint{ScrapeAuth: kubemeta.ScrapeAuth{AuthSecret: ref}}
+}
+
 var dropRule = kubemeta.RelabelRule{Action: "drop", SourceLabels: []string{"__name__"}, Regex: "a_.*"}
 var keepRule = kubemeta.RelabelRule{Action: "keep", SourceLabels: []string{"job"}, Regex: "api"}
 
@@ -23,7 +28,7 @@ var keepRule = kubemeta.RelabelRule{Action: "keep", SourceLabels: []string{"job"
 // already everything both monitors declared.
 func TestMergeBareEndpointIsANoOp(t *testing.T) {
 	held := mergeHeld("ns/a", servicemonitors.Endpoint{
-		BearerSecret:      "ns/tok/token",
+		ScrapeAuth:        kubemeta.ScrapeAuth{AuthSecret: "ns/tok/token"},
 		MetricRelabelings: []kubemeta.RelabelRule{dropRule},
 	})
 	want := held
@@ -120,11 +125,11 @@ func TestMergeAdoptsOneSidedAuthWhole(t *testing.T) {
 	held := mergeHeld("ns/a", servicemonitors.Endpoint{
 		MetricRelabelings: []kubemeta.RelabelRule{dropRule},
 	})
-	if rep := MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{
-		BearerSecret:  "ns/tok/token",
+	if rep := MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{ScrapeAuth: kubemeta.ScrapeAuth{
+		AuthSecret:    "ns/tok/token",
 		TLSCA:         "ns/ca/ca.crt",
 		TLSServerName: "svc.internal",
-	}); rep.AuthConflict {
+	}}); rep.AuthConflict {
 		t.Error("one-sided auth reported as a conflict")
 	}
 	if held.AuthSecret != "ns/tok/token" || held.TLSCA != "ns/ca/ca.crt" || held.TLSServerName != "svc.internal" {
@@ -139,15 +144,15 @@ func TestMergeAdoptsOneSidedAuthWhole(t *testing.T) {
 // the holder's and reports the conflict — the one merge outcome that loses a
 // declaration.
 func TestMergeAuthIdenticalKeepsConflictingReports(t *testing.T) {
-	held := mergeHeld("ns/a", servicemonitors.Endpoint{BearerSecret: "ns/tok/token"})
-	if rep := MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{BearerSecret: "ns/tok/token"}); rep.AuthConflict {
+	held := mergeHeld("ns/a", *bearerEndpoint("ns/tok/token"))
+	if rep := MergeMonitorEndpoint(&held, "ns/b", bearerEndpoint("ns/tok/token")); rep.AuthConflict {
 		t.Error("identical auth reported as a conflict")
 	}
 	if held.Monitors != nil {
 		t.Errorf("identical auth listed a contributor: %v", held.Monitors)
 	}
 
-	if rep := MergeMonitorEndpoint(&held, "ns/c", &servicemonitors.Endpoint{BearerSecret: "ns/other/token"}); !rep.AuthConflict {
+	if rep := MergeMonitorEndpoint(&held, "ns/c", bearerEndpoint("ns/other/token")); !rep.AuthConflict {
 		t.Error("differing auth not reported as a conflict")
 	}
 	if held.AuthSecret != "ns/tok/token" {
@@ -156,8 +161,8 @@ func TestMergeAuthIdenticalKeepsConflictingReports(t *testing.T) {
 	// InsecureSkipVerify alone is auth material too: it selects the trust
 	// decision, and a monitor that verifies must conflict with one that does
 	// not.
-	held2 := mergeHeld("ns/a", servicemonitors.Endpoint{InsecureSkipVerify: true})
-	if rep := MergeMonitorEndpoint(&held2, "ns/b", &servicemonitors.Endpoint{BearerSecret: "ns/tok/token"}); !rep.AuthConflict {
+	held2 := mergeHeld("ns/a", servicemonitors.Endpoint{ScrapeAuth: kubemeta.ScrapeAuth{InsecureSkipVerify: true}})
+	if rep := MergeMonitorEndpoint(&held2, "ns/b", bearerEndpoint("ns/tok/token")); !rep.AuthConflict {
 		t.Error("skip-verify vs bearer not reported as a conflict")
 	}
 	if !held2.InsecureSkipVerify || held2.AuthSecret != "" {
@@ -169,9 +174,9 @@ func TestMergeAuthIdenticalKeepsConflictingReports(t *testing.T) {
 // chain still concatenates and the monitor is still listed — only its auth is
 // refused.
 func TestMergeConflictStillMergesTheRest(t *testing.T) {
-	held := mergeHeld("ns/a", servicemonitors.Endpoint{BearerSecret: "ns/tok/token"})
+	held := mergeHeld("ns/a", *bearerEndpoint("ns/tok/token"))
 	if rep := MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{
-		BearerSecret:      "ns/other/token",
+		ScrapeAuth:        kubemeta.ScrapeAuth{AuthSecret: "ns/other/token"},
 		MetricRelabelings: []kubemeta.RelabelRule{dropRule},
 		Interval:          "10s",
 	}); !rep.AuthConflict {
@@ -233,7 +238,7 @@ func TestMergeSameMonitorSecondEndpointIsNotAContributor(t *testing.T) {
 	}{
 		{"cadence", servicemonitors.Endpoint{Interval: "15s"}},
 		{"relabelings", servicemonitors.Endpoint{MetricRelabelings: []kubemeta.RelabelRule{keepRule}}},
-		{"auth", servicemonitors.Endpoint{BearerSecret: "ns/tok/token"}},
+		{"auth", *bearerEndpoint("ns/tok/token")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			held := mergeHeld("ns/pm", servicemonitors.Endpoint{

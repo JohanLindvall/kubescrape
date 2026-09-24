@@ -24,9 +24,9 @@ func TestBucketHeavyHistogramStaysUnderCollectorLimit(t *testing.T) {
 	)
 	var body strings.Builder
 	body.WriteString("# TYPE h histogram\n")
-	for s := 0; s < nSeries; s++ {
+	for s := range nSeries {
 		cum := 0
-		for i := 0; i < nBounds; i++ {
+		for i := range nBounds {
 			cum++
 			_, _ = fmt.Fprintf(&body, "h_bucket{svc=\"s%d\",le=\"%d\"} %d\n", s, i, cum)
 		}

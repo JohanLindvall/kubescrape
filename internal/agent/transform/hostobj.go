@@ -15,6 +15,9 @@ package transform
 import (
 	"errors"
 	"fmt"
+	"log/slog"
+	"slices"
+	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -23,6 +26,9 @@ import (
 	"go.starlark.net/starlark"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/route"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/pkg/otlpsplit"
 )
 
 // DropMarker flags an element for post-run pruning. Logs and spans carry it
@@ -125,13 +131,25 @@ func (a attrsView) Has(k starlark.Value) (bool, error) {
 }
 
 // SetKey implements attrs["k"] = v; None deletes.
+//
+// Both act on EVERY occurrence of the key. An OTLP attribute list is a
+// repeated field, so a pushed payload may carry a key twice, and pdata's
+// Remove and PutEmpty each stop at the FIRST match — so `attrs[k] = None` left
+// the second copy behind (and `k in attrs` still answered True), and an
+// overwrite left the old value riding beside the new one. Every consumer reads
+// through first-wins Get, so an operator's script-side strip or redaction —
+// in a batch transform, or in the ingest admit hook that carries per-sender
+// policy — was bypassed by a sender that simply wrote the attribute twice: the
+// same hole otlpingest's removeAll closed for the receipt-time strip.
 func (a attrsView) SetKey(k, v starlark.Value) error {
 	key, ok := starlark.AsString(k)
 	if !ok {
 		return errors.New("attribute key must be a string")
 	}
 	if v == starlark.None {
-		a.m.Remove(key)
+		// RemoveIf rather than a Remove loop: Remove swaps the LAST entry into
+		// the hole, reordering the map on every delete; this compacts in order.
+		a.m.RemoveIf(func(k string, _ pcommon.Value) bool { return k == key })
 		return nil
 	}
 	// Check convertibility BEFORE touching the map, so a failed assignment is a
@@ -140,8 +158,10 @@ func (a attrsView) SetKey(k, v starlark.Value) error {
 	// Two wrong versions preceded this one, and both are easy to re-introduce.
 	// PutEmpty adds the key before the value is converted, so returning the
 	// error alone left an Empty-valued attribute behind — a partial mutation
-	// the fail-open `admit` hook then forwards, contradicting "a hook error did
-	// nothing". Removing the key on error is WORSE, not better: PutEmpty has
+	// the fail-open `admit` hook then forwarded, contradicting "a hook error did
+	// nothing" (admit's view is read-only now, which closes that door whatever
+	// this does; the rule stands for any payload a failed script leaves behind).
+	// Removing the key on error is WORSE, not better: PutEmpty has
 	// already overwritten whatever was there, so a failed assignment to an
 	// EXISTING key deleted it outright — turning a stray attribute into data
 	// loss, on a path where the deleted key can be identity (a script assigning
@@ -150,6 +170,21 @@ func (a attrsView) SetKey(k, v starlark.Value) error {
 	if err := convertible(v); err != nil {
 		return err
 	}
+	// Drop the LATER duplicates only: PutEmpty then updates the first
+	// occurrence in place, so an ordinary (unrepeated) key keeps its position
+	// — removing every copy and re-adding would move it to the end on every
+	// overwrite.
+	seen := false
+	a.m.RemoveIf(func(k string, _ pcommon.Value) bool {
+		if k != key {
+			return false
+		}
+		if !seen {
+			seen = true
+			return false
+		}
+		return true
+	})
 	return fromStarlark(a.m.PutEmpty(key), v)
 }
 
@@ -407,12 +442,50 @@ func (s *spanObj) Freeze()               {}
 func (s *spanObj) Truth() starlark.Bool  { return true }
 func (s *spanObj) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 
-func (s *spanObj) AttrNames() []string {
-	return []string{
-		"attributes", "drop", "duration_ms", "emit_metric", "kind", "name",
-		"resource", "route", "span_id", "status_code", "status_message",
-		"trace_id",
+func (s *spanObj) AttrNames() []string { return slices.Clone(spanObjAttrNames) }
+
+// spanReadFields are the READ-ONLY span fields spanReadAttr resolves, for the
+// traces batch's spanObj and the sample hook's sampleSpanObj alike. One list
+// and one resolver, because the two views had drifted: decide() could not read
+// status_message or span_id, so a tail-sampling policy matching on an error
+// message failed on every trace — and a hook fails open, so it abstained
+// silently rather than erroring. The views differ only in what they ADD: the
+// batch span its writable attribute views and its verbs, the sample span its
+// read-only attribute views.
+var spanReadFields = []string{"duration_ms", "kind", "name", "span_id", "status_code", "status_message", "trace_id"}
+
+var (
+	spanObjAttrNames    = spanAttrNames("attributes", "drop", "emit_metric", "resource", "route")
+	sampleSpanAttrNames = spanAttrNames("attributes", "resource")
+)
+
+// spanAttrNames is spanReadFields plus a view's own extras, sorted.
+func spanAttrNames(extra ...string) []string {
+	names := append(slices.Clone(spanReadFields), extra...)
+	slices.Sort(names)
+	return names
+}
+
+// spanReadAttr resolves one of spanReadFields on sp; ok is false for any
+// other name, which the caller resolves (or reports as absent).
+func spanReadAttr(sp ptrace.Span, name string) (v starlark.Value, ok bool) {
+	switch name {
+	case "name":
+		return starlark.String(sp.Name()), true
+	case "kind":
+		return starlark.String(spanKind(sp.Kind())), true
+	case "status_code":
+		return starlark.MakeInt(int(sp.Status().Code())), true
+	case "status_message":
+		return starlark.String(sp.Status().Message()), true
+	case "duration_ms":
+		return spanDurationMs(sp), true
+	case "trace_id":
+		return hexID(sp.TraceID().String(), sp.TraceID().IsEmpty()), true
+	case "span_id":
+		return hexID(sp.SpanID().String(), sp.SpanID().IsEmpty()), true
 	}
+	return nil, false
 }
 
 // spanKind names the kind for scripts, in the spanmetrics/OTLP spelling.
@@ -434,10 +507,6 @@ func spanKind(k ptrace.SpanKind) string {
 
 func (s *spanObj) Attr(name string) (starlark.Value, error) {
 	switch name {
-	case "name":
-		return starlark.String(s.sp.Name()), nil
-	case "status_code":
-		return starlark.MakeInt(int(s.sp.Status().Code())), nil
 	case "attributes":
 		return attrsView{s.sp.Attributes()}, nil
 	case "resource":
@@ -448,19 +517,27 @@ func (s *spanObj) Attr(name string) (starlark.Value, error) {
 		return routeFn(s.res), nil
 	case "emit_metric":
 		return emitFn(s.res, s.em), nil
-	case "kind":
-		return starlark.String(spanKind(s.sp.Kind())), nil
-	case "status_message":
-		return starlark.String(s.sp.Status().Message()), nil
-	case "duration_ms":
-		d := int64(s.sp.EndTimestamp()) - int64(s.sp.StartTimestamp())
-		return starlark.Float(float64(d) / 1e6), nil
-	case "trace_id":
-		return hexID(s.sp.TraceID().String(), s.sp.TraceID().IsEmpty()), nil
-	case "span_id":
-		return hexID(s.sp.SpanID().String(), s.sp.SpanID().IsEmpty()), nil
+	}
+	if v, ok := spanReadAttr(s.sp, name); ok {
+		return v, nil
 	}
 	return nil, nil
+}
+
+// spanDurationMs is a span's duration as scripts read it (duration_ms, on the
+// traces batch and on the sample hook's read-only spans alike), in
+// milliseconds. An unfinished span (end unset) or a clock-skewed one (end
+// before start) reads as 0 — the rule cumagg.SpanSeconds and tailsample's
+// latency policy already apply — rather than as end-start: an unset end made
+// that about -1.7e12 ms, which a decide() script compared against a threshold
+// the built-in latency policy never saw, and which emit_metric fed straight
+// into a histogram (negatives are legal there).
+func spanDurationMs(sp ptrace.Span) starlark.Float {
+	start, end := sp.StartTimestamp(), sp.EndTimestamp()
+	if end <= start {
+		return 0
+	}
+	return starlark.Float(float64(end-start) / 1e6)
 }
 
 func (s *spanObj) SetField(name string, v starlark.Value) error {
@@ -616,8 +693,8 @@ func (d *datapoints) Truth() starlark.Bool  { return d.Len() > 0 }
 func (d *datapoints) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 
 // Len makes len(m.datapoints) work and lets a script skip empty metrics.
-// One five-way switch, one owner: engine.go's dataPointCount.
-func (d *datapoints) Len() int { return dataPointCount(d.m) }
+// One five-way switch, one owner: otlpsplit.DataPointCount.
+func (d *datapoints) Len() int { return otlpsplit.DataPointCount(d.m) }
 
 // Iterate walks the metric's data points positionally — see logBatch.Iterate.
 // A promscrape chunk is 10,000 points, and materializing them all cost
@@ -632,7 +709,7 @@ type dpIter struct {
 }
 
 func (it *dpIter) Next(v *starlark.Value) bool {
-	if it.i >= dataPointCount(it.m) {
+	if it.i >= otlpsplit.DataPointCount(it.m) {
 		return false
 	}
 	i := it.i
@@ -749,6 +826,16 @@ func routeFn(res pcommon.Resource) starlark.Value {
 // resource. An undeclared name — or no logMetrics section at all — is a
 // script error, surfaced like any other (obs.TransformErrors + the export's
 // retry); the fix is a config edit, and both files hot-reload.
+//
+// The observation's unit is one script RUN, not one record, and nothing here
+// can tell a first run from a repeat: a copy-path producer re-running the
+// script per export attempt, a tailer rewind rebuilding the batch and a
+// sender's retransmission all emit again. A logMetrics rule over the same
+// records counts once per record on every producer (journald and azurediag
+// retry the built batch without rebuilding it; the tailer and events skip what
+// logchain.Input.Observed says was already counted) — only ingest counts per
+// receive attempt — which is the documented remedy when a count must stay
+// exact across outages.
 func emitFn(res pcommon.Resource, em MetricEmitter) starlark.Value {
 	return starlark.NewBuiltin("emit_metric", func(th *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 		bud := budgetOf(th)
@@ -784,12 +871,61 @@ func emitFn(res pcommon.Resource, em MetricEmitter) starlark.Value {
 		if em == nil {
 			return nil, fmt.Errorf("emit_metric %q: no logMetrics section is configured", name)
 		}
-		if err := em.EmitDirect(name, f, lbls, res.Attributes()); err != nil {
+		attrs := res.Attributes()
+		if n := attrs.Len(); n > maxEmitResourceAttrs {
+			emitTooWide(name, n)
+			return starlark.None, nil
+		}
+		if err := em.EmitDirect(name, f, lbls, attrs); err != nil {
 			return nil, err
 		}
 		return starlark.None, nil
 	})
 }
+
+// maxEmitResourceAttrs bounds the width of the resource an emit_metric
+// observation is grouped under. emit_metric is the one door into the log-metric
+// store that no other bound covers: the ingest log chain stops observing past
+// 64 attributes (otlpingest's maxObservedResourceAttrs), but a script runs over
+// ingested METRICS and TRACES too, where the resource is the sender's own at
+// whatever width it chose, and the store's identity for a resource wider than
+// 64 is a QUADRATIC fold (metrics/resource.go), paid again inside the series
+// lock when the observation admits a new series. That is one uninterruptible
+// builtin call — neither the step limit nor the wall clock can stop it midway —
+// so a sub-MiB push of a 40,000-attribute resource held one export for 7.7 s
+// against the 2 s budget and then SUCCEEDED, while stalling every other
+// observer of that metric. 1024 is where the fold measured ~5 ms, far past any
+// resource Kubernetes attribution builds, and still reachable by a tenant pod
+// growing its own tailer resource through the kubescrape.io/logs annotation's
+// attributes — which is why the refusal below is a SKIP and not a script error.
+const maxEmitResourceAttrs = 1024
+
+// emitWideGate throttles emitTooWide's warning: the condition persists for as
+// long as the wide sender keeps pushing, and it is noticed per item per batch.
+var emitWideGate logdedupe.Throttle
+
+// emitTooWide records an emit_metric call refused for its resource's width.
+// It is a counted SKIP rather than a script error on purpose: a script error
+// fails the export and the producer retries the same batch, so a width the
+// SENDER controls would stop that whole signal from shipping — the data keeps
+// flowing and only this observation is lost.
+func emitTooWide(name string, attrs int) {
+	obs.TransformEmitSkipped.Inc()
+	if emitWideGate.Allow(time.Minute) {
+		slog.Warn("emit_metric skipped an observation: the item's resource is too wide to key a series on "+
+			"(the data itself is still exported; drop or trim the sender's resource attributes)",
+			"metric", name, "attributes", attrs, "limit", maxEmitResourceAttrs)
+	}
+}
+
+// maxEmitLabels bounds the labels ONE emit_metric call may carry. The label
+// set is built with a linear-scan insert per key, so one call is quadratic in
+// the count — 32Ki labels held an export for 3.4 s against the 2 s budget and
+// then succeeded — and the call is one uninterruptible builtin. The dict can
+// be data-derived (a body split into k=v pairs), so the bound is on the count
+// itself, refused before anything is built. 64 is twice Mimir's default
+// max_label_names_per_series (30): nothing a backend would accept is refused.
+const maxEmitLabels = 64
 
 // emitLabels materialises emit_metric's labels dict, charged.
 //
@@ -805,8 +941,8 @@ func emitLabels(th *starlark.Thread, d *starlark.Dict) (map[string]string, error
 		return nil, nil
 	}
 	bud := budgetOf(th)
-	if int64(d.Len()) > maxSeqElems {
-		return nil, positioned(th, fmt.Errorf("emit_metric: %d labels is over the %d-element limit for one value", d.Len(), int64(maxSeqElems)))
+	if d.Len() > maxEmitLabels {
+		return nil, positioned(th, fmt.Errorf("emit_metric: %d labels is over the %d-label limit for one observation", d.Len(), maxEmitLabels))
 	}
 	if err := bud.project(satMul(int64(d.Len()), 2*bytesPerValue)); err != nil {
 		return nil, positioned(th, err)
@@ -832,13 +968,15 @@ func emitLabels(th *starlark.Thread, d *starlark.Dict) (map[string]string, error
 		v, ok := starlark.AsString(val)
 		cost += 2 * bytesPerValue
 		if !ok {
-			limit := int64(maxStringBytes)
-			if r := bud.remaining(); r < limit {
-				limit = r
-			}
-			sz := renderSize(val, 0, limit)
-			if sz > maxStringBytes {
-				return nil, positioned(th, fmt.Errorf("emit_metric: label %q would render at least %d bytes, over the %d-byte limit for one value", k, sz, int64(maxStringBytes)))
+			// Projected against what is left AFTER the labels already built
+			// (cost), and refused before the render — checkRender's second
+			// half. This copy used to stop at the per-value check, so with
+			// less than a per-value limit of budget left the walk returned a
+			// truncated size that passed it and the whole value was rendered
+			// before the budget refused it.
+			sz, deep := renderSize(val, bud.valueCeiling(cost))
+			if err := bud.checkRender(sz, deep, cost); err != nil {
+				return nil, positioned(th, fmt.Errorf("emit_metric: label %q: %w", k, err))
 			}
 			v = val.String()
 			cost += int64(len(v))

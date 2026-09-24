@@ -3,6 +3,7 @@ package tailbuffer
 import (
 	"context"
 	"encoding/binary"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
@@ -224,8 +226,8 @@ func BenchmarkReceiveLateKeep(b *testing.B) {
 func BenchmarkDecide(b *testing.B) {
 	const traces, spans = 100, 10
 	specs := make([]spanSpec, 0, traces*spans)
-	for t := 0; t < traces; t++ {
-		for s := 0; s < spans; s++ {
+	for t := range traces {
+		for s := range spans {
 			specs = append(specs, spanSpec{trace: uint64(t), span: uint64(t*spans + s), end: 10,
 				attrs: map[string]any{"http.route": "/api/v1/orders"}})
 		}
@@ -332,4 +334,67 @@ func BenchmarkReceiveLateDropAtCacheSize(b *testing.B) {
 			}
 		})
 	}
+}
+
+// Deciding a trace DROP is the verdict a tail sampler reaches most, and it runs
+// under the mutex every receiver shares, once per trace. It used to cost three
+// allocations: a fresh ptrace.Traces to release the payload (two) and a heap
+// *decision for the verdict cache (one). Both are gone — the release is the zero
+// value and the cache stores decisions by value — so what is left is the
+// amortized growth of slices that reach their working size once.
+func TestDropDecisionAllocationBudget(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	per := decisionAllocsPerTrace(t, errorsCfg())
+	t.Logf("%.3f allocations per dropped trace", per)
+	if per > 0.05 {
+		t.Fatalf("a drop decision allocates %.2f times, want ~0 (amortized slice growth only)", per)
+	}
+}
+
+// The KEEP half of the same claim. A kept trace's ResourceSpans are MOVED into
+// the drain's outbound payload (MoveAndAppendTo re-points the slice, it copies
+// no span), so a keep costs the amortized growth of the outbound slice plus a
+// share of the drain's one send — never an allocation per decision. The comments
+// on Buffer.scratch and decide say the decision path is allocation-free; this
+// and the drop test are what make that a checked claim rather than a hope.
+func TestKeepDecisionAllocationBudget(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	per := decisionAllocsPerTrace(t, alwaysCfg())
+	t.Logf("%.3f allocations per kept trace", per)
+	if per > 0.05 {
+		t.Fatalf("a keep decision allocates %.2f times, want ~0 (amortized slice growth and one send per drain only)", per)
+	}
+}
+
+// decisionAllocsPerTrace parks 1000 one-span traces under cfg, lets their window
+// close, and returns the heap allocations one Sweep deciding all of them made,
+// per trace. The receive happens OUTSIDE the measurement: only the decisions
+// (and the drain's one send, amortized over them) are counted.
+func decisionAllocsPerTrace(t *testing.T, cfg tailsample.Config) float64 {
+	t.Helper()
+	const traces = 1000 // under the cache map's 1024-entry size hint, so the map never grows here
+	b, clk := newTestBuffer(t, Config{Config: cfg, DecisionWait: "5s"}, discard{})
+	ctx := context.Background()
+	specs := make([]spanSpec, traces)
+	for i := range specs {
+		specs[i] = spanSpec{trace: uint64(i) + 1, span: 1, end: 5}
+	}
+	if err := b.ExportTraces(ctx, payload("checkout", specs...)); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(10 * time.Second)
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	b.Sweep(ctx)
+	runtime.ReadMemStats(&after)
+
+	if st := b.Stats(); st != (Stats{}) {
+		t.Fatalf("the sweep left %+v buffered: the measurement is not of %d decisions", st, traces)
+	}
+	return float64(after.Mallocs-before.Mallocs) / traces
 }

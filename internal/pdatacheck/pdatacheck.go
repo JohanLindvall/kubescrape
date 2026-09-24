@@ -37,7 +37,7 @@ func EmptyMetrics(md pmetric.Metrics) []string {
 			ms := sms.At(j).Metrics()
 			for k := 0; k < ms.Len(); k++ {
 				m := ms.At(k)
-				if MetricPointCount(m) > 0 {
+				if metricPointCount(m) > 0 {
 					continue
 				}
 				out = append(out, fmt.Sprintf("rm[%d]/sm[%d]/metric[%d] %q (type %s)",
@@ -48,9 +48,18 @@ func EmptyMetrics(md pmetric.Metrics) []string {
 	return out
 }
 
-// MetricPointCount is the number of data points on m across every metric
+// metricPointCount is the number of data points on m across every metric
 // type, and 0 for an untyped one.
-func MetricPointCount(m pmetric.Metric) int {
+//
+// It is deliberately a COPY of the production switch (otlpsplit.DataPointCount,
+// which otlpingest's empty-metric drop, transform's prune and cumagg's render
+// all count through), not a call into it: this package is
+// the ORACLE those producers' tests assert through, and an oracle defined by
+// the code under test agrees with it by construction — a case missing from the
+// production switch would be missing here too, and every assertion made
+// through it would agree with the bug. Keep the two in step by hand; the
+// switch is five arms.
+func metricPointCount(m pmetric.Metric) int {
 	switch m.Type() {
 	case pmetric.MetricTypeGauge:
 		return m.Gauge().DataPoints().Len()

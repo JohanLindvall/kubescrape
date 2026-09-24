@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"slices"
 	"strings"
 )
@@ -47,6 +48,9 @@ type SourceSpec struct {
 func ResolveSources(spec SourceSpec, log *slog.Logger) ([]KafkaConfig, error) {
 	if log == nil {
 		log = slog.Default()
+	}
+	if err := ValidateGroup(spec.Group); err != nil {
+		return nil, err
 	}
 	namespaces := nonEmpty(spec.Namespaces)
 	files := nonEmpty(spec.ConnectionStringFiles)
@@ -113,8 +117,27 @@ func ResolveSources(spec SourceSpec, log *slog.Logger) ([]KafkaConfig, error) {
 	if err := rejectDuplicateSources(out, hint); err != nil {
 		return nil, err
 	}
-	disambiguateGroups(out, log)
+	if err := rejectRegexOverlap(out); err != nil {
+		return nil, err
+	}
+	if err := disambiguateGroups(out, log); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// ValidateGroup refuses an empty consumer group. kgo refuses one too — beside
+// the disabled autocommit this consumer runs with, every client build fails —
+// but only when the consumer is OPENED, i.e. after a rollout, as a Warn per
+// backoff and a readiness gate that never clears. The chart renders the group
+// flag unconditionally, so `azure.eventhub.group: ""` reaches here as an
+// explicit empty value rather than as the "$Default" flag default. It is a
+// flag-shape check, so -check-config calls it too.
+func ValidateGroup(group string) error {
+	if strings.TrimSpace(group) == "" {
+		return errors.New(`-azure-eventhub-group is empty: a consumer group is required (the flag's default "$Default" is the group every Event Hubs namespace is born with)`)
+	}
+	return nil
 }
 
 // SourceName identifies this consumer in a log line or a readiness gate:
@@ -145,14 +168,40 @@ func nonEmpty(in []string) []string {
 }
 
 // sourceKey identifies what a consumer consumes: its broker set plus its
-// topic set. Two consumers agreeing on both are the same subscription.
+// subscription. Two consumers agreeing on both are the same subscription.
+//
+// It is an IDENTITY, so it must be injective, and it is deliberately NOT built
+// from topicKey, the readable group suffix: that one spells the ^insights-.*
+// default as "insights", which is also a legal hub name, and joins a topic set
+// with "_", which a hub name may contain — so a namespace-scoped consumer and
+// an entity-scoped one for a hub literally named `insights` were refused as
+// duplicates although the regex does not even match that hub. Here the default
+// is the PATTERN, behind a discriminator no explicit set can produce, and
+// topics are NUL-separated (a hub name cannot contain NUL).
 func sourceKey(k KafkaConfig) string {
-	return strings.Join(k.Brokers, ",") + "\x00" + topicKey(k)
+	var b strings.Builder
+	b.WriteString(strings.Join(k.Brokers, ","))
+	if len(k.Topics) == 0 {
+		b.WriteString("\x00regex\x00")
+		b.WriteString(defaultTopicPattern)
+		return b.String()
+	}
+	b.WriteString("\x00topics")
+	t := slices.Clone(k.Topics)
+	slices.Sort(t)
+	for _, topic := range t {
+		b.WriteByte(0)
+		b.WriteString(topic)
+	}
+	return b.String()
 }
 
-// topicKey is a consumer's topic set in a canonical form. Empty (the
-// ^insights-.* default) is spelled out rather than left blank so it cannot
-// collide with a hub legitimately named "".
+// topicKey is a consumer's topic set in the readable form disambiguateGroups
+// appends to a group name — WIRE-VISIBLE, since the group's committed offsets
+// are the resume position, so it is kept exactly as it has always been rather
+// than made injective: the ^insights-.* default is spelled "insights" (no hub
+// can be named "", but one CAN be named `insights`, which disambiguateGroups
+// resolves) and a set is joined with "_". Identity is sourceKey's job.
 func topicKey(k KafkaConfig) string {
 	if len(k.Topics) == 0 {
 		return "insights"
@@ -160,6 +209,54 @@ func topicKey(k KafkaConfig) string {
 	t := slices.Clone(k.Topics)
 	slices.Sort(t)
 	return strings.Join(t, "_")
+}
+
+// defaultTopicRE is defaultTopicPattern compiled as kgo's ConsumeRegex compiles
+// it (Go regexp, unanchored unless the pattern anchors itself).
+var defaultTopicRE = regexp.MustCompile(defaultTopicPattern)
+
+// rejectRegexOverlap refuses an explicit hub that a regex-default consumer on
+// the SAME brokers already reads.
+//
+// sourceKey keeps the two apart — one is a pattern, the other a hub — and
+// disambiguateGroups gives each its own group, so both are accepted and every
+// record of that hub is consumed and exported TWICE, forever, with no counter
+// and no line. The shape is a namespace-scoped connection string (whose empty
+// topic list subscribes to ^insights-.*) beside an entity-scoped one for an
+// `insights-...` hub in the same namespace: the namespace-scoped key already
+// covers every hub there, so the entity-scoped string is redundant, which is
+// what the refusal says. It is the regex-overlap escape from the duplicate rule
+// rejectDuplicateSources states, and refused for the same reason: never what an
+// operator meant. A mixed pair whose entity is NOT an insights-* hub stays
+// legitimate — the regex does not read it.
+func rejectRegexOverlap(ks []KafkaConfig) error {
+	for _, re := range ks {
+		if len(re.Topics) != 0 {
+			continue
+		}
+		brokers := strings.Join(re.Brokers, ",")
+		for _, k := range ks {
+			if len(k.Topics) == 0 || strings.Join(k.Brokers, ",") != brokers {
+				continue
+			}
+			for _, topic := range k.Topics {
+				if defaultTopicRE.MatchString(topic) {
+					return fmt.Errorf("azure event hubs: hub %q in %s is consumed twice — by the consumer from %s, which names it, and by the one from %s, which already reads every hub matching %s in that namespace; every record would be exported twice. Remove the redundant entity-scoped connection string: the namespace-scoped one already covers that hub",
+						topic, hostOnly(brokers), describeSource(k), describeSource(re), defaultTopicPattern)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// describeSource names where a consumer's credential came from, for a refusal:
+// its connection-string file, or the managed identity.
+func describeSource(k KafkaConfig) string {
+	if k.ConnectionStringFile != "" {
+		return k.ConnectionStringFile
+	}
+	return "the managed identity"
 }
 
 // rejectDuplicateSources refuses two consumers with the same brokers AND the
@@ -211,7 +308,18 @@ func rejectDuplicateSources(ks []KafkaConfig, hint string) error {
 // from one consumer to several DOES rename the first one's group, and a
 // group's committed offsets are the resume position — so that transition
 // restarts consumption per -azure-start rather than resuming.
-func disambiguateGroups(ks []KafkaConfig, log *slog.Logger) {
+//
+// The suffix is topicKey, which is readable rather than injective, so two
+// DIFFERENT subscriptions can spell the same one: the regex default ("insights")
+// beside an entity-scoped hub literally named `insights`. The default-pattern
+// consumer then takes regexGroupSuffix instead — an `insights-` name, and a hub
+// of that shape beside a regex consumer in one namespace was already refused
+// (rejectRegexOverlap), so it cannot be taken — while the explicit hub keeps
+// the plain derivation, as every non-colliding shape does. A suffix still
+// shared after that is refused rather than handed out twice: two consumers in
+// one group with different subscriptions is the starvation this function
+// exists to prevent.
+func disambiguateGroups(ks []KafkaConfig, log *slog.Logger) error {
 	byNamespace := map[string][]int{}
 	for i, k := range ks {
 		ns := strings.Join(k.Brokers, ",")
@@ -221,18 +329,44 @@ func disambiguateGroups(ks []KafkaConfig, log *slog.Logger) {
 		if len(idx) < 2 {
 			continue
 		}
-		// Every consumer here necessarily has a DIFFERENT topic set: a
-		// namespace fixes the brokers, so two with the same topics would have
+		// Every consumer here necessarily has a DIFFERENT subscription: a
+		// namespace fixes the brokers, so two with the same one would have
 		// the same sourceKey and rejectDuplicateSources (which runs first)
 		// would already have refused them. There is therefore no
 		// same-subscription case to exempt — if that refusal is ever relaxed,
 		// this needs the exemption back, because members deliberately sharing
 		// one subscription SHOULD share a group.
+		suffix := make(map[int]string, len(idx))
+		explicit := map[string]bool{}
+		for _, i := range idx {
+			suffix[i] = topicKey(ks[i])
+			if len(ks[i].Topics) > 0 {
+				explicit[suffix[i]] = true
+			}
+		}
+		for _, i := range idx {
+			if len(ks[i].Topics) == 0 && explicit[suffix[i]] {
+				suffix[i] = regexGroupSuffix
+			}
+		}
+		taken := map[string]int{}
+		for _, i := range idx {
+			if j, dup := taken[suffix[i]]; dup {
+				return fmt.Errorf("azure event hubs: the consumers for %s and %s in %s would share the consumer group %q although they consume different hubs; the group leader would starve one of them — rename a hub or split the namespace",
+					ks[j].SourceName(), ks[i].SourceName(), hostOnly(ns), ks[i].Group+"."+suffix[i])
+			}
+			taken[suffix[i]] = i
+		}
 		for _, i := range idx {
 			base := ks[i].Group
-			ks[i].Group = base + "." + topicKey(ks[i])
+			ks[i].Group = base + "." + suffix[i]
 			log.Info("azure event hubs: giving this consumer its own group — several consumers in one namespace consume different hubs, and a shared group would let the group leader starve them",
 				"namespace", ns, "topics", ks[i].Topics, "group", ks[i].Group, "configuredGroup", base)
 		}
 	}
+	return nil
 }
+
+// regexGroupSuffix is the group suffix the regex-default consumer takes when
+// its usual one ("insights") is already an explicit hub's (disambiguateGroups).
+const regexGroupSuffix = "insights-regex"

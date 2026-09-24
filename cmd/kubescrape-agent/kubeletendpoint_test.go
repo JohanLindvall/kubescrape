@@ -1,6 +1,6 @@
 package main
 
-// -kubelet-endpoint normalisation (kubeletBase, config.go).
+// -kubelet-endpoint normalisation (kubeletBase, kubeletendpoint.go).
 //
 // The shipped default is `https://$(NODE_IP):10250` in both the chart and
 // deploy/agent.yaml, and NODE_IP is status.hostIP — so on an IPv6 node it
@@ -42,6 +42,9 @@ func TestKubeletBaseBracketsOnlyAnIPv6Literal(t *testing.T) {
 		{"bare IPv6, 3-digit port", "https://fd00::1:443", "https://[fd00::1]:443"},
 		{"bare IPv6 loopback, 3-digit port", "https://::1:443", "https://[::1]:443"},
 		{"bare IPv6, 4-digit port and a path", "https://fd00::1:4317/metrics", "https://[fd00::1]:4317/metrics"},
+		// url.Parse lowercases the scheme, and so does the request path.
+		{"upper-case scheme", "HTTPS://node-1.example:10250", "HTTPS://node-1.example:10250"},
+		{"plain http", "http://10.0.0.5:10255", "http://10.0.0.5:10255"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := kubeletBase(tc.in)
@@ -80,6 +83,12 @@ func TestValidateConfigParsesTheKubeletEndpoint(t *testing.T) {
 	for _, bad := range []string{
 		"10.0.0.5:10250",           // no scheme: url.Parse reads the host as one
 		"https://[10.0.0.5]:10250", // bracketed IPv4 — the naive manifest "fix"
+		// A host but no requestable scheme: both PARSE with an authority, so
+		// the host check alone signed them off, and every scrape then failed
+		// with "unsupported protocol scheme".
+		"//node:10250",
+		"ftp://node:10250",
+		"ftp://fd00:10::5:10250", // the bracketing repair must not launder it
 	} {
 		*kubeletEndpoint = bad
 		err := validateConfig(agentConfig{}, "")
@@ -89,10 +98,11 @@ func TestValidateConfigParsesTheKubeletEndpoint(t *testing.T) {
 	}
 }
 
-// End to end through the shipped path: startScraper is the one place the flag
-// is read, so the normalisation has to be there for a kubelet on an IPv6 node
-// to be scraped at all. The endpoint is built the way the manifests build it —
-// scheme://host:port with a bare host — against a listener on ::1.
+// End to end through the shipped path: compileConfig is the one place the flag
+// is read and startScraper scrapes what it normalised, so the normalisation has
+// to survive that hand-off for a kubelet on an IPv6 node to be scraped at all.
+// The endpoint is built the way the manifests build it — scheme://host:port
+// with a bare host — against a listener on ::1.
 func TestKubeletScrapeReachesAnIPv6KubeletEndpoint(t *testing.T) {
 	restoreKubeletFlags(t)
 
@@ -133,8 +143,12 @@ func TestKubeletScrapeReachesAnIPv6KubeletEndpoint(t *testing.T) {
 	*healthMetrics = false
 	*scrapeInterval = time.Hour // one cycle, then park
 
+	cc, err := compileConfig(agentConfig{}, "")
+	if err != nil {
+		t.Fatalf("compileConfig refused the manifest-shaped IPv6 endpoint %q: %v", endpoint, err)
+	}
 	var wg sync.WaitGroup
-	p := &pipelines{wg: &wg, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	p := &pipelines{wg: &wg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), kubeletBase: cc.kubeletBase}
 	ctx, cancel := context.WithCancel(context.Background())
 	if sc := p.startScraper(ctx); sc == nil {
 		cancel()

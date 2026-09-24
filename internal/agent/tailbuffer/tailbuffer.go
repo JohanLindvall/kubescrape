@@ -31,7 +31,16 @@
 // sender still holding a copy. The exposure is bounded in three ways and is
 // visible before it is spent:
 //
-//   - by TIME: at most decisionWait (5s by default) of received spans;
+//   - by TIME: a trace is decided about decisionWait (5s by default) after
+//     its first span, plus up to one decision tick (a quarter of the window,
+//     clamped to 100ms-1s: see tickFor) — and plus however long the decision
+//     loop's own EXPORT takes, because the loop decides nothing while its send
+//     is in flight. Without -buffer-dir a send to a slow or blackholed
+//     collector can last sendAttempts x the exporter's timeout plus ~750ms of
+//     backoff, and for that long the buffer only fills, until the SIZE bound
+//     below starts deciding the oldest traces early (the early-decision line
+//     then names the slowest such export, so a stalled loop can be told from
+//     an undersized bound);
 //   - by SIZE: at most maxSpans of them, whatever the rate;
 //   - by SHUTDOWN: a graceful stop (SIGTERM, a rolling update, an eviction)
 //     calls Flush, which decides every buffered trace immediately and exports
@@ -65,7 +74,10 @@
 //     the payload (full, or a failed fsync).
 //   - Without one, it is retried a few times and then dropped and counted
 //     (kubescrape_tail_sampling_spans_total{outcome="lost"}), because at that
-//     point nobody else holds it either.
+//     point nobody else holds it either. That holds whichever path decided
+//     it: a keep the sweep decided and a keep a bound forced out inside an
+//     application's push (sendOwned) get the same retry, the same send
+//     detached from the caller's cancellation, and the same loss report.
 //
 // Ownership is per PAYLOAD rather than a switch on the traces signal, because
 // the same exporter carries plain forwarded traces from the tier's application
@@ -121,15 +133,17 @@
 // fast one is never invented) where a blind eviction loses the trace outright
 // including the errors it may have been about to reveal. Every early decision is
 // counted separately from a normal one, with the bound that caused it as the
-// reason.
+// reason — and only a genuinely early one: a trace whose window had already
+// closed when a bound caught it was judged on its full window (see judge).
 package tailbuffer
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -137,55 +151,17 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
-	"github.com/JohanLindvall/kubescrape/internal/config"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
-// Defaults. The memory ones are sized for a shard with a ~1 GiB limit: a
-// buffered span costs ~365 B for a minimal one and ~1 KiB for a realistic one
-// (bench_test.go measures both), plus ~470 B once per (pushed payload, trace)
-// group for the ResourceSpans/ScopeSpans wrapper and its copy of the resource
-// attributes — the part that surprises people. maxSpans 200k is therefore
-// ~100-300 MiB of spans.
-//
-// It is not left at that number blindly: memory.go checks it against the
-// container's actual memory limit at startup, lowers the DEFAULT when the limit
-// cannot afford it, and refuses an explicit setting that could only end in an
-// OOM. The sizing rule in one line is
-//
-//	maxSpans x 1 KiB must fit in a quarter of the pod's memory limit.
-//
-// The arithmetic an operator has to do on top of that: a shard receiving R
-// spans/second holds R * decisionWait spans in the steady state. At 50k spans/s
-// and a 5s window that is 250k — above the default, so the maxSpans bound would
-// bind and decide the oldest traces about a second early. Raising maxSpans costs
-// memory LINEARLY and raises the odds of the OOM that loses the whole buffer, so
-// the answer above a pod's budget is more shards (the ring divides R by the
-// shard count), not a bigger number; the early counter says which is happening.
-const (
-	defaultDecisionWait     = 5 * time.Second
-	defaultMaxTraces        = 100_000
-	defaultMaxSpansPerTrace = 1_000
-	defaultMaxSpans         = 200_000
-	defaultCacheSize        = 100_000
-	defaultCacheTTL         = time.Minute
-)
-
-// Early-decision reasons: the bound that forced the decision, as the metric
-// label reports it. Not a free-form string — these are the whole set.
-const (
-	reasonSpansPerTrace = "spans_per_trace"
-	reasonMaxTraces     = "max_traces"
-	reasonMaxSpans      = "max_spans"
-	reasonShutdown      = "shutdown"
-)
-
-// sendAttempts bounds the decision loop's retry of one export. The spans are
-// already acked, so there is no sender to hand the failure to and dropping them
-// on the first blip would be gratuitous; but this goroutine also owes every
-// other buffered trace its decision, so the retry cannot be unbounded either.
+// sendAttempts bounds the retry of one export of spans that came out of the
+// BUFFER (sendOwned) — the decision loop's, and a push's early decisions. The
+// spans are already acked, so there is no sender to hand the failure to and
+// dropping them on the first blip would be gratuitous; but the decision loop
+// owes every other buffered trace its decision, and a push holds its sender's
+// in-flight slot, so the retry cannot be unbounded either.
 const sendAttempts = 3
 
 // sendBackoff is the first retry delay; it doubles per attempt.
@@ -194,155 +170,6 @@ const sendBackoff = 250 * time.Millisecond
 // warnEvery throttles the failed-export warning. A collector outage would
 // otherwise write one line per tick per shard for as long as it lasts.
 const warnEvery = 30 * time.Second
-
-// Config is the agent config's tailSampling section: the policy list
-// (agent/tailsample, embedded so the section reads as one thing) plus this
-// layer's own memory and timing knobs.
-//
-// Every duration is a STRING parsed with time.ParseDuration, never a
-// time.Duration: the agent config decodes through sigs.k8s.io/yaml ->
-// encoding/json, which accepts only a raw nanosecond integer for a
-// time.Duration, and because the file is UnmarshalStrict'ed one such field
-// rejects the WHOLE config and the workload does not start. Same treatment as
-// tailsample's own thresholds, servicegraph.Config.Wait and
-// tracesample.Config.KeepSlowerThan.
-type Config struct {
-	// Config is the policy list — `policies`, evaluated in order, first match
-	// wins. Embedded, so the section is one flat object and the policy syntax is
-	// documented in exactly one place (agent/tailsample's package doc).
-	tailsample.Config
-
-	// DecisionWait is how long a trace is held from the moment its FIRST span
-	// arrives before it is judged ("5s" by default). It is the assembly budget:
-	// long enough to cover the slowest span's journey from its process to this
-	// shard, short enough that the buffer's contents — which a hard kill loses —
-	// stay small. It is not a latency budget for the trace itself; a trace whose
-	// root span is still open when the window closes is judged on what arrived.
-	DecisionWait string `json:"decisionWait,omitempty"`
-
-	// MaxTraces caps distinct traces held at once (100000 default). At the cap
-	// the oldest is decided early rather than evicted.
-	MaxTraces int `json:"maxTraces,omitempty"`
-	// MaxSpansPerTrace caps one trace's buffered spans (1000 default). At the cap
-	// that trace is decided on the spans present and its remainder follows the
-	// decision through the cache — which is what keeps one pathological trace
-	// (a retry storm under a single id, an instrumented loop) from being the
-	// whole buffer.
-	MaxSpansPerTrace int `json:"maxSpansPerTrace,omitempty"`
-	// MaxSpans caps the buffer's TOTAL spans (200000 default) — the bound that
-	// actually determines the process's memory, since the other two multiply.
-	//
-	// Budget ~1 KiB per span and keep the product under a QUARTER of the pod's
-	// memory limit (memory.go explains the share). Left unset, the default is
-	// lowered at startup to whatever the limit affords; set explicitly it is
-	// honoured, warned about above that budget, and refused outright when the
-	// spans alone would need the whole limit — an OOM here loses every buffered
-	// span at once, which is strictly worse than the early decisions a smaller
-	// ceiling causes.
-	MaxSpans int `json:"maxSpans,omitempty"`
-
-	// DecisionCacheSize bounds the verdict cache used for spans arriving after
-	// their trace decided (100000 default). At the cap the oldest verdict is
-	// evicted and a later span for it starts a FRESH window — see put.
-	DecisionCacheSize int `json:"decisionCacheSize,omitempty"`
-	// DecisionCacheTTL is how long a verdict is remembered ("1m" default). It
-	// bounds how late a straggler can still follow its trace's decision;
-	// stragglers later than this are indistinguishable from a new trace.
-	DecisionCacheTTL string `json:"decisionCacheTTL,omitempty"`
-}
-
-// Enabled reports whether tail sampling is configured. The knobs alone do not
-// enable it: a section with bounds but no policies would drop every trace.
-func (c *Config) Enabled() bool { return c != nil && c.Config.Enabled() }
-
-// Validate reports a malformed section. Shape-only — no clock, no filesystem, no
-// network — so -check-config runs it, and it validates the policy list by
-// COMPILING it (tailsample.Config.Validate), so the dry run cannot drift from
-// what a real start accepts.
-func (c *Config) Validate() error {
-	if c == nil {
-		return nil
-	}
-	if !c.Enabled() {
-		// Bounds without policies: the section reads as configured and samples
-		// nothing, which is indistinguishable from the feature being off. The
-		// cache knobs count too — `decisionCacheSize: 50000` with no policies
-		// is the same misconfiguration as `maxTraces: 5` with none, and only
-		// the latter used to be caught.
-		if c.DecisionWait != "" || c.MaxTraces != 0 || c.MaxSpans != 0 || c.MaxSpansPerTrace != 0 ||
-			c.DecisionCacheSize != 0 || c.DecisionCacheTTL != "" {
-			return errors.New("tailSampling has buffer settings but no policies (an evaluator with no policies drops every trace, so the settings would silently sample nothing)")
-		}
-		return nil
-	}
-	if err := c.Config.Validate(); err != nil {
-		return err
-	}
-	_, err := c.settings()
-	return err
-}
-
-// settings resolves the config to its effective values, defaults applied. It is
-// the ONE place a default or a bound check lives, shared by Validate and New so
-// a dry run and a start cannot disagree.
-func (c *Config) settings() (settings, error) {
-	s := settings{
-		wait:             defaultDecisionWait,
-		maxTraces:        defaultMaxTraces,
-		maxSpansPerTrace: defaultMaxSpansPerTrace,
-		maxSpans:         defaultMaxSpans,
-		cacheSize:        defaultCacheSize,
-		cacheTTL:         defaultCacheTTL,
-	}
-	var err error
-	// config.Duration is the one optional-duration reader (empty takes the
-	// default, a negative value is an error naming the field and the value);
-	// Positive folds in the bound check these two fields need, so the
-	// explanation stays attached to the error rather than living in a separate
-	// if below it.
-	if s.wait, err = config.Duration("tailSampling.decisionWait", c.DecisionWait, defaultDecisionWait,
-		config.Positive("a zero window decides every trace on its first span")); err != nil {
-		return s, err
-	}
-	if s.cacheTTL, err = config.Duration("tailSampling.decisionCacheTTL", c.DecisionCacheTTL, defaultCacheTTL,
-		config.Positive("with no cache every late span re-decides its trace")); err != nil {
-		return s, err
-	}
-	for _, b := range []struct {
-		field string
-		val   int
-		dst   *int
-	}{
-		{"maxTraces", c.MaxTraces, &s.maxTraces},
-		{"maxSpansPerTrace", c.MaxSpansPerTrace, &s.maxSpansPerTrace},
-		{"maxSpans", c.MaxSpans, &s.maxSpans},
-		{"decisionCacheSize", c.DecisionCacheSize, &s.cacheSize},
-	} {
-		if b.val < 0 {
-			return s, fmt.Errorf("tailSampling.%s %d is negative", b.field, b.val)
-		}
-		if b.val > 0 {
-			*b.dst = b.val
-		}
-	}
-	// A trace that cannot fit under the total ceiling could never be decided
-	// normally: the per-trace bound would never be reached, and the ceiling would
-	// early-decide it (and everything else) on every payload.
-	if s.maxSpansPerTrace > s.maxSpans {
-		return s, fmt.Errorf("tailSampling.maxSpansPerTrace %d is above maxSpans %d (one trace could never fit in the buffer)", s.maxSpansPerTrace, s.maxSpans)
-	}
-	return s, nil
-}
-
-// settings is the resolved config.
-type settings struct {
-	wait             time.Duration
-	maxTraces        int
-	maxSpansPerTrace int
-	maxSpans         int
-	cacheSize        int
-	cacheTTL         time.Duration
-}
 
 // TracesExporter is the downstream exporter (otlpexport.Client, Buffered and the
 // servicegraph/spanmetrics taps all satisfy it).
@@ -394,7 +221,9 @@ type Buffer struct {
 	cur map[pcommon.TraceID]ptrace.ScopeSpans
 	// scratch is the span view handed to Decide, refilled per decision. The
 	// evaluator neither retains nor mutates it (tailsample.Trace says so), so one
-	// buffer serves every decision and the decision path stays allocation-free.
+	// buffer serves every decision — which is part of why a decision allocates
+	// nothing beyond amortized slice growth (TestDropDecisionAllocationBudget,
+	// TestKeepDecisionAllocationBudget).
 	scratch []tailsample.Span
 
 	// Counters resolved once at New, so neither the per-span receive path nor
@@ -408,33 +237,45 @@ type Buffer struct {
 	spansLost  *metrics.RegCounter
 	lateKept   *metrics.RegCounter
 	lateDrop   *metrics.RegCounter
-	earlyCount map[string]*metrics.RegCounter
+	earlyCount [numEarlyReasons]*metrics.RegCounter // nil at reasonNone
 	// earlyPending accumulates early decisions per reason since the last drain
 	// that actually REPORTED them (a suppressed drain leaves them standing, so
 	// the line describes the window it names), and earlyWarn throttles that
 	// report on earlyEvery — a field only so tests can drive the window. The
-	// DECISION path is
-	// allocation-budgeted and runs per trace under the mutex, so it may only
-	// bump a counter; the line belongs to the sweep, which is the repo's rule
-	// for anything a hot path notices (see the tailer's per-line counters).
-	// Pre-populated with every reason at New, so the increment never grows the
-	// map.
-	earlyPending map[string]int
+	// DECISION path is allocation-budgeted (TestDropDecisionAllocationBudget,
+	// TestKeepDecisionAllocationBudget) and runs per trace under the mutex, so
+	// it may only bump a counter; the line belongs to the sweep, which is the
+	// repo's rule for anything a hot path notices (see the tailer's per-line
+	// counters).
+	earlyPending [numEarlyReasons]int
 	earlyWarn    logdedupe.Throttle
 	earlyEvery   time.Duration
+	// slowestExport is the longest decision-loop export (in nanoseconds) since
+	// the last drain that either emitted the early-decision line or had nothing
+	// to report (takeEarlyLocked), and rides on that line. The loop
+	// decides nothing while its own send is in flight, so a slow collector
+	// fills the buffer and makes maxSpans bind — an early decision caused by
+	// EXPORT LATENCY, which the bounds alone would misdiagnose as a bound
+	// sized below the shard's span rate. An atomic rather than a field under
+	// mu: it is written after the send, with the mutex long released, and the
+	// shutdown Flush can drain concurrently with a Run sweep's send.
+	slowestExport atomic.Int64
 
-	// TWO gates for the two failed-export lines, never one. They describe the
+	// TWO gates for the failed-export lines, never one. They describe the
 	// same downstream condition and therefore CO-OCCUR, but they are not the
-	// same event: ExportTraces' line reports a NACK (nothing is lost — the
-	// sender still holds every span and retransmits), while the drain's
-	// reports spans DESTROYED (their senders were acked at buffering time,
-	// and this line is the only one that names them). Sharing one gate let
-	// the harmless line — emitted from every concurrent receive goroutine, so
-	// far more frequent — claim the slot and suppress the loss report for the
-	// whole window, leaving an operator reading a log that says the senders
-	// have it covered while buffered spans are being dropped. Same rule, and
-	// the same reason, as the tailer's unresolved-file and metadata-budget
-	// pair.
+	// same event: nackWarn's line reports a NACK of a push that carried only
+	// the SENDER's spans (late spans, spans decided on arrival) — nothing is
+	// lost, the sender still holds every one and retransmits — while
+	// lossWarn's reports spans DESTROYED: spans that came out of the BUFFER,
+	// whose senders were acked at buffering time. Both places that send such
+	// spans report there (sendOwned — the decision loop's final attempt, and
+	// a push carrying keeps a bound forced out early), and it is the only
+	// line that names them. Sharing one gate let the harmless line — emitted
+	// from every concurrent receive goroutine, so far more frequent — claim
+	// the slot and suppress the loss report for the whole window, leaving an
+	// operator reading a log that says the senders have it covered while
+	// buffered spans are being dropped. Same rule, and the same reason, as
+	// the tailer's unresolved-file and metadata-budget pair.
 	nackWarn logdedupe.Throttle
 	lossWarn logdedupe.Throttle
 }
@@ -480,25 +321,23 @@ func New(cfg Config, next TracesExporter, log *slog.Logger) (*Buffer, error) {
 		return nil, err
 	}
 	b := &Buffer{
-		ev:           ev,
-		next:         next,
-		set:          set,
-		tick:         tickFor(set.wait),
-		log:          log,
-		now:          time.Now,
-		trace:        make(map[pcommon.TraceID]*bufTrace, 1024),
-		cache:        newDecisionCache(set.cacheSize, set.cacheTTL),
-		res:          make(map[pcommon.TraceID]ptrace.ResourceSpans, 64),
-		cur:          make(map[pcommon.TraceID]ptrace.ScopeSpans, 64),
-		byPolicy:     make(map[string]policyCounters),
-		spansKept:    obs.TailSampleSpans.WithLabelValues("kept"),
-		spansDrop:    obs.TailSampleSpans.WithLabelValues("dropped"),
-		spansLost:    obs.TailSampleSpans.WithLabelValues("lost"),
-		lateKept:     obs.TailSampleLate.WithLabelValues("kept"),
-		lateDrop:     obs.TailSampleLate.WithLabelValues("dropped"),
-		earlyCount:   make(map[string]*metrics.RegCounter, 4),
-		earlyPending: make(map[string]int, 4),
-		earlyEvery:   earlyWarnEvery,
+		ev:         ev,
+		next:       next,
+		set:        set,
+		tick:       tickFor(set.wait),
+		log:        log,
+		now:        time.Now,
+		trace:      make(map[pcommon.TraceID]*bufTrace, 1024),
+		cache:      newDecisionCache(set.cacheSize, set.cacheTTL),
+		res:        make(map[pcommon.TraceID]ptrace.ResourceSpans, 64),
+		cur:        make(map[pcommon.TraceID]ptrace.ScopeSpans, 64),
+		byPolicy:   make(map[string]policyCounters),
+		spansKept:  obs.TailSampleSpans.WithLabelValues("kept"),
+		spansDrop:  obs.TailSampleSpans.WithLabelValues("dropped"),
+		spansLost:  obs.TailSampleSpans.WithLabelValues("lost"),
+		lateKept:   obs.TailSampleLate.WithLabelValues("kept"),
+		lateDrop:   obs.TailSampleLate.WithLabelValues("dropped"),
+		earlyEvery: earlyWarnEvery,
 	}
 	// "" is the no-policy-had-an-opinion default drop, which is a real and
 	// important outcome — it is what a policy list that matches nothing looks
@@ -509,19 +348,18 @@ func New(cfg Config, next TracesExporter, log *slog.Logger) (*Buffer, error) {
 			drop: obs.TailSampleTraces.WithLabelValues("drop", policyLabel(name)),
 		}
 	}
-	for _, r := range []string{reasonSpansPerTrace, reasonMaxTraces, reasonMaxSpans, reasonShutdown} {
-		b.earlyCount[r] = obs.TailSampleEarly.WithLabelValues(r)
-		b.earlyPending[r] = 0
+	for r := reasonNone + 1; r < numEarlyReasons; r++ {
+		b.earlyCount[r] = obs.TailSampleEarly.WithLabelValues(r.String())
 	}
 	return b, nil
 }
 
-// policyLabel renders an unattributed decision. "" would render as an empty
-// label value, which in Prometheus is indistinguishable from the series not
-// having the label at all.
+// policyLabel renders an unattributed decision as tailsample.NoPolicyLabel. ""
+// would render as an empty label value, which in Prometheus is
+// indistinguishable from the series not having the label at all.
 func policyLabel(name string) string {
 	if name == "" {
-		return "none"
+		return tailsample.NoPolicyLabel
 	}
 	return name
 }
@@ -573,99 +411,119 @@ func (b *Buffer) Stats() Stats {
 // the push there is deliberate: those spans are in the payload the sender still
 // holds, so its retry recovers them, and the retry costs only duplicates (the
 // re-pushed spans of a still-buffering trace are buffered twice, which is the
-// same at-least-once trade the re-shard hop makes). Spans that came out of the
-// BUFFER in the same send — an early decision forced by a bound — are ours, so
-// the payload is marked otlpexport.Own and a disk buffer takes it; without one,
-// a failure loses them and they are counted as lost rather than left to a retry
-// that will not re-send them. (A few of those may in fact be recoverable: an
-// early-decided trace can include spans from THIS push, which the retry will
-// re-deliver against the cached verdict. Counting them lost over-reports a rare
-// corner — a bound binding in the same instant the collector fails — in the
-// direction that does not hide loss.)
+// same at-least-once trade the re-shard hop makes).
 //
-// After the shutdown Flush has run (the flushed latch), a push's NEW traces are
-// decided inside take() itself — buffering them would be silent loss, since
-// nothing will flush this buffer again — and their keeps ride out in the same
-// returned payload as everything else: tallied only when this push acks, never
-// marked otlpexport.Own and never counted lost, because unlike `mine` the
-// sender still holds every one of them, and a NACK makes it retransmit them
-// against the verdict take() just cached (whereupon they are ordinary late
-// spans). The straggler's ack is thereby honest: a 200 means its keeps went
-// out on this very push.
+// Spans that came out of the BUFFER in the same send — an early decision forced
+// by a bound (`mine`) — are ours, and they leave through sendOwned exactly as a
+// sweep's keeps do: marked otlpexport.Own so a disk buffer spools them, retried
+// sendAttempts times, on a context detached from the SENDER's cancellation (its
+// deadline kept), and counted lost on the final failure with the report on the
+// loss gate. A push carrying them used to get one attempt on the sender's own
+// context and report through the NACK gate, so an acked trace's delivery
+// guarantee depended on which path happened to decide it. The trade, stated:
+// during a downstream failure such a push holds its in-flight slot for up to
+// sendAttempts attempts plus ~750ms of backoff — bounded, and back-pressure on a
+// push that is failing anyway. (A few of the `mine` spans may in fact be
+// recoverable: an early-decided trace can include spans from THIS push, which
+// the retry will re-deliver against the cached verdict. Counting them lost
+// over-reports a rare corner — a bound binding in the same instant the collector
+// fails — in the direction that does not hide loss.)
+//
+// Spans decided ON ARRIVAL inside this push — every new trace once the shutdown
+// Flush has latched the buffer, and the spans that carry no trace id at all —
+// ride out in the same payload but are the SENDER's: both their tallies (kept
+// and dropped) wait for this push's ack, they are never marked otlpexport.Own
+// and never counted lost, because a NACK makes the sender retransmit them (a
+// latched trace's retransmission then follows the verdict take() cached, as
+// ordinary late spans; an id-less one is judged afresh). The straggler's ack is
+// thereby honest: a 200 means its keeps went out on this very push.
 func (b *Buffer) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	if td.SpanCount() == 0 {
 		return nil
 	}
-	out, late, lateDropped, mine, flushKept := b.take(td)
-	if out.spans == 0 {
-		// Nothing to forward means the push is acked right here — and the ack
-		// is what makes its late-DROPPED spans final, so this is where they are
-		// counted (see the success path below for the symmetric argument).
-		if lateDropped > 0 {
-			b.lateDrop.Add(float64(lateDropped))
+	r := b.take(td)
+	if r.out.spans > 0 {
+		if r.mine > 0 {
+			if err := b.sendOwned(ctx, &r.out, r.mine); err != nil {
+				// sendOwned counted the `mine` spans lost and reported on the
+				// loss gate. The rest of the payload is the sender's (late and
+				// arrival-decided spans): NACK it, and its retransmission
+				// re-presents them. Nothing else is tallied — see below.
+				return err
+			}
+		} else if err := b.next.ExportTraces(ctx, r.out.td); err != nil {
+			// Only the sender's spans rode this send, so nothing is lost here:
+			// the NACK makes the sender retransmit them. No tally moves —
+			// "kept" did not land, and "lost" for spans the sender still holds
+			// would be the over-report, not the honesty.
+			b.warn(&b.nackWarn, "forwarding tail-sampled spans failed; the push is NACKed and the sender's retry re-presents them (nothing is lost here)",
+				"spans", r.out.spans, "error", err)
+			return err
 		}
-		return nil
 	}
-	if mine > 0 {
-		// This payload carries spans that came out of the BUFFER (an early
-		// decision forced by a bound), whose senders were acked seconds ago.
-		// Marking it hands it to the disk buffer when one is open — see
-		// otlpexport/owned.go. The late spans riding along are spooled too,
-		// which is right: the sender is acked either way, so the spool has to
-		// be the thing that carries them.
-		ctx = otlpexport.Own(ctx)
+	// This push is acked. Every tally that describes the SENDER's spans is
+	// taken only now: a NACKed push is retransmitted whole and would present
+	// the same spans again, so counting at receive time tallied them once per
+	// attempt. That covers the late spans (kept and dropped against a cached
+	// verdict — a late-DROPPED span is not in out.td, but its push can still
+	// be NACKed by a sibling's failed forward) and the spans decided on
+	// arrival (heldKept/heldDropped). `mine` is counted kept here too: those
+	// spans left the buffer by a decision, and this ack is what made them
+	// real.
+	if r.lateDropped > 0 {
+		b.lateDrop.Add(float64(r.lateDropped))
 	}
-	if err := b.next.ExportTraces(ctx, out.td); err != nil {
-		if mine > 0 {
-			b.spansLost.Add(float64(mine))
-		}
-		// flushKept spans are deliberately NOT in that lost count: the push is
-		// NACKed below, the sender retransmits it, and the retransmission
-		// follows the cached verdicts as late spans — a loss tally for spans
-		// the sender still holds would be the over-report, not the honesty.
-		// And "lost" itself is an upper bound even for `mine`: downstream this
-		// send may be COMPOSITE (a routing fan-out, an otlpsplit into parts),
-		// so shares of it can have been delivered or spooled before the
-		// failure — at-least-once keeps those real.
-		b.warn(&b.nackWarn, "exporting tail-sampled spans failed; the push is NACKed (the sender's retry re-presents its own spans) and the spans that came out of the buffer are dropped from this process and counted lost — an upper bound: under a routed or size-split export, earlier shares may already have been delivered or spooled",
-			"spans", out.spans, "buffered", mine, "error", err)
-		return err
+	if r.late > 0 {
+		b.lateKept.Add(float64(r.late))
 	}
-	// Counted only now: a late span the sender will re-push must not be counted
-	// twice, and a decided trace's spans are "kept" only once they have landed.
-	// The late-DROPPED tally defers to the same ack: those spans are not in
-	// out.td, but a NACKed push is retransmitted whole, so counting them at
-	// receive time tallied the same spans once per retry attempt — this return
-	// is what stops the retransmissions that would re-present them. flushKept
-	// rides the same ack for the same reason, into the kept tally: those spans
-	// left the buffer by a decision, and this ack is what made them real.
-	if lateDropped > 0 {
-		b.lateDrop.Add(float64(lateDropped))
+	if r.heldDropped > 0 {
+		b.spansDrop.Add(float64(r.heldDropped))
 	}
-	if late > 0 {
-		b.lateKept.Add(float64(late))
-	}
-	if mine+flushKept > 0 {
-		b.spansKept.Add(float64(mine + flushKept))
+	if r.mine+r.heldKept > 0 {
+		b.spansKept.Add(float64(r.mine + r.heldKept))
 	}
 	return nil
 }
 
+// received is one push's walk: the payload to forward and how its spans divide
+// by who still holds a copy, which decides how each is tallied and whether a
+// failed forward is loss.
+type received struct {
+	out outbound
+	// late and lateDropped are spans of already-decided traces that followed a
+	// cached keep / drop verdict. The sender still holds them.
+	late, lateDropped int
+	// mine is the spans an early decision took out of the BUFFER (a bound
+	// bound). Their senders were acked when they were buffered; nobody else
+	// holds them.
+	mine int
+	// heldKept and heldDropped are THIS push's spans decided on arrival — after
+	// the shutdown Flush latched the buffer, or because they carry no trace id
+	// — kept / dropped. Like late spans the sender still holds them.
+	heldKept, heldDropped int
+}
+
 // take is the receive path's whole critical section: one walk of the payload
-// that buffers, classifies and enforces. It returns the payload to forward, how
-// many of its spans came from THIS push (the sender can re-send those), how
-// many were dropped against a cached DROP verdict (tallied by the caller only
-// once the push acks — a NACKed push is retransmitted and re-presents them),
-// how many came out of the buffer (the sender cannot re-send those), and how
-// many of THIS push's spans a post-Flush shutdown decision kept (flushKept —
-// like late, the sender still holds them, so they ride the push's ack and are
-// never marked owned or counted lost).
-func (b *Buffer) take(td ptrace.Traces) (out outbound, late, lateDropped, mine, flushKept int) {
+// that buffers, classifies and enforces. See received for what it reports.
+func (b *Buffer) take(td ptrace.Traces) (r received) {
 	now := b.now()
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	// unkeyed is this push's pseudo-trace of spans with no trace id. The
+	// OTLP-invalid all-zero id names no trace, so it is never buffered past
+	// this walk and never cached: keyed like any other id, it merged the
+	// id-less spans of unrelated senders into one trace, judged them once, and
+	// cached that verdict under the zero id for decisionCacheTTL — so every
+	// id-less span from ANY sender in that window followed a stranger's verdict
+	// (an ERROR span dropped because another sender's OK span was judged
+	// first). The resharder keeps such spans local rather than hashing them
+	// (servicegraph SpansUnkeyed), which is how they reach this buffer at all.
+	// Parked in the buffer like the post-Flush traces below, so the grouping
+	// and the decision are the ordinary ones, and decided at the end of the
+	// walk on exactly the spans this push carried.
+	var unkeyed *bufTrace
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
 		rs := rss.At(i)
@@ -682,16 +540,24 @@ func (b *Buffer) take(td ptrace.Traces) (out outbound, late, lateDropped, mine, 
 			for k := 0; k < spans.Len(); k++ {
 				sp := spans.At(k)
 				id := sp.TraceID()
+				if id.IsEmpty() {
+					// No enforce, for the post-Flush reason below: the entry is
+					// transient inside this critical section, and a bound
+					// firing on it would classify the sender's own spans as
+					// `mine`.
+					unkeyed = b.add(id, sp, rs, ss, now)
+					continue
+				}
 				if keep, ok := b.cache.get(id, now); ok {
 					// A span for a trace already judged. Deciding it again would
 					// re-charge rateLimiting and could answer differently, so the
 					// cached verdict is applied instead of a second Decide.
 					if !keep {
-						lateDropped++
+						r.lateDropped++
 						continue
 					}
 					if !haveRS {
-						lateRS = out.dest().ResourceSpans().AppendEmpty()
+						lateRS = r.out.dest().ResourceSpans().AppendEmpty()
 						rs.Resource().CopyTo(lateRS.Resource())
 						lateRS.SetSchemaUrl(rs.SchemaUrl())
 						haveRS = true
@@ -703,15 +569,17 @@ func (b *Buffer) take(td ptrace.Traces) (out outbound, late, lateDropped, mine, 
 						haveSS = true
 					}
 					sp.CopyTo(lateSS.Spans().AppendEmpty())
-					out.spans++
-					late++
+					r.out.spans++
+					r.late++
 					continue
 				}
 				// Not decided (or the verdict aged out of the cache, in which
-				// case this starts a FRESH window and the trace may be decided a
-				// second time — which does NOT re-charge rateLimiting or
-				// composite while the cache still remembers the trace at all;
-				// see decide and cache.go's two lifetimes).
+				// case this starts a FRESH window — holding only the stragglers,
+				// since the first decision already moved the original spans
+				// out — and the trace may be decided a second time, which
+				// re-charges only the rateLimiting/composite buckets the earlier
+				// decision did not SPEND, for as long as the cache still holds
+				// its entry; see decide and cache.go's two lifetimes).
 				e := b.add(id, sp, rs, ss, now)
 				if b.flushed {
 					// Post-Flush the span is only PARKED here until the end of
@@ -724,7 +592,7 @@ func (b *Buffer) take(td ptrace.Traces) (out outbound, late, lateDropped, mine, 
 					// when their sender in fact still holds every one of them.
 					continue
 				}
-				mine += b.enforce(&out, e, now)
+				r.mine += b.enforce(&r.out, e, now)
 			}
 		}
 	}
@@ -734,21 +602,26 @@ func (b *Buffer) take(td ptrace.Traces) (out outbound, late, lateDropped, mine, 
 		// spans this push carried for it. Every trace here IS from this push —
 		// the buffer was empty when the walk began (Flush drained it, and
 		// every earlier post-Flush take ended in this same loop) — so the
-		// keeps return as flushKept and ride the push's own ack like late
-		// spans: a NACKed sender retransmits, and the retransmission follows
-		// the verdicts cached here. That is what keeps a straggler's ack
-		// honest and the buffered-spans gauges at zero after Flush.
-		for b.head < len(b.order) {
-			e := b.order[b.head]
-			if e.gone {
-				b.head++
-				continue
-			}
-			b.head++
-			flushKept += b.decide(&out, e, now, reasonShutdown)
+		// verdicts ride the push's own ack like late spans: a NACKed sender
+		// retransmits, and the retransmission follows the verdicts cached here.
+		// That is what keeps a straggler's ack honest and the buffered-spans
+		// gauges at zero after Flush. The unkeyed pseudo-trace, if any, is one
+		// of them.
+		for e := b.frontLocked(); e != nil; e = b.frontLocked() {
+			kept, dropped := b.judge(&r.out, e, now, reasonShutdown)
+			r.heldKept += kept
+			r.heldDropped += dropped
 		}
+	} else if unkeyed != nil && !unkeyed.gone {
+		// Decided on arrival, not early: no window was ever going to assemble
+		// more of it. (gone: a bound took it out mid-walk, and its spans are
+		// then in `mine` — the take() imprecision the enforce skip above
+		// otherwise avoids, reachable only when it was the FIFO's front.)
+		kept, dropped := b.judge(&r.out, unkeyed, now, reasonNone)
+		r.heldKept += kept
+		r.heldDropped += dropped
 	}
-	return out, late, lateDropped, mine, flushKept
+	return r
 }
 
 // add copies one span into its trace's buffer, creating the trace and the
@@ -797,11 +670,12 @@ func (b *Buffer) add(id pcommon.TraceID, sp ptrace.Span, rs ptrace.ResourceSpans
 // enforce applies the three memory bounds after one span was admitted, deciding
 // early where one binds, and returns how many buffered spans left as a result.
 //
-// The victim is always the OLDEST trace, never the largest. It is the one
-// closest to its natural decision, so judging it early costs the least
-// completeness; picking the largest would need a heap keyed by a count that
-// changes on every span, and would systematically punish deep traces — exactly
-// the ones a tail sampler exists to catch.
+// maxSpansPerTrace decides the trace that just reached it, on the spans it
+// holds. The two FIFO bounds (maxTraces, maxSpans) decide the OLDEST trace,
+// never the largest: it is the one closest to its natural decision, so judging
+// it early costs the least completeness; picking the largest would need a heap
+// keyed by a count that changes on every span, and would systematically punish
+// deep traces — exactly the ones a tail sampler exists to catch.
 func (b *Buffer) enforce(out *outbound, e *bufTrace, now time.Time) int {
 	moved := 0
 	if e.spans >= b.set.maxSpansPerTrace && !e.gone {
@@ -826,28 +700,78 @@ func (b *Buffer) enforce(out *outbound, e *bufTrace, now time.Time) int {
 	return moved
 }
 
-// decideOldest decides the front of the arrival FIFO, skipping the slots of
-// traces that were already decided out from under it. It reports whether it
-// found one at all.
-func (b *Buffer) decideOldest(out *outbound, now time.Time, reason string) (int, bool) {
-	for b.head < len(b.order) {
-		e := b.order[b.head]
-		if e.gone {
-			b.head++
-			continue
-		}
-		return b.decide(out, e, now, reason), true
+// decideOldest decides the front of the arrival FIFO (frontLocked). It reports
+// whether it found a live trace at all.
+func (b *Buffer) decideOldest(out *outbound, now time.Time, reason earlyReason) (int, bool) {
+	e := b.frontLocked()
+	if e == nil {
+		return 0, false
 	}
-	return 0, false
+	return b.decide(out, e, now, reason), true
 }
 
-// decide judges one trace, removes it from the buffer, remembers the verdict for
-// late spans, and appends the spans to out when the verdict is keep. It returns
-// the number of spans that left the buffer into out (0 for a drop).
+// frontLocked returns the oldest LIVE trace in the arrival FIFO, or nil when
+// none is left, advancing head past the slots of traces already decided out
+// from under it. It is the one walk every consumer of the FIFO's front shares
+// (take's post-Flush loop, decideOldest, decideChunkLocked). Called with the
+// mutex held.
 //
-// reason is "" for a decision made because the window elapsed; anything else is
-// an early decision and names the bound that forced it.
-func (b *Buffer) decide(out *outbound, e *bufTrace, now time.Time, reason string) int {
+// It does not consume the slot it returns, and needs not: every caller DECIDES
+// that trace next, judge always remove()s it, and remove marks it gone — so the
+// next call steps over it like any other decided slot, and compact() treats a
+// gone slot at head the same as one behind it. A caller that returned without
+// deciding would get the same trace back, which is the right answer.
+func (b *Buffer) frontLocked() *bufTrace {
+	for ; b.head < len(b.order); b.head++ {
+		if e := b.order[b.head]; !e.gone {
+			return e
+		}
+	}
+	return nil
+}
+
+// decide judges one trace (judge) and tallies a DROP at once. It returns the
+// number of spans that left the buffer into out (0 for a drop).
+//
+// Every caller but take()'s arrival-decided traces uses it: those spans are
+// the SENDER's, so their drop tally has to wait for the push's ack like
+// everything else about them (ExportTraces), and they call judge directly.
+func (b *Buffer) decide(out *outbound, e *bufTrace, now time.Time, reason earlyReason) int {
+	kept, dropped := b.judge(out, e, now, reason)
+	if dropped > 0 {
+		b.spansDrop.Add(float64(dropped))
+	}
+	return kept
+}
+
+// judge decides one trace, removes it from the buffer, remembers the verdict
+// for late spans, and appends the spans to out when the verdict is keep. It
+// returns how many spans left into out (kept) or were discarded (dropped); one
+// of the two is always zero. It tallies everything about the DECISION (the
+// policy and early counters) and nothing about the SPANS' fate, which is the
+// caller's.
+//
+// reason names the bound that forced an early decision, or is reasonNone for
+// a decision made because the window elapsed. A trace whose window has ALREADY
+// elapsed is judged on its full window whatever the caller passed — it was only
+// waiting for the next sweep tick — so it is not counted early: a bound
+// catching a due trace (maxSpans between R*decisionWait and R*(decisionWait +
+// tick), or a backlog during a chunked drain) would otherwise inflate
+// kubescrape_tail_sampling_early_decisions_total and the "slow traces can be
+// missed" warning with traces that missed nothing. decideChunkLocked's
+// shutdown arm makes the same distinction.
+func (b *Buffer) judge(out *outbound, e *bufTrace, now time.Time, reason earlyReason) (kept, dropped int) {
+	if reason != reasonNone && now.Sub(e.first) >= b.set.wait {
+		reason = reasonNone
+	}
+	// The all-zero trace id names no trace (take()'s unkeyed pseudo-trace), so
+	// it has no verdict to remember and no earlier charge to read: caching
+	// either would hand one sender's verdict to every other id-less span.
+	keyed := !e.id.IsEmpty()
+	var charged tailsample.ChargedMask
+	if keyed {
+		charged = b.cache.charged(e.id)
+	}
 	b.scratch = b.scratch[:0]
 	rss := e.td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
@@ -868,16 +792,18 @@ func (b *Buffer) decide(out *outbound, e *bufTrace, now time.Time, reason string
 	// reported, not the decision — a decision the budget refused paid nothing,
 	// and skipping the charge for it would admit spans free every fresh window.
 	// See the two lifetimes in cache.go.
-	d := b.ev.Decide(tailsample.Trace{TraceID: e.id, Spans: b.scratch, Charged: b.cache.charged(e.id)})
+	d := b.ev.Decide(tailsample.Trace{TraceID: e.id, Spans: b.scratch, Charged: charged})
 	// The evaluator retains nothing (tailsample.Trace says so), so every element
 	// is dead the instant Decide returns — and they are HANDLES, not values: each
 	// one pins a whole span message plus its group's resource attributes. `[:0]`
 	// alone leaves the tail of the largest decision so far pointing into a trace
-	// this call is about to release (the drop branch below nils e.td for exactly
-	// that reason), and a workload of small traces would then never overwrite it.
-	// clear() zeroes [0,len) and the refill above starts from the front, so
-	// nothing past a decision's own fill is ever live. It allocates nothing, so
-	// the decision path stays allocation-free.
+	// this call is about to release (the drop branch below releases e.td for
+	// exactly that reason), and a workload of small traces would then never
+	// overwrite it. clear() zeroes [0,len) and the refill above starts from the
+	// front, so nothing past a decision's own fill is ever live. clear()
+	// allocates nothing, and neither does the rest of a decision beyond
+	// amortized slice growth (TestDropDecisionAllocationBudget,
+	// TestKeepDecisionAllocationBudget).
 	clear(b.scratch)
 
 	c, ok := b.byPolicy[d.Policy]
@@ -893,17 +819,19 @@ func (b *Buffer) decide(out *outbound, e *bufTrace, now time.Time, reason string
 	} else {
 		c.drop.Inc()
 	}
-	if reason != "" {
+	if reason != reasonNone {
 		b.earlyCount[reason].Inc()
 		b.earlyPending[reason]++ // reported by the sweep, never from here
 	}
 
 	b.remove(e)
-	// d.Charged, not "we decided it": a re-decision reads this back as
-	// Trace.Charged, and only a budget that actually moved may be skipped.
-	b.cache.put(e.id, d.Sampled, d.Charged, now)
+	if keyed {
+		// d.Charged, not "we decided it": a re-decision reads this back as
+		// Trace.Charged, and only a budget that actually moved may be skipped.
+		b.cache.put(e.id, d.Sampled, d.Charged, now)
+	}
 	if !d.Sampled {
-		b.spansDrop.Add(float64(e.spans))
+		dropped = e.spans
 		// Release the payload. remove() deliberately leaves this entry's
 		// POINTER in its b.order slot to be skipped when it reaches the front,
 		// and compact() only overwrites that prefix once the head passes
@@ -916,13 +844,22 @@ func (b *Buffer) decide(out *outbound, e *bufTrace, now time.Time, reason string
 		//
 		// The keep branch below gets this for free — MoveAndAppendTo nils the
 		// source slice. This branch has to say it.
-		e.td = ptrace.NewTraces()
-		return 0
+		//
+		// The ZERO value, not ptrace.NewTraces(): nothing reads a gone entry's
+		// td again (every FIFO walk skips gone slots, and add() only ever
+		// reaches a live entry through the map; a future read would panic on
+		// the nil message, which is the loud failure wanted over a silently
+		// empty payload), and NewTraces was 2 of the 3 allocations of every
+		// dropped trace's decision — under the mutex every receiver shares, on
+		// the verdict a tail sampler reaches most
+		// (TestDropDecisionAllocationBudget).
+		e.td = ptrace.Traces{}
+		return 0, dropped
 	}
-	n := e.spans
+	kept = e.spans
 	e.td.ResourceSpans().MoveAndAppendTo(out.dest().ResourceSpans())
-	out.spans += n
-	return n
+	out.spans += kept
+	return kept, 0
 }
 
 // remove takes a trace out of the buffer. Its slot in `order` is left to be
@@ -1050,6 +987,17 @@ func (b *Buffer) drain(ctx context.Context, all bool) {
 	// goroutine's alone. A push landing in the gap buffers a trace this drain
 	// has not reached, which the next tick decides.
 	//
+	// The gap has to be a real one, which is what the runtime.Gosched() is
+	// for. sync.Mutex in normal mode lets the goroutine that unlocks re-acquire
+	// ahead of the waiter it just woke (the waiter is only made runnable), so
+	// an Unlock immediately followed by a Lock usually hands the next chunk to
+	// this goroutine again and a push gets in only once it has waited past the
+	// mutex's 1ms starvation threshold — measured at ~4ms worst-case push
+	// waits against ~0.2-0.8ms with the yield. Yielding runs the woken waiter
+	// (it sits in this P's runnext) before this goroutine re-takes the lock.
+	// The cost is sweep throughput under contention, which is the priority
+	// this chunking exists to set: receive latency over sweep latency.
+	//
 	// The FLUSH path is deliberately ONE hold. Its first act was to latch the
 	// buffer, and take() answers that latch by deciding, itself, every trace
 	// it finds — on the assertion that a latched buffer holds only what THAT
@@ -1064,6 +1012,7 @@ func (b *Buffer) drain(ctx context.Context, all bool) {
 			continue
 		}
 		b.mu.Unlock()
+		runtime.Gosched()
 		b.mu.Lock()
 	}
 	early, report := b.takeEarlyLocked()
@@ -1090,20 +1039,62 @@ func (b *Buffer) drain(ctx context.Context, all bool) {
 	// shutdown Flush cannot recover it: those traces are already out of the
 	// buffer and their verdicts are already cached.
 	//
-	// One known over-report, accepted: downstream this send may be COMPOSITE
-	// (a routing fan-out, an otlpsplit into size-bounded parts), and a failure
-	// after some shares landed still counts the WHOLE payload into
-	// {outcome="lost"} — at-least-once delivered those shares for real, so the
-	// lost counter is an upper bound on loss, never an under-count.
+	// Timed, because this send is the one thing that stops the loop deciding:
+	// its duration rides on the early-decision line (slowestExport).
+	start := b.now()
+	err := b.sendOwned(ctx, &out, out.spans)
+	b.noteExport(b.now().Sub(start))
+	if err == nil {
+		b.spansKept.Add(float64(out.spans))
+	}
+}
+
+// sendOwned sends a payload carrying `owned` spans that came out of the BUFFER
+// — spans whose senders were acked at buffering time, so nobody else holds a
+// copy — and returns the final error. It is the ONE delivery path for such
+// spans, used by the decision loop's drain and by a push that carried keeps a
+// bound forced out early, so an acked trace gets the same guarantee whichever
+// path decided it:
+//
+//   - the payload is marked otlpexport.Own, so a disk buffer spools it;
+//   - the send runs on sendContext: the caller's DEADLINE without its
+//     CANCELLATION, because a cancelled send of the only copy is loss, not a
+//     retry;
+//   - it is retried (sendRetry), a permanent rejection excepted;
+//   - on the final failure the owned spans are counted lost and reported on
+//     the LOSS gate, which the NACK line can never starve.
+//
+// out may carry spans that are NOT owned (a push's late spans ride along);
+// they are the sender's, the caller NACKs the push, and they are neither
+// counted lost here nor reported as such.
+//
+// One known over-report, accepted: downstream this send may be COMPOSITE (a
+// routing fan-out, an otlpsplit into size-bounded parts), and a failure after
+// some shares landed still counts every owned span into {outcome="lost"} —
+// at-least-once delivered those shares for real, so the lost counter is an
+// upper bound on loss, never an under-count.
+func (b *Buffer) sendOwned(ctx context.Context, out *outbound, owned int) error {
 	sctx, cancel := sendContext(ctx)
 	defer cancel()
-	if err := b.sendRetry(otlpexport.Own(sctx), out.td); err != nil {
-		b.spansLost.Add(float64(out.spans))
-		b.warn(&b.lossWarn, "exporting tail-sampled traces failed on the final attempt; the spans are dropped from this process (their senders were acked at buffering time) and counted lost — an upper bound: under a routed or size-split export, earlier shares may already have been delivered or spooled",
-			"spans", out.spans, "error", err)
-		return
+	err := b.sendRetry(otlpexport.Own(sctx), out.td)
+	if err != nil {
+		b.spansLost.Add(float64(owned))
+		b.warn(&b.lossWarn, "exporting tail-sampled traces failed on the final attempt; the spans that came out of the buffer are dropped from this process (their senders were acked at buffering time) and counted lost — an upper bound: under a routed or size-split export, earlier shares may already have been delivered or spooled. Any of a push's own spans riding the same send are NACKed back to their sender",
+			"spans", out.spans, "buffered", owned, "error", err)
 	}
-	b.spansKept.Add(float64(out.spans))
+	return err
+}
+
+// noteExport folds one decision-loop export's duration into slowestExport.
+// A CAS loop rather than a mutex: it runs after the send, and the shutdown
+// Flush can race a Run sweep here.
+func (b *Buffer) noteExport(d time.Duration) {
+	for {
+		cur := b.slowestExport.Load()
+		if int64(d) <= cur || b.slowestExport.CompareAndSwap(cur, int64(d)) {
+			return
+		}
+	}
 }
 
 // decideChunk bounds ONE lock hold of a drain to that many decisions.
@@ -1126,28 +1117,21 @@ const decideChunk = 128
 // they cost a pointer test, and the budget exists to bound the expensive thing
 // — Decide.
 func (b *Buffer) decideChunkLocked(out *outbound, now time.Time, all bool) bool {
-	for n := 0; n < decideChunk; {
-		if b.head >= len(b.order) {
+	for range decideChunk {
+		e := b.frontLocked()
+		if e == nil {
 			return true
 		}
-		e := b.order[b.head]
-		if e.gone {
-			b.head++
-			continue
-		}
-		reason := ""
-		if !all {
-			if now.Sub(e.first) < b.set.wait {
+		reason := reasonNone
+		if now.Sub(e.first) < b.set.wait {
+			if !all {
 				// The FIFO is deadline-ordered: nothing behind it is due.
 				return true
 			}
-		} else if now.Sub(e.first) < b.set.wait {
 			// Judged before its window closed because the process is stopping.
 			reason = reasonShutdown
 		}
-		b.head++
 		b.decide(out, e, now, reason)
-		n++
 	}
 	return false
 }
@@ -1187,86 +1171,10 @@ func (b *Buffer) sendRetry(ctx context.Context, td ptrace.Traces) error {
 	})
 }
 
-// earlyReport is one sweep's worth of early decisions, taken out of the buffer
-// so the line can be written with the mutex released.
-type earlyReport struct {
-	spansPerTrace, maxTraces, maxSpans, shutdown int
-}
-
-func (e earlyReport) any() bool {
-	// shutdown is deliberately excluded from "is there anything to say": a
-	// graceful stop decides every buffered trace early BY DESIGN, so warning
-	// about it would put a scary line in every rolling update. The count still
-	// rides on the line when one of the real bounds also bound, and
-	// kubescrape_tail_sampling_early_decisions_total{reason="shutdown"} carries
-	// it either way.
-	return e.spansPerTrace > 0 || e.maxTraces > 0 || e.maxSpans > 0
-}
-
-// takeEarlyLocked decides whether this drain may emit the aggregate line and,
-// ONLY IF IT MAY, drains the pending tallies. Called with the mutex held.
-//
-// The order is the whole point. Draining unconditionally and throttling the
-// line afterwards zeroes the tallies on every sweep — a 100ms-1s ticker — while
-// the line that eventually escapes the throttle claims to describe a minute, so
-// the counts it carries understate the window it names by the tick ratio
-// (60-600x). Claiming the throttle slot first and zeroing only on the emitting
-// drain makes the numbers describe the window they are printed against; the
-// suppressed drains simply keep accumulating into it.
-//
-// Allow() is asked only when there is something to say, or a quiet minute would
-// spend the slot and suppress the first drain that actually binds.
-func (b *Buffer) takeEarlyLocked() (earlyReport, bool) {
-	r := earlyReport{
-		spansPerTrace: b.earlyPending[reasonSpansPerTrace],
-		maxTraces:     b.earlyPending[reasonMaxTraces],
-		maxSpans:      b.earlyPending[reasonMaxSpans],
-		shutdown:      b.earlyPending[reasonShutdown],
-	}
-	if !r.any() || !b.earlyWarn.Allow(b.earlyEvery) {
-		return earlyReport{}, false
-	}
-	for k := range b.earlyPending {
-		b.earlyPending[k] = 0
-	}
-	return r, true
-}
-
-// reportEarly is the throttled aggregate line for early decisions.
-//
-// An early decision is not loss — the engine reads a partial trace as a LOWER
-// BOUND, so a slow trace can be missed and a fast one is never invented — but a
-// sustained rate means a bound is sized below this shard's span rate, and the
-// sampling an operator configured is not the sampling they are getting. The
-// counter alone cannot say WHICH bound or how big the shard's backlog was when
-// it bound.
-// The throttle and the emptiness check live in takeEarlyLocked, which is what
-// couples them to the drain that zeroed the tallies.
-func (b *Buffer) reportEarly(r earlyReport) {
-	st := b.Stats() // re-takes the mutex: the caller has released it by now
-	b.log.Warn("traces are being decided before their decisionWait elapsed because a tail-sampling bound bound; the verdicts are made on the spans present, so slow traces can be missed",
-		// bySomething = how many this window; the bare config name = the bound
-		// that forced them. The two must not share a key — a line carrying
-		// maxTraces twice with different meanings is worse than either.
-		// byShutdown is on the line for the reason any() gives for leaving it
-		// out of the decision to WRITE one: a graceful stop decides everything
-		// early by design and is not news on its own, but once a real bound
-		// has forced the line out, how much of the burst was the stop and how
-		// much was the bound is exactly what the operator is reading it for.
-		"bySpansPerTrace", r.spansPerTrace, "byMaxTraces", r.maxTraces, "byMaxSpans", r.maxSpans,
-		"byShutdown", r.shutdown,
-		"maxTraces", b.set.maxTraces, "maxSpans", b.set.maxSpans,
-		"maxSpansPerTrace", b.set.maxSpansPerTrace,
-		"bufferedTraces", st.Traces, "bufferedSpans", st.Spans)
-}
-
-// earlyWarnEvery re-warns while a tail-sampling bound keeps binding.
-const earlyWarnEvery = time.Minute
-
 // warn logs at most once per warnEvery on ITS OWN gate. The gate is a
-// parameter rather than a field of the Buffer because the two callers report
-// two different events about one condition, and the loss report must never be
-// starved by the harmless one — see the fields.
+// parameter rather than a field of the Buffer because the callers report two
+// different events about one condition — a NACK and a loss — and the loss
+// report must never be starved by the harmless one; see the fields.
 func (b *Buffer) warn(gate *logdedupe.Throttle, msg string, args ...any) {
 	if !gate.Allow(warnEvery) {
 		return

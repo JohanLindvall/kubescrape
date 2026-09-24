@@ -1,5 +1,5 @@
-// Tests for rotation (rotate.go): drains, segments, carried prefixes and
-// crash/outage recovery.
+// Tests for rotation (rotate.go, replay.go, gone.go): drains, segments,
+// carried prefixes and crash/outage recovery.
 package tailer
 
 import (
@@ -287,12 +287,7 @@ func TestFileDeletionDrainsAndDrops(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool {
-		for _, r := range exp.get() {
-			if r == "final-words" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(exp.get(), "final-words")
 	}, "final line drained after deletion")
 
 	// Exactly the two records, no duplicates from the drain.
@@ -318,7 +313,7 @@ func TestRotationDrainsFullBacklog(t *testing.T) {
 	// Build a backlog far over 4*MaxBytesPerSweep, then rotate before the
 	// tailer can catch up.
 	var lines []string
-	for i := 0; i < 120; i++ {
+	for i := range 120 {
 		lines = append(lines, timeNowCRI()+" stdout F backlog-"+strings.Repeat("y", 100)+"-"+strconv.Itoa(i))
 	}
 	writeLog(t, dir, lines...)
@@ -394,7 +389,7 @@ func TestRotationDuringOutageKeepsDrainedTail(t *testing.T) {
 	tl.flush(ctx)       // succeeds; commitBatch retires the segments
 
 	// Give the tailer every further chance to redeliver.
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
 	}
@@ -455,7 +450,7 @@ func TestDeletionDuringOutageKeepsDrainedTail(t *testing.T) {
 	if exp.fail != 0 {
 		t.Fatalf("test setup: %d failures left unconsumed", exp.fail)
 	}
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		tl.scanDir(nil, false)
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
@@ -780,6 +775,7 @@ func TestRotationWhileDownRecoversRemainder(t *testing.T) {
 	writeLog(t, dir, "2026-07-05T10:00:02Z stdout F after-restart")
 
 	// Restart on the same checkpoint.
+	rotations := obs.LogRotations.Value()
 	exp2 := &fakeExporter{}
 	tl2 := newTestTailer(dir, ckpt, exp2)
 	tl2.scanDir(tl2.loadCheckpoints(), true)
@@ -787,6 +783,11 @@ func TestRotationWhileDownRecoversRemainder(t *testing.T) {
 		got := exp2.get()
 		return slices.Contains(got, "written-while-down") && slices.Contains(got, "after-restart")
 	}, "while-down remainder recovered from the rotated file")
+	// Handled like a rotation observed live, so counted like one — the
+	// synthesis in initFile was the one rotation door the counter never saw.
+	if got := obs.LogRotations.Value() - rotations; got != 1 {
+		t.Fatalf("kubescrape_log_rotations_total moved by %v across a rotation-while-down, want 1", got)
+	}
 	// And the synthetic segment retires (open-ended `to` pinned at EOF).
 	f := tl2.files[filepath.Join(dir, logName)]
 	driveUntil(t, ctx, tl2, func() bool { return len(f.segments) == 0 },
@@ -795,6 +796,61 @@ func TestRotationWhileDownRecoversRemainder(t *testing.T) {
 	for _, r := range exp2.get() {
 		if r == "shipped" {
 			t.Fatalf("committed prefix re-shipped: %v", exp2.get())
+		}
+	}
+}
+
+// The open-ended segment replay pins `to` at the last fed boundary when it
+// reaches the rotated file's EOF, so an unterminated final fragment there is
+// never read again: it is lost exactly as the fd-held drain's torn final line
+// is, and must be counted like it. Every open-ended door (rotation-while-down,
+// here; ensureOpen's replaced arm; reopen's unfinished drain) routed it into a
+// silent discard, while the fd-held rename drain moved
+// kubescrape_log_torn_final_lines_total for the identical loss.
+func TestOpenEndedReplayCountsATornFinalLine(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	ckpt := filepath.Join(dir, "positions.json")
+	path := filepath.Join(dir, logName)
+
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, ckpt, exp)
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir, "2026-07-05T10:00:00Z stdout F shipped")
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+	tl.saveCheckpoints()
+
+	// Down: one whole line and a fragment its writer never finished, then the
+	// runtime rotates.
+	fh, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fh.WriteString("2026-07-05T10:00:01Z stdout F written-while-down\n2026-07-05T10:00:02Z stdout F torn-fragm"); err != nil {
+		t.Fatal(err)
+	}
+	_ = fh.Close()
+	rotateAway(t, dir, 1)
+	writeLog(t, dir, "2026-07-05T10:00:03Z stdout F after-restart")
+
+	torn := obs.LogTornFinalLines.Value()
+	exp2 := &fakeExporter{}
+	tl2 := newTestTailer(dir, ckpt, exp2)
+	tl2.scanDir(tl2.loadCheckpoints(), true)
+	f := tl2.files[path]
+	driveUntil(t, ctx, tl2, func() bool {
+		got := exp2.get()
+		return slices.Contains(got, "written-while-down") && slices.Contains(got, "after-restart") &&
+			len(f.segments) == 0
+	}, "the while-down remainder recovered and its segment retired")
+	if got := obs.LogTornFinalLines.Value() - torn; got != 1 {
+		t.Fatalf("kubescrape_log_torn_final_lines_total moved by %v, want 1 for the rotated file's unterminated final line", got)
+	}
+	for _, r := range exp2.get() {
+		if strings.Contains(r, "torn-fragm") {
+			t.Fatalf("the unterminated fragment was exported as a record: %q", r)
 		}
 	}
 }
@@ -958,7 +1014,7 @@ func TestSecondRotationKeepsCarriedPrefix(t *testing.T) {
 		t.Fatalf("test setup: %d export failures left unconsumed", exp.fail)
 	}
 	// Collector recovers; give the tailer every chance to redeliver.
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		tl.scanDir(nil, false)
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
@@ -1027,7 +1083,7 @@ func TestCarriedPrefixSurvivesRotatedFileDeletion(t *testing.T) {
 	if exp.fail != 0 {
 		t.Fatalf("test setup: %d export failures left unconsumed", exp.fail)
 	}
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		tl.scanDir(nil, false)
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
@@ -1145,7 +1201,7 @@ func TestGoneFileDeliversCarriedPrefix(t *testing.T) {
 	tl.scanDir(nil, false) // marks it gone
 
 	// Drain + recover: everything must ship.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
 	}
@@ -1182,7 +1238,7 @@ func TestGoneFileUnterminatedTailDeliversAndSettles(t *testing.T) {
 		t.Fatal(err)
 	}
 	tl.scanDir(nil, false) // gone
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
 	}
@@ -1446,12 +1502,13 @@ func TestGoneDrainAccountsUnterminatedLineAtRealEOF(t *testing.T) {
 	}
 }
 
-// ledger.reset zeroes every segment's fedTo because it is written for the PURGE
-// case (a rewind discarded the buffered lines unemitted, so the replay must
-// start over from `committed`). reopen's non-carry arm reaches it through
-// newPipeline — but only AFTER stopPipeline, which DRAINS: the lines are in the
-// unflushed batch, not gone. With fedTo reset to zero the next sweep re-read
-// [committed, fedTo) and delivered every one of those records twice.
+// purgeSegmentFeeds zeroes every segment's fedTo because it is written for the
+// PURGE case (a rewind discarded the buffered lines unemitted, so the replay
+// must start over from `committed`). reopen's non-carry arm used to reach it
+// through newPipeline — but only AFTER stopPipeline, which DRAINS: the lines are
+// in the unflushed batch, not gone. With fedTo reset to zero the next sweep
+// re-read [committed, fedTo) and delivered every one of those records twice.
+// (It rebuilds through rebuildPipeline now, which skips the purge.)
 //
 // Shape: a replay cut by the per-sweep byte budget, and then a rename rotation
 // of the tail while the replay is still unfinished.
@@ -1509,6 +1566,67 @@ func TestRotationKeepsAnUnflushedReplayFeedFrontier(t *testing.T) {
 				"resumed pass re-read lines already sitting in the unflushed batch (exported %v)",
 				want, n, exp.get())
 		}
+	}
+}
+
+// TestNonCarryRotationSettlesSegmentFeedStateExactly pins, per segment, what
+// reopen's non-carry arm leaves behind. It drains the stages and rebuilds them
+// WITHOUT newPipeline's purge, so an older segment's replay frontiers (fedTo,
+// and the skipTo/discarding discard window) survive untouched, while `fed` —
+// for every segment, the one this rotation records included — is exactly the
+// incoming wasFed. That is what the old purge-then-restore produced, and the
+// fed flags are load-bearing (proposeCandidates reads them for traversal
+// claims): in particular a segment the rotation records `fed: true` at birth
+// ends unfed when an older one is still owed.
+func TestNonCarryRotationSettlesSegmentFeedStateExactly(t *testing.T) {
+	for _, wasFed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("wasFed=%v", wasFed), func(t *testing.T) {
+			dir := t.TempDir()
+			ctx := context.Background()
+			path := filepath.Join(dir, logName)
+			if err := os.WriteFile(path, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			tl := driveTailer(dir, &fakeExporter{})
+			tl.scanDir(nil, true)
+			f := tl.files[path]
+			if f == nil {
+				t.Fatal("file not tracked")
+			}
+
+			older := &segment{
+				id: f.tail, inode: 7, committed: 10, to: 100,
+				fedTo: 40, skipTo: 60, discarding: true, fed: wasFed,
+			}
+			f.newTail()
+			f.segments = []*segment{older}
+			f.segmentsFed = wasFed
+			// One fed, complete line at the tail: owed bytes the rename records
+			// as a segment, and nothing left buffered, so the rotation does not
+			// carry the pipeline.
+			raw := "2026-07-05T10:00:00.000000000Z stdout F live"
+			tl.feedLine(ctx, f, raw, 0, int64(len(raw)+1), time.Now())
+			if _, buffered := f.watermark(); buffered {
+				t.Fatal("test setup: nothing may be buffered, or the rotation carries")
+			}
+
+			tl.reopen(ctx, f, true, true)
+			if len(f.segments) != 2 {
+				t.Fatalf("segments = %d after a rename with owed bytes, want 2", len(f.segments))
+			}
+			if older.fedTo != 40 || older.skipTo != 60 || !older.discarding {
+				t.Fatalf("older segment's frontiers = fedTo %d skipTo %d discarding %v, want 40/60/true: "+
+					"a drained rebuild must not purge them", older.fedTo, older.skipTo, older.discarding)
+			}
+			for i, sg := range f.segments {
+				if sg.fed != wasFed {
+					t.Fatalf("segment %d fed = %v, want %v (the incoming wasFed)", i, sg.fed, wasFed)
+				}
+			}
+			if f.segmentsFed != wasFed {
+				t.Fatalf("segmentsFed = %v, want %v", f.segmentsFed, wasFed)
+			}
+		})
 	}
 }
 

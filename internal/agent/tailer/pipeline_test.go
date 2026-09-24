@@ -3,6 +3,7 @@
 package tailer
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
+	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 	"github.com/JohanLindvall/multiline"
 	"github.com/JohanLindvall/multiline/patterns"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -257,7 +259,7 @@ func TestRateLimitPauseAcrossRotation(t *testing.T) {
 
 	tl.scanDir(tl.loadCheckpoints(), true)
 	var lines []string
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		lines = append(lines, fmt.Sprintf("2026-07-05T10:00:00Z stdout F line-%02d", i))
 	}
 	writeLog(t, dir, lines...)
@@ -282,7 +284,7 @@ func TestRateLimitPauseAcrossRotation(t *testing.T) {
 	}
 
 	got := exp.get()
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		want := fmt.Sprintf("line-%02d", i)
 		if !slices.Contains(got, want) {
 			t.Fatalf("AT-LEAST-ONCE VIOLATED: %q lost — rate-limit pause + rotation; exported = %v", want, got)
@@ -386,6 +388,51 @@ func TestPendingBufferIsReusedAcrossChunks(t *testing.T) {
 	}
 }
 
+// The segment replay's pass-local carry had the same re-slicing trap as the
+// live carry above: `carry = carry[i+1:]` drains its spare capacity, so nearly
+// every read chunk's append reallocated a chunk-sized array and a replay pass
+// allocated ~2.2x the bytes it replayed. One array per PASS: the only per-read
+// allocations left are the per-line string(line)s.
+func TestSegmentReplayCarryBufferIsReused(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	ctx := context.Background()
+	tl, f := benchTailer(t, Config{Multiline: true, MaxBytesPerSweep: 64 << 20})
+	chunk, perChunk := benchChunk()
+	const chunks = 16 // 16 reads of the tailer's 64 KiB scratch buffer
+	data := bytes.Repeat(chunk, chunks)
+	path := filepath.Join(t.TempDir(), "rotated.log")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fh, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = fh.Close() }()
+
+	f.newTail()
+	p := &segment{id: f.tail, to: int64(len(data)), fd: fh, fed: true}
+	f.newTail()
+	f.segments = []*segment{p}
+	f.feeding = p.id
+
+	allocs := testing.AllocsPerRun(3, func() {
+		p.committed, p.fedTo, p.skipTo, p.discarding = 0, 0, 0, false
+		if !tl.replaySegment(ctx, f, p) {
+			t.Fatal("the replay pass did not finish its owed range")
+		}
+		tl.batch = tl.batch[:0]
+	})
+	// Measured lines+2 with the carry reused and lines+17 without (one array
+	// per read); +4 leaves slack well under one per read.
+	if lines := perChunk * chunks; allocs > float64(lines+4) {
+		t.Fatalf("a replay pass of %d lines in %d reads allocated %v times: the carry buffer is "+
+			"being reallocated per read (want about one string(line) per line)", lines, chunks, allocs)
+	}
+}
+
 // BenchmarkIngestLine REPORTS the per-line budget; a benchmark cannot fail a
 // build, so this is what holds it. The line path (CRI parse, offset ledger,
 // both multiline stages, batch append) is walked once per log line on every
@@ -420,28 +467,91 @@ func TestIngestLineAllocationBudget(t *testing.T) {
 // export. It is NOT allocation-free — every record is a pdata log record — but
 // its budget is a small constant per line, not a function of the line's
 // content. A regression here is a per-line map or closure in the flush loop.
+// Every flushShape BenchmarkIngestFlush reports is held to its ceiling here.
+//
+// saturated-observed is the enrich shape with the file's observed set sitting
+// at maxObservedEntries — what a multi-line group held open across the batch
+// produces — because alreadyObserved documents the per-line allocation count
+// as UNCHANGED at the cap (the added cost there is CPU only).
 func TestIngestFlushAllocationBudget(t *testing.T) {
 	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
-	ctx := context.Background()
-	tl, f := benchTailer(t, Config{Multiline: true, Enrich: true})
-	lines := benchLines(1024)
-	feedAll(tl, f, lines)
-	tl.flush(ctx)
+	measure := func(t *testing.T, tl *Tailer, f *file, lines []string) float64 {
+		t.Helper()
+		ctx := context.Background()
+		i := 0
+		return testing.AllocsPerRun(len(lines), func() {
+			feedOne(tl, f, lines[i])
+			if i++; i == len(lines) {
+				i = 0
+				tl.flush(ctx)
+			}
+		})
+	}
+	warm := func(tl *Tailer, f *file, lines []string) {
+		feedAll(tl, f, lines)
+		tl.flush(context.Background())
+	}
 
-	i := 0
-	allocs := testing.AllocsPerRun(len(lines), func() {
-		feedOne(tl, f, lines[i])
-		if i++; i == len(lines) {
-			i = 0
-			tl.flush(ctx)
+	shapes := flushShapes(t)
+	for _, tc := range shapes {
+		t.Run(tc.name, func(t *testing.T) {
+			tl, f := benchTailer(t, tc.cfg)
+			warm(tl, f, tc.lines)
+			if allocs := measure(t, tl, f, tc.lines); allocs > tc.ceiling {
+				t.Fatalf("the %s flush path allocates %v times per line, want <= %v "+
+					"(BenchmarkIngestFlush/%s)", tc.name, allocs, tc.ceiling, tc.name)
+			}
+		})
+	}
+
+	t.Run("saturated-observed", func(t *testing.T) {
+		enrich := shapes[slices.IndexFunc(shapes, func(s flushShape) bool { return s.name == "enrich" })]
+		tl, f := benchTailer(t, enrich.cfg)
+		warm(tl, f, enrich.lines)
+		// Identities reReadable keeps (tail segment, far above any committed
+		// offset) and no real entry can hit, so the set stays at the cap and
+		// every lookup takes the hashed path.
+		f.observed = make(map[obsKey]struct{}, maxObservedEntries)
+		for i := range maxObservedEntries {
+			f.observed[obsKey{startSeg: f.tail, endSeg: f.tail, start: 1 << 50, end: 1<<50 + int64(i), body: uint64(i)}] = struct{}{}
+		}
+		if allocs := measure(t, tl, f, enrich.lines); allocs > enrich.ceiling {
+			t.Fatalf("the flush path allocates %v times per line with the observed set at its cap, want <= %v "+
+				"(alreadyObserved documents the count as unchanged)", allocs, enrich.ceiling)
+		}
+		if len(f.observed) != maxObservedEntries {
+			t.Fatalf("observed set holds %d identities after the run, want %d: the subcase did not measure a saturated set",
+				len(f.observed), maxObservedEntries)
 		}
 	})
-	if allocs > 4 {
-		t.Fatalf("the flush path allocates %v times per line, want <= 4 "+
-			"(BenchmarkIngestFlush/enrich reports 4 allocs/op)", allocs)
+}
+
+// liftLines are JSON lines every one of which lifts a RESOURCE and a SCOPE
+// attribute under liftExtractor, over a handful of distinct values so the grouper's
+// maps are warm, as they are on a real node.
+func liftLines(n int) []string {
+	base := time.Date(2026, 7, 11, 10, 0, 0, 0, time.UTC)
+	out := make([]string, n)
+	for i := range out {
+		ts := base.Add(time.Duration(i) * time.Millisecond).Format(time.RFC3339Nano)
+		out[i] = fmt.Sprintf(`%s stdout F {"level":"info","tenant":"t%d","component":"c%d","msg":"handled request"}`,
+			ts, i%4, i%2)
 	}
+	return out
+}
+
+func liftExtractor(tb testing.TB) *logattrs.Extractor {
+	tb.Helper()
+	ex, err := logattrs.New(&logattrs.Config{Rules: []logattrs.Rule{
+		{Key: "tenant", Attribute: "tenant.id", Target: logattrs.TargetResource},
+		{Key: "component", Target: logattrs.TargetScope},
+	}})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return ex
 }
 
 // One over-long line must not pin a huge carry buffer on the file for good: a
@@ -470,6 +580,25 @@ func TestOversizedPendingBufferIsReleasedWhenIdle(t *testing.T) {
 	}
 	if !emitted(tl, "handled request") && len(bodies(tl)) == 0 {
 		t.Fatal("no records produced after the buffer was released")
+	}
+}
+
+// In DROP mode a refusal is per discarded LINE, so its counter is resolved
+// once (rateLimitedCounter) rather than through the vec's mutex and map probe
+// per line — and bound at construction only when rate limiting is configured,
+// for the configured action: binding publishes the series, so a tailer without
+// rate limiting must bind nothing.
+func TestRateLimitCounterIsBoundForTheConfiguredActionOnly(t *testing.T) {
+	base := Config{Metadata: fakeMeta{}, Exporter: nullExporter{}}
+	if New(base).rateLimited != nil {
+		t.Fatal("a tailer without rate limiting bound a rate-limit series")
+	}
+	for drop, action := range map[bool]string{true: "drop", false: "pause"} {
+		cfg := base
+		cfg.RateLimit, cfg.RateDrop = 1, drop
+		if got := New(cfg).rateLimited; got != obs.LogRateLimited.WithLabelValues(action) {
+			t.Errorf("RateDrop=%v: bound %p, want the %q series", drop, got, action)
+		}
 	}
 }
 

@@ -60,15 +60,15 @@ func (h *blockingHarness) observe(key string) {
 func (h *blockingHarness) render(sm pmetric.ScopeMetrics, _ time.Time) {
 	h.store.Lock()
 	defer h.store.Unlock()
-	if h.store.CountLocked() == 0 {
+	if len(h.store.series) == 0 {
 		return
 	}
 	dps := SumMetric(sm, "calls", "", "")
-	h.store.EachLocked(func(s *series) {
+	for _, s := range h.store.series {
 		h.store.MarkRenderedLocked(s)
 		p := dps.AppendEmpty()
 		p.SetIntValue(int64(s.calls))
-	})
+	}
 	h.mu.Lock()
 	h.renders++
 	h.mu.Unlock()
@@ -112,25 +112,21 @@ func TestOverlappingExportsCannotCertifyEachOthersValues(t *testing.T) {
 	ctx := context.Background()
 	res := pcommon.NewResource()
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		if err := h.store.Export(ctx, h, res); err != nil {
 			t.Errorf("the first export: %v", err)
 		}
-	}()
+	})
 	<-h.entered // the first export has rendered v1 and is inside its send
 	<-h.rendered
 
 	// A new observation the first payload does not carry.
 	h.observe("a")
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		// Fails; whether it even renders depends on the serialization.
 		_ = h.store.Export(ctx, h, res)
-	}()
+	})
 	// The second export must NOT render while the first holds the gate. There is
 	// no event to wait for when it is correctly blocked, so give it a window it
 	// would comfortably beat if it were not.

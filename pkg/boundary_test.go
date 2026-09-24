@@ -17,11 +17,16 @@ import (
 const modulePath = "github.com/JohanLindvall/kubescrape"
 
 // Everything under pkg/ is importable by other modules. Go's own internal rule
-// would NOT stop pkg/ from importing this module's internal/ — the import is
-// legal inside the module — but it breaks every external consumer at compile
-// time, and it breaks them at THEIR build, not ours. So nothing here would
-// fail: the offending import compiles, vets, lints and tests cleanly in this
-// repo forever.
+// does NOT stop pkg/ from importing this module's internal/: the rule is
+// checked per import edge against the IMPORTER's path, pkg/ sits inside the
+// tree internal/ belongs to, so the import is legal — here, and equally in an
+// external consumer's build, which still compiles. What the import costs is
+// the reason for the rule: every internal package pkg/ reaches, with its own
+// dependency tree, is dragged into every consumer's build; an internal type
+// surfacing in a pkg/ signature is one the consumer cannot name; and internal/
+// carries no compatibility promise, so its churn silently becomes a change to
+// a public package. Nothing in the toolchain objects — the offending import
+// compiles, vets, lints and tests cleanly here and downstream forever.
 //
 // AGENTS.md states the rule ("They must never import internal/"); this is what
 // makes it true rather than remembered.
@@ -44,20 +49,19 @@ func TestPublicPackagesDoNotImportInternal(t *testing.T) {
 		// module cache cannot answer the question, and a false alarm here would
 		// train people to ignore the one check that guards the pkg/ boundary.
 		var stderr string
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
+		if ee, ok := errors.AsType[*exec.ExitError](err); ok {
 			stderr = string(ee.Stderr)
 		}
 		t.Skipf("cannot run `go list -deps ./...` in %s (%v): %s", cmd.Dir, err, stderr)
 	}
 	var bad []string
-	for _, dep := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for dep := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		if strings.HasPrefix(dep, modulePath+"/internal/") {
 			bad = append(bad, dep)
 		}
 	}
 	if len(bad) > 0 {
-		t.Errorf("pkg/ transitively imports internal packages, which breaks every external consumer:\n\t%s",
+		t.Errorf("pkg/ transitively imports internal packages, which drags them (and their dependencies) into every external consumer's build and makes their unversioned APIs part of the public packages:\n\t%s",
 			strings.Join(bad, "\n\t"))
 	}
 }

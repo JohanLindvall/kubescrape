@@ -1,8 +1,8 @@
 package store
 
 // The pod-IP index's precedence where a TERMINATING pod is involved, on the two
-// places that implement it: the switch in claimOneIPLocked and beatsClaimant,
-// which promotion uses.
+// paths that decide a holder: the claim path (claimOneIPLocked) and promotion,
+// both of which call the one rule, beatsClaimant.
 //
 // The rule is that ACQUISITION ORDER decides and the terminating bit does not.
 // It reads backwards at first, because a draining pod keeps phase Running for
@@ -114,8 +114,9 @@ func TestALaterAcquisitionTakesTheAddressFromADrainer(t *testing.T) {
 // deleted, the LATER acquirer wins even when it is draining, for the reason the
 // claim path applies — it has not released the address yet, and its own
 // deletion brings the promotion round again. Only the claim path was pinned for
-// this, so deleting beatsClaimant's ipSeq comparison in favour of a terminating
-// one promoted the stale pod with the suite green.
+// this, so when promotion carried its own copy of the rule, replacing that
+// copy's ipSeq comparison with a terminating one promoted the stale pod with the
+// suite green.
 func TestPromotionPrefersTheLaterAcquirerEvenWhenItIsDraining(t *testing.T) {
 	s := New(time.Minute)
 	s.UpsertPod(runningPod("stale-uid", "stale", "1", "10.0.0.9", tOld))     // seq 1
@@ -142,5 +143,55 @@ func TestPromotionPrefersTheLaterAcquirerEvenWhenItIsDraining(t *testing.T) {
 	if np, ok := s.GetPodByIP("10.0.0.9"); !ok || np.Pod.Name != "stale" {
 		t.Fatalf("GetPodByIP = %q (ok=%v), want stale: the surviving claimant must be promoted",
 			np.Pod.Name, ok)
+	}
+}
+
+// The informer's initial LIST — every restart of this process — delivers every
+// pod as a FIRST SIGHTING, in list (namespace/name) order rather than in the
+// order the CNI handed out their addresses, so ipSeq minted there is not
+// acquisition evidence. For a pod first seen ALREADY DRAINING beside a live
+// claimant of the same (recycled) address, "the drainer is the earlier acquirer
+// by construction" does not hold either, and which of the two held the address
+// came down to their NAMES: the later-sorting pod won, silently (noteContested
+// skips terminating pairs), until the drainer was deleted — its grace period,
+// or indefinitely for a pod stuck Terminating on a lost node. A first sighting
+// of a drainer therefore carries no sequence at all: the live claimant holds
+// the address in BOTH orders, and the drainer's later re-asserts do not take it.
+func TestStartupListOrderDoesNotHandTheAddressToAStaleDrainer(t *testing.T) {
+	for _, liveFirst := range []bool{true, false} {
+		s := New(time.Minute)
+		live := func() { s.UpsertPod(runningPod("live-uid", "a-live", "1", "10.0.0.5", tOld)) }
+		drain := func() { s.UpsertPod(terminatingPod("drain-uid", "z-drain", "1", "10.0.0.5", tOld)) }
+		if liveFirst {
+			live()
+			drain()
+		} else {
+			drain()
+			live()
+		}
+		// A routine status update to the drainer, still reporting the address.
+		s.UpsertPod(terminatingPod("drain-uid", "z-drain", "2", "10.0.0.5", tOld))
+
+		np, ok := s.GetPodByIP("10.0.0.5")
+		if !ok || np.Pod.Name != "a-live" {
+			t.Fatalf("liveFirst=%v: GetPodByIP = %q (ok=%v), want a-live: a pod first seen draining carries "+
+				"no acquisition evidence, so the list order must not hand it the address", liveFirst, np.Pod.Name, ok)
+		}
+	}
+}
+
+// The no-evidence rule is only about FIRST SIGHTINGS. A drainer first seen
+// alone still resolves (nobody else claims the address), and a genuine later
+// acquisition still takes the address from it — as does any live pod.
+func TestAFirstSeenDrainerStillHoldsAnUnclaimedAddress(t *testing.T) {
+	s := New(time.Minute)
+	s.UpsertPod(terminatingPod("drain-uid", "drain", "1", "10.0.0.7", tOld))
+	if np, ok := s.GetPodByIP("10.0.0.7"); !ok || np.Pod.Name != "drain" {
+		t.Fatalf("GetPodByIP = %q (ok=%v), want drain: an address nobody else claims is still its", np.Pod.Name, ok)
+	}
+	s.UpsertPod(runningPod("next-uid", "next", "1", "", tOld))
+	s.UpsertPod(runningPod("next-uid", "next", "2", "10.0.0.7", tOld))
+	if np, ok := s.GetPodByIP("10.0.0.7"); !ok || np.Pod.Name != "next" {
+		t.Fatalf("GetPodByIP = %q (ok=%v), want next: a genuine later acquisition takes the address", np.Pod.Name, ok)
 	}
 }

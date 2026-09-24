@@ -2,6 +2,7 @@ package servicegraph
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"maps"
@@ -18,6 +19,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/cumagg"
+	"github.com/JohanLindvall/kubescrape/internal/agent/tracehash"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
@@ -308,8 +310,7 @@ func TestDimensionAndVirtualNodeLabels(t *testing.T) {
 // label set twice in one payload.
 func TestArrivalOrderDoesNotSplitSeries(t *testing.T) {
 	r := NewRegistry(Config{}, nil)
-	p := NewProcessor(Config{Dimensions: []string{"http.method", "http.route"}}, nil)
-	p.SetSink(r)
+	p := NewProcessor(Config{Dimensions: []string{"http.method", "http.route"}}, r, nil)
 	attrs := map[string]string{"http.method": "GET", "http.route": "/orders"}
 	half := func(tid byte, kind ptrace.SpanKind) ptrace.Traces {
 		s := sgSpan{kind: kind, dur: 0.1, traceID: traceID(tid), spanID: spanID(1), attrs: attrs}
@@ -417,6 +418,55 @@ func TestDurationHistogramExemplars(t *testing.T) {
 	}
 }
 
+// An edge the PROCESSOR pairs is stamped with the pairing pass's own clock — the
+// batch time Consume read, or the sweep's — never with a fresh read inside the
+// sink. The sink runs under the pairing mutex once per completed request, so a
+// clock read there stalled every concurrent Consume for a value the pass had
+// already read. Here the registry's clock is a sentinel that must never reach a
+// stamp: both the paired edge's exemplars and the promoted one's are the
+// processor's time.
+func TestPairedEdgesAreStampedWithThePairingClock(t *testing.T) {
+	r := NewRegistry(Config{}, nil)
+	export0 := t0.Add(time.Hour) // the registry's clock: only Export may read it
+	fixedClock(r, &export0)
+	p := NewProcessor(Config{Wait: "1s"}, r, nil)
+	pairAt := t0.Add(3 * time.Second)
+	p.now = func() time.Time { return pairAt }
+
+	// A completed pair (Consume's batch clock) ...
+	p.Consume(sgTraces("frontend", clientSpan(0.15, nil)))
+	p.Consume(sgTraces("checkout", serverSpan(0.05, nil)))
+	// ... and a promoted half (the sweep's clock), on another trace.
+	promoted := clientSpan(0.5, map[string]string{"peer.service": "payments"})
+	promoted.traceID = traceID(2)
+	p.Consume(sgTraces("frontend", promoted))
+	sweepAt := pairAt.Add(2 * time.Second)
+	p.now = func() time.Time { return sweepAt }
+	p.Sweep()
+
+	exp := &capExporter{}
+	export(t, r, exp)
+	dps := exp.last(t)["traces_service_graph_request_client_seconds"].Histogram().DataPoints()
+	if dps.Len() != 2 {
+		t.Fatalf("client histogram points = %d, want 2 (the pair and the promotion)", dps.Len())
+	}
+	for i := 0; i < dps.Len(); i++ {
+		want := pcommon.NewTimestampFromTime(pairAt)
+		if attrsOf(dps.At(i).Attributes())["server"] == "payments" {
+			want = pcommon.NewTimestampFromTime(sweepAt)
+		}
+		for _, ex := range exemplarsOf(dps.At(i)) {
+			if ex.TS != want {
+				t.Errorf("exemplar on %v stamped %v, want the pairing clock %v (the registry's is %v)",
+					attrsOf(dps.At(i).Attributes()), ex.TS.AsTime(), want.AsTime(), export0)
+			}
+		}
+		if len(exemplarsOf(dps.At(i))) == 0 {
+			t.Errorf("no exemplar on %v", attrsOf(dps.At(i).Attributes()))
+		}
+	}
+}
+
 // One per BUCKET, latest wins: a busy edge must not accumulate an exemplar per
 // request, and the newest is the one an operator watching a live graph wants.
 func TestExemplarsAreOnePerBucketLatestWins(t *testing.T) {
@@ -481,6 +531,60 @@ func TestExemplarsSkippedWithoutTraceID(t *testing.T) {
 	export(t, r, exp)
 	if ex := exemplarsOf(firstHist(t, exp.last(t), "traces_service_graph_request_client_seconds")); len(ex) != 0 {
 		t.Fatalf("exemplars = %+v, want none without a trace id", ex)
+	}
+}
+
+// The Registry sits ABOVE the trace tier's samplers so it counts every request,
+// but an exemplar is a link to a trace: at a head-sampling probability of 0.1,
+// nine in ten of them named a trace that was never exported. With the tier's
+// predicate installed every exemplar names a trace the sampler keeps — and the
+// edges it refuses an exemplar are still COUNTED.
+func TestExemplarsNameOnlyTracesTheSamplerKeeps(t *testing.T) {
+	r := NewRegistry(Config{}, nil)
+	threshold := tracehash.Threshold(0.1)
+	keep := func(id pcommon.TraceID) bool { return tracehash.Keep(id, threshold) }
+	r.SetExemplarKeep(keep)
+
+	const edges = 1000
+	var exemplars, sampledAway int
+	exp := &capExporter{}
+	for i := range edges {
+		e := edge("frontend", "checkout")
+		binary.BigEndian.PutUint64(e.TraceID[:8], uint64(i)*0x9E3779B97F4A7C15)
+		binary.BigEndian.PutUint64(e.TraceID[8:], uint64(i)+1)
+		if !keep(e.TraceID) {
+			sampledAway++
+		}
+		r.Record(e)
+		export(t, r, exp)
+		got := exp.last(t)
+		for _, name := range []string{"traces_service_graph_request_client_seconds", "traces_service_graph_request_server_seconds"} {
+			for _, ex := range exemplarsOf(firstHist(t, got, name)) {
+				exemplars++
+				if !keep(ex.TraceID) {
+					t.Fatalf("edge %d: %s carries an exemplar for trace %v, which the sampler drops", i, name, ex.TraceID)
+				}
+			}
+		}
+	}
+	if exemplars == 0 || sampledAway == 0 {
+		t.Fatalf("%d exemplars, %d sampled-away traces: the fixture exercises neither side", exemplars, sampledAway)
+	}
+	if n := firstHist(t, exp.last(t), "traces_service_graph_request_client_seconds").Count(); n != edges {
+		t.Fatalf("client histogram count = %d, want %d: the predicate gates exemplars, never counting", n, edges)
+	}
+
+	// nil removes it: an edge whose trace the predicate would refuse anchors
+	// one again.
+	r.SetExemplarKeep(nil)
+	e := edge("frontend", "checkout")
+	for keep(e.TraceID) {
+		e.TraceID[0]++
+	}
+	r.Record(e)
+	export(t, r, exp)
+	if ex := exemplarsOf(firstHist(t, exp.last(t), "traces_service_graph_request_client_seconds")); len(ex) != 1 {
+		t.Fatalf("exemplars with the predicate removed = %+v, want one", ex)
 	}
 }
 
@@ -662,11 +766,11 @@ func TestStartClampedWhenSeriesAdmittedDuringExport(t *testing.T) {
 	// Render with the export's EARLIER clock read — exactly what Export stamps
 	// when the admission lands inside the window.
 	exportTS := pcommon.NewTimestampFromTime(t0)
-	assertPointStamps(t, r.render(pcommon.NewResource(), t0), exportTS, exportTS)
+	assertPointStamps(t, r.store.Render(pcommon.NewResource(), t0), exportTS, exportTS)
 
 	// The next export's ts lies past the true start, which renders unclamped.
 	next := t0.Add(2 * time.Second)
-	assertPointStamps(t, r.render(pcommon.NewResource(), next),
+	assertPointStamps(t, r.store.Render(pcommon.NewResource(), next),
 		pcommon.NewTimestampFromTime(admitted), pcommon.NewTimestampFromTime(next))
 }
 
@@ -766,6 +870,44 @@ func TestRecordIsAllocationFree(t *testing.T) {
 	if n := testing.AllocsPerRun(200, func() { r.Record(e) }); n != 0 {
 		t.Errorf("Record allocates %v times per call, want 0", n)
 	}
+	// The tier's exemplar predicate runs inside Record on every completed
+	// request: calling it must cost nothing either.
+	threshold := tracehash.Threshold(0.5)
+	r.SetExemplarKeep(func(id pcommon.TraceID) bool { return tracehash.Keep(id, threshold) })
+	if n := testing.AllocsPerRun(200, func() { r.Record(e) }); n != 0 {
+		t.Errorf("Record with an exemplar predicate allocates %v times per call, want 0", n)
+	}
+}
+
+// The series key is built on a per-call stack buffer, so a key that outgrows it
+// is heap-allocated on EVERY completed request, inside the pairing store's
+// mutex — one 240-byte service name did it while the buffer was 256 bytes. The
+// largest key the built-in labels can make (both names at the truncation cut,
+// the longest connection type and a virtual-node marker) must still fit, and a
+// name far past the cut is keyed on its truncation, so it costs nothing either.
+func TestRecordWithNamesAtTheTruncationLimitIsAllocationFree(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	for _, tc := range []struct {
+		name           string
+		client, server string
+	}{
+		{"240-byte server", "frontend", strings.Repeat("s", 240)},
+		{"both at the cut", strings.Repeat("c", cumagg.MaxLabelBytes), strings.Repeat("s", cumagg.MaxLabelBytes)},
+		{"both past the cut", strings.Repeat("c", 4096), strings.Repeat("s", 4096)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := NewRegistry(Config{}, nil)
+			e := edge(tc.client, tc.server)
+			e.Connection = ConnectionMessagingSystem
+			e.VirtualNode = virtualNodeServer
+			r.Record(e) // admit the series: only the warm path is budgeted
+			if n := testing.AllocsPerRun(200, func() { r.Record(e) }); n != 0 {
+				t.Errorf("Record allocates %v times per call, want 0", n)
+			}
+		})
+	}
 }
 
 // Record is called from the pairing store on the ingest goroutines while the
@@ -773,11 +915,11 @@ func TestRecordIsAllocationFree(t *testing.T) {
 func TestRecordConcurrent(t *testing.T) {
 	r := NewRegistry(Config{}, nil)
 	var wg sync.WaitGroup
-	for w := 0; w < 8; w++ {
+	for w := range 8 {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			for i := 0; i < 200; i++ {
+			for i := range 200 {
 				e := edge(fmt.Sprintf("client-%d", w), fmt.Sprintf("server-%d", i%4))
 				e.Failed = i%3 == 0
 				r.Record(e)
@@ -785,13 +927,11 @@ func TestRecordConcurrent(t *testing.T) {
 		}(w)
 	}
 	exp := &capExporter{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 20; i++ {
+	wg.Go(func() {
+		for range 20 {
 			export(t, r, exp)
 		}
-	}()
+	})
 	wg.Wait()
 
 	export(t, r, exp)
@@ -857,9 +997,8 @@ func TestTruncatedLabelsDoNotRetainTheSenderStrings(t *testing.T) {
 	peer := strings.Repeat("y", huge)
 	dim := strings.Repeat("z", huge)
 
-	p := NewProcessor(Config{Dimensions: []string{"http.route"}}, nil)
 	reg := NewRegistry(Config{}, nil)
-	p.SetSink(reg)
+	p := NewProcessor(Config{Dimensions: []string{"http.route"}}, reg, nil)
 	p.Consume(sgTraces(name, sgSpan{
 		name: "GET /orders", kind: ptrace.SpanKindClient, dur: 0.1,
 		traceID: traceID(1), spanID: spanID(1),
@@ -886,8 +1025,8 @@ func TestTruncatedLabelsDoNotRetainTheSenderStrings(t *testing.T) {
 			default:
 				continue
 			}
-			if len(l.value) != maxDimensionValueBytes {
-				t.Errorf("label %s is %d bytes, want %d", l.name, len(l.value), maxDimensionValueBytes)
+			if len(l.value) != cumagg.MaxLabelBytes {
+				t.Errorf("label %s is %d bytes, want %d", l.name, len(l.value), cumagg.MaxLabelBytes)
 			}
 			if unsafe.StringData(l.value) == unsafe.StringData(src) {
 				t.Errorf("label %s still points into its %d-byte source: the whole string stays alive for as long as the series does",
@@ -906,7 +1045,7 @@ func TestTruncatedLabelsDoNotRetainTheSenderStrings(t *testing.T) {
 func TestRenderDoesNotStallRecord(t *testing.T) {
 	const series = 20000
 	r := NewRegistry(Config{MaxCardinality: series + 1}, nil)
-	for i := 0; i < series; i++ {
+	for i := range series {
 		e := edge(fmt.Sprintf("client-%05d", i), "checkout")
 		e.Dimensions = []EdgeDimension{{"client_http.route", "/api/v1/orders"}}
 		r.Record(e)
@@ -940,7 +1079,7 @@ func TestRenderDoesNotStallRecord(t *testing.T) {
 	}
 
 	start := time.Now()
-	md := r.render(pcommon.NewResource(), time.Now())
+	md := r.store.Render(pcommon.NewResource(), time.Now())
 	render := time.Since(start)
 	close(stop)
 	<-done
@@ -958,96 +1097,48 @@ func TestRenderDoesNotStallRecord(t *testing.T) {
 	}
 }
 
-// The render scratch is REUSED across renders, and a later, smaller render
-// reslices it. The tail past the new length keeps its bucket and exemplar
-// capacity on purpose — that reuse is what the scratch is for — but it must not
-// keep the LABELS of series that are gone: a burst up to the cardinality cap
-// followed by mass stale eviction would otherwise pin peak-cardinality label
-// sets (a slice each, plus their retained strings) for the process' life, which
-// is the same pin snapshot already avoids for the pointer slice.
+// The render scratch is reused across renders, and a smaller render must not
+// leave the LABELS of series it no longer covers in the tail: a burst to the
+// cardinality cap followed by mass stale eviction would otherwise pin every one
+// of those label sets for the process' life. The mechanism is
+// cumagg.Snapshotter's and cumagg tests it against a harness, but WHICH field
+// of the element aliases a series is this aggregator's to say, through the
+// Release it passes — so this goes through NewRegistry: a Release that stopped
+// clearing edgeSnapshot.labels passes every cumagg test.
 func TestRenderScratchDoesNotPinTheLabelsOfEvictedSeries(t *testing.T) {
+	// 64 is cumagg's shrink floor: a scratch no larger is never rebuilt, so the
+	// smaller render below keeps its tail and takes the Release branch. The
+	// bucket-capacity check fails loudly if that ever stops being true, rather
+	// than letting a rebuilt (and therefore empty) tail pass vacuously.
 	const peak = 64
 	now := time.Unix(1_700_000_000, 0)
 	r := NewRegistry(Config{MaxCardinality: peak + 8, StaleAfter: "1m"}, nil)
 	fixedClock(r, &now)
-	exp := &capExporter{}
-
-	for i := 0; i < peak; i++ {
+	for i := range peak {
 		r.Record(edge(fmt.Sprintf("client-%03d", i), "checkout"))
 	}
-	export(t, r, exp) // renders every series and marks them delivered
+	export(t, r, &capExporter{}) // renders every series and marks them delivered
 
 	// The whole burst goes stale; the next render covers one series.
 	now = now.Add(10 * time.Minute)
 	r.Record(edge("client-new", "checkout"))
-	export(t, r, exp)
 
-	if got := r.store.Len(); got != 1 {
-		t.Fatalf("the store holds %d series after the eviction, want 1", got)
+	r.renderMu.Lock() // the scratch's own lock, exactly as renderEdges takes it
+	defer r.renderMu.Unlock()
+	snap := r.snaps.Take(r.store, now)
+	if len(snap) != 1 {
+		t.Fatalf("the render covers %d series after the eviction, want 1", len(snap))
 	}
-	if cap(r.snap) < peak {
-		t.Fatalf("the scratch shrank to %d: the test no longer exercises its tail", cap(r.snap))
+	whole := snap[:cap(snap)] // Take hands back the scratch itself, capacity included
+	if len(whole) < peak {
+		t.Fatalf("the scratch holds %d slots: the test no longer exercises its tail", len(whole))
 	}
-	whole := r.snap[:cap(r.snap)]
-	for i := len(r.snap); i < len(whole); i++ {
+	for i := len(snap); i < len(whole); i++ {
+		if cap(whole[i].client.Buckets) == 0 {
+			t.Fatalf("scratch slot %d lost its bucket array: the scratch was rebuilt, so this no longer exercises Release", i)
+		}
 		if whole[i].labels != nil {
-			t.Fatalf("scratch slot %d (past the %d live series) still holds an evicted series' label set", i, len(r.snap))
+			t.Fatalf("scratch slot %d (past the %d live series) still pins an evicted series' labels %v", i, len(snap), whole[i].labels)
 		}
 	}
-}
-
-// Clearing the tail's labels bounds the STRINGS but not the ARRAYS: every unused
-// slot keeps two bucket slices and two exemplar slices, and a cumagg.Exemplar is
-// 48 B — 24.3 MB still reachable after one burst to the 20000-series cap and a
-// mass stale eviction that left ONE series, 71% of it exemplars. The reuse is
-// worth having for the steady state, not for a peak the process saw once, so a
-// scratch that stays far under its capacity is rebuilt at the live size.
-func TestRenderScratchShrinksBackAfterACardinalityBurst(t *testing.T) {
-	const peak = 2000
-	now := time.Unix(1_700_000_000, 0)
-	r := NewRegistry(Config{MaxCardinality: peak + 8, StaleAfter: "1m"}, nil)
-	fixedClock(r, &now)
-	exp := &capExporter{}
-
-	for i := 0; i < peak; i++ {
-		r.Record(edge(fmt.Sprintf("client-%04d", i), "checkout"))
-	}
-	export(t, r, exp) // renders every series and marks them delivered
-	if cap(r.snap) < peak {
-		t.Fatalf("the scratch holds %d slots after rendering %d series", cap(r.snap), peak)
-	}
-	burstArrays := snapArrayCap(r)
-
-	// The whole burst goes stale and one series takes its place. Several export
-	// cycles, because the shrink is deliberately hysteretic: an oscillating
-	// workload must keep its capacity.
-	now = now.Add(10 * time.Minute)
-	for i := 0; i < snapShrinkRuns+1; i++ {
-		r.Record(edge("client-new", "checkout"))
-		export(t, r, exp)
-		now = now.Add(time.Second)
-	}
-
-	if got := r.store.Len(); got != 1 {
-		t.Fatalf("the store holds %d series after the eviction, want 1", got)
-	}
-	if got := cap(r.snap); got > peak/snapShrinkFactor {
-		t.Errorf("the scratch still holds %d slots for 1 live series", got)
-	}
-	if got := snapArrayCap(r); got > burstArrays/10 {
-		t.Errorf("the scratch retains %d bucket+exemplar slots (peak render: %d): the tail's arrays are still reachable", got, burstArrays)
-	}
-}
-
-// snapArrayCap totals the bucket and exemplar slots the whole scratch holds —
-// its capacity, not its current length, which is the memory that stays
-// reachable between renders.
-func snapArrayCap(r *Registry) int {
-	whole := r.snap[:cap(r.snap)]
-	n := 0
-	for i := range whole {
-		n += cap(whole[i].client.buckets) + cap(whole[i].server.buckets)
-		n += cap(whole[i].client.ex) + cap(whole[i].server.ex)
-	}
-	return n
 }

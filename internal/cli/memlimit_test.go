@@ -1,137 +1,101 @@
 package cli
 
 import (
-	"os"
-	"path/filepath"
+	"bytes"
+	"log/slog"
+	"math"
+	"runtime/debug"
+	"strings"
 	"testing"
 )
 
-// fakeCgroup points the readers at a fixture tree. procLines is written
-// verbatim as /proc/self/cgroup.
-func fakeCgroup(t *testing.T, procLines string, files map[string]string) {
+// soleLimit runs SetMemoryLimit from a clean slate — the runtime unlimited and
+// GOMEMLIMIT absent, unless the test says otherwise before calling — and
+// returns the limit it left behind plus what it logged. The process-wide soft
+// limit is restored afterwards, which is also why none of these tests may run
+// in parallel.
+func soleLimit(t *testing.T, before int64) (int64, string) {
 	t.Helper()
-	root := t.TempDir()
-	for rel, body := range files {
-		p := filepath.Join(root, rel)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	proc := filepath.Join(root, "proc-self-cgroup")
-	if err := os.WriteFile(proc, []byte(procLines), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	oldRoot, oldProc := cgroupRoot, procCgroup
-	cgroupRoot, procCgroup = root, proc
-	t.Cleanup(func() { cgroupRoot, procCgroup = oldRoot, oldProc })
+	prev := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(prev) })
+	debug.SetMemoryLimit(before)
+	var buf bytes.Buffer
+	SetMemoryLimit(slog.New(NewLogfmtHandler(&buf, slog.LevelDebug)))
+	return debug.SetMemoryLimit(-1), buf.String()
 }
 
-// The shape a container gets when the runtime gave it a cgroup namespace: its
-// own limit is the mount point's own memory.max and the path is "/".
-func TestCgroupLimitInACgroupNamespace(t *testing.T) {
+// The ordinary case: 90% of this container's own limit.
+func TestSetMemoryLimitAppliesTheShareOfTheCgroupLimit(t *testing.T) {
+	t.Setenv("GOMEMLIMIT", "")
 	fakeCgroup(t, "0::/\n", map[string]string{"memory.max": "536870912\n"})
-	got, path, ok := cgroupMemoryLimit()
-	if !ok || got != 536870912 {
-		t.Fatalf("limit = %d, %q, %v; want 536870912", got, path, ok)
+	got, logged := soleLimit(t, math.MaxInt64)
+	limit := int64(536870912)
+	if want := int64(float64(limit) * memLimitShare); got != want {
+		t.Fatalf("soft limit = %d, want %d (%v of the cgroup limit)\n%s", got, want, memLimitShare, logged)
 	}
 }
 
-// cgroupns=host: the mount point is the node's root cgroup and reads "max",
-// while the container's real limit sits several levels down at the path
-// /proc/self/cgroup names. Reading only the top-level file — which is what a
-// naive implementation does — finds nothing here.
-func TestCgroupLimitWithoutACgroupNamespace(t *testing.T) {
-	const path = "kubepods.slice/kubepods-burstable.slice/pod123.slice/cri-containerd-abc.scope"
-	fakeCgroup(t, "0::/"+path+"\n", map[string]string{
-		"memory.max":                       "max\n",
-		path + "/memory.max":               "268435456\n",
-		filepath.Dir(path) + "/memory.max": "1073741824\n",
-	})
-	got, _, ok := cgroupMemoryLimit()
-	if !ok || got != 268435456 {
-		t.Fatalf("limit = %d, %v; want 268435456", got, ok)
+// GOMEMLIMIT=off is the operator saying "no soft limit", and it must win like
+// any other value. The runtime reads "off" as math.MaxInt64 — the same value it
+// reports when the variable is unset — so a check of the runtime's value alone
+// took the explicit opt-out for silence and installed 0.9 x the cgroup limit
+// anyway, then logged "set GOMEMLIMIT to override".
+func TestGOMEMLIMITOffIsNotOverridden(t *testing.T) {
+	t.Setenv("GOMEMLIMIT", "off")
+	fakeCgroup(t, "0::/\n", map[string]string{"memory.max": "536870912\n"})
+	got, logged := soleLimit(t, math.MaxInt64)
+	if got != math.MaxInt64 {
+		t.Fatalf("GOMEMLIMIT=off was overridden with a soft limit of %d\n%s", got, logged)
+	}
+	if !strings.Contains(logged, "leaving the Go soft memory limit alone") {
+		t.Errorf("want the line saying GOMEMLIMIT was honoured, got:\n%s", logged)
 	}
 }
 
-// An UNCAPPED container must report no limit even though every cgroup above it
-// carries one. This is the shape a real node has: --enforce-node-allocatable
-// puts a memory limit on kubepods.slice equal to the node's whole allocatable
-// memory and --cgroups-per-qos puts one on the QoS slice, so a walk up the
-// hierarchy hands an uncapped process ~0.9x the NODE's RAM as its heap goal —
-// the node-scale ceiling this file's own doc refuses, arriving by the back
-// door. The metadata service ships uncapped on purpose and is exactly this
-// case.
-func TestAncestorLimitIsNotInherited(t *testing.T) {
-	const path = "kubepods.slice/kubepods-burstable.slice/pod123.slice/cri-containerd-abc.scope"
-	fakeCgroup(t, "0::/"+path+"\n", map[string]string{
-		"memory.max":                "max\n",
-		"kubepods.slice/memory.max": "67386466304\n", // node allocatable
-		"kubepods.slice/kubepods-burstable.slice/memory.max": "50000000000\n",
-		filepath.Dir(path) + "/memory.max":                   "1073741824\n", // pod slice
-		path + "/memory.max":                                 "max\n",        // this container: uncapped
-	})
-	if v, p, ok := cgroupMemoryLimit(); ok {
-		t.Fatalf("an uncapped container inherited %d from %q", v, p)
+// A limit set in CODE is invisible to any environment check, which is what the
+// runtime-value check is still there for.
+func TestProgrammaticLimitIsLeftAlone(t *testing.T) {
+	t.Setenv("GOMEMLIMIT", "")
+	fakeCgroup(t, "0::/\n", map[string]string{"memory.max": "536870912\n"})
+	if got, logged := soleLimit(t, 1<<30); got != 1<<30 {
+		t.Fatalf("a programmatic limit of %d was replaced with %d\n%s", 1<<30, got, logged)
 	}
 }
 
-func TestCgroupLimitV1(t *testing.T) {
-	fakeCgroup(t, "8:memory:/docker/abc\n", map[string]string{
-		"memory/docker/abc/memory.limit_in_bytes": "268435456\n",
-	})
-	got, _, ok := cgroupMemoryLimit()
-	if !ok || got != 268435456 {
-		t.Fatalf("limit = %d, %v; want 268435456", got, ok)
+// Uncapped is a deliberate shape (the metadata service ships that way): no
+// limit, and nothing above Debug.
+func TestUncappedSetsNoLimitQuietly(t *testing.T) {
+	t.Setenv("GOMEMLIMIT", "")
+	fakeCgroup(t, "0::/\n", map[string]string{"memory.max": "max\n"})
+	fakeMountinfo(t, "30 25 0:26 / %s rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n")
+	got, logged := soleLimit(t, math.MaxInt64)
+	if got != math.MaxInt64 {
+		t.Fatalf("an uncapped workload got a soft limit of %d\n%s", got, logged)
+	}
+	if strings.Contains(logged, "level=WARN") {
+		t.Errorf("an uncapped workload warned; it is a documented shape:\n%s", logged)
 	}
 }
 
-// cgroup v1 in Kubernetes and Docker bind-mounts the CONTAINER's own cgroup
-// directory at /sys/fs/cgroup/memory while /proc/self/cgroup keeps naming the
-// host path, which does not exist inside the container. The controller root is
-// then the container's own file, which is why it is the one fallback.
-func TestCgroupLimitV1BindMountedController(t *testing.T) {
-	fakeCgroup(t, "8:memory:/kubepods/burstable/pod123/abcdef\n", map[string]string{
-		"memory/memory.limit_in_bytes": "268435456\n",
-	})
-	got, path, ok := cgroupMemoryLimit()
-	if !ok || got != 268435456 {
-		t.Fatalf("limit = %d, %q, %v; want 268435456 from the mounted controller root", got, path, ok)
+// The node's cgroup hierarchy bind-mounted OVER the container's own (the
+// cgroup-stats pipeline's hostPath at /sys/fs/cgroup): inside a cgroup
+// namespace /proc/self/cgroup says "/", which now names the NODE's root, whose
+// memory.max does not exist — so a capped agent read as uncapped and ran
+// without the soft limit, reporting it only at Debug. Measured in a container
+// with --memory 256m: limit found with the default mounts, nothing found with
+// the host's /sys/fs/cgroup mounted there, and mountinfo showing root /../..
+// for it. The limit is still unreadable (the container's own directory has a
+// name nothing here can learn), but it is no longer silent.
+func TestShadowedCgroupMountWarns(t *testing.T) {
+	t.Setenv("GOMEMLIMIT", "")
+	fakeCgroup(t, "0::/\n", map[string]string{})
+	fakeMountinfo(t, "30 25 0:26 /../.. %s ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n")
+	got, logged := soleLimit(t, math.MaxInt64)
+	if got != math.MaxInt64 {
+		t.Fatalf("soft limit = %d from a hierarchy that is not this container's\n%s", got, logged)
 	}
-}
-
-// The three ways a hierarchy says "not capped". None may become a limit: a
-// soft limit derived from a sentinel is worse than none at all.
-func TestUncappedReportsNoLimit(t *testing.T) {
-	cases := map[string]map[string]string{
-		"v2 max":        {"memory.max": "max\n"},
-		"v1 sentinel":   {"memory/memory.limit_in_bytes": "9223372036854771712\n"},
-		"nothing there": {},
-	}
-	for name, files := range cases {
-		t.Run(name, func(t *testing.T) {
-			fakeCgroup(t, "0::/\n8:memory:/\n", files)
-			if v, _, ok := cgroupMemoryLimit(); ok {
-				t.Fatalf("reported a limit of %d for an uncapped hierarchy", v)
-			}
-		})
-	}
-}
-
-// A /proc/self/cgroup that would leave the mount point must not read anything
-// above it: the escaping candidate is dropped and only the mount root itself
-// remains.
-func TestPathEscapeStaysUnderTheMount(t *testing.T) {
-	fakeCgroup(t, "0::/../../../../etc\n", map[string]string{"memory.max": "max\n"})
-	if v, p, ok := cgroupMemoryLimit(); ok {
-		t.Fatalf("escaped the mount: %d from %q", v, p)
-	}
-	for _, p := range limitFiles(cgroupRoot, "/../../../../etc", "memory.max") {
-		if p != filepath.Join(cgroupRoot, "memory.max") {
-			t.Fatalf("limitFiles offered %q, outside %q", p, cgroupRoot)
-		}
+	if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, "ancestor hierarchy") {
+		t.Errorf("want a WARN naming the shadowed mount, got:\n%s", logged)
 	}
 }
 

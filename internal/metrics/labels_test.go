@@ -75,7 +75,7 @@ func TestXorFoldIsSafeBecauseNoFoldCanRepeatAPair(t *testing.T) {
 	}
 }
 
-func TestLabelsSetGetWithout(t *testing.T) {
+func TestLabelsSetGet(t *testing.T) {
 	l := labels{{"a", "1"}}
 	l = l.set("b", "2")
 	l = l.set("a", "9") // replace
@@ -86,12 +86,8 @@ func TestLabelsSetGetWithout(t *testing.T) {
 	if _, ok := l.get("c"); ok {
 		t.Error("empty value stored")
 	}
-	l = l.without("a")
-	if _, ok := l.get("a"); ok {
-		t.Error("without did not remove")
-	}
-	if len(l) != 1 || l[0].key != "b" {
-		t.Errorf("after without = %+v", l)
+	if len(l) != 2 || l[0].key != "a" || l[1].key != "b" {
+		t.Errorf("after set = %+v, want a replaced in place and b appended", l)
 	}
 }
 
@@ -161,8 +157,8 @@ func TestLabelsKeyEscapingRoundTrip(t *testing.T) {
 }
 
 // A key's HASHED identity must equal its RENDERED one. String writes ", "
-// between pairs, so parseLabels — which is what export.go reads a sample's
-// labels back through — used to TrimSpace the key and ate an edge space the
+// between pairs, so parseLabels — which is what the render (putLabels) reads a
+// sample's labels back through — used to TrimSpace the key and ate an edge space the
 // hash had counted: " env" and "env" were two live series exporting
 // byte-identical attributes, and an escaped trailing space came back with a
 // dangling backslash.

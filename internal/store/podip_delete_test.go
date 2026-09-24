@@ -61,7 +61,7 @@ func TestZeroTTLDeletedPodDoesNotResolveByIP(t *testing.T) {
 	}
 }
 
-// Sweep never revisits byPodIP, so a re-claimed entry is permanent: one leaked
+// sweep never revisits byPodIP, so a re-claimed entry is permanent: one leaked
 // entry (pinning the whole record) per deleted pod that owned an IP.
 func TestPodIPIndexDoesNotLeakAcrossDeletes(t *testing.T) {
 	s, clk := newTestStore(time.Minute)
@@ -73,7 +73,7 @@ func TestPodIPIndexDoesNotLeakAcrossDeletes(t *testing.T) {
 		s.DeletePod(types.UID(uid))
 	}
 	clk.Advance(2 * time.Minute)
-	s.Sweep()
+	s.sweep()
 
 	s.mu.RLock()
 	pods, ips := len(s.pods), len(s.byPodIP)
@@ -108,7 +108,7 @@ func TestPromotionNeverReturnsTheAddressToTheRecordThatReleasedIt(t *testing.T) 
 	if got == leaver {
 		t.Fatal("the record that released the address was promoted back onto it: it is not tombstoned " +
 			"yet (and with -cache-ttl 0 never will be), so it would serve a deleted pod from " +
-			"GET /v1/pod-ips for the process lifetime — Sweep never revisits byPodIP")
+			"GET /v1/pod-ips for the process lifetime — sweep never revisits byPodIP")
 	}
 	if got != survivor {
 		t.Fatalf("promoted %v, want the surviving claimant p-survivor", got)

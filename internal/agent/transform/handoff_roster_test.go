@@ -27,27 +27,36 @@ import (
 // Per FILE rather than per package because the drift that happened is invisible
 // at package granularity: cgroupstats' marks live in main.go, which the roster
 // already covered for internal/metrics.
+//
+// The two marker KINDS are pinned apart: a Consumed mark is a second promise —
+// that no retry runs the script over these records again, which is what lets a
+// failed forward count its drops — and a plain Handoff turned Consumed (or the
+// reverse) changes what kubescrape_transform_dropped_total reads during an
+// outage, so it is exactly as much a moment to re-read the roster.
 var handoffMarkers = map[string]struct {
-	count  int
-	roster []string
+	handoff, consumed int
+	roster            []string
 }{
-	"internal/agent/promscrape/scraper.go":  {1, []string{"agent/promscrape"}},
-	"internal/agent/promscrape/cadvisor.go": {1, []string{"agent/promscrape"}},
-	"internal/agent/promscrape/summary.go":  {1, []string{"agent/promscrape"}},
-	"internal/agent/cumagg/cumagg.go":       {1, []string{"agent/cumagg"}},
-	"internal/agent/otlpingest/server.go":   {2, []string{"agent/otlpingest"}},
-	// Six marks, two producers: obs.Registry and the logMetrics set
-	// (internal/metrics), plus the cgroup sampler's export loop and its final
-	// export. Both are marked at the call site because that is what knows the
-	// retry policy — which is exactly why neither is visible from its own
-	// package's source.
-	"cmd/kubescrape-agent/main.go": {6, []string{"internal/metrics", "agent/cgroupstats"}},
+	"internal/agent/promscrape/scraper.go": {0, 1, []string{"agent/promscrape"}},
+	"internal/agent/promscrape/session.go": {0, 1, []string{"agent/promscrape"}},
+	"internal/agent/promscrape/summary.go": {0, 1, []string{"agent/promscrape"}},
+	"internal/agent/cumagg/cumagg.go":      {0, 1, []string{"agent/cumagg"}},
+	// The sender retransmits the SAME records: Handoff, never Consumed.
+	"internal/agent/otlpingest/server.go": {2, 0, []string{"agent/otlpingest"}},
+	// Six marks, three producers, marked at the call site because that is what
+	// knows the retry policy — which is exactly why none is visible from its
+	// own package's source. obs.Registry (Run and FinalExport) and the cgroup
+	// sampler (Run and FinalExport) are Consumed; the logMetrics set (Run and
+	// the final Export) is a plain Handoff, because its failed chunks' samples
+	// are retained and come back as the same points.
+	"cmd/kubescrape-agent/main.go": {2, 4, []string{"internal/metrics", "agent/cgroupstats"}},
 }
 
 func TestHandoffRosterNamesEveryProducerThatMarks(t *testing.T) {
 	root := moduleRoot(t)
 
-	got := map[string]int{}
+	type marks struct{ handoff, consumed int }
+	got := map[string]marks{}
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -66,9 +75,10 @@ func TestHandoffRosterNamesEveryProducerThatMarks(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if n := strings.Count(string(b), "transform.Handoff("); n > 0 {
+		m := marks{strings.Count(string(b), "transform.Handoff("), strings.Count(string(b), "transform.Consumed(")}
+		if m.handoff+m.consumed > 0 {
 			rel, _ := filepath.Rel(root, path)
-			got[filepath.ToSlash(rel)] = n
+			got[filepath.ToSlash(rel)] = m
 		}
 		return nil
 	})
@@ -79,14 +89,16 @@ func TestHandoffRosterNamesEveryProducerThatMarks(t *testing.T) {
 	for file, n := range got {
 		want, ok := handoffMarkers[file]
 		if !ok {
-			t.Errorf("%s marks transform.Handoff (%d site(s)) and is not in the roster map: "+
-				"verify its FAILURE path (does a retry rebuild from source, and is the payload "+
-				"never read back?), add it to handoff.go's \"Who hands off\" list, then add it here", file, n)
+			t.Errorf("%s marks transform.Handoff/Consumed (%d/%d site(s)) and is not in the roster map: "+
+				"verify its FAILURE path (does a retry rebuild from source, is the payload never read "+
+				"back, and — for Consumed — does no retry bring these records back to the script?), "+
+				"add it to handoff.go's \"Who hands off\" list, then add it here", file, n.handoff, n.consumed)
 			continue
 		}
-		if n != want.count {
-			t.Errorf("%s has %d Handoff marks, the roster map expects %d: a marker was added or "+
-				"removed — re-read handoff.go's list and update both", file, n, want.count)
+		if n.handoff != want.handoff || n.consumed != want.consumed {
+			t.Errorf("%s has %d Handoff and %d Consumed marks, the roster map expects %d and %d: a marker "+
+				"was added, removed or changed kind — re-read handoff.go's list and update both",
+				file, n.handoff, n.consumed, want.handoff, want.consumed)
 		}
 	}
 	for file := range handoffMarkers {

@@ -73,12 +73,68 @@ func TestEmitDirectUnmutatedResourceSharesOneSeries(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := res(map[string]string{"service.name": "checkout"})
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if err := set.EmitDirect("emit_total", 1, nil, r); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if n := len(set.rules[0].series.db); n != 1 {
 		t.Fatalf("live samples = %d, want 1", n)
+	}
+}
+
+// -logs-metrics-name-prefix prefixes every EXPORTED series name, and a script
+// names the metric the way the logMetrics config does. EmitDirect compared the
+// script's name against the PREFIXED series name, so the moment an operator
+// set a prefix, every script following the documented contract failed every
+// batch with "no logMetrics rule declares this metric" — a failed export, and
+// on the tailer's in-place seam a rewind that re-read and re-failed the same
+// files on every sweep.
+func TestEmitDirectAcceptsTheDeclaredNameUnderANamePrefix(t *testing.T) {
+	setTimeForTest(time.Unix(1_800_600_200, 0))
+	defer testEpoch.Store(0)
+
+	set, err := newTestSet([]Dynamic{
+		{Name: "errors_total", Type: CounterType, Value: "1"},
+		// A declared name equal to ANOTHER rule's prefixed series name: the
+		// declared match must win, deterministically.
+		{Name: "app_x_total", Type: CounterType, Value: "1"},
+		{Name: "x_total", Type: CounterType, Value: "1"},
+	}, WithNamePrefix("app_"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]*series{}
+	for _, r := range set.rules {
+		byName[r.series.name] = r.series
+	}
+
+	if err := set.EmitDirect("errors_total", 1, nil, noRes()); err != nil {
+		t.Fatalf("the declared name under a prefix: %v", err)
+	}
+	// The prefixed spelling still works, for a script written around the old
+	// behaviour.
+	if err := set.EmitDirect("app_errors_total", 1, nil, noRes()); err != nil {
+		t.Fatalf("the prefixed name: %v", err)
+	}
+	if got := byName["app_errors_total"]; got == nil || got.count != 1 {
+		t.Fatalf("both emits must land in the one app_errors_total series")
+	}
+	for samp := range byName["app_errors_total"].all() {
+		if samp.value != 2 {
+			t.Fatalf("app_errors_total = %v, want 2", samp.value)
+		}
+	}
+
+	if err := set.EmitDirect("app_x_total", 1, nil, noRes()); err != nil {
+		t.Fatal(err)
+	}
+	if byName["app_app_x_total"].count != 1 || byName["app_x_total"].count != 0 {
+		t.Fatalf("emit_metric(\"app_x_total\") reached the rule whose PREFIXED name it is (app_x_total=%d, app_app_x_total=%d); "+
+			"the rule that DECLARES the name must win", byName["app_x_total"].count, byName["app_app_x_total"].count)
+	}
+
+	if err := set.EmitDirect("nope_total", 1, nil, noRes()); err == nil {
+		t.Fatal("an undeclared name must still be a script error")
 	}
 }

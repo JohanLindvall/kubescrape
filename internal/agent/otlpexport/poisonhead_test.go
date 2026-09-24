@@ -344,7 +344,7 @@ func TestTotalRefusalDropsNothingAndKeepsTheBackedOffCycle(t *testing.T) {
 	defer func() { _ = ls.Close() }()
 	b := NewBuffered(send, ls, nil, nil, 5*time.Millisecond, quietLogger())
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if err := b.ExportLogs(context.Background(), logsWith("good")); err != nil {
 			t.Fatal(err)
 		}

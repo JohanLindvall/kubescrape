@@ -20,8 +20,8 @@
 // how much of a distribution the window actually measured (below two, the four
 // beside it are the previous window's — see finish). The volume on the wire is
 // ten gauges per container per scrape interval — the same order as the cadvisor
-// series they sit beside, and see the metric-name block for why the set grew
-// from six.
+// series they sit beside, and see the metric-name block (names.go) for why the
+// set grew from six.
 //
 // # The decision this argues with
 //
@@ -75,8 +75,9 @@
 // does not sit beside anything. It is the same deliberate divergence
 // agent/servicegraph makes for its Tempo-verbatim edge metrics, for the same
 // reason: the consumer's vocabulary wins over ours where the whole point is
-// that the consumer can put the two side by side. See metricNames below for
-// the exact spellings and why the CPU ones drop cadvisor's _seconds suffix.
+// that the consumer can put the two side by side. See the name constants in
+// names.go (nameCPUStddev and its siblings) for the exact spellings and why the
+// CPU ones drop cadvisor's _seconds suffix.
 //
 // # Cost
 //
@@ -220,8 +221,6 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
-	"github.com/JohanLindvall/kubescrape/internal/metrics"
-	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 const scopeName = "github.com/JohanLindvall/kubescrape/agent/cgroupstats"
@@ -240,12 +239,12 @@ const DefaultInterval = time.Second
 
 // MinInterval is the floor on the sampling period, and it is a floor in the one
 // direction that can hurt the node: a sweep costs three pread(2) calls per
-// container and runs on the goroutine that also does discovery, so the period
-// is what divides that cost. At MinInterval a 200-container node already issues
-// 6000 reads a second; ten times faster is not ten times more insight into a
-// burst, it is a busy loop on the shared node agent. Values below it are
-// refused where an operator typed one (-cgroup-stats-interval, checkFlagValues)
-// and clamped where one arrives programmatically (New).
+// container, so the period is what divides that cost. At MinInterval a
+// 200-container node already issues 6000 reads a second; ten times faster is
+// not ten times more insight into a burst, it is a busy loop on the shared
+// node agent. Values below it are refused where an operator typed one
+// (-cgroup-stats-interval, checkFlagValues) and clamped where one arrives
+// programmatically (New).
 const MinInterval = 100 * time.Millisecond
 
 // DefaultDiscoverInterval is how often the container set is re-read from the
@@ -271,12 +270,13 @@ const MinInterval = 100 * time.Millisecond
 // the size matters more than the existence: a container the sampler had
 // descriptors open on, which left the hierarchy before two readings of either
 // signal could be taken, is counted obs.CgroupWindowsDropped{reason="too_short"}
-// (see Sampler.snapshot for the three guards that keep the count meaning that,
-// for the two neighbours that share the branch without being short-lived at
-// all, and for what it deliberately excludes). In the measured case below it
-// fires for a container whose DISCOVERY landed within TWO SAMPLING PERIODS of
-// its death — a container found earlier in its life is sampled for the
-// remainder, and any more than two seconds of remainder describes it — so of
+// (see Sampler.finalWindowLocked for the three guards that keep the count
+// meaning that, for the two neighbours that share the verdict without being
+// short-lived at all, and for what it deliberately excludes). In the measured
+// case below it fires for a container whose DISCOVERY landed within TWO
+// SAMPLING PERIODS of its death — a container found earlier in its life is
+// sampled for the remainder, and any more than two seconds of remainder
+// describes it — so of
 // the containers a pass sees at all it catches exactly 2*Interval/lifetime (up
 // to a lifetime of one discovery period; past that a second pass covers what
 // the last one missed), and nothing whatsoever of the two larger classes: a
@@ -446,12 +446,12 @@ const exportResolveBudget = 5 * time.Second
 // well past a full node; past it, a newly resolved container is not promoted
 // into the sampled set and is counted (obs.CgroupContainersCapped{cap=tracked}).
 //
-// Only entries that HOLD descriptors are counted against it (liveTrackedLocked,
-// not len(tracked)), and that rule has had to be applied twice. It used to be
-// tested against tracked+pending, which spent an fd budget on entries that own
-// no fd — and since every pod's sandbox cgroup is permanently pending, a large
-// node's sandboxes crowded out its real workload containers, which is precisely
-// backwards. The same defect then survived inside the tracked map itself: a
+// Only entries that HOLD descriptors are counted against it (countsLocked's
+// live count, not len(tracked)), and that rule has had to be applied twice. It
+// used to be tested against tracked+pending, which spent an fd budget on
+// entries that own no fd — and since every pod's sandbox cgroup is permanently
+// pending, a large node's sandboxes crowded out its real workload containers,
+// which is precisely backwards. The same defect then survived inside the tracked map itself: a
 // GONE container has already released its three descriptors and lingers only
 // until the export that carries its final window, so on a dense node a batch of
 // exits refused newly resolved live containers for up to one whole export
@@ -594,7 +594,8 @@ type Config struct {
 	// Root is the cgroup v2 mount point (empty = DefaultRoot, and see
 	// ErrUnsupportedNode: whether Root was set is what decides whether a
 	// hierarchy this package cannot read is the operator's error or the node's
-	// property).
+	// property — except a genuine cgroup v1 hierarchy, which is the node's at
+	// any root; see v1Error).
 	Root string
 	// Interval is the sampling period (0 or negative = DefaultInterval, below
 	// MinInterval = MinInterval).
@@ -709,6 +710,10 @@ type Sampler struct {
 	// different resources and one must not silence the other.
 	capped    bool
 	cappedFDs bool
+	// lastOpenErr is the most recent failure to open a resolved container's
+	// files (an *os.PathError naming the file), kept for the nothing-is-sampled
+	// warning; see pendingContainer.unreadable. Guarded by mu.
+	lastOpenErr error
 
 	// snap is export()'s reusable snapshot buffer, and it is guarded by
 	// exportSem rather than by mu: snapshot() fills it under mu and the payload
@@ -729,12 +734,15 @@ type Sampler struct {
 	nPending  atomic.Int64
 	nDiscover atomic.Int64
 
-	// The two ways to export nothing are throttled SEPARATELY: they have
-	// different causes and different fixes, so one must not silence the other
+	// The three ways to export nothing are throttled SEPARATELY: they have
+	// different causes and different fixes, so one must not silence another
 	// for the throttle window (a node that starts empty and then fills with
-	// cgroups nobody can resolve would report only the first).
+	// cgroups nobody can resolve would report only the first; a metadata
+	// outage that heals onto cgroups whose files will not open would keep
+	// blaming the metadata service for ten minutes).
 	emptyWarn      logdedupe.Throttle
 	unresolvedWarn logdedupe.Throttle
+	unreadableWarn logdedupe.Throttle
 	// readWarn names ONE offending cgroup path per interval when reads start
 	// failing. The counters are per FILE, which says what broke but never
 	// where; a line per container per second would be a flood proportional to
@@ -756,10 +764,7 @@ type Sampler struct {
 // container is one tracked container cgroup: its identity, the three open
 // descriptors the sample path preads, and the state of the window in progress.
 type container struct {
-	id      string
-	podUID  string
-	dir     string
-	baseLen int // len(basename(dir)); see repointLocked
+	cgroupRef // where it lives; dir can move to a better path (repointLocked)
 
 	fds  cgroupFDs
 	open bool // fds are valid: false once the cgroup is gone or retired
@@ -795,12 +800,12 @@ type container struct {
 	deadWindows int
 	// described records that some window of this container's life was
 	// exported. It is the difference between "too short to measure" and "died
-	// shortly after an export"; see the too_short branch in snapshot.
+	// shortly after an export"; see finalWindowLocked's too_short verdict.
 	described bool
 	// atShutdown distinguishes the two ways gone gets set: the cgroup left the
 	// hierarchy (reconcile) or this PROCESS is leaving (stop). Only the first
-	// is evidence about the container, which is what the too_short branch in
-	// snapshot counts.
+	// is evidence about the container, which is what finalWindowLocked's
+	// too_short verdict counts.
 	atShutdown bool
 }
 
@@ -846,10 +851,7 @@ func (c *container) unreadable() bool { return c.deadWindows > 0 }
 
 // pendingContainer is a discovered cgroup whose identity has not resolved.
 type pendingContainer struct {
-	id      string
-	podUID  string
-	dir     string
-	baseLen int
+	cgroupRef
 	// firstFail is the first ANSWERED failure — a 404 — which is what
 	// maxUnresolvedAge is measured from; see that constant for why it is
 	// neither the discovery time nor the first failure of any kind.
@@ -860,9 +862,18 @@ type pendingContainer struct {
 	// sorts to the front of every pass forever.
 	lastTry time.Time
 	// nextTry is only meaningful once gaveUp: abandonRetryEvery after a
-	// definitive miss, reconsiderEvery after one the service could not answer.
+	// definitive miss or after a resolved retry whose files still would not
+	// open, reconsiderEvery after a miss the service could not answer or a
+	// resolved retry the descriptor cap refused (see track).
 	nextTry time.Time
 	gaveUp  bool
+	// unreadable records that the LATEST attempt resolved the identity and the
+	// cgroup's files then failed — the open in track, or the dead reads that
+	// retired it (quarantineLocked). It is what lets warnIfExportingNothing
+	// tell "nothing resolves" (a metadata problem) from "everything resolves
+	// and nothing opens" (a hierarchy problem); a later unresolved attempt
+	// clears it.
+	unreadable bool
 }
 
 // pendingSnap is one resolution request, copied out from under the lock. It
@@ -870,43 +881,6 @@ type pendingContainer struct {
 type pendingSnap struct {
 	id, podUID string
 	lastTry    time.Time
-}
-
-// held is the last distribution exported for one signal of one container, and
-// how many consecutive windows have now re-stated it (bounded by
-// maxHeldWindows).
-type held struct {
-	ok                     bool
-	n                      int
-	stddev, max, min, mean float64
-}
-
-// signalOut is one signal's rendered contribution to one export.
-//
-// samples is THIS window's own sample count, and it is what makes every other
-// number in the struct readable: below two the four statistics beside it are
-// the PREVIOUS window's, re-stated (see finish), and between two and thirty
-// they say how much of a distribution the window actually measured. It is
-// deliberately not taken from the held value — a re-statement that also
-// re-stated its count would be indistinguishable from a fresh measurement,
-// which is the whole reason it is exported.
-type signalOut struct {
-	emit                   bool
-	stddev, max, min, mean float64
-	samples                int64
-}
-
-// windowPair is one container's finished window, copied out from under the
-// lock so the identity rebuild and the OTLP build can run without it.
-//
-// It carries the two IDS rather than a resource: the resource is rebuilt from
-// current metadata at every export (see the package doc), so there is nothing
-// resource-shaped to copy out, and the ids are exactly what the resolver takes.
-type windowPair struct {
-	id     string
-	podUID string
-	cpu    signalOut
-	mem    signalOut
 }
 
 // New builds a sampler and performs the one-time checks an operator has to
@@ -962,16 +936,22 @@ func New(cfg Config) (*Sampler, error) {
 		check = checkCgroup2
 	}
 	if err := check(root); err != nil {
-		if cfg.Root == "" {
-			// The DEFAULT root. What we just learned is a property of this
-			// NODE, not of anything the operator typed, and it is identical on
-			// every node of its kind — so the caller disables this pipeline and
-			// keeps the others (ErrUnsupportedNode).
+		var v1 *v1Error
+		if cfg.Root == "" || errors.As(err, &v1) {
+			// The DEFAULT root, or ANY root holding a genuine cgroup v1
+			// hierarchy. What we just learned is a property of this NODE, not
+			// of anything the operator typed, and it is identical on every node
+			// of its kind — so the caller disables this pipeline and keeps the
+			// others (ErrUnsupportedNode). A v1 hierarchy at an explicit root
+			// proves the operator pointed at the node's cgroup mount; the chart
+			// renders an explicit root by default, so reading it as an operator
+			// error would CrashLoop every v1 node of a mixed fleet (v1Error).
 			return nil, fmt.Errorf("%w: %w", ErrUnsupportedNode, err)
 		}
-		// An explicitly configured root that is not a cgroup v2 hierarchy is an
-		// operator error, uniform across the fleet and fixable by editing one
-		// value: fatal, as loudly as possible.
+		// An explicitly configured root that is not a cgroup hierarchy this
+		// sampler can use (nothing mounted there, a typo) is an operator error,
+		// uniform across the fleet and fixable by editing one value: fatal, as
+		// loudly as possible.
 		return nil, err
 	}
 	now := cfg.now
@@ -1035,6 +1015,20 @@ func New(cfg Config) (*Sampler, error) {
 // answers: no cgroups at all is a missing mount, while cgroups that never
 // resolve is a metadata-service problem — and one of them is normal for one
 // cgroup per pod, so it is only worth a line when NOTHING is being sampled.
+//
+// There is a THIRD way, and it must not borrow the second's words: cgroups
+// that RESOLVE and whose files then will not open (or were retired for reads
+// that all failed). Those are pending too, so they used to be reported as
+// "resolved none", with a hint sending the operator to the metadata service
+// and a counter that moves on every healthy node anyway (the sandboxes) —
+// while the counter that was actually moving, kubescrape_cgroup_open_errors_total,
+// was named nowhere. The per-entry mark (pendingContainer.unreadable) is what
+// tells the two apart, and each arm has its OWN throttle, so the arm is chosen
+// BEFORE a slot is claimed: claiming one shared slot first let whichever line
+// fired first silence the other for the whole window. That means the pending
+// set is counted under mu on every discovery pass while nothing is sampled —
+// one more walk beside the one resolvePending already makes, bounded by
+// maxPending, and only on a node that is exporting nothing.
 func (s *Sampler) warnIfExportingNothing() {
 	if s.nSampled.Load() > 0 {
 		return
@@ -1042,6 +1036,27 @@ func (s *Sampler) warnIfExportingNothing() {
 	pending := s.nPending.Load()
 	if pending == 0 {
 		s.warnIfEmpty()
+		return
+	}
+	s.mu.Lock()
+	unreadable, lastErr := 0, s.lastOpenErr
+	for _, p := range s.pending {
+		if p.unreadable {
+			unreadable++
+		}
+	}
+	s.mu.Unlock()
+	if unreadable > 0 {
+		if !s.unreadableWarn.Allow(emptyWarnEvery) {
+			return
+		}
+		args := []any{"root", s.root, "cgroups", unreadable,
+			"hint", "their identities resolved; their cgroup files did not open or read — check kubescrape_cgroup_open_errors_total and kubescrape_cgroup_read_errors_total, and that the memory controller is enabled on the container cgroups (without it they have no memory.current or memory.stat)",
+		}
+		if lastErr != nil {
+			args = append(args, "error", lastErr)
+		}
+		s.log.Warn("cgroup sampler resolved container cgroups but could not read their files: it is running and will export nothing", args...)
 		return
 	}
 	if !s.unresolvedWarn.Allow(emptyWarnEvery) {
@@ -1078,50 +1093,46 @@ func (s *Sampler) Unresolved() int { return int(s.nPending.Load()) }
 // not, for the startup log line.
 func (s *Sampler) Discovered() int { return int(s.nDiscover.Load()) }
 
-// liveTrackedLocked counts the tracked containers that still HOLD descriptors,
-// which is what the maxContainers cap bounds. Caller holds mu.
+// countsLocked is the ONE definition of which tracked containers count, shared
+// by the descriptor cap (track) and the gauges (publishCountsLocked). Caller
+// holds mu.
 //
-// It applies the same `if c.gone { continue }` rule publishCountsLocked does: a
-// gone container released its three descriptors in markGone and stays in the
-// map only until the export that carries its final window, so charging it
-// against a descriptor budget refuses a live container for descriptors nobody
-// holds.
-func (s *Sampler) liveTrackedLocked() int {
-	n := 0
+// live is the tracked containers that still HOLD descriptors, which is what the
+// maxContainers cap bounds. A gone container is excluded: it released its three
+// descriptors in markGone and stays in the map only until the export that
+// carries its final window, so charging it against a descriptor budget refuses
+// a live container for descriptors nobody holds.
+//
+// sampled is the live containers currently producing data. SAMPLED is not the
+// same as TRACKED: a container that is still listed but has stopped answering
+// every read produces no data at all, and counting it said the node was
+// measuring 110 containers while it was measuring 109. It rejoins the count as
+// soon as a read succeeds (and leaves the tracked set altogether at
+// maxDeadWindows). The lag either way is one export window, which is inherent —
+// the streak is per window.
+func (s *Sampler) countsLocked() (live, sampled int) {
 	for _, c := range s.tracked {
 		if c.gone {
 			continue
 		}
-		n++
-	}
-	return n
-}
-
-// publishCountsLocked refreshes the atomics the gauges read. Caller holds mu.
-//
-// SAMPLED is not the same as TRACKED, and the gauge is the sampled count: a
-// container that is still listed but has stopped answering every read produces
-// no data at all, and counting it said the node was measuring 110 containers
-// while it was measuring 109. It rejoins the count as soon as a read succeeds
-// (and leaves the tracked set altogether at maxDeadWindows). The lag either way
-// is one export window, which is inherent — the streak is per window.
-func (s *Sampler) publishCountsLocked() {
-	sampled, tracked := 0, 0
-	for _, c := range s.tracked {
-		if c.gone {
-			continue
-		}
-		tracked++
+		live++
 		if !c.unreadable() {
 			sampled++
 		}
 	}
+	return live, sampled
+}
+
+// publishCountsLocked refreshes the atomics the gauges read; the gauge is the
+// SAMPLED count (see countsLocked). Caller holds mu.
+func (s *Sampler) publishCountsLocked() {
+	live, sampled := s.countsLocked()
 	s.nSampled.Store(int64(sampled))
 	s.nPending.Store(int64(len(s.pending)))
 	// DISCOVERED is what is in the hierarchy, so an unreadable-but-listed
 	// container still counts here: it was found, and it is the difference
 	// between this and the sampled gauge that says so.
-	s.nDiscover.Store(int64(tracked + len(s.pending)))
+	s.nDiscover.Store(int64(live + len(s.pending)))
 }
 
 // Root is the resolved cgroup root, for the startup log line.
@@ -1160,635 +1171,11 @@ func (s *Sampler) Run(ctx context.Context, exp Exporter, exportEvery time.Durati
 	// every container's first reading a whole interval late.
 	s.discover(ctx, s.now())
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		s.exportLoop(ctx, exp, exportEvery)
-	}()
-	go func() {
-		defer wg.Done()
-		s.discoverLoop(ctx)
-	}()
+	wg.Go(func() { s.exportLoop(ctx, exp, exportEvery) })
+	wg.Go(func() { s.discoverLoop(ctx) })
 	s.sampleLoop(ctx)
 	wg.Wait()
 	s.stop()
-}
-
-// sampleLoop is the reader, and it does NOTHING that can block: every read is
-// a pread on a descriptor this process already holds. See the Sampler doc for
-// why discovery is not here any more.
-func (s *Sampler) sampleLoop(ctx context.Context) {
-	sampleTick := time.NewTicker(s.interval)
-	defer sampleTick.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-sampleTick.C:
-			s.sample()
-		}
-	}
-}
-
-// discoverLoop re-reads the container set and resolves identities. It is its
-// own goroutine because a pass makes metadata lookups, bounded only by
-// resolveBudget — see the Sampler doc.
-func (s *Sampler) discoverLoop(ctx context.Context) {
-	t := time.NewTicker(s.discoverEvery)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			s.discover(ctx, s.now())
-		}
-	}
-}
-
-// exportLoop ships one window per tick. It returns on cancellation WITHOUT
-// exporting; the final window is FinalExport's, after the sampler has stopped,
-// so it cannot race a sweep that is still writing into it.
-func (s *Sampler) exportLoop(ctx context.Context, exp Exporter, every time.Duration) {
-	t := time.NewTicker(every)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			if err := s.export(ctx, exp); err != nil {
-				s.log.Warn("cgroup-stats export failed", "error", err)
-			}
-		}
-	}
-}
-
-// sample reads every tracked container once. It runs on the sampler goroutine
-// and is allocation-free (TestSampleAllocationBudget); keep it that way — it
-// runs once per second per container on the process that also tails every log
-// file on the node.
-//
-// Nothing here may BLOCK. Every read is a pread on a descriptor this process
-// already holds, and that is the property that lets the interval mean what it
-// says; see the Sampler doc for what sharing this goroutine with discovery
-// cost the numbers.
-func (s *Sampler) sample() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, c := range s.tracked {
-		if !c.open {
-			continue // a vanished cgroup, waiting for its final flush
-		}
-		s.sampleOne(c)
-	}
-}
-
-func (s *Sampler) sampleOne(c *container) {
-	obs.CgroupSamples.Inc()
-	// A sample was attempted, which is what makes a window that produced
-	// nothing evidence of an unreadable container rather than of a sampler that
-	// was not running (see endWindow).
-	c.tried = true
-
-	if usec, err := readField(c.fds.cpuStat, s.buf, keyUsageUsec); err != nil {
-		s.c.readCPUStat.Inc()
-		s.warnRead(c, fileCPUStat, err)
-	} else {
-		c.readOK = true
-		// The clock is read HERE, per container, right after the read that
-		// produced the counter — not once per sweep. A sweep timestamp is the
-		// interval between sweep STARTS while each container is read at its own
-		// varying offset inside the sweep, so the jitter between two offsets
-		// lands in the divisor: measured, a dead-flat container reported a
-		// stddev of up to 0.012 cores and an inflated max out of nothing but
-		// that. Per-container timing cancels it, because both ends of the
-		// interval carry the same offset.
-		now := s.now()
-		// rebase says this reading becomes the next interval's baseline. It is
-		// false in exactly one case, the short interval below, and that case is
-		// why the assignment is not unconditional any more.
-		rebase := true
-		switch {
-		case !c.havePrev:
-			// First reading of this container: no interval, so no rate.
-		case usec < c.prevUsec:
-			// A cumulative counter went backwards. On cgroup v2 that means the
-			// cgroup was replaced under the same path (a container restart
-			// keeping its id is impossible, but a re-created cgroup is not), and
-			// the difference would be a large NEGATIVE rate rendered as a huge
-			// positive one by the unsigned subtraction. The interval is dropped
-			// and the new value becomes the baseline.
-			obs.CgroupCounterResets.Inc()
-		case now.Sub(c.prevAt) < s.minElapsed:
-			// Too short an interval to divide by. usage_usec advances in the
-			// scheduler's accounting quanta, so over a few milliseconds the
-			// quotient is dominated by where the quanta happened to land — an
-			// arithmetically correct rate for the interval measured, and
-			// therefore indistinguishable downstream from the real burst _max
-			// exists to preserve. It happens when the sampler was blocked and
-			// the ticker is catching up (see the Sampler doc for the measured
-			// spread: a 0.5-core container's 5 ms catch-up pair reads 0.00 to
-			// 0.97 cores, half the draws above its true steady-state max).
-			//
-			// WHAT IS AND IS NOT LOST, stated precisely because the loose
-			// version of this sentence ("nothing is lost") was true only of
-			// the CPU-SECONDS and this pipeline's product is the DISTRIBUTION:
-			//
-			//   - the CPU TIME is not lost. The baseline is KEPT (rebase =
-			//     false) and the counter is cumulative, so the sliver's
-			//     microseconds are charged to the NEXT interval rather than to
-			//     one of their own, and every microsecond cpu.stat reported
-			//     still lands in exactly one interval —
-			//     TestAShortIntervalIsDeferredNotDiscarded pins that sum.
-			//   - the window's MEAN is NOT preserved, and the sentence that
-			//     stood here ("the MEAN comes out the same to the last bit")
-			//     was simply wrong, as well as contradicting the bullet below
-			//     it: mean is the unweighted average of the PER-INTERVAL
-			//     RATES, so folding two intervals into one removes a term AND
-			//     lengthens the divisor of the term that survives. In that
-			//     same test's fixture it reads (1 + 3/1.4 + 1)/3 = 1.38 cores
-			//     where the four undeferred intervals would have averaged
-			//     (1 + 5 + 1 + 1)/4 = 2.00 — which is the trade, not a defect:
-			//     the 5.0 term is the stall artefact.
-			//   - the window's SAMPLE is lost: it takes n-1 readings, so
-			//     stddev, max and min are computed over one fewer point. A
-			//     burst confined to the sliver is not erased — it lands in the
-			//     next interval — but it is DILUTED over that longer interval,
-			//     which is a smaller `_max` than a burst of the same size
-			//     landing inside an ordinary interval.
-			//
-			// It is not counted, and the argument for that is not that it is
-			// free: it is that the loss is already REPORTED, per container and
-			// per window, by container_cpu_usage_samples — which exists for
-			// exactly this class of question and drops by one for every skip
-			// here. A fleet-wide counter would say the same thing less
-			// precisely, and the alternative to skipping is worse in the
-			// direction that matters: an inflated `_max` is a wrong number
-			// where a missing sample is a smaller n, and only the first is
-			// indistinguishable from the burst the gauge exists to preserve.
-			//
-			// Measured on the shipped arrangement (200 real cgroup v2 scopes,
-			// discovery and export on their own goroutines) it fired ZERO
-			// times in 23,600 rate readings at the 1s default and zero in
-			// 239,600 at the 100ms floor: on a healthy node this arm is inert,
-			// and it arms only once something has already stalled the sweep.
-			rebase = false
-		default:
-			if el := now.Sub(c.prevAt).Seconds(); el > 0 {
-				// usage_usec is MICROseconds of CPU time; divided by the wall
-				// seconds it accrued over, that is CPU cores.
-				c.cpu.add(float64(usec-c.prevUsec) / 1e6 / el)
-			}
-		}
-		if rebase {
-			c.prevUsec, c.prevAt, c.havePrev = usec, now, true
-		}
-	}
-
-	// The memory working set is a LEVEL, not a rate, so it has no divisor for a
-	// short interval to corrupt: two readings close together are two honest
-	// readings of what the container held, and the guard above deliberately
-	// does not apply here.
-	cur, curErr := readValue(c.fds.memCurrent, s.buf)
-	if curErr != nil {
-		s.c.readMemCurrent.Inc()
-		s.warnRead(c, fileMemCurrent, curErr)
-	} else {
-		c.readOK = true
-	}
-	inactive, inactErr := readField(c.fds.memStat, s.buf, keyInactiveFile)
-	if inactErr != nil {
-		s.c.readMemStat.Inc()
-		s.warnRead(c, fileMemStat, inactErr)
-	} else {
-		c.readOK = true
-	}
-	if curErr == nil && inactErr == nil {
-		// cadvisor's own definition of the working set, matched exactly:
-		// container_memory_working_set_bytes is memory.current minus the
-		// inactive file cache. A different definition here would make _max and
-		// _min incomparable with the series they annotate, which is the whole
-		// reason this package borrows cadvisor's naming and resource identity.
-		var ws float64
-		if cur > inactive {
-			ws = float64(cur - inactive)
-		}
-		c.mem.add(ws)
-	}
-}
-
-// warnRead names one failing cgroup file per readWarnEvery. It is on the
-// error arm only, so the healthy sample path never reaches time.Now.
-//
-// A container torn down between two discovery passes fails every read until
-// the next pass drops it, which is a normal few seconds of noise on a node with
-// churn — hence the throttle rather than a line per failure, and hence a
-// warning that says so.
-func (s *Sampler) warnRead(c *container, file string, err error) {
-	if !s.readWarn.Allow(readWarnEvery) {
-		return
-	}
-	s.log.Warn("cgroup read failed (throttled; a container removed between discovery passes fails every read until the next one)",
-		"cgroup", c.dir, "file", file, "error", err)
-}
-
-// snapshot renders every window and resets it, under the lock. The copy is what
-// lets the identity rebuild and the OTLP build run with the lock free.
-//
-// The windows are reset HERE rather than after a successful send: they describe
-// one bounded interval, so carrying a failed window forward would either
-// double-count it into the next one or silently stretch the interval the
-// numbers claim to cover. A lost window is one gap in a distribution; a wrong
-// one is worse. With -buffer-dir the send is an enqueue, so the outage case
-// this trades away is already covered by the spool. What the reset is NOT
-// allowed to be is silent: every window discarded — by a failed send, or by an
-// identity that could not be rebuilt — is counted into obs.CgroupWindowsDropped
-// by the caller, since a loss nobody can see is the one thing worse than a loss.
-//
-// It is also where containers are RETIRED, in the two ways one can be: a GONE
-// container (its cgroup left the hierarchy) ships its accumulated window once
-// and is dropped, and one that is still listed but has answered no read for
-// maxDeadWindows windows is dropped too.
-//
-// The caller holds exportSem, which is what makes reusing s.snap safe.
-func (s *Sampler) snapshot() []windowPair {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.snap = s.snap[:0]
-	for id, c := range s.tracked {
-		var cpu, mem signalOut
-		if c.gone {
-			// A dead container's LAST datapoint is the one an operator zooms
-			// into after an OOM kill, so it has to be real. finish would hold
-			// here — re-emitting the PREVIOUS window's numbers stamped at
-			// the retirement instant — and the hold exists to bridge a sampling
-			// hiccup in a LIVING container, not to invent a final reading for a
-			// container that has stopped producing them. A gap is the honest
-			// report of a window that measured too little to describe.
-			cpu, mem = measured(&c.cpu), measured(&c.mem)
-			if !cpu.emit && !mem.emit && !c.described && !c.atShutdown {
-				// The literal test: this container was resolved and had three
-				// descriptors open, and its cgroup left the hierarchy without
-				// either signal ever yielding two readings — so no window of
-				// its life can be described. Everything measured about it is
-				// discarded here, so it is counted:
-				// obs.CgroupWindowsDropped{reason="too_short"}.
-				//
-				// THE NAME IS THE COMMON CASE, NOT THE WHOLE BRANCH. Two
-				// neighbours land here as well. Both are genuine losses of a
-				// window this node can say nothing about, so the lower-bound
-				// property survives — but neither is a short-lived container,
-				// and an operator reading a rate off this series should know
-				// which of the three they might be looking at:
-				//
-				//   - a container a pass discovered whose cgroup was already
-				//     gone by the time the sweep reached it. It held three
-				//     descriptors and yielded no reading at all — every attempt
-				//     failing, or none attempted if the next pass marked it
-				//     gone first. "Too short to measure" is right about the
-				//     outcome and wrong about the cause: what was late was the
-				//     discovery, not short the life.
-				//   - a container that lived for MINUTES whose three files
-				//     failed every read — a CRI-O container whose own scope was
-				//     removed while its conmon scope lingers, a stale listing;
-				//     see maxDeadWindows — and whose cgroup then vanished
-				//     before the dead-window streak could retire it. That is an
-				//     unreadable-cgroup fault, and it is ALREADY counted, three
-				//     times per sampling period, as
-				//     kubescrape_cgroup_read_errors_total. Read the two
-				//     together before concluding that a node is losing
-				//     short-lived containers: a rate here with a matching read
-				//     error rate is the second case, not the first.
-				//
-				// Three guards, and each one is what keeps the count from
-				// meaning something else:
-				//
-				//   - `described` excludes the container that has been
-				//     exporting all along and dies shortly after an export.
-				//     Its final partial window is lost too, but "never
-				//     describable" is not what happened, and at a 1s period
-				//     inside a 30s window a few percent of every ORDINARY
-				//     termination lands there. A signal that fires on normal
-				//     shutdowns is one nobody can alert on.
-				//   - `atShutdown` excludes THIS PROCESS exiting (see stop):
-				//     every container is gone by then, and a SIGTERM before
-				//     the second sweep would otherwise publish the verdict for
-				//     the whole node.
-				//   - the emit tests are the event itself: a container that
-				//     produced a distribution of either signal is exported on
-				//     the line below and is not a loss at all.
-				//
-				// WHAT IT DOES NOT COVER, because the sampler has no evidence
-				// of it (stated here because the counter's value as an
-				// argument for a shorter -cgroup-stats-discover-interval turns
-				// on how far below the truth it sits — see
-				// DefaultDiscoverInterval):
-				//
-				//   - a cgroup that appeared and vanished BETWEEN two discovery
-				//     passes. Nothing in the hierarchy remembers it.
-				//   - a cgroup discovered but never RESOLVED — it lives in
-				//     s.pending, holds no descriptors, and reconcile simply
-				//     deletes it. That set is dominated by every pod's sandbox
-				//     cgroup, which never resolves by construction, so counting
-				//     its deletions here would drown the signal in one
-				//     increment per pod terminated.
-				//   - a container discovered LATE in its life: it is sampled
-				//     for the remainder, and two seconds of remainder is enough
-				//     to describe it.
-				//
-				// So the counter is a strict lower bound and a narrow one. It
-				// is worth having anyway because it is CERTAIN — every
-				// increment is a container this node measured and threw away —
-				// where the rest of the blind spot is unmeasurable.
-				s.c.droppedTooShort.Inc()
-			}
-		} else {
-			cpu = s.finish(&c.cpu, &c.heldCPU)
-			mem = s.finish(&c.mem, &c.heldMem)
-		}
-		if cpu.emit || mem.emit {
-			s.snap = append(s.snap, windowPair{id: c.id, podUID: c.podUID, cpu: cpu, mem: mem})
-			// This container has now been described at least once, which is
-			// what the too_short verdict above turns on.
-			c.described = true
-		}
-		c.cpu.reset()
-		c.mem.reset()
-		switch {
-		case c.gone:
-			c.release()
-			delete(s.tracked, id)
-		case c.endWindow():
-			// Listed and unreadable: released, dropped and counted. See
-			// maxDeadWindows.
-			c.release()
-			delete(s.tracked, id)
-			obs.CgroupContainersRetired.Inc()
-			s.quarantineLocked(c)
-			if s.retireWarn.Allow(readWarnEvery) {
-				s.log.Warn("cgroup sampler retired a container that is still listed but has answered no read for several export windows (throttled); its descriptors are released and it is no longer counted as sampled",
-					"cgroup", c.dir, "container", c.id, "windows", c.deadWindows)
-			}
-		}
-	}
-	s.publishCountsLocked()
-	return s.snap
-}
-
-// quarantineLocked puts a retired container back into the PENDING set on the
-// slow clock. Caller holds mu.
-//
-// Retirement alone would not stick: the cgroup is still in the hierarchy, so the
-// very next discovery pass — fifteen seconds later — finds an id that is in
-// neither map, resolves it (its identity is fine; it is the cgroup FILES that
-// stopped answering), re-opens three descriptors and starts the same three dead
-// windows over. That is a retirement undone before it saved anything: measured
-// against the fifteen-second discovery cadence and a thirty-second window, such
-// a container would be back to holding descriptors and failing reads for about
-// five sixths of the time.
-//
-// The pending set is already exactly the right place — "discovery knows about
-// it, nothing is being sampled from it" — and gaveUp is already how that set
-// spells "ask about this one rarely". So the entry lands there past its grace
-// period, and abandonRetryEvery later it gets one more chance: if whatever broke
-// has healed it is sampled again, and if not it costs three failing reads for
-// three windows out of every ten minutes instead of forever.
-//
-// One nuance worth stating rather than hiding: it now counts in
-// kubescrape_cgroup_unresolved_containers, whose name is about IDENTITY, and
-// this container's identity resolved perfectly well. The gauge's real subject is
-// "discovered and not exported", which is true of it, and the retirement counter
-// plus the warning are what name the actual reason.
-// The pending CAP is deliberately not consulted: this entry is not a new
-// discovery competing for memory, it is a container that already held three
-// descriptors, and refusing it would put it straight back into the churn the
-// quarantine exists to stop. The overshoot is bounded by the tracked cap
-// (maxContainers entries of ~150 bytes) and only in a hierarchy that is already
-// at both caps at once.
-func (s *Sampler) quarantineLocked(c *container) {
-	now := s.now()
-	s.pending[c.id] = &pendingContainer{
-		id: c.id, podUID: c.podUID, dir: c.dir, baseLen: c.baseLen,
-		firstFail: now, lastTry: now, nextTry: now.Add(abandonRetryEvery), gaveUp: true,
-	}
-}
-
-// measured renders one signal's window WITHOUT the sparse-window hold: a real
-// distribution or nothing. It is what a container being retired gets; see
-// snapshot and finish.
-func measured(w *window) signalOut {
-	if w.n < 2 {
-		return signalOut{}
-	}
-	return signalOut{emit: true, stddev: w.stddev(), max: w.max, min: w.min, mean: w.mean, samples: int64(w.n)}
-}
-
-// finish renders one signal's window and folds the sparse-window rule in.
-//
-// A window holding FEWER THAN TWO samples of a signal is not a distribution: a
-// single reading has a stddev of zero by construction and a max and a min that
-// are the same number — which is the average the cadvisor scrape already
-// publishes, dressed up as three new series. So such a window HOLDS: the last
-// distribution actually measured is re-emitted, and the series keeps its shape
-// instead of alternating between real numbers and degenerate ones.
-//
-// Per SIGNAL, because the two fill at different rates: a CPU rate needs two raw
-// readings before it yields even one value, so CPU is permanently one sample
-// behind memory and a per-container rule would throw away a perfectly good
-// working-set measurement to protect the CPU one.
-//
-// With nothing held — a container's very first window — nothing is emitted. A
-// gap is honest about a distribution that has not been measured yet; inventing
-// one is not. The hold is BOUNDED for the same reason (maxHeldWindows): past
-// the bound the signal stops being emitted, because re-stating a measurement
-// indefinitely is not bridging a gap, it is reporting a dead container as a
-// live one. What happens to such a container one step later is maxDeadWindows'
-// business: it is retired, so it stops costing descriptors and reads as well as
-// series.
-//
-// A container being RETIRED does not come through here at all — snapshot uses
-// measured() for it. The hold bridges a hiccup in a LIVING container; a dead
-// one's last datapoint has to be something that was actually read.
-//
-// A held window carries NO MARKER distinguishing it downstream, and that is a
-// decision rather than an omission. The only two places a marker could go both
-// fork the series: a resource attribute changes the derived job and instance,
-// which is the exact identity flap the whole design is built to prevent, and a
-// data-point attribute on a gauge changes the label set, which breaks the join
-// to the cadvisor series these gauges exist to annotate — for precisely the
-// windows it marks. So the bound is the answer instead: at most maxHeldWindows
-// re-statements, then a gap, and the gap is the signal. What an operator
-// staring at a flat max needs is on the AGENT's own metrics, where it costs no
-// series identity: obs.CgroupHeldWindows{outcome} counts both the holding and
-// the giving up.
-func (s *Sampler) finish(w *window, h *held) signalOut {
-	if w.n >= 2 {
-		*h = held{ok: true, stddev: w.stddev(), max: w.max, min: w.min, mean: w.mean}
-		return signalOut{emit: true, stddev: h.stddev, max: h.max, min: h.min, mean: h.mean, samples: int64(w.n)}
-	}
-	if !h.ok {
-		return signalOut{}
-	}
-	if h.n >= maxHeldWindows {
-		// Cleared, not merely skipped: this is what makes `expired` an EVENT
-		// counted once at the transition rather than once per window forever,
-		// and what makes a later real window start a fresh hold budget.
-		*h = held{}
-		s.c.heldExpired.Inc()
-		return signalOut{}
-	}
-	h.n++
-	s.c.heldWindows.Inc()
-	// samples is w.n — 0 or 1 — and NOT the held value's: it is the one field
-	// that must describe this window rather than the one being re-stated, so
-	// that a consumer can tell the two apart at all. See signalOut.
-	return signalOut{emit: true, stddev: h.stddev, max: h.max, min: h.min, mean: h.mean, samples: int64(w.n)}
-}
-
-// export snapshots, rebuilds every identity and sends one window.
-//
-// The whole body is serialised by exportSem: the export loop and FinalExport
-// are concurrent in production (see the field), and two of these interleaving
-// would race on the snapshot scratch and split one window's containers across
-// two payloads.
-func (s *Sampler) export(ctx context.Context, exp Exporter) error {
-	select {
-	case s.exportSem <- struct{}{}:
-	case <-ctx.Done():
-		// The other exporter has the window and is shipping it; waiting past
-		// the caller's deadline would spend a shutdown budget the later steps
-		// need. Nothing is dropped here that the holder is not already sending.
-		return ctx.Err()
-	}
-	defer func() { <-s.exportSem }()
-
-	snap := s.snapshot()
-	if len(snap) == 0 {
-		return nil
-	}
-	md := s.build(ctx, snap, s.now())
-	if md.DataPointCount() == 0 {
-		return nil
-	}
-	if err := exp.ExportMetrics(ctx, md); err != nil {
-		s.c.droppedExport.Add(float64(md.ResourceMetrics().Len()))
-		return err
-	}
-	return nil
-}
-
-// FinalExport ships the last window, on the CALLER's context.
-//
-// The caller owns the budget deliberately: this used to manufacture its own
-// five seconds, which is the shape internal/metrics.Registry.FinalExport had
-// removed from it — a fixed timeout cannot be fitted inside the pod's
-// termination grace, which the agent's shutdown sequence is tracking as one
-// shared deadline for every final flush. The context must also be DETACHED
-// (WithoutCancel, never a bare Background: otlpexport.Own's durability marker
-// and the transform handoff marker ride on it).
-//
-// It is safe to call while Run is still going, and the agent does exactly that:
-// the shutdown sequence joins its producers under a bounded budget and proceeds
-// when the join times out. exportSem serialises the two, and the ctx bounds the
-// wait. Once Run HAS returned every descriptor is released and every container
-// is marked for a final flush, so this then carries whatever the last partial
-// window measured, including the seconds of a container that vanished just
-// before shutdown.
-func (s *Sampler) FinalExport(ctx context.Context, exp Exporter) error {
-	return s.export(ctx, exp)
-}
-
-// build rebuilds each container's identity and renders one ResourceMetrics per
-// container that still has one, with up to ten gauges (five per signal, and a
-// signal whose window measured nothing contributes none of its five).
-//
-// The rebuild runs HERE, on the export goroutine with the mutex free, and never
-// on the sampler goroutine: an identity lookup can block for as long as the
-// metadata service takes, and the sweep must keep measuring the node while it
-// does. See resolveExport for the budget.
-func (s *Sampler) build(ctx context.Context, snap []windowPair, now time.Time) pmetric.Metrics {
-	md := pmetric.NewMetrics()
-	ts := pcommon.NewTimestampFromTime(now)
-	rctx, cancel := context.WithTimeout(ctx, s.exportBudget)
-	defer cancel()
-	for i := range snap {
-		w := &snap[i]
-		res := pcommon.NewResource()
-		if !s.resolveExport(rctx, res, w) {
-			continue
-		}
-		rm := md.ResourceMetrics().AppendEmpty()
-		res.MoveTo(rm.Resource())
-		sm := rm.ScopeMetrics().AppendEmpty()
-		sm.Scope().SetName(scopeName)
-		sm.Scope().SetVersion(obs.ScopeVersion)
-		if w.cpu.emit {
-			putGauge(sm, nameCPUStddev, descCPUStddev, unitCores, w.cpu.stddev, ts)
-			putGauge(sm, nameCPUMax, descCPUMax, unitCores, w.cpu.max, ts)
-			putGauge(sm, nameCPUMin, descCPUMin, unitCores, w.cpu.min, ts)
-			putGauge(sm, nameCPUMean, descCPUMean, unitCores, w.cpu.mean, ts)
-			putGauge(sm, nameCPUSamples, descCPUSamples, unitSamples, float64(w.cpu.samples), ts)
-		}
-		if w.mem.emit {
-			putGauge(sm, nameMemStddev, descMemStddev, unitBytes, w.mem.stddev, ts)
-			putGauge(sm, nameMemMax, descMemMax, unitBytes, w.mem.max, ts)
-			putGauge(sm, nameMemMin, descMemMin, unitBytes, w.mem.min, ts)
-			putGauge(sm, nameMemMean, descMemMean, unitBytes, w.mem.mean, ts)
-			putGauge(sm, nameMemSamples, descMemSamples, unitSamples, float64(w.mem.samples), ts)
-		}
-	}
-	return md
-}
-
-// resolveExport rebuilds one container's resource for one export, reporting
-// whether it may be exported at all.
-//
-// The cost is one Resolver call per container per export, and the claim that
-// this is cheap is load-bearing enough to be measured rather than assumed
-// (promscrape's TestFillContainerResourceIsA304InTheSteadyState): the resolver
-// keeps a one-minute cache keyed by container id — the SAME entries the
-// cadvisor scrape fills, since it resolves the same ids through the same body —
-// and a miss underneath it reaches metaclient, which holds the decoded
-// document with its ETag and revalidates a stale one as a conditional GET the
-// metadata service answers 304. So the steady state is a map lookup, and the
-// worst case once a minute per container is a 304 with no body.
-//
-// A container that does not resolve is NOT exported and its window is LOST —
-// counted, because it was measured. That is the same verdict discovery applies
-// before spending descriptors, taken again here because a container's identity
-// can stop resolving between the two (a metadata-service outage, a pod whose
-// tombstone aged out from under a cgroup that has not been cleaned up yet).
-//
-// A lookup cut short by the pass deadline lands here too, which is the right
-// accounting for the LOSS counter (the window really is gone) and a slightly
-// generous reading of the unresolved one — but only in the state where the
-// metadata service is too slow to answer a node's worth of lookups, which is
-// exactly what that counter is there to show.
-// The failure CLASSIFICATION is deliberately ignored here. It governs a retry
-// cadence for a cgroup that is not being sampled, and everything reaching this
-// seam is already tracked and will be offered again by the next export whatever
-// the answer was; the pending set's policy is resolveFailed's.
-func (s *Sampler) resolveExport(ctx context.Context, res pcommon.Resource, w *windowPair) bool {
-	ok, _ := s.resolver.FillContainerResource(ctx, res, w.id, w.podUID)
-	if !ok {
-		s.c.droppedUnresolved.Inc()
-		s.c.unresolvedExport.Inc()
-		return false
-	}
-	return true
-}
-
-func putGauge(sm pmetric.ScopeMetrics, name, desc, unit string, v float64, ts pcommon.Timestamp) {
-	m := sm.Metrics().AppendEmpty()
-	m.SetName(name)
-	m.SetDescription(desc)
-	if unit != "" {
-		m.SetUnit(unit)
-	}
-	dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
-	dp.SetTimestamp(ts)
-	dp.SetDoubleValue(v)
 }
 
 // stop releases every held descriptor and marks every container for one final
@@ -1796,8 +1183,8 @@ func putGauge(sm pmetric.ScopeMetrics, name, desc, unit string, v float64, ts pc
 // have stopped.
 //
 // The mark is atShutdown, NOT the plain vanished-from-the-hierarchy one, and
-// the difference is a loss counter's credibility. snapshot counts a gone
-// container that never produced a distribution as
+// the difference is a loss counter's credibility. finalWindowLocked counts a
+// gone container that never produced a distribution as
 // obs.CgroupWindowsDropped{reason="too_short"} — evidence that this node runs
 // containers shorter than the pipeline can describe. Every container on the
 // node is gone by this line, so without the distinction a SIGTERM published
@@ -1821,236 +1208,4 @@ func (s *Sampler) stop() {
 		c.markGone()
 	}
 	s.publishCountsLocked()
-}
-
-// closeAll releases every descriptor and forgets every container, for tests and
-// for a sampler that is discarded without a final export.
-func (s *Sampler) closeAll() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for id, c := range s.tracked {
-		c.release()
-		delete(s.tracked, id)
-	}
-	clear(s.pending)
-	s.publishCountsLocked()
-}
-
-// --- metric names, units and descriptions ---
-//
-// Prometheus-style names, deliberately, so these land beside the cadvisor
-// series they explain (see the package doc). Two details are load-bearing:
-//
-//   - the CPU names drop cadvisor's `_seconds` suffix. container_cpu_usage_
-//     seconds_total is a cumulative count of CPU-seconds; these are a RATE in
-//     cores, which is what `rate(container_cpu_usage_seconds_total[5m])`
-//     produces and what every dashboard actually plots. Carrying `_seconds` on
-//     a value measured in cores would be a lie in the name.
-//
-//   - the UNIT field is set on the CPU gauges and left EMPTY on the memory
-//     ones, which looks inconsistent and is not. The OTLP→Prometheus
-//     translation appends the unit as a name suffix, skipping it when the unit
-//     is brace-annotated (`{cpu}` is never appended, so those names are safe)
-//     or when the name is judged to carry it already. The memory names carry
-//     `_bytes` in the MIDDLE (container_memory_working_set_bytes_max), and
-//     whether the translator's "already present" test is a substring or a
-//     suffix test has varied; a translator that suffixes would render
-//     container_memory_working_set_bytes_max_bytes, which joins nothing. The
-//     name is the contract here, so the memory gauges state their unit in the
-//     DESCRIPTION and leave the field that can rewrite the name alone.
-//
-// The MEAN and the SAMPLE COUNT are the two that were argued about, so the
-// argument is here rather than in a commit message.
-//
-// The original set was six, on the reasoning that cadvisor supplies the average
-// and the join makes it available beside these. That is true of CPU and FALSE
-// of memory, and it is conditional on cadvisor:
-//
-//   - cadvisor's container_cpu_usage_seconds_total is a COUNTER, so
-//     rate(...[window]) IS the window's mean CPU rate, exactly. Nothing here
-//     improves on it — while -cadvisor is on and the kubelet scrape is working.
-//   - cadvisor's container_memory_working_set_bytes is a GAUGE sampled once per
-//     scrape. avg_over_time of it across one window is that single instant, not
-//     the window's mean. So the average working set — the number that says
-//     whether the peak this pipeline exports was a spike or the norm — was
-//     available NOWHERE, under any configuration.
-//   - `-cadvisor=false` with `-cgroup-stats` on is a supported and sensible
-//     deployment (this is then the node's only container CPU/memory signal),
-//     and a kubelet scrape can simply fail. Either leaves stddev/max/min with
-//     no centre to be read against, and a standard deviation without a mean is
-//     not interpretable at all.
-//
-// The COUNT answers the other half: it separates a 30-sample window from a
-// 3-sample one, and — because a held window reports its OWN count rather than
-// the re-stated one — it is what tells a fresh measurement from the
-// re-statement finish() emits for a sparse window. That gap was previously
-// only visible fleet-wide, on obs.CgroupHeldWindows, which cannot answer "is
-// THIS container's flat max real".
-//
-// The price is ten gauges per container per export where there were six. It is
-// paid rather than avoided because the alternative reading of the same trade —
-// documenting the cadvisor coupling as a hard requirement — would make a
-// legal, useful configuration silently produce numbers nobody can read, and
-// because the comparison that justifies this pipeline is against shipping
-// 30-60 raw samples per container per window, which ten gauges is still an
-// order of magnitude below.
-const (
-	nameCPUStddev  = "container_cpu_usage_stddev"
-	nameCPUMax     = "container_cpu_usage_max"
-	nameCPUMin     = "container_cpu_usage_min"
-	nameCPUMean    = "container_cpu_usage_mean"
-	nameCPUSamples = "container_cpu_usage_samples"
-
-	nameMemStddev  = "container_memory_working_set_bytes_stddev"
-	nameMemMax     = "container_memory_working_set_bytes_max"
-	nameMemMin     = "container_memory_working_set_bytes_min"
-	nameMemMean    = "container_memory_working_set_bytes_mean"
-	nameMemSamples = "container_memory_working_set_bytes_samples"
-)
-
-const (
-	// unitCores is brace-annotated on purpose; see the block comment above.
-	unitCores = "{cpu}"
-	unitBytes = ""
-	// unitSamples is brace-annotated for the same reason: a bare "samples"
-	// would be appended to the name by the OTLP→Prometheus translation, and
-	// container_cpu_usage_samples_samples joins nothing.
-	unitSamples = "{sample}"
-)
-
-// The descriptions are SHORT, and that is a cost decision made against a
-// measurement (TestDescriptionsAreAffordablePerContainer).
-//
-// A description rides on every metric of every ResourceMetrics, and this
-// pipeline emits one ResourceMetrics PER CONTAINER — so unlike a payload with a
-// handful of resources, the descriptor text is repeated once per container per
-// metric per export. The first cut of these carried a ~480-byte explanatory
-// note apiece; measured on a 110-container node that was 81% of the whole
-// payload (317 KiB of 390 KiB), i.e. the pipeline spent four bytes explaining
-// itself for every byte of data, every scrape interval, forever. The same
-// arithmetic is why promscrape's cadvisor and split batchers charge descriptor
-// bytes to their chunk estimate (metricMeta.apply / metaFieldBytes).
-//
-// Shortening rather than chunking, deliberately. Chunking is what bounds a
-// payload against a receiver's message limit, and that bound already exists one
-// layer down and applies to everything this agent sends: otlpexport measures
-// the exact proto size and splits over -otlp-max-send-bytes via pkg/otlpsplit.
-// Adding a second chunker here would re-implement it and still ship every one
-// of those bytes. Only shortening actually removes them — from the wire and
-// from the collector's parse, which is where the repetition is charged.
-//
-// NOT from the backend's storage, which this comment used to claim: Prometheus
-// and Mimir keep HELP per metric FAMILY, not per series, so the ten descriptions
-// are stored once however many containers repeat them on the wire. The
-// per-container cost is real and it is transmission and parsing; the storage
-// claim was not, and an argument that overstates itself is one nobody can
-// re-derive.
-//
-// What is lost is prose that was never useful AT THE POINT OF USE: an operator
-// hovering a series in Grafana needs to know what the number is and over what
-// window, not the argument for why the pipeline exists. That argument is in the
-// package doc, in docs/METRICS.md and in the -cgroup-stats flag help, none of
-// which is charged per container per export.
-const (
-	descCPUStddev = "Standard deviation of the container's CPU rate, in cores, per export window."
-	descCPUMax    = "Peak CPU rate for the container, in cores, per export window."
-	descCPUMin    = "Lowest CPU rate for the container, in cores, per export window."
-	descCPUMean   = "Mean CPU rate for the container, in cores, per export window."
-	// The two sample-count descriptions carry the one thing that cannot be
-	// derived from the name — below 2 the four statistics beside them are the
-	// previous window's — and nothing else, for the reason the others are short.
-	descCPUSamples = "CPU rate readings this window; below 2 the four beside it are the previous window's."
-
-	descMemStddev  = "Standard deviation of the working set (memory.current-inactive_file), in bytes, per export window."
-	descMemMax     = "Peak working set (memory.current-inactive_file), in bytes, per export window."
-	descMemMin     = "Lowest working set (memory.current-inactive_file), in bytes, per export window."
-	descMemMean    = "Mean working set (memory.current-inactive_file), in bytes, per export window."
-	descMemSamples = "Working-set readings this window; below 2 the four beside it are the previous window's."
-)
-
-// metricNames is the exported set, for the test that pins the spellings.
-var metricNames = []string{
-	nameCPUStddev, nameCPUMax, nameCPUMin, nameCPUMean, nameCPUSamples,
-	nameMemStddev, nameMemMax, nameMemMin, nameMemMean, nameMemSamples,
-}
-
-// counters are this pipeline's label bindings of the obs families, bound ONCE
-// rather than per observation so the sample path's error arm costs an atomic
-// add and not a label-vector lookup — the failing case is exactly the one that
-// repeats every second.
-//
-// They live on the SAMPLER and are bound in New, not in a package-level var
-// block, because BINDING A LABEL SET PUBLISHES ITS SERIES AT ZERO
-// (internal/metrics' vec.with → series.materialize, deliberately: a bound
-// value is a statement that this process can produce that outcome). A var
-// block runs at package initialisation, which happens because
-// cmd/kubescrape-agent IMPORTS this package — so every agent in the fleet
-// published fifteen kubescrape_cgroup_* series reading 0 whether or not
-// -cgroup-stats was on, which is precisely the ambiguity the pipeline's own
-// gauge was built to avoid (obs.RegisterCgroupStats: "a published 0 always
-// means enabled and finding nothing"). An operator alerting on
-// kubescrape_cgroup_read_errors_total or graphing
-// kubescrape_cgroup_windows_dropped_total could not tell a healthy sampler
-// from an absent one.
-//
-// New binds them AFTER the cgroup-version check, so a node that refuses the
-// pipeline (ErrUnsupportedNode) publishes nothing either.
-type counters struct {
-	readCPUStat, readMemCurrent, readMemStat *metrics.RegCounter
-
-	unresolvedPending, unresolvedUnreachable *metrics.RegCounter
-	unresolvedAbandoned, unresolvedExport    *metrics.RegCounter
-
-	cappedTracked, cappedPending *metrics.RegCounter
-
-	listErrRoot, listErrSubtree *metrics.RegCounter
-
-	droppedUnresolved, droppedExport, droppedTooShort *metrics.RegCounter
-
-	heldWindows, heldExpired *metrics.RegCounter
-}
-
-func newCounters() *counters {
-	// The UNLABELED families of this pipeline, published at 0 by the same rule
-	// and for the same reason. metrics.Registry.Counter deliberately publishes
-	// nothing at REGISTRATION (obs registers both binaries' metrics at package
-	// init, so a zero there would assert "this never happened" about a feature
-	// the process does not contain), and there is no exported way to
-	// materialise a scalar series other than adding zero to it — which for a
-	// cumulative counter is exactly the statement wanted: this outcome exists
-	// here and has occurred no times. Without it, four of these five are rare
-	// by design (an open error, a counter reset, a truncated scan, a
-	// retirement), so "absent" and "healthy" looked identical on the one
-	// pipeline that argues hardest that they must not.
-	for _, c := range []*metrics.RegCounter{
-		obs.CgroupSamples, obs.CgroupOpenErrors, obs.CgroupCounterResets,
-		obs.CgroupScanTruncated, obs.CgroupContainersRetired,
-	} {
-		c.Add(0)
-	}
-	return &counters{
-		readCPUStat:    obs.CgroupReadErrors.WithLabelValues(fileCPUStat),
-		readMemCurrent: obs.CgroupReadErrors.WithLabelValues(fileMemCurrent),
-		readMemStat:    obs.CgroupReadErrors.WithLabelValues(fileMemStat),
-
-		unresolvedPending:     obs.CgroupUnresolved.WithLabelValues("pending"),
-		unresolvedUnreachable: obs.CgroupUnresolved.WithLabelValues("unreachable"),
-		unresolvedAbandoned:   obs.CgroupUnresolved.WithLabelValues("abandoned"),
-		unresolvedExport:      obs.CgroupUnresolved.WithLabelValues("export"),
-
-		cappedTracked: obs.CgroupContainersCapped.WithLabelValues("tracked"),
-		cappedPending: obs.CgroupContainersCapped.WithLabelValues("pending"),
-
-		listErrRoot:    obs.CgroupDiscoveryErrors.WithLabelValues("root"),
-		listErrSubtree: obs.CgroupDiscoveryErrors.WithLabelValues("subtree"),
-
-		droppedUnresolved: obs.CgroupWindowsDropped.WithLabelValues("unresolved"),
-		droppedExport:     obs.CgroupWindowsDropped.WithLabelValues("export_failed"),
-		// too_short is the observable half of the short-lived-container blind
-		// spot; see Sampler.snapshot.
-		droppedTooShort: obs.CgroupWindowsDropped.WithLabelValues("too_short"),
-
-		heldWindows: obs.CgroupHeldWindows.WithLabelValues("held"),
-		heldExpired: obs.CgroupHeldWindows.WithLabelValues("expired"),
-	}
 }

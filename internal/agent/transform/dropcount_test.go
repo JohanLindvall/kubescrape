@@ -68,7 +68,7 @@ def transform(batch):
 		sm := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
 		whole := sm.Metrics().AppendEmpty()
 		whole.SetName("whole")
-		for i := 0; i < 2; i++ {
+		for range 2 {
 			whole.SetEmptySum().DataPoints().AppendEmpty()
 		}
 		partial := sm.Metrics().AppendEmpty()
@@ -189,18 +189,20 @@ func TestTransformNoDropsNoCount(t *testing.T) {
 	}
 }
 
-// A FAILED export is where the two producer classes part company, and the
-// failure branch used to apply the copy path's reasoning to both.
+// A FAILED export is where the producer classes part company, and the failure
+// branch has got it wrong in both directions.
 //
 // A copy-path producer re-offers the same object and the retry re-runs the
 // script over a fresh copy, so counting on failure would multiply one batch's
-// drops by the length of an outage. A HANDED-OFF producer never re-offers it:
-// handoff.go's contract is that it rebuilds from source, and for promscrape
-// (a take()n chunk behind its exportFailed latch) and cgroupstats (windows
-// that snapshot() reset as it read them) the source is destroyed by the
-// attempt. Their drops were counted nowhere at all — precisely during the
-// collector outage in which an operator reads this counter to tell an
-// intentional script drop from a delivery failure.
+// drops by the length of an outage. So does a HANDED-OFF producer whose retry
+// brings the same RECORDS back — the ingest sender retransmits the bytes it
+// pushed — which is why handing off the OBJECT is not enough to count. Only a
+// CONSUMED payload's failure is final for its records: promscrape (a take()n
+// chunk behind its exportFailed latch) and cgroupstats (windows that
+// snapshot() reset as it read them) destroy the source in the attempt, and
+// their drops were counted nowhere at all — precisely during the collector
+// outage in which an operator reads this counter to tell an intentional script
+// drop from a delivery failure.
 func TestFailedExportCountsDropsOnlyForProducersThatWillNotRetryTheScript(t *testing.T) {
 	prog, err := compileStarlark("logs", "def transform(batch):\n    for r in batch:\n        if r.body != \"keep\":\n            r.drop()\n")
 	if err != nil {
@@ -216,15 +218,34 @@ func TestFailedExportCountsDropsOnlyForProducersThatWillNotRetryTheScript(t *tes
 		return ld
 	}
 
-	t.Run("handed off: counted, because the script never sees them again", func(t *testing.T) {
+	t.Run("consumed: counted, because the script never sees them again", func(t *testing.T) {
+		next := &failN{fail: 1}
+		w := Wrap(next, next, program)
+		before := obs.TransformDropped.WithLabelValues("logs").Value()
+		if err := w.ExportLogs(Consumed(context.Background()), payload()); err == nil {
+			t.Fatal("want the export error")
+		}
+		if got := obs.TransformDropped.WithLabelValues("logs").Value() - before; got != 3 {
+			t.Fatalf("counted %v drops, want 3", got)
+		}
+	})
+
+	// The ingest shape: the object is handed off (a fresh decode per attempt,
+	// so the script may run in place), but the sender RETRANSMITS the same
+	// records, and the script drops them again on every attempt. Counting the
+	// failed attempt made one intended drop read as one per NACK.
+	t.Run("handed off but re-offered: counted once, on delivery", func(t *testing.T) {
 		next := &failN{fail: 1}
 		w := Wrap(next, next, program)
 		before := obs.TransformDropped.WithLabelValues("logs").Value()
 		if err := w.ExportLogs(Handoff(context.Background()), payload()); err == nil {
 			t.Fatal("want the export error")
 		}
+		if err := w.ExportLogs(Handoff(context.Background()), payload()); err != nil {
+			t.Fatal(err)
+		}
 		if got := obs.TransformDropped.WithLabelValues("logs").Value() - before; got != 3 {
-			t.Fatalf("counted %v drops, want 3", got)
+			t.Fatalf("counted %v drops for one failed push and its retransmission, want 3", got)
 		}
 	})
 

@@ -12,6 +12,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -57,6 +58,15 @@ type scopeKey struct {
 }
 
 func (g *logGrouper) scope(f *file, resAttrs, scopeAttrs []logattrs.Attr) group {
+	return g.scopeKeyed(f, logattrs.Key(resAttrs), resAttrs, scopeAttrs)
+}
+
+// scopeKeyed is scope with the resource half's key already computed:
+// logattrs.Key allocates for any non-empty input (a strings.Builder plus a
+// strconv.Quote per attribute), and a record that lifts a RESOURCE attribute
+// needs that key for its log-metrics bind key too, so buildRecord computes it
+// once and hands it to both. resKey must be logattrs.Key(resAttrs).
+func (g *logGrouper) scopeKeyed(f *file, resKey string, resAttrs, scopeAttrs []logattrs.Attr) group {
 	if len(resAttrs) == 0 && len(scopeAttrs) == 0 {
 		if gr, ok := g.plain[f]; ok {
 			return gr
@@ -65,7 +75,7 @@ func (g *logGrouper) scope(f *file, resAttrs, scopeAttrs []logattrs.Attr) group 
 		g.plain[f] = gr
 		return gr
 	}
-	key := scopeKey{f: f, res: logattrs.Key(resAttrs), scope: logattrs.Key(scopeAttrs)}
+	key := scopeKey{f: f, res: resKey, scope: logattrs.Key(scopeAttrs)}
 	if gr, ok := g.scopes[key]; ok {
 		return gr
 	}
@@ -119,22 +129,23 @@ type recordBuilder struct {
 	// materialised records that a group was created before the rules ran, so
 	// the flush knows it may need pruning.
 	materialised bool
+	// gr is the CURRENT entry's group when buildRecord already resolved it
+	// (haveGr, re-armed per record): Dest returns it rather than rebuilding
+	// both grouping keys only to find the same group. Valid for the one Emit
+	// it was resolved for — pdata slice element wrappers stay valid across
+	// appends, which is what the grouper's own maps already rely on.
+	gr     group
+	haveGr bool
 }
 
 func (t *Tailer) newRecordBuilder(ld plog.Logs) *recordBuilder {
 	// anyPodRules is O(files), so evaluate it once (short-circuited when a
 	// global rule set already forces the scratch path).
 	return &recordBuilder{
-		t:   t,
-		g:   &logGrouper{ld: ld, plain: map[*file]group{}, scopes: map[scopeKey]group{}},
-		now: pcommon.NewTimestampFromTime(time.Now()),
-		chain: logchain.NewChain[bindKey](logchain.Config{
-			Scrub:      t.cfg.Scrub,
-			LogAttrs:   t.cfg.LogAttrs,
-			Enrich:     t.cfg.Enrich,
-			LogMetrics: t.cfg.LogMetrics,
-			Rules:      t.cfg.Rules,
-		}, t.cfg.Rules == nil && t.anyPodRules()),
+		t:     t,
+		g:     &logGrouper{ld: ld, plain: map[*file]group{}, scopes: map[scopeKey]group{}},
+		now:   pcommon.NewTimestampFromTime(time.Now()),
+		chain: logchain.NewChain[bindKey](t.cfg.Chain, t.cfg.Chain.Rules == nil && t.anyPodRules()),
 	}
 }
 
@@ -142,6 +153,9 @@ func (t *Tailer) newRecordBuilder(ld plog.Logs) *recordBuilder {
 // this record's file plus its line-derived resource/scope attributes. Called
 // only for a KEPT record, so a rules drop never materialises a group.
 func (b *recordBuilder) Dest() plog.LogRecordSlice {
+	if b.haveGr {
+		return b.gr.sl.LogRecords()
+	}
 	return b.g.scope(b.e.file, b.ext.Resource, b.ext.Scope).sl.LogRecords()
 }
 
@@ -221,7 +235,7 @@ func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
 	}
 	// Scrub + extract must precede GROUPING: the extraction's resource/scope
 	// halves decide which ResourceLogs/ScopeLogs the record lands in.
-	body, ext := b.chain.Line(e.body)
+	body, ext := b.chain.Line(e.body, observed)
 	e.body = body
 	b.e, b.ext = e, ext
 	// Metric labels and rule keys resolve against the record's attributes
@@ -237,10 +251,18 @@ func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
 	// Only the lifted-RESOURCE case pays for it. With none (the overwhelmingly
 	// common line, and the one BenchmarkIngestLine pins at zero allocations)
 	// the group's resource IS file.resource and the key is the bare file.
+	//
+	// The resource key is computed ONCE here and serves both the group lookup
+	// and the bind key, and the group is kept for Dest: this path used to
+	// build logattrs.Key up to five times per record (twice in scope, once
+	// for the bind key, twice more when Dest re-ran scope), six allocations a
+	// record that no budget covered.
 	res, key := e.file.resource.Attributes(), bindKey{f: e.file}
+	b.haveGr = false
 	if len(ext.Resource) > 0 {
-		gr := b.g.scope(e.file, ext.Resource, ext.Scope)
-		res, key = gr.res, bindKey{f: e.file, res: logattrs.Key(ext.Resource)}
+		rk := logattrs.Key(ext.Resource)
+		b.gr, b.haveGr = b.g.scopeKeyed(e.file, rk, ext.Resource, ext.Scope), true
+		res, key = b.gr.res, bindKey{f: e.file, res: rk}
 		b.materialised = true
 	}
 	if b.chain.Emit(b, logchain.Input[bindKey]{
@@ -387,6 +409,7 @@ func (t *Tailer) flush(ctx context.Context) {
 	t.lastFlush = time.Now()
 	// An all-dropped batch has nothing to send but its offsets still commit.
 	var err error
+	transformDropped := 0 // counted below once the batch's records are settled, never on a rewind
 	if kept > 0 {
 		// The transform runs ONCE per batch, in place, before the retry loop:
 		// this flush just built ld and nothing else holds it. (Sending through
@@ -397,11 +420,11 @@ func (t *Tailer) flush(ctx context.Context) {
 		// re-read next sweep re-runs the possibly hot-reloaded program on a
 		// batch rebuilt from source.
 		if t.cfg.Transform != nil {
-			err = t.cfg.Transform(ld)
+			transformDropped, err = t.cfg.Transform(ld)
 		}
 		if err == nil {
 			// kept becomes the DELIVERED count: a transform may have dropped
-			// records (each already counted into transform_dropped_total), and
+			// records (counted into transform_dropped_total below), and
 			// kubescrape_log_entries_total means "entries exported" — counting
 			// the pre-transform build size credited records nothing sent. The
 			// offsets still commit for all of them.
@@ -411,9 +434,19 @@ func (t *Tailer) flush(ctx context.Context) {
 			}
 		}
 	}
+	// The script's drops are counted where the batch's records SETTLE — they
+	// commit (delivered, or transformed to nothing) or are dropped as
+	// permanently rejected — and never on the rewind arm: the re-read next
+	// sweep rebuilds the batch from the same bytes and the script drops the
+	// same records again, so counting at transform time counted one intended
+	// drop once per failed flush of an outage. (A record whose commit was
+	// withheld behind an open multi-line group and later rewound is
+	// re-transformed and re-counted: at-least-once's duplicate, bounded by the
+	// withheld window, not a per-outage multiplier.)
 	switch {
 	case err == nil:
 		t.commitBatch(inf)
+		countTransformDropped(transformDropped)
 	case otlpexport.IsPermanent(err):
 		// A definitive rejection (bad payload, unimplemented, over a receiver's
 		// body limit) is not survivable by retrying: rebuilding the identical
@@ -435,6 +468,7 @@ func (t *Tailer) flush(ctx context.Context) {
 		// either — journald's permanent arm, the stated model, counts only its
 		// drop. LogPermanentDropped plus the Error log carry the loss exactly.
 		t.advanceBatch(inf)
+		countTransformDropped(transformDropped) // never re-read: the script will not see them again
 	default:
 		t.failBatch(inf, err)
 	}
@@ -465,6 +499,15 @@ func (t *Tailer) flush(ctx context.Context) {
 	clear(t.flushed)
 }
 
+// countTransformDropped records the transform script's drops for a batch whose
+// records have settled (Config.Transform reports them rather than counting, so
+// that a rewound batch is not counted once per failed flush).
+func countTransformDropped(n int) {
+	if n > 0 {
+		obs.TransformDropped.WithLabelValues("logs").Add(float64(n))
+	}
+}
+
 // exportWithRetry sends one batch through the shared bounded-retry shape
 // (otlpexport.Retry: sleep-before-retry, doubling backoff, permanent
 // rejections returned immediately for the caller to drop-and-advance). This
@@ -472,7 +515,13 @@ func (t *Tailer) flush(ctx context.Context) {
 // the final failure — dead seconds on the single sweep goroutine, and of the
 // shutdown budget everything after the tailer shares. The closure costs one
 // allocation per FLUSH (amortized over up to BatchSize lines), not per line.
+//
+// The batch is marked route.Reoffer: a failed flush rewinds its files and the
+// next sweep re-sends the same records, so a router splitting it may hold the
+// default share back while a tenant route fails rather than spool a copy of it
+// per attempt (route/reoffer.go). One more allocation per flush.
 func (t *Tailer) exportWithRetry(ctx context.Context, ld plog.Logs) error {
+	ctx = route.Reoffer(ctx)
 	return otlpexport.Retry(ctx, 3, t.retryBackoff, func() error {
 		return t.cfg.Exporter.ExportLogs(ctx, ld)
 	})
@@ -506,10 +555,9 @@ func (t *Tailer) commitBatch(inf *batchInfo) {
 	// operator has to watch a counter STOP moving to learn it is over. Two
 	// field reads on the flush path (measured against
 	// TestIngestFlushAllocationBudget, which is unchanged).
-	if t.exportFailures > 0 {
-		t.log.Info("log export recovered", "failures", t.exportFailures,
-			"outage", time.Since(t.exportFailingSince).Round(time.Second))
-		t.exportFailures, t.exportFailingSince = 0, time.Time{}
+	if t.exportOutage.Failing() {
+		failures, lasted, _ := t.exportOutage.Recover(time.Now())
+		t.log.Info("log export recovered", "failures", failures, "outage", lasted)
 	}
 	t.advanceBatch(inf)
 }
@@ -549,15 +597,7 @@ func (t *Tailer) advanceBatch(inf *batchInfo) {
 			// Keep only what is still AHEAD of that segment's commit frontier,
 			// and only ids that still resolve — a retired or truncated-away
 			// segment must not be re-offered forever.
-			var committed int64
-			if seg == f.tail {
-				committed = f.committed
-			} else if sg := f.segmentByID(seg); sg != nil {
-				committed = sg.committed
-			} else {
-				continue // dead id: nothing to commit against
-			}
-			if off > committed {
+			if committed, ok := f.committedIn(seg); ok && off > committed {
 				if f.exportedHighs == nil {
 					f.exportedHighs = make(map[int]int64, 1)
 				}
@@ -581,28 +621,20 @@ func (t *Tailer) failBatch(inf *batchInfo, err error) {
 	obs.LogExportFailures.Inc()
 	// A collector outage fails EVERY flush for its whole duration — one line
 	// every couple of seconds per node, for one condition — so the repeats are
-	// throttled and the rate lives on the counter. The FIRST failure always
-	// logs (exportFailures is 0, so the transition arm runs before the
-	// throttle is consulted), which is the line that says an outage started;
-	// commitBatch logs the one that says it ended.
-	if t.exportFailures == 0 {
-		t.exportFailingSince = time.Now()
-		t.exportFailures++
-		// The transition CLAIMS the throttle's window (the result is
-		// deliberately ignored): without it the very next failed flush — two
-		// seconds later, in the same outage — would be the throttle's first
-		// consultation and would log immediately, so every outage opened with
-		// two lines saying the same thing.
-		t.exportWarn.Allow(exportWarnEvery)
+	// throttled and the rate lives on the counter. The FIRST failure of every
+	// run logs (logdedupe.Outage: it opens the run AND claims the throttle, so
+	// the next failed flush two seconds later is not a second line saying the
+	// same thing), which is the line that says an outage started; commitBatch
+	// logs the one that says it ended.
+	now := time.Now()
+	switch first, loud := t.exportOutage.Fail(now, exportWarnEvery); {
+	case first:
 		t.log.Error("exporting logs failed, rewinding", "records", inf.kept, "error", err,
 			"files", len(inf.cands))
-	} else {
-		t.exportFailures++
-		if t.exportWarn.Allow(exportWarnEvery) {
-			t.log.Error("exporting logs is still failing, rewinding", "records", inf.kept, "error", err,
-				"files", len(inf.cands), "failures", t.exportFailures,
-				"outage", time.Since(t.exportFailingSince).Round(time.Second))
-		}
+	case loud:
+		t.log.Error("exporting logs is still failing, rewinding", "records", inf.kept, "error", err,
+			"files", len(inf.cands), "failures", t.exportOutage.Failures(),
+			"outage", t.exportOutage.Lasted(now))
 	}
 	for f := range inf.cands {
 		t.rewind(f)

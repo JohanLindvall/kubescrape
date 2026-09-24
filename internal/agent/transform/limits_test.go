@@ -11,8 +11,11 @@ package transform
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -20,9 +23,13 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
@@ -31,7 +38,7 @@ import (
 func logsScript(body string) []byte {
 	var b strings.Builder
 	b.WriteString("logs: |\n  def transform(batch):\n")
-	for _, line := range strings.Split(strings.TrimRight(body, "\n"), "\n") {
+	for line := range strings.SplitSeq(strings.TrimRight(body, "\n"), "\n") {
 		b.WriteString("      " + line + "\n")
 	}
 	return []byte(b.String())
@@ -73,8 +80,13 @@ func mustContain(t *testing.T, err error, want string) {
 	if err == nil {
 		t.Fatalf("no error; want one mentioning %q", want)
 	}
-	if !strings.Contains(err.Error(), want) {
-		t.Fatalf("error %q does not mention %q", err, want)
+	if msg := err.Error(); !strings.Contains(msg, want) {
+		// Clipped: the failure this file guards against is an error text the
+		// size of an amplified render, and printing it whole buries the log.
+		if len(msg) > 1024 {
+			msg = fmt.Sprintf("%s…(%d bytes)", msg[:1024], len(msg))
+		}
+		t.Fatalf("error %q does not mention %q", msg, want)
 	}
 }
 
@@ -157,7 +169,9 @@ func TestLastGoodProgramSurvivesAHogEdit(t *testing.T) {
 // that renamed one would otherwise silently un-shadow it.
 func TestBoundedBuiltinsShadowTheUniverse(t *testing.T) {
 	pre := predeclared("logs")
-	for _, name := range append([]string{"range"}, materialisers...) {
+	// print and fail are not materialisers but render exactly like str() —
+	// into a log line and an error text — so they are shadowed the same way.
+	for _, name := range append([]string{"range", "print", "fail"}, materialisers...) {
 		if _, ok := starlark.Universe[name]; !ok {
 			t.Errorf("universe has no %q: the shadow no longer shadows anything", name)
 		}
@@ -404,16 +418,30 @@ func TestRewriteReachesEveryOperandPosition(t *testing.T) {
 
 // The measured pathology: `s = s + "0123456789abcdef"` is O(n) per step, so
 // 200,000 iterations took 1m51.8s while spending 20% of the step budget, and
-// through the real seam it held Wrapper.ExportLogs for 31.3s. Nothing about it
-// is illegal — only long — so the bound has to be the clock.
+// through the real seam it held Wrapper.ExportLogs for 31.3s — before the
+// cumulative allocation budget existed. That budget now refuses the same loop
+// on its own (within ~4,000 iterations), so this test no longer uses it: it
+// raced a real 25ms clock against the allocation budget, passed only while the
+// allocation refusal took longer than 25ms, and failed with the allocation
+// message on hardware a few times faster — the machine-dependent bet
+// TestWallClockBudgetFiresInAPureLoop's comment already rejects.
+//
+// So the clock is fake, and the body reaches the budget through the binary-op
+// guard: `n + 1` on ints goes through guardBinary, whose overtime check on
+// entry is what this pins (the sibling's `n = n` calls nothing, so it pins
+// OnMaxSteps). A `while`, because range() would fire its own check first.
 func TestWallClockBudgetFires(t *testing.T) {
 	withWallClock(t, 25*time.Millisecond)
-	start := time.Now()
-	err := runBody(t, "s = \"\"\nfor _i in range(200000):\n    s = s + \"0123456789abcdef\"\n")
-	mustContain(t, err, "over the 25ms budget")
-	if d := time.Since(start); d > 5*time.Second {
-		t.Fatalf("the script ran %s past a 25ms budget: the checkpoint is too coarse", d)
-	}
+	withFakeClock(t, time.Second)
+	mustContain(t, runBody(t, "n = 0\nwhile True:\n    n = n + 1\n"), "over the 25ms budget")
+}
+
+// ...and the concatenation loop the clock was once the only bound on is now
+// refused by the allocation budget, whatever the hardware: with a clock that
+// never advances, the only thing that can stop it is the budget.
+func TestQuadraticConcatenationIsRefusedByTheAllocationBudget(t *testing.T) {
+	withFakeClock(t, 0)
+	mustContain(t, runBody(t, "s = \"\"\nfor _i in range(200000):\n    s = s + \"0123456789abcdef\"\n"), "in one invocation")
 }
 
 // The checkpoint has to fire from inside a tight loop that allocates nothing
@@ -482,6 +510,34 @@ func TestStepBudgetStillBounds(t *testing.T) {
 func TestCumulativeAllocationBudget(t *testing.T) {
 	err := runBody(t, "s = \"x\" * (1<<20)\nfor _i in range(1000):\n    _t = s + s\n")
 	mustContain(t, err, "in one invocation")
+}
+
+// enumerate() and zip() BUILD a tuple per element — a list word, the tuple's
+// slots and a boxed slice header, ~72 bytes an element for enumerate — and
+// were charged as a plain list's 16. Retained results walked straight past the
+// cumulative budget: nine million-element enumerates allocated ~650 MiB before
+// the charge caught up, against a 128 MiB budget a plain list() loop cannot get
+// past.
+func TestMaterialisedTuplesAreChargedAtWhatTheyBuild(t *testing.T) {
+	for _, tc := range []struct{ name, call string }{
+		{"enumerate", "enumerate(range(1<<20))"},
+		{"zip", "zip(range(1<<20), range(1<<20))"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var err error
+			grew, measured := allocatedBy(func() {
+				err = runBody(t, "l = []\nfor _i in range(9):\n    l.append("+tc.call+")\n")
+			})
+			mustContain(t, err, "in one invocation")
+			if measured && grew > 200<<20 {
+				t.Fatalf("refused only after allocating %d MiB — each result must be charged what it built", grew>>20)
+			}
+		})
+	}
+	// An ordinary one still passes.
+	if got := evalToAttr(t, "for r in batch:\n    r.attributes[\"out\"] = str(len(zip([1, 2, 3], \"abc\".elems())) + len(enumerate(range(1000))))\n"); got != "1003" {
+		t.Fatalf("got %q", got)
+	}
 }
 
 // The budget is per INVOCATION, and threads are pooled: a spend (or a
@@ -618,8 +674,8 @@ func TestPrintGoesToTheThrottledScriptLog(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(old) })
 	// The 1/s gate is per SIGNAL and process-wide, so a sibling test that
 	// logged within the last second would otherwise swallow this line.
-	scriptLogGates.Delete("logs")
-	t.Cleanup(func() { scriptLogGates.Delete("logs") })
+	scriptLogGates.logs = logdedupe.Throttle{}
+	t.Cleanup(func() { scriptLogGates.logs = logdedupe.Throttle{} })
 
 	// Capture anything that reaches the raw stderr fallback.
 	r, wpipe, err := os.Pipe()
@@ -654,8 +710,8 @@ func TestPrintIsThrottledTogetherWithLog(t *testing.T) {
 	old := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
 	t.Cleanup(func() { slog.SetDefault(old) })
-	scriptLogGates.Delete("logs")
-	t.Cleanup(func() { scriptLogGates.Delete("logs") })
+	scriptLogGates.logs = logdedupe.Throttle{}
+	t.Cleanup(func() { scriptLogGates.logs = logdedupe.Throttle{} })
 
 	if err := runBody(t, "for _i in range(50):\n    print(\"p\")\n    log(\"l\")\n"); err != nil {
 		t.Fatal(err)
@@ -679,8 +735,8 @@ func TestCompileTimePrintIsAlsoRouted(t *testing.T) {
 	old := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
 	t.Cleanup(func() { slog.SetDefault(old) })
-	scriptLogGates.Delete("logs")
-	t.Cleanup(func() { scriptLogGates.Delete("logs") })
+	scriptLogGates.logs = logdedupe.Throttle{}
+	t.Cleanup(func() { scriptLogGates.logs = logdedupe.Throttle{} })
 
 	r, wpipe, err := os.Pipe()
 	if err != nil {
@@ -702,6 +758,103 @@ func TestCompileTimePrintIsAlsoRouted(t *testing.T) {
 	if !strings.Contains(logged.String(), "at-module-level") {
 		t.Fatalf("a module-level print did not reach the script log: %q", logged.String())
 	}
+}
+
+// The script log is throttled in how OFTEN it writes and — until this — not in
+// how MUCH: `log(r.body)` wrote the whole body, up to the 16 MiB ingest cap,
+// once a second per signal, into the agent's own log stream (collected, and
+// rotated by the kubelet at 10Mi). Every door a script's text leaves through —
+// log(), print(), and the error a fail() raises, which reaches the runtime
+// Warn, the hook Warn and the producer's own failure line — is clipped.
+func TestScriptTextInTheAgentLogIsClipped(t *testing.T) {
+	var logged bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	// The clip plus its mark, and slack for the handler's own quoting (a
+	// rendered list carries `"`, which the text handler escapes).
+	const limit = maxScriptLogBytes + len("…") + len(`output=""`) + 16
+	outputOf := func(t *testing.T) string {
+		t.Helper()
+		line := logged.String()
+		i := strings.Index(line, "output=")
+		if i < 0 {
+			t.Fatalf("no output attribute in %q", line)
+		}
+		return strings.TrimRight(line[i:], "\n")
+	}
+	for _, body := range []string{
+		`log("x" * (1<<20))`,
+		`log(["x" * (1<<19)])`, // a render, not a string
+		`print("x" * (1<<19), "y" * (1<<19))`,
+		`print("a", "b", sep="-" * (1<<20))`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			logged.Reset()
+			scriptLogGates.logs = logdedupe.Throttle{}
+			t.Cleanup(func() { scriptLogGates.logs = logdedupe.Throttle{} })
+			if err := runBody(t, "for r in batch:\n    "+body+"\n"); err != nil {
+				t.Fatal(err)
+			}
+			out := outputOf(t)
+			if len(out) > limit {
+				t.Fatalf("the script log line carried %d bytes of script output, over the %d-byte clip", len(out), limit)
+			}
+			if !strings.Contains(out, "…") {
+				t.Fatalf("a clipped line must say so: %q", out[:min(len(out), 64)])
+			}
+		})
+	}
+	// Short output is untouched.
+	logged.Reset()
+	scriptLogGates.logs = logdedupe.Throttle{}
+	if err := runBody(t, "for r in batch:\n    log(\"short\")\n"); err != nil {
+		t.Fatal(err)
+	}
+	if out := outputOf(t); out != "output=short" {
+		t.Fatalf("got %q", out)
+	}
+
+	t.Run("a runtime error", func(t *testing.T) {
+		logged.Reset()
+		runWarnGates.logs = logdedupe.Throttle{}
+		err := runBody(t, "for r in batch:\n    fail(\"x\" * (1<<20))\n")
+		if err == nil {
+			t.Fatal("fail() must fail the run")
+		}
+		if n := len(err.Error()); n > maxScriptLogBytes+256 {
+			t.Fatalf("the error handed to the producer is %d bytes — it lands in the producer's log and a sender's gRPC status", n)
+		}
+		if _, ok := errors.AsType[*starlark.EvalError](err); !ok {
+			t.Fatal("the clipped error must still unwrap to the *starlark.EvalError (scriptPos reads the position from it)")
+		}
+		if !strings.Contains(logged.String(), "script=logs.star:") {
+			t.Fatalf("the runtime Warn lost the script position: %q", logged.String()[:min(logged.Len(), 256)])
+		}
+		if n := logged.Len(); n > maxScriptLogBytes+1024 {
+			t.Fatalf("the runtime Warn is %d bytes", n)
+		}
+	})
+	t.Run("a hook error", func(t *testing.T) {
+		logged.Reset()
+		hookWarnGates.parse = logdedupe.Throttle{}
+		w := hookWrapper(t, "parse: |\n  def parse(line):\n      fail(line * 64)\n")
+		if _, ok := w.ParseLine(strings.Repeat("y", 1<<14)); ok {
+			t.Fatal("a failing parse hook must leave the line unparsed")
+		}
+		if n := logged.Len(); n == 0 || n > maxScriptLogBytes+1024 {
+			t.Fatalf("the hook Warn is %d bytes", n)
+		}
+	})
+	t.Run("a module-level error", func(t *testing.T) {
+		_, err := Compile([]byte("logs: |\n  fail(\"z\" * (1<<20))\n  def transform(batch): pass\n"))
+		if err == nil {
+			t.Fatal("a module-level fail() must fail the compile")
+		}
+		if n := len(err.Error()); n > maxScriptLogBytes+256 {
+			t.Fatalf("the compile error (logged by the reloader) is %d bytes", n)
+		}
+	})
 }
 
 // --- the bound has to bind BEFORE the allocation ---
@@ -813,4 +966,231 @@ func TestEmitMetricLabelsAreCharged(t *testing.T) {
 	mustContain(t, runBody(t,
 		"s = \"x\" * (1<<20)\nl = [s] * 200\nfor r in batch:\n    r.emit_metric(\"m\", 1, {\"k\": l})\n"),
 		"limit for one value")
+}
+
+// A label rendered once less than a per-value limit of the invocation budget
+// is left must be projected against what IS left before it is built. The walk
+// stops at that ceiling, so its truncated figure passes the per-value check;
+// str() and log() then refuse on the budget, and emit_metric used to render
+// first and refuse afterwards — measured at 923 MiB allocated for a label the
+// other two refused after 120.
+func TestEmitMetricLabelIsProjectedAgainstTheBudgetLeft(t *testing.T) {
+	// 120 MiB of the 128 MiB budget spent and kept alive, then a label that
+	// renders ~100 MiB.
+	const prelude = "pad = [\"x\" * (15<<20) for _i in range(8)]\nl = [\"y\" * (256<<10)] * 400\n"
+	for _, tc := range []struct{ name, call string }{
+		{"emit_metric", "for r in batch:\n    r.emit_metric(\"m\", 1, {\"k\": l})\n"},
+		{"str", "_x = str(l)\n"},
+		{"log", "log(l)\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scriptLogGates.logs = logdedupe.Throttle{} // log() must reach its projection, not the throttle
+			t.Cleanup(func() { scriptLogGates.logs = logdedupe.Throttle{} })
+			var err error
+			grew, measured := allocatedBy(func() { err = runBody(t, prelude+tc.call) })
+			mustContain(t, err, "in one invocation")
+			if measured && grew > 200<<20 {
+				t.Fatalf("refused only after allocating %d MiB — the label was rendered before the budget was asked", grew>>20)
+			}
+		})
+	}
+}
+
+// print() and fail() render their arguments exactly as str() does — print into
+// the agent's own (collected) log stream, fail into an error text that is then
+// wrapped and logged — and neither was shadowed, so `print([body] * 64)` built
+// and logged a 64 MiB line and `fail(l)` a 40 MiB error while str() of the same
+// value was refused after a megabyte. Module level matters most: Compile runs
+// it at every startup and every reload, before there is a last-good program.
+func TestPrintAndFailRendersAreProjected(t *testing.T) {
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	for _, name := range []string{"print", "fail"} {
+		for _, level := range []string{"transform()", "module level"} {
+			t.Run(name+" at "+level, func(t *testing.T) {
+				// The gate must be open, or print() suppresses the call
+				// before there is anything to project.
+				scriptLogGates.logs = logdedupe.Throttle{}
+				t.Cleanup(func() { scriptLogGates.logs = logdedupe.Throttle{} })
+				body := "s = \"x\" * (1<<20)\nl = [s] * 64\n" + name + "(\"prefix\", l)\n"
+				var err error
+				grew, measured := allocatedBy(func() {
+					if level == "module level" {
+						_, err = Compile([]byte("logs: |\n  " + strings.ReplaceAll(body, "\n", "\n  ") + "def transform(batch): pass\n"))
+					} else {
+						err = runBody(t, body)
+					}
+				})
+				mustContain(t, err, "limit for one value")
+				if measured && grew > 64<<20 {
+					t.Fatalf("refused only after allocating %d MiB — the bound must be predictive", grew>>20)
+				}
+			})
+		}
+	}
+	// The shadows change nothing a legal call sees: fail's text is the
+	// universe builtin's, byte for byte, and print still reaches the log.
+	mustContain(t, runBody(t, "fail(\"boom\", [1, \"x\"], sep=\"|\")\n"), `fail: boom|[1, "x"]`)
+	if err := runBody(t, "print(\"a\", [1], b\"z\", sep=\"-\")\n"); err != nil {
+		t.Fatalf("an ordinary print was refused: %v", err)
+	}
+}
+
+// The projection has to follow a value all the way down. It used to stop at
+// depth 4 and charge everything below a byte, so wrapping an amplified list in
+// four brackets took it past every predictive check: str() allocated ~1.5 GiB
+// before the after-the-fact charge fired, and log() of the same value was never
+// refused at all. Past maxRenderDepth it now refuses rather than guesses.
+func TestDeeplyNestedRenderIsBounded(t *testing.T) {
+	for _, call := range []string{"_x = str(x)\n", "_x = repr(x)\n", "log(x)\n", "for r in batch:\n    r.emit_metric(\"m\", 1, {\"k\": x})\n"} {
+		t.Run(call, func(t *testing.T) {
+			scriptLogGates.logs = logdedupe.Throttle{}
+			t.Cleanup(func() { scriptLogGates.logs = logdedupe.Throttle{} })
+			var err error
+			grew, measured := allocatedBy(func() {
+				err = runBody(t, "s = \"x\" * (1<<20)\nl = [s] * 100\nx = [[[[l]]]]\n"+call)
+			})
+			mustContain(t, err, "limit for one value")
+			if measured && grew > 64<<20 {
+				t.Fatalf("refused only after allocating %d MiB — the bound must be predictive", grew>>20)
+			}
+		})
+	}
+	// Past the depth ceiling the render is refused, whatever the leaves hold;
+	// below it, a deep but small value renders as usual.
+	deep := func(n int) string {
+		return fmt.Sprintf("x = 1\nfor _i in range(%d):\n    x = [x]\n", n)
+	}
+	mustContain(t, runBody(t, deep(maxRenderDepth+1)+"_x = str(x)\n"), "nests containers more than")
+	if got := evalToAttr(t, deep(maxRenderDepth-1)+"for r in batch:\n    r.attributes[\"out\"] = str(len(str(x)))\n"); got != fmt.Sprint(2*(maxRenderDepth-1)+1) {
+		t.Fatalf("a %d-deep one-element list rendered to %s bytes", maxRenderDepth-1, got)
+	}
+}
+
+// A bignum renders as its decimal digits, not as one byte: 64 references to
+// one ~1M-bit integer render ~20 MB, over the per-value limit, and used to be
+// projected at 64 bytes and rendered in full — seconds of decimal conversion
+// inside ONE interpreter step, past the wall clock that cannot interrupt it.
+func TestBignumRenderIsProjected(t *testing.T) {
+	var err error
+	grew, measured := allocatedBy(func() {
+		err = runBody(t, "a = 1 << 500\nfor _i in range(11):\n    a = a * a\n_x = str([a] * 64)\n")
+	})
+	mustContain(t, err, "limit for one value")
+	if measured && grew > 64<<20 {
+		t.Fatalf("refused only after allocating %d MiB", grew>>20)
+	}
+}
+
+// repr() quotes a string, writing a control or invalid byte as \xNN — four
+// bytes for one — so a projection charging len(s) let repr() of a 5 MiB body
+// of control bytes build 20 MiB past a 16 MiB per-value limit.
+func TestReprOfEscapedBytesIsProjectedAtItsQuotedSize(t *testing.T) {
+	mustContain(t, runBody(t, "for r in batch:\n    r.body = \"\\x01\" * (5<<20)\n    _x = repr(r.body)\n"), "limit for one value")
+	// str() of a string is the string itself, so the same body is legal there.
+	if err := runBody(t, "for r in batch:\n    r.body = \"\\x01\" * (5<<20)\n    _x = str(r.body)\n"); err != nil {
+		t.Fatalf("str() of a 5 MiB string was refused: %v", err)
+	}
+}
+
+// renderSize mirrors writeValue case for case, so it must agree with the real
+// render EXACTLY — never below it (a refusal that lets an over-limit value
+// through) and never above it (a refusal of a value that fits). The one
+// deliberate exception is a bignum, whose digit count is a lower bound.
+func TestRenderSizeIsExact(t *testing.T) {
+	cyclic := starlark.NewList(nil)
+	_ = cyclic.Append(cyclic)
+	selfDict := starlark.NewDict(1)
+	_ = selfDict.SetKey(starlark.String("me"), selfDict)
+	set := new(starlark.Set)
+	_ = set.Insert(starlark.MakeInt(1))
+	_ = set.Insert(starlark.String("é\x00"))
+	dict := starlark.NewDict(2)
+	_ = dict.SetKey(starlark.String("k\"\\"), starlark.NewList([]starlark.Value{starlark.None, starlark.True}))
+	_ = dict.SetKey(starlark.MakeInt(-7), starlark.Float(1e21))
+	inner := starlark.NewList(nil)
+	tupleCycle := starlark.Tuple{inner}
+	_ = inner.Append(tupleCycle)
+	values := []starlark.Value{
+		starlark.None, starlark.True, starlark.False,
+		starlark.MakeInt(0), starlark.MakeInt(-1), starlark.MakeInt64(math.MinInt64), starlark.MakeInt64(math.MaxInt64),
+		starlark.Float(0), starlark.Float(-1.5), starlark.Float(3), starlark.Float(1e-7), starlark.Float(math.Inf(-1)), starlark.Float(math.NaN()),
+		starlark.String(""), starlark.String("plain"), starlark.String("q\"b\\\a\b\f\n\r\t\v\x00\x1f\x7f"),
+		starlark.String("\xff\xfe invalid"), starlark.String("ü€😀"), starlark.String("\u200b\u2028\U000e0001"),
+		starlark.Bytes("\x00\xffab\"c"),
+		starlark.NewList([]starlark.Value{starlark.String("a\n"), starlark.MakeInt(12), starlark.Tuple{starlark.String("t")}}),
+		starlark.Tuple{}, starlark.Tuple{starlark.MakeInt(1)}, starlark.Tuple{starlark.MakeInt(1), starlark.None},
+		cyclic, selfDict, set, new(starlark.Set), dict, starlark.NewDict(0), inner, tupleCycle,
+		starlark.Universe["len"], &logRecord{},
+	}
+	for _, v := range values {
+		want := len(v.String())
+		if got, deep := renderSize(v, math.MaxInt64); deep || got != int64(want) {
+			t.Errorf("renderSize(%s) = %d (tooDeep=%v), the render is %d bytes", v.String(), got, deep, want)
+		}
+		strV, err := starlark.Call(new(starlark.Thread), starlark.Universe["str"], starlark.Tuple{v}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := materialisedRenderSize("str", v, math.MaxInt64); got != int64(len(strV.(starlark.String))) {
+			t.Errorf("str() projection of %s = %d, str() is %d bytes", v.String(), got, len(strV.(starlark.String)))
+		}
+	}
+	// A bignum's projection is a LOWER bound, and a tight one.
+	for _, bits := range []uint{63, 64, 65, 100, 1000, 12345, 1 << 16} {
+		for _, sign := range []int64{1, -1} {
+			for _, delta := range []int64{-1, 0, 1} {
+				x := starlark.MakeInt64(sign).Mul(starlark.MakeInt(1).Lsh(bits)).Add(starlark.MakeInt64(delta))
+				real := int64(len(x.String()))
+				if got := intRenderLen(x); got > real || got < real-1 {
+					t.Errorf("intRenderLen(±2^%d%+d) = %d, the render is %d bytes", bits, delta, got, real)
+				}
+			}
+		}
+	}
+}
+
+// A host view that is a Sequence — a metric's datapoints, a sampled trace's
+// spans — or starlark's own range renders as its String(), a constant name or
+// `range(n)`, never as its elements. A walk over "every Sequence/Indexable"
+// projected datapoints of 1000 points at 3002 bytes where the render is
+// "datapoints", minted a view per point to do it, and refused
+// `str([range(1<<20)] * 6)` as an 18 MB string when it renders to ~100 bytes.
+// Only starlark's own containers are walked; everything else is measured by
+// the String() writeValue itself calls.
+func TestHostSequencesRenderAsTheirOwnString(t *testing.T) {
+	rng, err := starlark.Call(new(starlark.Thread), starlark.Universe["range"], starlark.Tuple{starlark.MakeInt(1 << 20)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := pmetric.NewMetric()
+	pts := m.SetEmptyGauge().DataPoints()
+	for i := range 10000 {
+		pts.AppendEmpty().SetIntValue(int64(i))
+	}
+	dp := &datapoints{m: m}
+	spans := &sampleSpans{spans: make([]tailsample.Span, 1000)}
+	views := []starlark.Value{
+		rng, dp, spans,
+		&logBatch{ld: logsPayload("hello")},
+		&metricBatch{md: pmetric.NewMetrics()},
+		&traceBatch{td: ptrace.NewTraces()},
+		starlark.NewList([]starlark.Value{rng, dp, spans}),
+	}
+	for _, v := range views {
+		if got, deep := renderSize(v, math.MaxInt64); deep || got != int64(len(v.String())) {
+			t.Errorf("renderSize(%s) = %d (tooDeep=%v), the render is %d bytes", v.String(), got, deep, len(v.String()))
+		}
+	}
+	// Measuring a view must not walk it: no per-point view is minted.
+	if !testrace.Enabled {
+		if allocs := testing.AllocsPerRun(20, func() { renderSize(dp, math.MaxInt64) }); allocs != 0 {
+			t.Errorf("renderSize of a 10000-point datapoints view allocated %v times; it must not walk the points", allocs)
+		}
+	}
+	// And at the script level, the render the old walk refused.
+	if got := evalToAttr(t, "for r in batch:\n    r.attributes[\"out\"] = str(len(str([range(1<<20)] * 6)))\n"); got != fmt.Sprint(len("[]")+6*len("range(1048576)")+5*len(", ")) {
+		t.Fatalf("str([range(1<<20)] * 6) rendered to %s bytes", got)
+	}
 }

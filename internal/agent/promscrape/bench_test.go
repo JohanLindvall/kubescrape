@@ -5,11 +5,13 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"github.com/JohanLindvall/kubescrape/pkg/promparse"
 	dto "github.com/prometheus/client_model/go"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -20,7 +22,7 @@ import (
 func k8sScrapeBody(series int) string {
 	var sb strings.Builder
 	sb.WriteString("# TYPE http_requests_total counter\n")
-	for i := 0; i < series; i++ {
+	for i := range series {
 		fmt.Fprintf(&sb, "http_requests_total{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",container=\"app\",method=\"GET\",code=\"200\",path=\"/api/v1/orders\"} %d\n", i%40, i*7)
 	}
 	sb.WriteString("# TYPE process_resident_memory_bytes gauge\n")
@@ -44,11 +46,11 @@ func k8sScrapeBody(series int) string {
 func ksmSplitBody(pods int) string {
 	var sb strings.Builder
 	sb.WriteString("# TYPE kube_pod_info gauge\n")
-	for i := 0; i < pods; i++ {
+	for i := range pods {
 		fmt.Fprintf(&sb, "kube_pod_info{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",uid=\"0a1b2c3d-1111-2222-3333-4444555%05d\",node=\"node9\"} 1\n", i, i)
 	}
 	sb.WriteString("# TYPE kube_pod_status_phase gauge\n")
-	for i := 0; i < pods; i++ {
+	for i := range pods {
 		for _, phase := range []string{"Pending", "Running", "Succeeded", "Failed", "Unknown"} {
 			fmt.Fprintf(&sb, "kube_pod_status_phase{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",uid=\"0a1b2c3d-1111-2222-3333-4444555%05d\",phase=\"%s\"} 0\n", i, i, phase)
 		}
@@ -111,11 +113,11 @@ func cadvisorBenchBody(containers int) string {
 		return fmt.Sprintf("/kubepods/burstable/pod0a1b2c3d-1111-2222-3333-4444555%05d/d4f00c1e8a2b4c5d6e7f80912a3b4c5d6e7f80912a3b4c5d6e7f80912a3%05d", i, i)
 	}
 	sb.WriteString("# TYPE container_cpu_usage_seconds_total counter\n")
-	for i := 0; i < containers; i++ {
+	for i := range containers {
 		fmt.Fprintf(&sb, "container_cpu_usage_seconds_total{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",container=\"app\",id=\"%s\",image=\"img:1\"} 12.5\n", i, cg(i))
 	}
 	sb.WriteString("# TYPE container_fs_usage_bytes gauge\n")
-	for i := 0; i < containers; i++ {
+	for i := range containers {
 		for _, dev := range []string{"/dev/sda1", "/dev/sda2", "overlay"} {
 			fmt.Fprintf(&sb, "container_fs_usage_bytes{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",container=\"app\",id=\"%s\",device=\"%s\"} 4096\n", i, cg(i), dev)
 		}
@@ -171,7 +173,7 @@ func histSummBody(sets int) string {
 	var sb strings.Builder
 	bounds := []string{"0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "+Inf"}
 	sb.WriteString("# TYPE http_request_duration_seconds histogram\n")
-	for i := 0; i < sets; i++ {
+	for i := range sets {
 		for bi, le := range bounds {
 			fmt.Fprintf(&sb, "http_request_duration_seconds_bucket{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",container=\"app\",handler=\"/api/v1/orders\",method=\"GET\",le=\"%s\"} %d\n", i, le, (bi+1)*10)
 		}
@@ -179,7 +181,7 @@ func histSummBody(sets int) string {
 		fmt.Fprintf(&sb, "http_request_duration_seconds_count{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",container=\"app\",handler=\"/api/v1/orders\",method=\"GET\"} 120\n", i)
 	}
 	sb.WriteString("# TYPE rpc_latency_seconds summary\n")
-	for i := 0; i < sets; i++ {
+	for i := range sets {
 		for _, q := range []string{"0.5", "0.9", "0.99"} {
 			fmt.Fprintf(&sb, "rpc_latency_seconds{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",service=\"orders\",quantile=\"%s\"} 0.25\n", i, q)
 		}
@@ -215,6 +217,59 @@ func BenchmarkHistogramConvert(b *testing.B) {
 	}
 	if points == 0 {
 		b.Fatal("no points")
+	}
+}
+
+// discardSink is a converter sink that emits nothing, so an allocation count
+// taken through it is the CONVERTER's own and not pdata's.
+type discardSink struct{}
+
+func (discardSink) addNumber(Sample, bool)        {}
+func (discardSink) addHistogram(string, *histAcc) {}
+func (discardSink) addSummary(string, *summAcc)   {}
+
+// A converter lives for one scrape, so its freelists start empty and the
+// largest histogram/summary family of every scrape builds a FRESH accumulator
+// per label set. Growing that accumulator's labels and buckets one append at a
+// time cost ~9 allocations per series; presized from the previous label set
+// (converter.bucketHint/quantHint) it is the struct, the key, the labels and
+// the buckets — four. BenchmarkHistogramConvert reports it; this is what fails
+// a build.
+func TestHistogramConvertAllocationBudget(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	const sets = 400 // one histogram and one summary family of this many series
+	var samples []Sample
+	p := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20})
+	if _, err := p.Parse(strings.NewReader(histSummBody(sets)), func(s Sample) error {
+		s.Labels = slices.Clone(s.Labels) // only valid during the callback
+		samples = append(samples, s)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	promparse.Put(p)
+
+	convert := func() {
+		conv := newConverter(discardSink{}, nil)
+		for _, s := range samples {
+			if err := conv.add(s); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := conv.finish(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Four per fresh accumulator plus the per-converter maps and order slice
+	// growing: measured 3,276 for the 800 series here, against 7,670 with the
+	// accumulators grown one append at a time.
+	const ceiling = 5 * 2 * sets
+	if allocs := testing.AllocsPerRun(20, convert); allocs > ceiling {
+		t.Fatalf("converting %d histogram and %d summary series allocates %v times, want <= %d "+
+			"(an accumulator grown one append at a time costs ~9 per series)",
+			sets, sets, allocs, ceiling)
 	}
 }
 
@@ -286,6 +341,103 @@ func TestFilterSessionAllocationBudget(t *testing.T) {
 	}); allocs != 0 {
 		t.Fatalf("the per-sample filter path allocates %v times, want 0", allocs)
 	}
+
+	// Past maxMemoBytes the memo stops growing and mask() computes into the
+	// session's scratch words instead — the path a target naming thousands of
+	// long series lands on for the rest of its scrape, and one that must not
+	// trade the memo's allocation for a per-sample one.
+	spent := filter.session()
+	spent.budget.bytes = maxMemoBytes
+	if allocs := testing.AllocsPerRun(200, func() {
+		spent.Keep("http_request_duration_seconds_bucket", labels)
+	}); allocs != 0 {
+		t.Fatalf("the over-budget filter path allocates %v times, want 0", allocs)
+	}
+	if len(spent.offsets) != 0 {
+		t.Fatalf("the spent session still memoized %d names", len(spent.offsets))
+	}
+
+	// A filter past 128 rules takes a three-word mask; a memo hit is still a
+	// reslice of the flat backing array.
+	many := make([]FilterRule, 0, 130)
+	for i := range 129 {
+		many = append(many, FilterRule{Action: "drop", Metrics: fmt.Sprintf("never_%d_.+", i)})
+	}
+	many = append(many, FilterRule{Action: "keep", Metrics: "http_.+", Labels: map[string]string{"handler": "/api"}})
+	wide, err := newMetricFilter(many)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws := wide.session()
+	if ws.words != 3 {
+		t.Fatalf("a %d-rule filter has a %d-word mask, want 3", len(many), ws.words)
+	}
+	ws.Keep("http_request_duration_seconds_bucket", labels) // warm both memos
+	if allocs := testing.AllocsPerRun(200, func() {
+		ws.Keep("http_request_duration_seconds_bucket", labels)
+	}); allocs != 0 {
+		t.Fatalf("the multi-word filter path allocates %v times, want 0", allocs)
+	}
+}
+
+// relabelBenchChain is a kube-prometheus-shaped metricRelabelings chain: a
+// name-only drop, a keep on a low-cardinality join, and a drop keyed on the
+// high-cardinality pod label, which the per-rule last-seen memo cannot help.
+func relabelBenchChain(tb testing.TB) *relabelFilter {
+	tb.Helper()
+	var c relabelCache
+	f, _, err := c.session([]kubemeta.RelabelRule{
+		{Action: "drop", SourceLabels: []string{"__name__"}, Regex: "(go_|promhttp_|process_start_).+"},
+		{Action: "keep", SourceLabels: []string{"namespace", "container"}, Regex: "prod-.*;app"},
+		{Action: "drop", SourceLabels: []string{"pod"}, Regex: "canary-.*"},
+	})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return f
+}
+
+// The relabel chain runs once per SAMPLE for every target a monitor with
+// metricRelabelings selects. Its per-rule last-seen memo must cost nothing on
+// either path: a HIT is a memcmp against a buffer the rule already owns, and a
+// MISS re-copies into that buffer's existing capacity. Two label sets
+// alternate here so every call exercises the pod rule's miss.
+func TestRelabelChainAllocationBudget(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	f := relabelBenchChain(t)
+	a := []Label{{Name: "namespace", Value: "prod-payments"}, {Name: "pod", Value: "payments-6f7b9c001"}, {Name: "container", Value: "app"}}
+	b := []Label{{Name: "namespace", Value: "prod-payments"}, {Name: "pod", Value: "payments-6f7b9c002"}, {Name: "container", Value: "app"}}
+	f.Keep("http_requests_total", a) // warm every rule's memo buffer
+	f.Keep("http_requests_total", b)
+	if allocs := testing.AllocsPerRun(200, func() {
+		f.Keep("http_requests_total", a)
+		f.Keep("http_requests_total", b)
+	}); allocs != 0 {
+		t.Fatalf("the per-sample relabel path allocates %v times, want 0", allocs)
+	}
+}
+
+// BenchmarkRelabelKeep REPORTS the relabel chain's per-sample cost over a
+// family-ordered exposition's label sets; TestRelabelChainAllocationBudget is
+// what fails a build.
+func BenchmarkRelabelKeep(b *testing.B) {
+	f := relabelBenchChain(b)
+	sets := make([][]Label, 64)
+	for i := range sets {
+		sets[i] = []Label{
+			{Name: "namespace", Value: "prod-payments"},
+			{Name: "pod", Value: fmt.Sprintf("payments-6f7b9c%03d", i)},
+			{Name: "container", Value: "app"},
+		}
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		for _, ls := range sets {
+			f.Keep("http_requests_total", ls)
+		}
+	}
 }
 
 // protoHistBody synthesizes a delimited-protobuf exposition of one classic
@@ -295,19 +447,19 @@ func protoHistBody(tb testing.TB, metrics int) []byte {
 	tb.Helper()
 	bounds := []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, math.Inf(1)}
 	fam := &dto.MetricFamily{
-		Name: ptr("http_request_duration_seconds"), Help: ptr("Request latency."), Unit: ptr("seconds"),
+		Name: new("http_request_duration_seconds"), Help: new("Request latency."), Unit: new("seconds"),
 		Type: dto.MetricType_HISTOGRAM.Enum(),
 	}
-	for i := 0; i < metrics; i++ {
-		h := &dto.Histogram{SampleCount: ptr(uint64(120)), SampleSum: ptr(42.5)}
+	for i := range metrics {
+		h := &dto.Histogram{SampleCount: new(uint64(120)), SampleSum: new(42.5)}
 		for bi, ub := range bounds {
-			h.Bucket = append(h.Bucket, &dto.Bucket{UpperBound: ptr(ub), CumulativeCount: ptr(uint64((bi + 1) * 10))})
+			h.Bucket = append(h.Bucket, &dto.Bucket{UpperBound: new(ub), CumulativeCount: new(uint64((bi + 1) * 10))})
 		}
 		fam.Metric = append(fam.Metric, &dto.Metric{
 			Label: []*dto.LabelPair{
-				{Name: ptr("namespace"), Value: ptr("prod-payments")},
-				{Name: ptr("pod"), Value: ptr(fmt.Sprintf("payments-6f7b9c%03d", i))},
-				{Name: ptr("handler"), Value: ptr("/api/v1/orders")},
+				{Name: new("namespace"), Value: new("prod-payments")},
+				{Name: new("pod"), Value: new(fmt.Sprintf("payments-6f7b9c%03d", i))},
+				{Name: new("handler"), Value: new("/api/v1/orders")},
 			},
 			Histogram: h,
 		})
@@ -322,7 +474,7 @@ func protoBenchScrape(tb testing.TB, s *Scraper, body []byte) {
 	tb.Helper()
 	cb := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
 	ss := s.newScrapeSession(context.Background(), cb, pipelineTargets, "t", "t", nil, true)
-	if _, err := s.parseProtoAndExport(ss, bytes.NewReader(body)); err != nil {
+	if _, err := ss.parseProtoAndExport(bytes.NewReader(body)); err != nil {
 		tb.Fatal(err)
 	}
 	if cb.count() == 0 {
@@ -351,7 +503,10 @@ func BenchmarkProtoClassicHistograms(b *testing.B) {
 // fmt.Sprintf — a string plus interface boxing — once per bucket of every
 // metric. -scrape-native-histograms puts EVERY classic family of every target
 // on this front, so at the package's 100k-series target that was ~1M avoidable
-// allocations per scrape per target.
+// allocations per scrape per target. It also copied the metric's whole label
+// slice into a fresh array for every bucket row (one component slice per
+// Metric now, only its le slot rewritten): 50,617 -> 44,620 allocs per scrape
+// here, 7.23 -> 6.37 per sample, which is what the ceiling of 7 pins.
 func TestProtoClassicHistogramAllocationBudget(t *testing.T) {
 	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
@@ -364,9 +519,9 @@ func TestProtoClassicHistogramAllocationBudget(t *testing.T) {
 	})
 	const samples = protoBenchMetrics * 14 // 12 buckets + _sum + _count
 	allocs := testing.AllocsPerRun(20, func() { protoBenchScrape(t, s, body) })
-	if perSample := allocs / samples; perSample > 8 {
-		t.Fatalf("the protobuf front allocates %.2f times per sample (%v per scrape), want <= 8: "+
-			"the family-invariant names or the bucket-bound strings are being rebuilt per metric", perSample, allocs)
+	if perSample := allocs / samples; perSample > 7 {
+		t.Fatalf("the protobuf front allocates %.2f times per sample (%v per scrape), want <= 7: "+
+			"the family-invariant names, the bucket-bound strings or the component label sets are being rebuilt per row", perSample, allocs)
 	}
 }
 

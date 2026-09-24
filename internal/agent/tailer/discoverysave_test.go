@@ -224,7 +224,7 @@ func TestAFailingStoreDoesNotRetryTheDeferredDiscoveryEveryWindow(t *testing.T) 
 	}
 	t.Cleanup(func() { _ = os.Chmod(posDir, 0o755) })
 	tl.scanDir(nil, false) // discovers, saves, fails
-	if !tl.positionsFailing {
+	if !tl.positionsOutage.Failing() {
 		t.Fatal("setup: the save into a read-only directory did not fail")
 	}
 	if !tl.discoveryUnsaved {
@@ -247,7 +247,7 @@ func TestAFailingStoreDoesNotRetryTheDeferredDiscoveryEveryWindow(t *testing.T) 
 		t.Fatal(err)
 	}
 	tl.saveCheckpoints()
-	if tl.discoveryUnsaved || tl.positionsFailing {
+	if tl.discoveryUnsaved || tl.positionsOutage.Failing() {
 		t.Fatal("the successful save did not clear the deferred discovery")
 	}
 	if !storedHas(t, filepath.Join(posDir, "pos.json"), filepath.Join(dir, logName)) {

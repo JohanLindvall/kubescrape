@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -68,8 +69,8 @@ func TestEventSweepsNotStarvedByContinuousWrites(t *testing.T) {
 	defer stop()
 
 	// Continuous writes: an event at least every few milliseconds.
-	writerCtx, cancelWriter := context.WithCancel(context.Background())
-	defer cancelWriter()
+	writerCtx, cancelWriter := context.WithCancel(t.Context())
+	defer cancelWriter() // stop the writer BEFORE the stop() deferred above; t.Context() alone ends after it
 	go func() {
 		for i := 0; writerCtx.Err() == nil; i++ {
 			writeLog(t, dir, timeNowCRI()+" stdout F line"+strconv.Itoa(i))
@@ -81,31 +82,49 @@ func TestEventSweepsNotStarvedByContinuousWrites(t *testing.T) {
 }
 
 // TestIdleCloseReleasesAndReopens: a fully-caught-up idle file's fd closes
-// after IdleClose, and the file transparently reopens and resumes on new
-// activity without loss or duplication.
+// after IdleClose — through HOUSEKEEPING, the production wiring, not a direct
+// closeIdleFiles call — and the file transparently reopens and resumes on new
+// activity without loss or duplication. It is driven synchronously and asserts
+// the release itself: the earlier Run-based version only checked that the
+// second line arrived, which it does with the fd never closed, so it passed
+// with closeIdleFiles removed from housekeeping.
 func TestIdleCloseReleasesAndReopens(t *testing.T) {
 	dir := t.TempDir()
+	ctx := context.Background()
 	exp := &fakeExporter{}
-	tl := newTestTailer(dir, filepath.Join(t.TempDir(), "chk"), exp)
+	tl := driveTailer(dir, exp)
 	tl.cfg.IdleClose = 200 * time.Millisecond
-	stop := startTailer(t, tl)
-	defer stop()
 
+	tl.scanDir(tl.loadCheckpoints(), true)
 	writeLog(t, dir, timeNowCRI()+" stdout F before-idle")
-	waitFor(t, func() bool { return len(exp.get()) == 1 }, "first line exported")
+	tl.scanDir(nil, false)
+	path := filepath.Join(dir, logName)
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "before-idle") },
+		"first line exported")
+	f := tl.files[path]
 
-	// Age the file's mtime past IdleClose so housekeeping closes the fd.
+	// Age the file's mtime past IdleClose, and let one sweep observe it.
 	old := time.Now().Add(-time.Minute)
-	if err := os.Chtimes(filepath.Join(dir, logName), old, old); err != nil {
+	if err := os.Chtimes(path, old, old); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(500 * time.Millisecond) // let housekeeping close the idle fd
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+	tl.housekeeping(ctx)
+	if f.f != nil || !f.idleClosed {
+		t.Fatalf("housekeeping did not idle-close a caught-up file past IdleClose: fd held=%v idleClosed=%v",
+			f.f != nil, f.idleClosed)
+	}
 
 	writeLog(t, dir, timeNowCRI()+" stdout F after-idle")
-	waitFor(t, func() bool {
-		recs := exp.get()
-		return len(recs) == 2 && recs[1] == "after-idle"
-	}, "file reopened and resumed after idle close")
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "after-idle") },
+		"file reopened and resumed after idle close")
+	if f.f == nil || f.idleClosed {
+		t.Fatalf("activity did not reopen the idle-closed file: fd held=%v idleClosed=%v", f.f != nil, f.idleClosed)
+	}
+	if got := exp.get(); len(got) != 2 {
+		t.Fatalf("records = %v, want exactly before-idle and after-idle (no loss, no duplication)", got)
+	}
 }
 
 // drop drains a vanished file into the batch and releases it unconditionally
@@ -384,6 +403,7 @@ func TestIdleClosedRotationRecovered(t *testing.T) {
 	writeLog(t, dir, timeNowCRI()+" stdout F final-before-rotate")
 	rotateAway(t, dir, 1)
 	writeLog(t, dir, timeNowCRI()+" stdout F after-rotate")
+	rotations := obs.LogRotations.Value()
 
 	driveUntil(t, ctx, tl, func() bool {
 		got := exp.get()
@@ -391,6 +411,98 @@ func TestIdleClosedRotationRecovered(t *testing.T) {
 	}, "rotation while idle-closed recovered through the replaced arm")
 	driveUntil(t, ctx, tl, func() bool { return len(f.segments) == 0 },
 		"open-ended segment retired after recovery")
+	// Handled like every other rotation, so counted like one: the replaced arm
+	// was the one rotation door kubescrape_log_rotations_total never saw.
+	if got := obs.LogRotations.Value() - rotations; got != 1 {
+		t.Fatalf("kubescrape_log_rotations_total moved by %v across a rotation handled by ensureOpen's "+
+			"replaced arm, want 1", got)
+	}
+}
+
+// A copytruncate (or an O_TRUNC reopen) while the fd is idle-closed rewrites
+// the SAME inode: the head no longer matches, so ensureOpen sees an identity
+// change — but there is no rotated copy under that inode to replay. Recording
+// an open-ended segment for it only ever produced a certain findRotated miss:
+// kubescrape_log_prefix_lost_total plus a "rotated segment source not found"
+// warning for a file that was fully caught up when its fd was released, and no
+// rotation counted at all.
+func TestIdleClosedCopytruncateIsNotALoss(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.IdleClose = time.Millisecond
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir, timeNowCRI()+" stdout F one")
+	tl.scanDir(nil, false)
+	path := filepath.Join(dir, logName)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+	f := tl.files[path]
+	closeIdle(t, tl, ctx, path, f)
+
+	lost, rotations := obs.LogPrefixLost.Value(), obs.LogRotations.Value()
+	if err := os.Truncate(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, dir, timeNowCRI()+" stdout F fresh-after-copytruncate")
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "fresh-after-copytruncate") },
+		"the rewritten file's content delivered")
+
+	if got := obs.LogPrefixLost.Value() - lost; got != 0 {
+		t.Fatalf("kubescrape_log_prefix_lost_total moved by %v for an idle-closed, caught-up file rewritten in place", got)
+	}
+	if got := obs.LogRotations.Value() - rotations; got != 1 {
+		t.Fatalf("kubescrape_log_rotations_total moved by %v, want 1", got)
+	}
+	if len(f.segments) != 0 {
+		t.Fatalf("an in-place rewrite recorded %d segment(s) under the live inode; findRotated can never resolve one",
+			len(f.segments))
+	}
+}
+
+// The other door into the same arm keeps its loss report: through a restart
+// (or a rewind whose Seek dropped the handle) a same-inode head mismatch is
+// also what a rename rotation, a prune and INODE REUSE while the agent was
+// down look like — a genuine loss of the checkpointed remainder, which the
+// segment's findRotated miss used to count. Only the wording changes.
+func TestInPlaceRewriteFoundAtRestartIsStillCountedLost(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir, timeNowCRI()+" stdout F one")
+	tl.scanDir(nil, false)
+	path := filepath.Join(dir, logName)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+	f := tl.files[path]
+	// No fd, but NOT an idle close: the restart-before-first-open shape.
+	_ = f.f.Close()
+	f.f = nil
+
+	lost, rotations := obs.LogPrefixLost.Value(), obs.LogRotations.Value()
+	if err := os.WriteFile(path, []byte(timeNowCRI()+" stdout F rewritten\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := tl.ensureOpen(f); err != nil {
+		t.Fatal(err)
+	}
+	if got := obs.LogPrefixLost.Value() - lost; got != 1 {
+		t.Fatalf("kubescrape_log_prefix_lost_total moved by %v, want 1 through the restart door", got)
+	}
+	if got := obs.LogRotations.Value() - rotations; got != 1 {
+		t.Fatalf("kubescrape_log_rotations_total moved by %v, want 1", got)
+	}
+	if len(f.segments) != 0 || f.committed != 0 || f.readPos != 0 {
+		t.Fatalf("segments=%d committed=%d readPos=%d, want no segment and a restart at zero",
+			len(f.segments), f.committed, f.readPos)
+	}
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "rewritten") },
+		"the rewritten file's content delivered")
 }
 
 // A caught-up file whose trailing bytes never entered the pipeline must still
@@ -444,6 +556,57 @@ func TestIdleCloseWithNeverFedTrailingBytes(t *testing.T) {
 	}
 }
 
+// closeIdleFiles deliberately releases the fd of a file whose oversized-line
+// discard window is still OPEN (see TestIdleCloseWithNeverFedTrailingBytes). The
+// reopen must resume that window: restarting at `committed` — the line's start —
+// re-read the already-dropped prefix, and when the re-read met the newline
+// before crossing the cap again, the ONE physical line was counted into
+// kubescrape_log_oversized_dropped_total AND exported as a truncated record.
+func TestIdleCloseResumesAnOpenDiscardWindow(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.IdleClose = time.Millisecond
+	tl.cfg.MaxEntryBytes = 1024
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	path := filepath.Join(dir, logName)
+	oversized := obs.LogOversizedDropped.Value()
+	if err := os.WriteFile(path, []byte(strings.Repeat("y", tl.cfg.MaxEntryBytes+oversizeSlack+1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+	f := tl.files[path]
+	if !f.discarding {
+		t.Fatal("precondition: the oversized prefix was not discarded")
+	}
+	closeIdle(t, tl, ctx, path, f)
+
+	// The writer completes the line, then writes a normal one.
+	fh, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fh.WriteString("yyyy\n" + timeNowCRI() + " stdout F after-oversized\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = fh.Close()
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "after-oversized") },
+		"the line after the oversized one delivered")
+
+	for _, r := range exp.get() {
+		if strings.HasPrefix(r, "yyyy") {
+			t.Fatalf("the dropped oversized line was exported after the idle reopen (%d bytes)", len(r))
+		}
+	}
+	if got := obs.LogOversizedDropped.Value() - oversized; got != 1 {
+		t.Fatalf("kubescrape_log_oversized_dropped_total moved by %v for ONE oversized line, want 1", got)
+	}
+}
+
 // allowLine grants only whole tokens and caps the bucket at RateBurst, so an
 // effective burst below 1 could never grant: -logs-rate-limit=0.4 (burst
 // derived as 2x) wedged every file in pause mode and discarded 100% in drop
@@ -486,7 +649,7 @@ func TestIdleCloseKeepsTheFdWhileARotatedSegmentIsOwed(t *testing.T) {
 	// Fixed-WIDTH timestamps: RFC3339Nano trims trailing zeros, so a per-line
 	// byte budget derived from the first line would not hold for the rest.
 	var segLines []string
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		segLines = append(segLines, fmt.Sprintf("2026-07-05T10:00:%02dZ stdout F seg-%d", i, i))
 	}
 	writeLines(t, rot, segLines...)

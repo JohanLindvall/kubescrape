@@ -91,7 +91,7 @@ func TestKubeletSummaryIsScheduledFromItsFlag(t *testing.T) {
 	*scrapeInterval = time.Hour // one cycle, then park
 
 	var wg sync.WaitGroup
-	p := &pipelines{wg: &wg, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	p := &pipelines{wg: &wg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), kubeletBase: srv.URL}
 	ctx, cancel := context.WithCancel(context.Background())
 	sc := p.startScraper(ctx)
 	if sc == nil {

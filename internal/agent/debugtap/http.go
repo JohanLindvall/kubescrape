@@ -1,9 +1,17 @@
 package debugtap
 
 // The HTTP half: GET /debug/otlp (the stream) and GET /debug/otlp/ui (a
-// self-contained page driving it). Served on the agent's -listen port beside
-// the other /debug endpoints — same exposure profile, and the payloads it
-// shows are the ones any pod on the collector path can already see.
+// self-contained page driving it). Served on the agent's -listen port but NOT
+// with the exposure of the ungated /debug surfaces beside it (the homepage,
+// /debug/targets, /debug/transforms): the stream is, verbatim, every record
+// the process exports — on the DaemonSet every container log line on the
+// node — and that port is reachable from every pod in the cluster. So
+// cmd/kubescrape-agent's debugauth.go gates both routes (debugMux wraps them
+// in guard.protect): a local connection carrying a loopback Host, which is
+// what `kubectl port-forward` arrives as, or the -debug-token-file bearer
+// token. Nothing in this package checks it; the gate is the caller's, and
+// the bounds here (subscribers, filters, queue bytes) hold for whoever passes
+// it.
 
 import (
 	"fmt"
@@ -16,6 +24,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/config"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
+	"github.com/JohanLindvall/kubescrape/internal/peerip"
 )
 
 // The two throttles this endpoint needs, and they are SEPARATE on purpose: a
@@ -109,7 +118,7 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("refusing a /debug/otlp stream: more resource-attribute filters than this endpoint "+
 				"evaluates, and every filter is walked against every resource of every export on the "+
 				"exporting goroutine; further refusals are throttled",
-				"filters", n, "max", maxAttrFilters, "remoteAddr", r.RemoteAddr)
+				"filters", n, "max", maxAttrFilters, "peer", peerip.ForLog(r.RemoteAddr))
 		}
 		http.Error(w, fmt.Sprintf("too many attr filters (%d; max %d) — they are ANDed, so narrow with fewer",
 			n, maxAttrFilters), http.StatusBadRequest)
@@ -119,11 +128,11 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, a := range q["attr"] {
 		// The SIZE half of the ceiling above, checked BEFORE anything parses,
 		// validates or echoes the value: a glob's cost is linear in its length
-		// (path.Match is O(pattern x name), and globMatch copies a pattern
-		// containing '/' once per comparison) and it is paid per resource
-		// attribute per resource per export, on the exporting goroutine. The
-		// count bound alone left one glob bounded only by net/http's 1 MiB
-		// request line — the caller's choice, not this endpoint's.
+		// (path.Match is O(pattern x name), and a `*` glob's substring scans are
+		// linear in the pattern) and it is paid per resource attribute per
+		// resource per export, on the exporting goroutine. The count bound
+		// alone left one glob bounded only by net/http's 1 MiB request line —
+		// the caller's choice, not this endpoint's.
 		//
 		// The refusal names the LENGTH and never the glob: the caller gets its
 		// own bytes back in the 400, but a log line carrying a megabyte the
@@ -133,7 +142,7 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				slog.Warn("refusing a /debug/otlp stream: a resource-attribute filter is larger than this "+
 					"endpoint matches with, and every glob is walked against every attribute of every "+
 					"resource of every export on the exporting goroutine; further refusals are throttled",
-					"bytes", len(a), "max", maxAttrFilterBytes, "remoteAddr", r.RemoteAddr)
+					"bytes", len(a), "max", maxAttrFilterBytes, "peer", peerip.ForLog(r.RemoteAddr))
 			}
 			http.Error(w, fmt.Sprintf("attr filter is %d bytes (max %d) — each glob is matched against every "+
 				"resource attribute of every export", len(a), maxAttrFilterBytes), http.StatusBadRequest)
@@ -154,7 +163,7 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		filters = append(filters, attrFilter{Key: key, Value: val})
+		filters = append(filters, newAttrFilter(key, val))
 	}
 
 	// Subscribe BEFORE the response header goes out: a refusal must still be
@@ -174,7 +183,7 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("refusing a /debug/otlp stream: every stream slot is taken, and each one costs a render "+
 				"per export on the exporting goroutine; further refusals are throttled",
 				"streams", streams, "max", maxSubscribers,
-				"oldest", oldest.Round(time.Second), "remoteAddr", r.RemoteAddr)
+				"oldest", oldest.Round(time.Second), "peer", peerip.ForLog(r.RemoteAddr))
 		}
 		http.Error(w, fmt.Sprintf("too many debug streams (max %d); close one and retry", maxSubscribers),
 			http.StatusServiceUnavailable)
@@ -196,7 +205,7 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if announced {
 		slog.Info("a /debug/otlp stream attached; it renders every matching payload on the exporting goroutine "+
 			"until it disconnects; further attach/detach lines are throttled",
-			"signal", sigNames(sig), "filters", len(filters), "sample", sample, "remoteAddr", r.RemoteAddr)
+			"signal", sigNames(sig), "filters", len(filters), "sample", sample, "peer", peerip.ForLog(r.RemoteAddr))
 	}
 	defer func() {
 		unsubscribe()
@@ -219,6 +228,11 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "# streaming; signals=%s sample=%g%% filters=%d — one OTLP JSON payload per line\n",
 		sigNames(sig), sample, len(filters))
 	_ = rc.Flush()
+	// The drop report runs after every delivery AND on a timer: a stream whose
+	// every payload is dropped delivers nothing, and a report that waited for a
+	// delivery never came — the reader saw its banner and then silence.
+	tick := time.NewTicker(t.reportEvery)
+	defer tick.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
@@ -231,12 +245,41 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if err := rc.Flush(); err != nil {
 				return
 			}
-			if d := sub.dropped.Swap(0); d > 0 {
-				_, _ = fmt.Fprintf(w, "# %d payload(s) dropped for this stream (slow reader)\n", d)
-				_ = rc.Flush()
+			if !t.reportDrops(w, rc, sub) {
+				return
+			}
+		case <-tick.C:
+			if !t.reportDrops(w, rc, sub) {
+				return
 			}
 		}
 	}
+}
+
+// reportDrops tells the stream's reader about payloads it did not get since
+// the last report, one line per cause, since the two have opposite remedies:
+// a slow reader should read faster (or filter more), while a render over the
+// whole queue budget will never be delivered at any speed and can only be
+// narrowed away. It reports false when the connection is gone.
+func (t *Tap) reportDrops(w http.ResponseWriter, rc *http.ResponseController, sub *subscriber) bool {
+	wrote := false
+	if d := sub.dropped.Swap(0); d > 0 {
+		if _, err := fmt.Fprintf(w, "# %d payload(s) dropped for this stream (slow reader)\n", d); err != nil {
+			return false
+		}
+		wrote = true
+	}
+	if d := sub.oversized.Swap(0); d > 0 {
+		if _, err := fmt.Fprintf(w, "# %d payload(s) rendered larger than this stream's whole queue budget (%d bytes) and were skipped; narrow the attr filters or the signal\n",
+			d, t.queueBudget); err != nil {
+			return false
+		}
+		wrote = true
+	}
+	if wrote {
+		return rc.Flush() == nil
+	}
+	return true
 }
 
 func sigNames(s signal) string {
@@ -254,7 +297,9 @@ func sigNames(s signal) string {
 }
 
 // ServeUI serves the built-in page. Self-contained (inline CSS/JS, no
-// external assets): the port it lives on is cluster-internal.
+// external assets): it is usually reached through a port-forward from a
+// machine that may have no route out, and nothing third-party belongs in a
+// page reading the node's telemetry.
 func (t *Tap) ServeUI(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(uiHTML))
@@ -285,7 +330,7 @@ on-demand counterpart of a collector debug exporter. Raw endpoint:
   <label><input type="checkbox" id="sig-metrics" checked> metrics</label>
   <label><input type="checkbox" id="sig-traces" checked> traces</label>
 </fieldset>
-<fieldset><legend>Resource attribute filters (key=value, one per line; * and ? are wildcards on both halves; ANDed)</legend>
+<fieldset><legend>Resource attribute filters (key=value, one per line; * and ? are wildcards on both halves; ANDed; only scalar values match — a map, slice or bytes attribute never does)</legend>
   <textarea id="attrs" rows="3" placeholder="k8s.namespace.name=team-*&#10;service.name=checkout"></textarea>
 </fieldset>
 <fieldset><legend>Sample</legend>

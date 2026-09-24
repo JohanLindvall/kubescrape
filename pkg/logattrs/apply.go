@@ -1,6 +1,7 @@
 package logattrs
 
 import (
+	"math"
 	"strconv"
 	"strings"
 
@@ -17,8 +18,8 @@ func Put(m pcommon.Map, attrs []Attr) {
 		case bool:
 			m.PutBool(a.Key, v)
 		case float64:
-			if v == float64(int64(v)) {
-				m.PutInt(a.Key, int64(v))
+			if i, ok := storedAsInt(v); ok {
+				m.PutInt(a.Key, i)
 			} else {
 				m.PutDouble(a.Key, v)
 			}
@@ -51,13 +52,14 @@ func Key(attrs []Attr) string {
 			b.WriteString(strconv.FormatBool(v))
 		case float64:
 			// A whole float64 keys as the int it will be STORED as (Put maps it
-			// to PutInt): keying it 'f' while storing it int meant {"shard":2}
+			// to PutInt inside ±2^53, storedAsInt; past that both key and store
+			// it as a double): keying it 'f' while storing it int meant {"shard":2}
 			// and {"shard":2.0} grouped as two ResourceLogs whose exported
 			// resources were byte-identical — split, never merged, but a
 			// duplicate resource per payload for an emitter mixing spellings.
-			if v == float64(int64(v)) {
+			if i, ok := storedAsInt(v); ok {
 				b.WriteByte('i')
-				b.WriteString(strconv.FormatInt(int64(v), 10))
+				b.WriteString(strconv.FormatInt(i, 10))
 				break
 			}
 			b.WriteByte('f')
@@ -72,4 +74,21 @@ func Key(attrs []Attr) string {
 		b.WriteByte('\x00')
 	}
 	return b.String()
+}
+
+// storedAsInt reports whether Put stores the float v as an INT, and which: a
+// whole value inside ±2^53, where every integer is exact and the decimal the
+// int renders is the one FloatString renders for the double — so the label
+// path (internal/logline's RawScalarString, logchain's attrString, both
+// FloatString) and the stored attribute read the same text. Past 2^53 a whole
+// float is only the nearest representable value: stored as an int it read
+// "70000000000001728" where the other two paths said "70000000000001730" for
+// the same `7.0000000000001728e16` field, so there it stays a double. (It also
+// used to test v == float64(int64(v)), whose conversion is implementation-
+// defined past int64's range.)
+func storedAsInt(v float64) (int64, bool) {
+	if v != math.Trunc(v) || math.Abs(v) >= 1<<53 {
+		return 0, false
+	}
+	return int64(v), true
 }

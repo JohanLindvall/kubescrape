@@ -9,6 +9,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"os"
 	"strings"
 
@@ -52,6 +54,55 @@ func selfResolve(meta *metaclient.Client) func(context.Context) (*kubemeta.Pod, 
 		obs.SelfMetadataLookups.WithLabelValues(obs.SelfLookupByName).Inc()
 		return byName, nil
 	}
+}
+
+// startSelfPod returns the pod source the self-attribute stamp (selfmeta.Wrap)
+// reads, re-read on -self-attributes-refresh so a relabelled pod or namespace
+// reaches the metrics it stamps. Three cases:
+//
+//   - nil when nothing is stamped at all: -self-attributes=false, or nothing
+//     self-describing is exported (an agent that generates no such metrics has
+//     no reason to poll the service about itself).
+//   - a source that is ALWAYS nil when the lookup is off
+//     (-self-attributes-refresh=0). The lookup is what 0 disables — not the
+//     stamp. selfmeta.Wrap returns the sink unwrapped for a nil SOURCE, so
+//     leaving it nil here used to drop the `self` pipeline's static and
+//     template attributes (a cluster name, typically) from every self-metric
+//     and span-metric export, which neither the flag nor its docs said; a nil
+//     POD is the unresolved case the build already handles, exactly as the
+//     node pipelines keep their static attributes with -node-metadata-refresh=0.
+//   - the polled lookup otherwise, with kubescrape_self_metadata_resolved
+//     registered — exactly when the lookup RUNS, so a published 0 always means
+//     unresolved, never "off".
+func startSelfPod(ctx context.Context, rt http.RoundTripper, log *slog.Logger) func() *kubemeta.Pod {
+	if !*selfAttrsOn || !selfDescribing() {
+		return nil
+	}
+	if *selfAttrsRefresh <= 0 {
+		return func() *kubemeta.Pod { return nil }
+	}
+	// Its OWN client, deliberately without the Observe hook. This lookup
+	// retries on the refresh period forever when it cannot resolve — a
+	// hostNetwork pod, a NAT hop, an address family status.podIP does not
+	// carry — and errors are never cached, so through the shared client it
+	// added a permanent per-node not_found floor to
+	// kubescrape_metadata_requests_total, burying the container-attribution
+	// failures the alert on that metric exists to catch. Its outcomes are
+	// counted by kubescrape_self_metadata_lookups_total instead, which is
+	// what that counter was added for.
+	//
+	// Its own CLIENT, not its own transport: rt is the pool the shared client
+	// uses (nil takes a fresh one, which is what a test wants), so this lookup
+	// rides the keep-alive connection that is already open rather than holding
+	// a second one on the metadata service per agent.
+	selfMeta := metaclient.New(metaclient.Config{
+		Base:      *metadataURL,
+		Timeout:   metaTimeout(),
+		Transport: rt,
+	})
+	pod := selfmeta.StartPod(ctx, selfResolve(selfMeta), *selfAttrsRefresh, log)
+	obs.RegisterSelfMetadata(func() bool { return pod() != nil })
+	return pod
 }
 
 // selfInstanceName is the pod name agentSelfResource uses as a singleton's /

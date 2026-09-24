@@ -90,8 +90,9 @@
 //     under-charges the budget. A trace decided twice (late spans, a
 //     re-assembly, a restart) would charge twice, which is what Trace.Charged
 //     exists to prevent — an assembler that knows it has decided this trace
-//     before sets it, and the second decision checks the budget instead of
-//     spending it.
+//     before sets it to the buckets that decision SPENT (Decision.Charged), and
+//     the second decision checks those instead of spending them again, while
+//     still charging any the first one did not pay.
 //   - probabilistic and alwaysSample are the two that do not care: they are a
 //     function of the trace id alone.
 //
@@ -105,7 +106,9 @@
 //
 // Decide is safe for concurrent use — buckets and caches are mutex-guarded,
 // everything else is immutable after New — and is allocation-free for every
-// policy type (see bench_test.go).
+// BUILT-IN policy type (TestDecideAllocationBudget asserts each one, and the
+// benchmarks in bench_test.go report them). A `script` policy costs whatever
+// its injected decide(trace) body costs, which this package cannot bound.
 //
 // # No metrics here
 //
@@ -122,6 +125,7 @@ package tailsample
 import (
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -426,7 +430,11 @@ type Trace struct {
 	// TraceID drives the probabilistic policy and must be set (the assembler
 	// keys by it anyway). A zero id is not rejected but hashes like any other
 	// value, so EVERY zero-id trace decides identically — visibly all-or-
-	// nothing rather than silently re-rolled per trace.
+	// nothing rather than silently re-rolled per trace. That is the ENGINE's
+	// answer; the buffer does not key by the zero id at all (agent/tailbuffer
+	// judges each push's id-less spans on arrival, as a trace of their own, and
+	// never caches the verdict), so spans from unrelated senders are never
+	// merged into one pseudo-trace or made to follow each other's verdict.
 	TraceID pcommon.TraceID
 	// Spans may be empty: a trace with no spans abstains from every span-based
 	// policy and can still be sampled by probabilistic or alwaysSample.
@@ -466,13 +474,26 @@ type Trace struct {
 // no realistic policy list reaches. The zero mask means "spent nothing".
 type ChargedMask uint64
 
+// NoPolicyLabel is the metric label value an assembler renders for a Decision
+// whose Policy is "" — the unattributed default drop, which is a real outcome
+// (it is what a policy list that matches nothing looks like) and so gets a
+// series like any named policy. An empty label value would be
+// indistinguishable, in Prometheus, from the series not carrying the label.
+//
+// It lives HERE rather than beside the metric (agent/tailbuffer) because it
+// is also a RESERVED policy name: compilePolicies refuses a policy called
+// this, which would otherwise share those counters and conflate its decisions
+// with every no-opinion drop. One constant keeps the refusal and the label
+// from drifting apart.
+const NoPolicyLabel = "none"
+
 // Decision is the verdict plus its author.
 type Decision struct {
 	// Sampled is the verdict: keep the trace.
 	Sampled bool
 	// Policy names the policy that decided — the one that matched, or the
 	// inverted one that vetoed. Empty when no policy had an opinion (the
-	// default drop).
+	// default drop), which a metric renders as NoPolicyLabel.
 	//
 	// This is meant to be a metric label ({policy, sampled}), which is why it
 	// is a config-supplied name and never anything derived from a span: its
@@ -579,12 +600,24 @@ func (e *Evaluator) Names() []string {
 // traceDuration is earliest start to latest end across the spans PRESENT, and
 // the second return reports whether any span had a usable start at all.
 //
-// Spans with no start timestamp cannot bound an interval and are skipped; a
-// span whose end precedes its start (unfinished, or a clock that stepped) is
-// treated as instantaneous rather than dragging the interval backwards. Both
-// are one-line decisions with the same justification: a malformed span must
-// never make a trace look SLOWER than it was, because that is the direction
-// that costs money.
+// Three shapes of malformed span are recognisable on their own, and each is
+// handled so it cannot make the trace look SLOWER than it was, because that is
+// the direction that costs money:
+//
+//   - no start timestamp: it cannot bound an interval, so the span is skipped;
+//   - an end before its start (unfinished, or a clock that stepped): treated as
+//     instantaneous rather than dragging the interval backwards;
+//   - a span lasting longer than a time.Duration can hold (~292 years — a
+//     garbage end timestamp): skipped like a missing start. It used to be
+//     measured, and the uint64 difference converted to a NEGATIVE Duration, so
+//     one such span beside a genuinely slow trace made the whole trace fail
+//     every latency window — threshold 0 included, which promises that every
+//     trace with a usable timestamp qualifies.
+//
+// What cannot be recognised is a nonzero start that is merely WRONG (start=1
+// beside a real one): it is indistinguishable from a valid timestamp and
+// widens the interval like one. The final difference is saturated rather than
+// allowed to wrap, so even that case reads as very slow and never as negative.
 func traceDuration(t Trace) (time.Duration, bool) {
 	var minStart, maxEnd pcommon.Timestamp
 	found := false
@@ -594,9 +627,9 @@ func traceDuration(t Trace) (time.Duration, bool) {
 		if start == 0 {
 			continue
 		}
-		end := sp.EndTimestamp()
-		if end < start {
-			end = start
+		end := max(sp.EndTimestamp(), start)
+		if uint64(end-start) > math.MaxInt64 {
+			continue
 		}
 		if !found || start < minStart {
 			minStart = start
@@ -609,22 +642,65 @@ func traceDuration(t Trace) (time.Duration, bool) {
 	if !found {
 		return 0, false
 	}
-	return time.Duration(maxEnd - minStart), true
+	if d := uint64(maxEnd - minStart); d <= math.MaxInt64 {
+		return time.Duration(d), true
+	}
+	return time.Duration(math.MaxInt64), true
 }
 
-// lookup resolves key for one span: its own attributes first, its resource's
-// second. See StringAttributeConfig.Key for why that order.
-func lookup(s Span, key string) (pcommon.Value, bool) {
-	if v, ok := s.Span.Attributes().Get(key); ok {
-		return v, true
+// valueMatcher is the per-value test of the three attribute policies
+// (stringAttribute, numericAttribute, booleanAttribute), which differ in
+// nothing else.
+type valueMatcher interface {
+	matchValue(v pcommon.Value) bool
+}
+
+// anySpanMatches reports whether key resolves, on any span, to a value m
+// accepts. The key resolves per span: its own attributes first, its resource's
+// second (see StringAttributeConfig.Key for why that order) — so a span that
+// carries the key decides on its OWN value, and its resource's is not consulted
+// for it even when the span's value does not match.
+//
+// A resource is evaluated once per distinct HANDLE rather than once per span:
+// the assembler hands every span of a group the same resource map
+// (agent/tailbuffer builds one Span per span over one attributes handle per
+// ResourceSpans), and a resource-keyed policy that matches nothing would
+// otherwise re-scan the same resource attributes linearly for every span of
+// the group — ~3x the whole evaluation, under the buffer's mutex. Only a
+// NON-matching resource needs remembering (a match returns at once), and equal
+// handles are the same underlying map, so reusing the answer is exact.
+func anySpanMatches(t Trace, key string, m valueMatcher) bool {
+	var noMatch pcommon.Map // the last resource evaluated, which did not match
+	have := false
+	for i := range t.Spans {
+		s := &t.Spans[i]
+		if v, ok := s.Span.Attributes().Get(key); ok {
+			if m.matchValue(v) {
+				return true
+			}
+			continue
+		}
+		if have && s.Resource == noMatch {
+			continue
+		}
+		if resourceMatches(s.Resource, key, m) {
+			return true
+		}
+		noMatch, have = s.Resource, true
 	}
-	if s.Resource == (pcommon.Map{}) {
+	return false
+}
+
+// resourceMatches is anySpanMatches' resource half for one resource map.
+func resourceMatches(res pcommon.Map, key string, m valueMatcher) bool {
+	if res == (pcommon.Map{}) {
 		// Zero-value Map: pdata says a zero-initialised instance is not valid
 		// for use and panics on access. An assembler with no resource for a
 		// span should lose attribute matching, not the process.
-		return pcommon.Value{}, false
+		return false
 	}
-	return s.Resource.Get(key)
+	v, ok := res.Get(key)
+	return ok && m.matchValue(v)
 }
 
 // errPolicy formats a config error that names the offending policy, so a

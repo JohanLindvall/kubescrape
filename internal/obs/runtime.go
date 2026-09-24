@@ -36,21 +36,24 @@ func RuntimeHandler(internal bool) http.Handler {
 	reg.MustRegister(collectors.NewGoCollector())
 	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	if internal {
-		reg.MustRegister(registryCollector{})
+		reg.MustRegister(registryCollector{reg: Registry})
 	}
 	return promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 }
 
-// registryCollector bridges the OTLP-push Registry onto a Prometheus scrape as
+// registryCollector bridges an OTLP-push Registry onto a Prometheus scrape as
 // const metrics, via metrics.Registry.Dump (point-in-time, non-mutating). An
 // unchecked collector: the label sets are data-driven, so there is nothing
-// useful to Describe.
-type registryCollector struct{}
+// useful to Describe. reg is the registry it serves — always the process's
+// Registry in production; a field rather than the global so a test can drive
+// the refusal arm on a private registry instead of leaving a deliberately
+// broken series registered on the one every test in this package shares.
+type registryCollector struct{ reg *metrics.Registry }
 
 func (registryCollector) Describe(chan<- *prometheus.Desc) {}
 
-func (registryCollector) Collect(ch chan<- prometheus.Metric) {
-	for _, s := range Registry.Dump() {
+func (c registryCollector) Collect(ch chan<- prometheus.Metric) {
+	for _, s := range c.reg.Dump() {
 		for _, p := range s.Points {
 			names := make([]string, 0, len(p.Labels))
 			values := make([]string, 0, len(p.Labels))
@@ -88,13 +91,18 @@ func (registryCollector) Collect(ch chan<- prometheus.Metric) {
 				// metrics.Registry already counts one layer down, on the same
 				// counter (kubescrape_self_metrics_points_skipped_total).
 				//
-				// Nothing here can fail today: NewDesc refuses only an invalid
-				// metric or label NAME, and NewConstMetric/NewConstHistogram
-				// only a label-count mismatch, and every self-metric name and
-				// label name is code-defined kubescrape_* (only label VALUES
-				// are data-driven, and those cannot make these calls fail). The
-				// guard exists so that if one ever does, it says so.
-				Registry.NoteSkippedPoint(s.Name, err)
+				// What can refuse: NewDesc an invalid metric or label NAME
+				// (every one here is code-defined kubescrape_*, so that is a
+				// bug); NewConstMetric/NewConstHistogram a label-count
+				// mismatch (also a bug) AND a label VALUE that is not valid
+				// UTF-8. The last is reachable: most values are code-defined
+				// too, but some are operator-supplied strings — a readiness
+				// gate named after a flag value, and argv is not guaranteed
+				// to be UTF-8 — and nothing below this bridge validates one
+				// (metrics.truncLabelCut even keeps an already-invalid value's
+				// bytes rather than dropping the label). Either way the point
+				// is counted and named rather than silently absent.
+				c.reg.NoteSkippedPoint(s.Name, err)
 				continue
 			}
 			ch <- m
@@ -129,24 +137,38 @@ func ServeMetrics(addr string, internal bool, log *slog.Logger) (func(), error) 
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	// Bind SYNCHRONOUSLY so a failure reaches the caller. It used to be logged
-	// from inside the goroutine and dropped: with -self-metrics-interval=0 —
-	// the documented way to choose the scrape modality over the OTLP push —
-	// this port is the ONLY delivery path for every kubescrape_* metric, and
-	// the chart's prometheus.io annotations keep pointing at a port that never
-	// opened. A dead ingest listener is fatal for exactly this reason.
-	ln, err := net.Listen("tcp", addr)
+	return serve(srv, "metrics", "/metrics", log)
+}
+
+// serve binds srv.Addr and serves srv on it in the background, returning its
+// stopper. The endpoint's name ("metrics", "pprof") and path only label the
+// error and the lines.
+//
+// The bind is SYNCHRONOUS so a failure reaches the caller. It used to be logged
+// from inside the goroutine and dropped: with -self-metrics-interval=0 — the
+// documented way to choose the scrape modality over the OTLP push — the metrics
+// port is the ONLY delivery path for every kubescrape_* metric, and the chart's
+// prometheus.io annotations keep pointing at a port that never opened. A dead
+// ingest listener is fatal for exactly this reason.
+func serve(srv *http.Server, name, path string, log *slog.Logger) (func(), error) {
+	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
-		return func() {}, fmt.Errorf("metrics endpoint %s: %w", addr, err)
+		return func() {}, fmt.Errorf("%s endpoint %s: %w", name, srv.Addr, err)
 	}
 	go func() {
-		log.Info("metrics endpoint started", "addr", addr, "path", "/metrics")
+		log.Info(name+" endpoint started", "addr", srv.Addr, "path", path)
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("metrics endpoint failed", "addr", addr, "error", err)
+			log.Error(name+" endpoint failed", "addr", srv.Addr, "error", err)
 		}
 	}()
 	return stopper(srv), nil
 }
+
+// ListenerShutdownTimeout bounds each ServeMetrics/ServePprof stopper's
+// Shutdown. Exported because both binaries defer those stoppers AFTER their own
+// shutdown sequence, so it is part of the termination-grace budget they are
+// tested against.
+const ListenerShutdownTimeout = 5 * time.Second
 
 // stopper returns an idempotent shutdown func for srv.
 //
@@ -164,14 +186,11 @@ func ServeMetrics(addr string, internal bool, log *slog.Logger) (func(), error) 
 // is what actually keeps the listener from leaking. The doc comments say that
 // now instead of promising ctx.
 func stopper(srv *http.Server) func() {
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = srv.Shutdown(sctx)
-		})
-	}
+	return sync.OnceFunc(func() {
+		sctx, cancel := context.WithTimeout(context.Background(), ListenerShutdownTimeout)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
+	})
 }
 
 // ServePprof starts a dedicated HTTP listener serving net/http/pprof under
@@ -183,8 +202,8 @@ func stopper(srv *http.Server) func() {
 // the port that carries them is the one you firewall, bind to localhost, or
 // leave unset. Empty addr disables it.
 //
-// The bind is synchronous and its failure returned, like ServeMetrics. The
-// consequence is milder here — this listener is opt-in, and an unset flag
+// The bind is synchronous and its failure returned, like ServeMetrics (serve).
+// The consequence is milder here — this listener is opt-in, and an unset flag
 // produces no log line at all while a bind failure produces exactly one Error,
 // so the two states were already distinguishable — but a caller that asked for
 // a port and did not get one should not have to read the log to find out.
@@ -198,13 +217,11 @@ func ServePprof(addr string, log *slog.Logger) (func(), error) {
 	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
-	// ReadHeaderTimeout only: no whole-request Read/WriteTimeout, because
-	// /debug/pprof/profile legitimately streams for its full ?seconds=
-	// duration and either bound would cut a long profile off mid-body.
 	// No WriteTimeout here: /debug/pprof/profile?seconds=N streams for as long
 	// as it was asked to, and a write deadline would cut a 30-second CPU
 	// profile short. The read side and idle keep-alives are bounded as on the
-	// metrics port.
+	// metrics port — ReadTimeout covers reading the REQUEST, which a profile
+	// GET finishes at once, so it neither cancels nor shortens a long profile.
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -212,15 +229,5 @@ func ServePprof(addr string, log *slog.Logger) (func(), error) {
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return func() {}, fmt.Errorf("pprof endpoint %s: %w", addr, err)
-	}
-	go func() {
-		log.Info("pprof endpoint started", "addr", addr, "path", "/debug/pprof/")
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("pprof endpoint failed", "addr", addr, "error", err)
-		}
-	}()
-	return stopper(srv), nil
+	return serve(srv, "pprof", "/debug/pprof/", log)
 }

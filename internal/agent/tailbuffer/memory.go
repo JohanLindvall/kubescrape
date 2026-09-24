@@ -80,7 +80,7 @@ var (
 // source is named in every message, because a warning sized against 64 GiB of
 // host RAM means something different from one sized against a 1 GiB limit.
 //
-// The cgroup half is internal/cli's cgroupMemoryLimit, not a second reader
+// The cgroup half is internal/cli's CgroupMemoryLimit, not a second reader
 // here, and that is the whole point of the delegation: the limit this file
 // sizes maxSpans against and the limit SetMemoryLimit hands the Go runtime
 // MUST be the same number, and they were not. This file read the mount ROOT

@@ -12,7 +12,10 @@ package azurediag
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -102,6 +105,61 @@ func TestResolveWiresCredentialInvalidationOnlyWhereACacheExists(t *testing.T) {
 	}
 	// nil is not a trap for the caller.
 	cs.invalidateCredentials()
+}
+
+// Resolve must wire Invalidate to the SAME token cache its Mechanism serves
+// from. A non-nil hook is not enough: one bound to a second source would drop
+// a cache nothing reads, and the rebuild would re-present the rejected token
+// for the rest of its life. Driven end to end through the workload-identity
+// env the AKS webhook sets, against a token endpoint that counts fetches.
+func TestResolvedInvalidateDropsTheTokenTheMechanismServes(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		fetches int
+	)
+	entra := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		fetches++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"tok","expires_in":3600}`)
+	}))
+	defer entra.Close()
+	tokenFile := filepath.Join(t.TempDir(), "federated-token")
+	if err := os.WriteFile(tokenFile, []byte("assertion"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AZURE_FEDERATED_TOKEN_FILE", tokenFile)
+	t.Setenv("AZURE_TENANT_ID", "tenant")
+	t.Setenv("AZURE_CLIENT_ID", "client")
+	t.Setenv("AZURE_AUTHORITY_HOST", entra.URL)
+
+	k := KafkaConfig{Namespace: "myns.servicebus.windows.net"}
+	if err := k.Resolve(slog.New(slog.DiscardHandler)); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	authenticate := func() {
+		t.Helper()
+		if _, _, err := k.Mechanism.Authenticate(ctx, k.Brokers[0]); err != nil {
+			t.Fatalf("authenticating: %v", err)
+		}
+	}
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return fetches
+	}
+	authenticate()
+	authenticate()
+	if n := count(); n != 1 {
+		t.Fatalf("token fetches after two sessions = %d, want 1 (cached)", n)
+	}
+	k.invalidateCredentials()
+	authenticate()
+	if n := count(); n != 2 {
+		t.Fatalf("token fetches after Invalidate = %d, want 2: the hook dropped a cache the mechanism does not read", n)
+	}
 }
 
 func TestInvalidateForcesAFreshTokenAndClearsTheBackoff(t *testing.T) {
@@ -224,7 +282,13 @@ func TestTokenBackoffNeverOutlivesTheTokenItProtects(t *testing.T) {
 }
 
 // The failure lines are about a STATE — the endpoint is down — noticed once per
-// SASL session for the length of the outage.
+// SASL session for the length of the outage: one line per tokenWarnEvery, not
+// one per failed fetch, and — the half this used to leave unpinned — AGAIN once
+// that interval has passed, or a long outage says nothing after its first
+// minute. The throttle reads the token source's own injected clock
+// (logdedupe.Throttle.AllowAt); it read the wall clock, so stepping this clock
+// through a ten-minute outage still produced exactly one line and the test
+// expecting one passed whatever the cadence was.
 func TestTokenFailureWarningsAreThrottled(t *testing.T) {
 	log, dump := capturedLog()
 	now := time.Unix(1000, 0)
@@ -237,17 +301,71 @@ func TestTokenFailureWarningsAreThrottled(t *testing.T) {
 			return "", 0, errors.New("imds: connection refused")
 		},
 	}
-	for range 10 {
+	fail := func() {
+		t.Helper()
 		if _, err := ts.get(context.Background()); err == nil {
 			t.Fatal("want an error")
 		}
-		now = now.Add(2 * tokenRetryBackoff) // past the negative cache every time
 	}
-	if calls != 10 {
-		t.Fatalf("fetches = %d, want one per elapsed back-off window", calls)
+	warns := func() int { return strings.Count(dump(), "level=WARN") }
+
+	// Inside one tokenWarnEvery: two fetches (the back-off is shorter), one line.
+	fail()
+	now = now.Add(tokenRetryBackoff)
+	fail()
+	if calls != 2 || warns() != 1 {
+		t.Fatalf("fetches = %d, warnings = %d inside one warn interval, want 2 and 1:\n%s", calls, warns(), dump())
 	}
-	if n := strings.Count(dump(), "level=WARN"); n != 1 {
-		t.Errorf("want one throttled warning for the outage, got %d:\n%s", n, dump())
+	// The interval passes: the outage is restated.
+	now = now.Add(tokenWarnEvery - tokenRetryBackoff)
+	fail()
+	if warns() != 2 {
+		t.Fatalf("warnings = %d once tokenWarnEvery elapsed, want 2 — a long outage must keep saying so:\n%s", warns(), dump())
+	}
+	now = now.Add(tokenRetryBackoff)
+	fail()
+	if warns() != 2 {
+		t.Fatalf("warnings = %d inside the second interval, want still 2", warns())
+	}
+}
+
+// The stale-serve line — the token endpoint is failing but the last good token
+// still works — has its own throttle and the same cadence.
+func TestTokenStaleServeWarningsAreThrottled(t *testing.T) {
+	log, dump := capturedLog()
+	now := time.Unix(1000, 0)
+	calls := 0
+	ts := &tokenSource{
+		log: log, what: "imds",
+		now: func() time.Time { return now },
+		fetch: func(context.Context) (string, time.Duration, error) {
+			calls++
+			if calls == 1 {
+				return "tok", time.Hour, nil
+			}
+			return "", 0, errors.New("imds: connection refused")
+		},
+	}
+	serveStale := func() {
+		t.Helper()
+		if tok, err := ts.get(context.Background()); err != nil || tok != "tok" {
+			t.Fatalf("want the stale token served, got %q, %v", tok, err)
+		}
+	}
+	warns := func() int { return strings.Count(dump(), "level=WARN") }
+
+	serveStale()                                           // the first acquisition
+	now = now.Add(time.Hour - refreshMargin + time.Second) // inside the refresh margin
+	serveStale()
+	now = now.Add(tokenRetryBackoff)
+	serveStale()
+	if calls != 3 || warns() != 1 {
+		t.Fatalf("fetches = %d, warnings = %d inside one warn interval, want 3 and 1:\n%s", calls, warns(), dump())
+	}
+	now = now.Add(tokenWarnEvery - tokenRetryBackoff)
+	serveStale()
+	if warns() != 2 {
+		t.Fatalf("warnings = %d once tokenWarnEvery elapsed, want 2:\n%s", warns(), dump())
 	}
 }
 
@@ -282,5 +400,64 @@ func TestTokenRecoveryIsReported(t *testing.T) {
 	}
 	if !strings.Contains(dump(), "recovered") {
 		t.Errorf("no recovery line after the token endpoint came back:\n%s", dump())
+	}
+}
+
+// The failure that OPENS an outage always says so, on both lines, however soon
+// after the previous outage's last line it lands. The two throttles alone
+// fired once per tokenWarnEvery, so an outage opening inside that interval —
+// seconds after a "recovered" line — was silent, and the log read as an
+// endpoint that got better and stayed better.
+func TestASecondTokenOutageWarnsAtOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// ttl is what the successful fetches grant: inside the refresh margin
+		// but unexpired a moment later puts the second failure on the
+		// stale-serve line, already expired puts it on the no-token line.
+		ttl, step time.Duration
+		line      string
+	}{
+		{"stale", refreshMargin + 10*time.Second, 20 * time.Second, "serving the last good token"},
+		{"no token", time.Second, 2 * time.Second, "the consumer cannot authenticate"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log, dump := capturedLog()
+			now := time.Unix(1000, 0)
+			calls := 0
+			ts := &tokenSource{
+				log: log, what: "imds",
+				now: func() time.Time { return now },
+				fetch: func(context.Context) (string, time.Duration, error) {
+					calls++
+					if calls%2 == 1 {
+						return "tok", tc.ttl, nil
+					}
+					return "", 0, errors.New("imds: connection refused")
+				},
+			}
+			get := func() { _, _ = ts.get(context.Background()) }
+			lines := func() int { return strings.Count(dump(), tc.line) }
+
+			get() // 1: acquired
+			now = now.Add(tc.step)
+			get() // 2: the first outage opens
+			if lines() != 1 {
+				t.Fatalf("first outage logged %d %q lines, want 1:\n%s", lines(), tc.line, dump())
+			}
+			now = now.Add(tokenRetryBackoff)
+			get() // 3: recovered
+			if !strings.Contains(dump(), "recovered") {
+				t.Fatalf("setup: no recovery line:\n%s", dump())
+			}
+			now = now.Add(tc.step)
+			get() // 4: a second outage, well inside tokenWarnEvery of the first line
+			if calls != 4 {
+				t.Fatalf("setup: %d fetches, want 4", calls)
+			}
+			if lines() != 2 {
+				t.Fatalf("second outage logged %d %q lines in total, want 2 — it opened %v after the first "+
+					"outage's line and must announce itself:\n%s", lines(), tc.line, tokenRetryBackoff+tc.step, dump())
+			}
+		})
 	}
 }

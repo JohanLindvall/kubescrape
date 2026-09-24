@@ -62,7 +62,7 @@ func TestEscapedLenNeverUnderchargesTheRenderer(t *testing.T) {
 // The bytes arm has the same invariant: base64 rounds UP, and the truncating
 // estimate came in low for every value that is not a multiple of three.
 func TestBytesEstimateNeverUnderchargesBase64(t *testing.T) {
-	for n := 0; n < 32; n++ {
+	for n := range 32 {
 		v := pcommon.NewValueMap()
 		v.Map().PutEmptyBytes("k").FromRaw(make([]byte, n))
 		rem := maxChainBodyBytes
@@ -124,7 +124,7 @@ func TestRenderedSizeEstimateNeverUnderchargesTheRenderer(t *testing.T) {
 		}
 	}
 	const budget = 1 << 20
-	for i := 0; i < 2000; i++ {
+	for range 2000 {
 		v := build(0)
 		if v.Type() != pcommon.ValueTypeMap && v.Type() != pcommon.ValueTypeSlice {
 			continue // chainBody only estimates structured bodies
@@ -149,7 +149,7 @@ func TestRenderedSizeEstimateNeverUnderchargesTheRenderer(t *testing.T) {
 func TestScalarChargeCoversTheWidestRenderedNumber(t *testing.T) {
 	const entries = 30000
 	m := pcommon.NewValueMap()
-	for i := 0; i < entries; i++ {
+	for i := range entries {
 		m.Map().PutDouble(fmt.Sprintf("k%05d", i), -1.2345678901234567e-6)
 	}
 	const budget = 1 << 30

@@ -71,6 +71,12 @@ func TestIsPermanentClassification(t *testing.T) {
 		{"http 501 not implemented", &HTTPStatusError{Code: 501}, true},
 		{"grpc InvalidArgument", status.Error(codes.InvalidArgument, "bad"), true},
 		{"grpc Unimplemented", status.Error(codes.Unimplemented, "no logs pipeline"), true},
+		// ...except the Unimplemented grpc-go SYNTHESIZES from a plain HTTP
+		// 404 (a proxy that is not gRPC-aware): the collector never said it,
+		// and 404 stays transient on both protocols. The wording is pinned
+		// against a real h2c peer by TestGRPC404FromANonGRPCProxyIsTransient.
+		{"grpc 404 from a non-gRPC proxy", status.Error(codes.Unimplemented,
+			`unexpected HTTP status code received from server: 404 (Not Found); transport: received unexpected content-type "text/html"`), false},
 		{"grpc Unavailable", status.Error(codes.Unavailable, "down"), false},
 		{"grpc ResourceExhausted", status.Error(codes.ResourceExhausted, "message larger than max"), false},
 		{"grpc Unauthenticated", status.Error(codes.Unauthenticated, "token"), false},
@@ -111,8 +117,8 @@ func TestPoisonBatchIsDroppedOnceCollectorTakesOthers(t *testing.T) {
 	}
 	before := obs.BufferDroppedBatches.WithLabelValues("metrics").Value()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel() // stop Run BEFORE the queue Closes deferred above; t.Context() alone ends after them
 	go b.Run(ctx)
 
 	// Good data behind it, produced CONTINUOUSLY as a live agent does. The
@@ -161,7 +167,7 @@ func TestOutageNeverDropsBufferedData(t *testing.T) {
 	defer func() { _ = ms.Close() }()
 	b := NewBuffered(send, ls, ms, nil, time.Millisecond, nil)
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if err := b.ExportMetrics(context.Background(), metricsWith("data")); err != nil {
 			t.Fatal(err)
 		}
@@ -169,8 +175,8 @@ func TestOutageNeverDropsBufferedData(t *testing.T) {
 	before := obs.BufferDroppedBatches.WithLabelValues("metrics").Value()
 	queued := ms.Bytes()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel() // stop Run BEFORE the queue Closes deferred above; t.Context() alone ends after them
 	go b.Run(ctx)
 
 	// Past the per-batch budget (maxDrainCycles cycles x stuckAfterAttempts
@@ -234,8 +240,8 @@ func TestPermanentRejectionDoesNotBlockQueue(t *testing.T) {
 	if err := b.ExportMetrics(context.Background(), metricsWith("cpu")); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel() // stop Run BEFORE the queue Closes deferred above; t.Context() alone ends after them
 	go b.Run(ctx)
 	waitFor(t, func() bool { return len(send.gotMetrics()) == 1 }, "the batch behind the poison frame")
 }

@@ -35,7 +35,7 @@ func TestAttributionSurvivesABudgetExhaustingProbeWalk(t *testing.T) {
 	dps := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().
 		SetEmptyGauge().DataPoints()
 	points := maxLookupsPerRequest + 10
-	for i := 0; i < points; i++ {
+	for i := range points {
 		dp := dps.AppendEmpty()
 		dp.SetIntValue(1)
 		dp.Attributes().PutStr("k8s.pod.uid", fmt.Sprintf("bogus-%d", i))
@@ -56,9 +56,11 @@ func TestAttributionSurvivesABudgetExhaustingProbeWalk(t *testing.T) {
 }
 
 // The decision's cheap half must run to completion before its expensive half
-// starts: one resource with NO id at all settles the whole push, so no other
-// resource's data points are worth walking — and that walk is what spends the
-// lookup budget, on probes whose answer cannot change the outcome.
+// starts: one id-LESS resource whose point names an object settles the whole
+// push (it has to split), so no other resource's data points are worth walking
+// for FOREIGN ids — and that walk is what spends the lookup budget, on probes
+// whose answer cannot change the outcome. The cheap half asks only whether an
+// id is PRESENT, which costs no lookup.
 func TestResourceIDPassPrecedesThePointWalk(t *testing.T) {
 	meta := &recordingMeta{fakeMeta: newMeta()}
 	e := NewEnricher(Config{Meta: meta, MetricsMode: MetricsAuto, Wait: 3 * time.Second})
@@ -68,18 +70,21 @@ func TestResourceIDPassPrecedesThePointWalk(t *testing.T) {
 	rm0.Resource().Attributes().PutStr("container.id", "cafe01")
 	dps := rm0.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().
 		SetEmptyGauge().DataPoints()
-	for i := 0; i < 5000; i++ {
+	for i := range 5000 {
 		dp := dps.AppendEmpty()
 		dp.SetIntValue(1)
 		dp.Attributes().PutStr("container.id", fmt.Sprintf("bogus-%d", i))
 	}
-	// The decisive resource: no container id, no pod uid, so resource mode
-	// cannot suffice whatever rm0's points say.
+	// The decisive resource: no container id and no pod uid of its own, but a
+	// point naming an object — so resource mode cannot suffice whatever rm0's
+	// points say. (An id-less resource whose points name nothing does NOT
+	// decide: the resource branch attributes it exactly as the split would.)
 	rm1 := md.ResourceMetrics().AppendEmpty()
 	rm1.Resource().Attributes().PutStr("service.name", "no-id-here")
 	dp := rm1.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().
 		SetEmptyGauge().DataPoints().AppendEmpty()
 	dp.SetIntValue(1)
+	dp.Attributes().PutStr("k8s.pod.uid", "pod-uid-2")
 
 	e.EnrichMetrics(context.Background(), md)
 
@@ -117,7 +122,7 @@ func (b *blockingMeta) Container(ctx context.Context, id string, wait time.Durat
 // the shape whose every attribution lookup parks for the full wait.
 func ghostLogs(ids int) plog.Logs {
 	ld := plog.NewLogs()
-	for i := 0; i < ids; i++ {
+	for i := range ids {
 		rl := ld.ResourceLogs().AppendEmpty()
 		rl.Resource().Attributes().PutStr("container.id", fmt.Sprintf("ghost-%d", i))
 		rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()

@@ -42,26 +42,47 @@ func NewBucket(rate float64) *Bucket {
 	return &Bucket{rate: rate, burst: burst, tokens: burst}
 }
 
-// refillLocked banks the tokens accrued since the last operation. The
-// first-call guard matters: with last still zero there is no elapsed interval
-// to bill, only the initial full burst.
+// refillLocked banks the tokens accrued since the last operation (accruedLocked)
+// and moves `last` forward to now.
 //
-// A NEGATIVE elapsed is treated as zero, and `last` only ever moves forward:
-// tracesample reads its clock OUTSIDE the bucket mutex (concurrent ingest
-// handlers, injectable-clock design), so two handlers can reach refillLocked
-// with out-of-order `now` values. Billing a negative interval would DEBIT
-// tokens and rewind `last`, transiently misaccounting the rate cap; clamping
-// makes a late handler's earlier `now` a harmless no-op instead. Tokens
-// accrued equal rate × (max observed now − start), which is exactly right.
+// `last` only ever moves forward: tracesample reads its clock OUTSIDE the
+// bucket mutex (concurrent ingest handlers, injectable-clock design), so two
+// handlers can reach refillLocked with out-of-order `now` values. Rewinding
+// `last` to a late handler's earlier `now` would bill the next caller for an
+// interval already banked; keeping the maximum makes the straggler a harmless
+// no-op instead. Tokens accrued equal rate × (max observed now − start), which
+// is exactly right.
 func (b *Bucket) refillLocked(now time.Time) {
-	if !b.last.IsZero() {
-		if elapsed := now.Sub(b.last); elapsed > 0 {
-			b.tokens = min(b.burst, b.tokens+b.rate*elapsed.Seconds())
-		}
-	}
+	b.tokens = b.accruedLocked(now)
 	if now.After(b.last) {
 		b.last = now
 	}
+}
+
+// accruedLocked is the token count the bucket WOULD hold at now, touching
+// nothing. It is the one spelling of the refill arithmetic: refillLocked banks
+// it, Peek only reads it, and the two must agree or a re-decision answers a
+// different question than the admission it stands in for.
+//
+// The first-call guard matters: with last still zero there is no elapsed
+// interval to bill, only the initial full burst. A NEGATIVE elapsed (an
+// out-of-order `now`, see refillLocked) is billed as zero: billing it would
+// DEBIT tokens, transiently misaccounting the rate cap.
+func (b *Bucket) accruedLocked(now time.Time) float64 {
+	if b.last.IsZero() {
+		return b.tokens
+	}
+	if elapsed := now.Sub(b.last); elapsed > 0 {
+		return min(b.burst, b.tokens+b.rate*elapsed.Seconds())
+	}
+	return b.tokens
+}
+
+// admitsLocked is AdmitDebt's admission test over a token count: min(n, burst)
+// must be present (see AdmitDebt for why not n). Shared with Peek, which asks
+// the same question of tokens it has not banked.
+func (b *Bucket) admitsLocked(tokens, n float64) bool {
+	return tokens >= min(n, b.burst)
 }
 
 // TakeExact takes n tokens if the bucket holds them all, and reports whether
@@ -92,8 +113,7 @@ func (b *Bucket) AdmitDebt(n float64, now time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.refillLocked(now)
-	need := min(n, b.burst)
-	if b.tokens < need {
+	if !b.admitsLocked(b.tokens, n) {
 		return false
 	}
 	b.tokens -= n
@@ -105,15 +125,11 @@ func (b *Bucket) AdmitDebt(n float64, now time.Time) bool {
 // the budget is a rate of spans leaving, and those spans were billed the
 // first time. It does not even bank the refill; leaving the bucket's state
 // entirely untouched is what makes a re-decision invisible to every trace
-// being decided for the first time.
+// being decided for the first time. The refill arithmetic and the admission
+// test are AdmitDebt's own (accruedLocked, admitsLocked), so the two cannot
+// answer differently; TestPeekAgreesWithAdmitDebt pins it.
 func (b *Bucket) Peek(n float64, now time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	tokens := b.tokens
-	if !b.last.IsZero() {
-		if elapsed := now.Sub(b.last); elapsed > 0 { // never a negative bill (see refillLocked)
-			tokens = min(b.burst, tokens+b.rate*elapsed.Seconds())
-		}
-	}
-	return tokens >= min(n, b.burst)
+	return b.admitsLocked(b.accruedLocked(now), n)
 }

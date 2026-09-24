@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -31,8 +32,8 @@ import (
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
-// hookErr counts and (throttled) logs a hook's script error; every caller
-// then takes its fail-open path.
+// hookWarnGates throttle the hooks' failure lines, one gate per hook (and per
+// message class where two alternate — see parseShape and sampleGone).
 var hookWarnGates struct {
 	ingest, targets, sample, parse logdedupe.Throttle
 	// parseShape gates ParseLine's wrong-return-type warning separately from
@@ -49,20 +50,18 @@ var hookWarnGates struct {
 	sampleGone logdedupe.Throttle
 }
 
+// hookErr counts and (throttled) logs a hook's script error; every caller
+// then takes its fail-open path. The position reportScriptError logs matters
+// more here than anywhere: a hook fails open, so the ONLY symptom is that
+// nothing happened, and the bare Starlark message names no line in the file.
 func hookErr(gate *logdedupe.Throttle, signal string, err error) {
-	obs.TransformErrors.WithLabelValues(signal).Inc()
-	if gate.Allow(time.Minute) {
-		// The position matters more here than anywhere: a hook fails open, so
-		// the ONLY symptom is that nothing happened, and the bare Starlark
-		// message ("undefined: foo") names no line in the file.
-		slog.Warn("transform hook failed (failing open)",
-			"hook", signal, "script", scriptPos(err), "error", err)
-	}
+	reportScriptError(gate, signal, "transform hook failed (failing open)", err)
 }
 
 // roAttrsView is the read-only attribute view hooks hand to scripts whose
 // subject they must not mutate (a sampler's buffered spans are owned by the
-// buffer; a target's pod labels are the store's).
+// buffer; a target's pod labels are the store's; an admitted resource is only
+// being JUDGED — see AdmitResource).
 type roAttrsView struct{ m pcommon.Map }
 
 func (a roAttrsView) String() string        { return "attributes" }
@@ -82,24 +81,25 @@ func (a roAttrsView) Has(k starlark.Value) (bool, error) { return attrsView(a).H
 // (the operator's per-sender policy — the honest mitigation for senders a
 // built-in bound can only slow down). No hook, a non-False return, or a
 // script error all admit.
+//
+// The resource is READ-ONLY to the script (roAttrsView; an assignment is a
+// script error, which admits). admit is a predicate, and a writable view broke
+// the fail-open contract every other hook keeps: a script that wrote and then
+// erred forwarded its write, where the targets hook restores the pre-script
+// target on error precisely because "the hook did nothing" excludes a
+// half-applied write. It would also have let a script put back, AFTER the
+// receipt-time strip, the identity keys that strip exists to remove.
 func (w *Wrapper) AdmitResource(attrs pcommon.Map) bool {
 	p := w.program.Load()
 	if p == nil || p.ingest == nil {
 		return true
 	}
-	v, err := p.ingest.call(attrsView{attrs})
+	v, err := p.ingest.call(roAttrsView{attrs})
 	if err != nil {
 		hookErr(&hookWarnGates.ingest, "ingest", err)
 		return true
 	}
 	return v != starlark.False
-}
-
-// HasAdmit reports whether an ingest admission hook is configured (so the
-// receiver can skip the per-resource call entirely).
-func (w *Wrapper) HasAdmit() bool {
-	p := w.program.Load()
-	return p != nil && p.ingest != nil
 }
 
 // --- scrape-target hook ---
@@ -283,7 +283,7 @@ func (w *Wrapper) SampleDecider() func(tailsample.Trace) (sample, abstain bool) 
 			obs.TransformErrors.WithLabelValues("sample").Inc()
 			if hookWarnGates.sampleGone.Allow(time.Minute) {
 				slog.Warn("transforms file no longer defines a sample: section; the type: script tail-sampling policy abstains on every decision (traces fall through to the next policy or the default drop) — restore the section or remove the type: script policy",
-					"hook", "sample")
+					"signal", "sample")
 			}
 			return false, true
 		}
@@ -356,7 +356,8 @@ func (it *sampleSpanIter) Done() {}
 
 // sampleSpanObj is one buffered span, READ-ONLY (unlike the traces batch
 // transform's spanObj): drop/route/mutation make no sense on a whole-trace
-// decision, and the buffer still owns the pdata.
+// decision, and the buffer still owns the pdata. Read-only is not NARROWER:
+// every field a batch span can read, this one reads too (spanReadAttr).
 type sampleSpanObj struct{ s tailsample.Span }
 
 func (o *sampleSpanObj) String() string        { return "span" }
@@ -365,25 +366,17 @@ func (o *sampleSpanObj) Freeze()               {}
 func (o *sampleSpanObj) Truth() starlark.Bool  { return true }
 func (o *sampleSpanObj) Hash() (uint32, error) { return 0, errors.New("unhashable") }
 
-func (o *sampleSpanObj) AttrNames() []string {
-	return []string{"attributes", "duration_ms", "kind", "name", "resource", "status_code"}
-}
+func (o *sampleSpanObj) AttrNames() []string { return slices.Clone(sampleSpanAttrNames) }
 
 func (o *sampleSpanObj) Attr(name string) (starlark.Value, error) {
 	switch name {
-	case "name":
-		return starlark.String(o.s.Span.Name()), nil
-	case "kind":
-		return starlark.String(spanKind(o.s.Span.Kind())), nil
-	case "status_code":
-		return starlark.MakeInt(int(o.s.Span.Status().Code())), nil
-	case "duration_ms":
-		d := int64(o.s.Span.EndTimestamp()) - int64(o.s.Span.StartTimestamp())
-		return starlark.Float(float64(d) / 1e6), nil
 	case "attributes":
 		return roAttrsView{o.s.Span.Attributes()}, nil
 	case "resource":
 		return roAttrsView{o.s.Resource}, nil
+	}
+	if v, ok := spanReadAttr(o.s.Span, name); ok {
+		return v, nil
 	}
 	return nil, nil
 }
@@ -426,7 +419,7 @@ func (w *Wrapper) ParseLine(line string) (Parsed, bool) {
 			if hookWarnGates.parseShape.Allow(time.Minute) {
 				slog.Warn("the parse hook returned neither a dict nor None, so the line is left unparsed "+
 					"(parse(line) must return {\"body\": ...} or None)",
-					"hook", "parse", "type", v.Type())
+					"signal", "parse", "type", v.Type())
 			}
 		}
 		return Parsed{}, false
@@ -446,10 +439,4 @@ func (w *Wrapper) ParseLine(line string) (Parsed, bool) {
 		}
 	}
 	return out, true
-}
-
-// HasParse reports whether a parse hook is configured.
-func (w *Wrapper) HasParse() bool {
-	p := w.program.Load()
-	return p != nil && p.parse != nil
 }

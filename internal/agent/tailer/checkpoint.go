@@ -3,6 +3,7 @@ package tailer
 // Offset persistence through the shared positions store.
 
 import (
+	"maps"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
@@ -38,9 +39,7 @@ func (t *Tailer) saveCheckpoints() {
 	// currently see, and let a successful listing prune them.
 	cps := make(map[string]checkpoint, len(t.files))
 	if !t.lastListingOK {
-		for path, cp := range t.cfg.Positions.Logs() {
-			cps[path] = cp
-		}
+		maps.Copy(cps, t.cfg.Positions.Logs())
 	}
 	// Stored entries not yet matched to a discovered file survive the rebuild.
 	// claimPath keeps a path whose stat failed with a non-ENOENT error (EIO,
@@ -97,18 +96,22 @@ func (t *Tailer) saveCheckpoints() {
 		// actually fails) is six identical lines a minute from every node in
 		// the fleet for one unchanging fact, while
 		// kubescrape_positions_save_errors_total already carries the rate. The
-		// FIRST failure always logs (the throttle's window has not opened) and
-		// the recovery logs once at Info, so the pair reads as a transition
-		// rather than as a flood with no end marker.
-		if t.positionsWarn.Allow(time.Minute) {
-			t.log.Warn("writing positions file", "error", err)
+		// FIRST failure of every run logs, and the recovery logs once at Info,
+		// so the pair reads as a transition rather than as a flood with no end
+		// marker.
+		now := time.Now()
+		if first, loud := t.positionsOutage.Fail(now, time.Minute); loud {
+			if first {
+				t.log.Warn("writing positions file", "error", err)
+			} else {
+				t.log.Warn("writing positions file", "error", err,
+					"failures", t.positionsOutage.Failures(), "outage", t.positionsOutage.Lasted(now))
+			}
 		}
-		t.positionsFailing = true
 		return
 	}
-	if t.positionsFailing {
-		t.positionsFailing = false
-		t.log.Info("positions file write recovered")
+	if failures, lasted, ok := t.positionsOutage.Recover(time.Now()); ok {
+		t.log.Info("positions file write recovered", "failures", failures, "outage", lasted)
 	}
 	t.hopsUnsaved = false
 	t.discoveryUnsaved = false
@@ -131,13 +134,13 @@ func (t *Tailer) saveCheckpoints() {
 // less than a window ago is still fresh are deferred, and the deferral is what
 // caps positions I/O at one save per window while the churn lasts.
 //
-// What is deliberately NOT coalesced is the ROTATION half — reopen's and
-// readFile's "one file never carries two unsaved hops" saves, and the sweep's
-// closing hopsUnsaved save. A missing hop is the case with no route back
-// (nothing on disk names the intermediate inode), so those stay synchronous
-// and immediate; a missing DISCOVERY entry resolves under the default
-// -logs-unknown-files=auto to re-reading the file whole, i.e. duplicates,
-// which at-least-once already tolerates.
+// What is deliberately NOT coalesced is the ROTATION half — noteHop's "one
+// file never carries two unsaved hops" save (reached from reopen and from
+// ensureOpen), and the sweep's closing hopsUnsaved save. A missing hop is the
+// case with no route back (nothing on disk names the intermediate inode), so
+// those stay synchronous and immediate; a missing DISCOVERY entry resolves
+// under the default -logs-unknown-files=auto to re-reading the file whole,
+// i.e. duplicates, which at-least-once already tolerates.
 const discoverySaveWindow = 250 * time.Millisecond
 
 // saveDiscovery persists a discovery pass, coalescing bursts (see
@@ -164,5 +167,5 @@ func (t *Tailer) saveDiscovery() {
 // what a failed discovery save did before this window existed; the first save
 // that succeeds clears the flag with it.
 func (t *Tailer) discoverySaveDue() bool {
-	return t.discoveryUnsaved && !t.positionsFailing && time.Since(t.lastCheckpoint) >= discoverySaveWindow
+	return t.discoveryUnsaved && !t.positionsOutage.Failing() && time.Since(t.lastCheckpoint) >= discoverySaveWindow
 }

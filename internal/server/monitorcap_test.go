@@ -64,7 +64,7 @@ func TestMonitorEndpointsCannotExceedThePerPodCeiling(t *testing.T) {
 	})
 
 	eps := make([]any, 0, endpoints)
-	for i := 0; i < endpoints; i++ {
+	for i := range endpoints {
 		eps = append(eps, map[string]any{"port": "http", "path": "/m" + strconv.Itoa(i)})
 	}
 	monitors := servicemonitors.NewIndex()

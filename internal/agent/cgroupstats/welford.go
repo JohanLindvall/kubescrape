@@ -10,21 +10,29 @@ import "math"
 // # Why Welford, explicitly
 //
 // The obvious implementation keeps sum and sum-of-squares and finishes with
-// sqrt(sumsq/n - mean²). That expression subtracts two nearly equal large
-// numbers, and the CPU case is exactly where it fails: a container sitting at a
-// steady 2.0000 cores with millisecond jitter has a mean whose square is ~4 and
-// a mean-of-squares that differs from it in the eighth significant digit.
-// float64 carries about sixteen, so the difference is computed from the last
-// eight bits of the mantissa — catastrophic cancellation. Measured, the naive
-// form returns garbage (and routinely a small NEGATIVE variance, whose sqrt is
-// NaN) on precisely the series an operator most wants to see: a large steady
-// mean with a small variance, which is what a well-behaved container looks like
-// right up to the moment it bursts. TestWelfordBeatsNaiveOnLargeMean pins it.
+// sqrt(sumsq/n - mean²). That expression subtracts two nearly equal numbers, so
+// its accuracy is set by how small the variance is RELATIVE to the mean, and a
+// large steady mean with a small variance — what a well-behaved container looks
+// like right up to the moment it bursts — is the case it handles worst.
 //
-// Welford instead updates the mean and the second moment incrementally, so
-// every quantity it holds is of the same order as the DEVIATIONS rather than of
-// the values. It costs one extra multiply per sample, which at three preads per
-// container per second is not a cost at all.
+// Measured, over windows of 30 one-second readings at a steady 2.0 cores, the
+// damage is real but graded rather than total. With millisecond jitter the two
+// terms first differ in about the seventh significant digit, leaving roughly
+// nine of float64's sixteen, and the naive stddev is good to ~1e-8 relative.
+// It decays as the jitter shrinks: ~1e-6 at 0.1 ms, ~5e-5 at 10 µs, and ~0.4%
+// at the 1 µs quantum of cpu.stat's usage_usec. The outright failure is the
+// ZERO-variance window: when every reading is the same value that is not
+// exactly representable (a stalled container, a pinned rate), the two terms
+// round differently and the naive variance comes out NEGATIVE about half the
+// time — its sqrt is NaN, which then poisons every aggregation downstream. At
+// the magnitude TestWelfordBeatsNaiveOnLargeMean uses, the naive form loses
+// the variance entirely; that test pins the failure mode.
+//
+// Welford is chosen because it has neither problem at any magnitude: it updates
+// the mean and the second moment incrementally, so every quantity it holds is
+// of the same order as the DEVIATIONS rather than of the values, and a
+// constant window leaves m2 exactly 0. It costs one extra multiply per sample,
+// which at three preads per container per second is not a cost at all.
 //
 // This is the numerical half of the argument the package doc makes against
 // internal/metrics/series.go's closed aggregation set — where the note "stddev

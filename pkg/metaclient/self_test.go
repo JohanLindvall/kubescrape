@@ -98,9 +98,9 @@ func TestSelfRevalidatesAfterTTL(t *testing.T) {
 // zero-valued pod that would stamp empty attributes on everything — and the
 // failure is not cached, so the next poll retries for real.
 func TestSelfUnresolved(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		atomic.AddInt32(&hits, 1)
+		hits.Add(1)
 		http.Error(w, `{"error":"no live pod with peer IP"}`, http.StatusNotFound)
 	}))
 	defer srv.Close()
@@ -111,7 +111,31 @@ func TestSelfUnresolved(t *testing.T) {
 			t.Fatalf("attempt %d: Self returned %+v; want an error for an unattributable caller", i, pod)
 		}
 	}
-	if n := atomic.LoadInt32(&hits); n != 2 {
+	if n := hits.Load(); n != 2 {
 		t.Fatalf("server hits = %d; want 2 (a 404 must not be cached)", n)
+	}
+}
+
+// The client must never route through an environment proxy: a proxy hop
+// REPLACES the connection's source address, which is the only thing /v1/self
+// attributes the caller by, so a cluster-wide HTTP_PROXY would stamp the
+// PROXY's pod on every agent's self-metrics while the resolved gauge reads 1.
+// The server half of that argument is internal/server's
+// TestASilentReOriginatingHopIsAnsweredWithTheHopsOwnIdentity, which defers
+// the client half to here. It is asserted structurally because it cannot be
+// asserted behaviourally against httptest: http.ProxyFromEnvironment never
+// proxies a loopback address, and it reads the environment only once per
+// process.
+func TestClientNeverUsesAnEnvironmentProxy(t *testing.T) {
+	if NewTransport().Proxy != nil {
+		t.Fatal("NewTransport sets a Proxy; the metadata service must be dialled directly")
+	}
+	c := New(Config{Base: "http://kubescrape.monitoring:8080"})
+	tr, ok := c.http.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("default transport is %T; want *http.Transport", c.http.Transport)
+	}
+	if tr.Proxy != nil {
+		t.Fatal("New's default transport sets a Proxy; the metadata service must be dialled directly")
 	}
 }

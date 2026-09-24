@@ -103,9 +103,7 @@ func TestConcurrentGzipBodiesAtCap(t *testing.T) {
 	var wg sync.WaitGroup
 	statuses := make([]int, workers)
 	for w := range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			body := underGz
 			if w == workers-1 {
 				body = overGz
@@ -124,7 +122,7 @@ func TestConcurrentGzipBodiesAtCap(t *testing.T) {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
 			statuses[w] = resp.StatusCode
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -256,7 +254,13 @@ func TestContentLengthLies(t *testing.T) {
 	})
 
 	t.Run("longer", func(t *testing.T) {
-		conn, err := net.Dial("tcp", addr)
+		// A server of its own, so the one handler its probe counts is this
+		// request's.
+		srv, probe := probedHTTPTestServer(t, exporterFunc(func(plog.Logs) error {
+			exported.Add(1)
+			return nil
+		}))
+		conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -265,8 +269,9 @@ func TestContentLengthLies(t *testing.T) {
 		_, _ = conn.Write(body) // fewer bytes than promised
 		_ = conn.Close()        // and hang up
 		// The handler's read fails with unexpected EOF; nothing to assert on
-		// the wire, but nothing may be exported and nothing may leak.
-		time.Sleep(300 * time.Millisecond)
+		// the wire, but nothing may be exported and nothing may leak — asserted
+		// once the handler has RETURNED, not after a sleep it may outlast.
+		probe.await(t, "the starved handler", &probe.returned, 1)
 		if exported.Load() != 0 {
 			t.Errorf("starved payload was exported")
 		}

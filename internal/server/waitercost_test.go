@@ -744,7 +744,7 @@ func hostileShapes(t testing.TB) []hostileShape {
 	}, {
 		// The escape that motivated computing keeps() from the
 		// request line: the path is not the container id. NormalizeContainerID
-		// returns what follows the LAST colon, so maxContainerIDLen never saw
+		// returns what follows the LAST colon, so kubemeta.MaxContainerIDLen never saw
 		// these 16 KiB, the id parked normally, and the %-escape bought a second
 		// and a third copy of the path (url.setPath's unescape, ServeMux's
 		// pathUnescape into r.matches). With the head HELD it retains 63 KB of
@@ -811,8 +811,7 @@ func hostileShapes(t testing.TB) []hostileShape {
 func parkAndMeasure(t *testing.T, n int, shape hostileShape) (perWaiter int) {
 	t.Helper()
 
-	st := store.New(time.Minute)
-	st.SetMaxWaiters(n + 10)
+	st := store.New(time.Minute, store.WithMaxWaiters(n+10))
 	// A wait budget far longer than the test, so nothing unparks underneath the
 	// measurement.
 	api := newAPI(st, 10*time.Minute)
@@ -1009,10 +1008,9 @@ const plausibleParkedHeap = 8 << 10
 // routed by one.
 func retainedWhileParked(t measureT, head string, n int) (perRequest int, validator string, ok bool) {
 	t.Helper()
-	st := store.New(time.Minute)
+	st := store.New(time.Minute, store.WithMaxWaiters(n*measureAttempts+8))
 	// Every attempt parks another batch (see the corroboration loop below), and
 	// the pilot holds one slot of its own.
-	st.SetMaxWaiters(n*measureAttempts + 8)
 	h := newAPI(st, 10*time.Minute).Handler()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1065,12 +1063,10 @@ func retainedWhileParked(t measureT, head string, n int) (perRequest int, valida
 	}
 	serve := func(r *http.Request) (done chan struct{}) {
 		done = make(chan struct{})
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			defer close(done)
 			h.ServeHTTP(&discardWriter{}, r)
-		}()
+		})
 		return done
 	}
 	parked := func(want int) bool {

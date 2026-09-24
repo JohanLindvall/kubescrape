@@ -102,19 +102,6 @@ func (l labels) set(key, value string) labels {
 	return append(l, kv{key, value})
 }
 
-// without returns the labels with key removed, order preserved. It allocates
-// only when key is present.
-func (l labels) without(key string) labels {
-	for i := range l {
-		if l[i].key == key {
-			out := make(labels, 0, len(l)-1)
-			out = append(out, l[:i]...)
-			return append(out, l[i+1:]...)
-		}
-	}
-	return l
-}
-
 // strHash is one string's 128-bit xxh3 hash — the input to every accumulator
 // in this package.
 //
@@ -154,12 +141,15 @@ func (l labels) without(key string) labels {
 // key is 128 bits wide", which it is not: the map key and the IDENTITY are two
 // different things. series.db now buckets on the key's LOW HALF and compares
 // the full 128 bits inside the bucket, so the fast64 path is back and nothing
-// about this hash changed. Measured (ABBA-interleaved, n=24): DynamicAddBound
-// -11.6%, DynamicAddAttrs -11.8%, DynamicAddHistogram -8.9%, the fleet-scale
-// observe paths -6 to -8%, every allocation count unchanged — and the pure
-// fold benchmarks (LabelsAccums, ResourceAccum, ResLabelsAccum), which touch
-// no map, all "~", which is what says the recovered time was the probe. See
-// series.db.
+// about this hash changed. What is measured: every allocation count is
+// unchanged, and the pure fold benchmarks (LabelsAccums, ResourceAccum,
+// ResLabelsAccum), which touch no map, are "~" — which is what says whatever
+// time was recovered was recovered at the probe. The clean signal for the
+// probe itself is internal/obs' BenchmarkCounterInc, which drives it with no
+// fold in front: -43.3% (ABBA n=10, 0 allocs/op both arms). Per-benchmark
+// wall-clock figures for the DynamicAdd* paths are deliberately NOT quoted:
+// three ABBA runs on one machine agreed on their sign and on little else (see
+// AGENTS.md's internal/metrics bullet). See series.db.
 func strHash(s string) xxh3.Uint128 { return xxh3.Sum128String(s) }
 
 // hashAccum is the order-independent accumulator of the label set: every entry

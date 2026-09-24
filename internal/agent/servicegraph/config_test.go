@@ -97,7 +97,7 @@ func TestConfigDurationSemantics(t *testing.T) {
 
 	// An unparseable value never refuses to aggregate — Validate reports it and
 	// the constructors fall back to the default, exactly as spanmetrics does.
-	if got := NewProcessor(Config{Wait: "nonsense"}, discardLog()).Wait(); got != DefaultWait {
+	if got := NewProcessor(Config{Wait: "nonsense"}, nil, discardLog()).Wait(); got != DefaultWait {
 		t.Errorf("a bad wait fell back to %v, want %v", got, DefaultWait)
 	}
 	if got := NewRegistry(Config{StaleAfter: "nonsense"}, nil).store.StaleAfter(); got != DefaultStaleAfter {

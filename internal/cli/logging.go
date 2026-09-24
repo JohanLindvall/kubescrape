@@ -6,23 +6,26 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"k8s.io/klog/v2"
 )
 
-// NewLogger builds the process logger from the -log-level flag value: any level
+// newLogger builds the process logger from the -log-level flag value: any level
 // slog.Level.UnmarshalText accepts, logfmt on stderr.
 //
 // There is no format choice. One format means an operator, a Loki pipeline and
 // an alert annotation all parse the same bytes — and it means the format is a
 // guarantee this package can hold rather than a per-deployment coin flip.
 //
-// A MAIN calls SetupLogging, never this: the logger alone leaves the OTHER
-// loggers linked into the process (client-go's klog, grpc-go's grpclog) writing
-// their own formats into the same stream, which is how the guarantee was
-// already half-broken once.
-func NewLogger(level string) (*slog.Logger, error) {
+// Unexported because a MAIN calls SetupLogging, never this: the logger alone
+// leaves the OTHER loggers linked into the process (client-go's klog, grpc-go's
+// grpclog) writing their own formats into the same stream, which is how the
+// guarantee was already half-broken once.
+func newLogger(level string) (*slog.Logger, error) {
 	var lvl slog.Level
 	if err := lvl.UnmarshalText([]byte(level)); err != nil {
 		return nil, fmt.Errorf("log level %q: %w", level, err)
@@ -46,19 +49,31 @@ func NewLogger(level string) (*slog.Logger, error) {
 // grpclog.SetLoggerV2 writes a package global with no lock and must not race a
 // live gRPC client, and klog's records are otherwise glog-formatted.
 func SetupLogging(level string) (*slog.Logger, error) {
-	log, err := NewLogger(level)
+	log, err := newLogger(level)
 	if err != nil {
 		return nil, err
 	}
 	// The process default, for the few places that log through slog's package
 	// functions (and for anything a dependency does the same way).
 	slog.SetDefault(log)
+	// SetDefault also routes the stdlib `log` package into this logger, at the
+	// bridge's default level — INFO. What reaches it is net/http's own reports
+	// (no http.Server here sets ErrorLog): "http: panic serving …" with its
+	// stack, the ONLY record of a handler panic net/http recovered;
+	// "superfluous response.WriteHeader"; "http: Accept error"; and the
+	// Transport's "Unsolicited response received on idle HTTP channel". None of
+	// that is steady-state lifecycle, and at INFO a panic stack sat among the
+	// startup lines. WARN is this repo's level for "something unexpected the
+	// code handled", which each of them is. Deliberately not ERROR: the
+	// unsolicited-response line is triggered by a SCRAPE TARGET, which a tenant
+	// controls, and ERROR means "a pipeline is dead and a human must act".
+	slog.SetLogLoggerLevel(slog.LevelWarn)
 	// client-go logs through klog: its lease churn, watch errors and backoffs
 	// would otherwise go out as glog lines ("I0829 ... leaderelection.go:250]").
 	// Unconditional in both binaries: klog is linked either way.
 	klog.SetSlogLogger(log)
 	// grpc-go, see grpclog.go.
-	SetGRPCLogger(log)
+	setGRPCLogger(log)
 	return log, nil
 }
 
@@ -105,6 +120,21 @@ func SetupLogging(level string) (*slog.Logger, error) {
 // `slog.Group("ok", slog.Group("bad key", …))` rendered `"ok.bad key.x"=v` —
 // one attribute silently becoming two wrong pairs, the exact failure this
 // wrapper exists to make impossible.
+//
+// A FOURTH door is a slog.LogValuer that resolves to a group (klog's
+// ObjectRef is one, and client-go logs through klog into this handler):
+// TextHandler resolves the value first and then skips ReplaceAttr because the
+// result is a group, so neither its key nor any group name inside it was ever
+// judged. Both scans treat a LogValuer as needing the rebuild, which resolves
+// it ONCE and hands TextHandler the resolved value (so LogValue is not called
+// twice), at every depth — slog resolves nested values too.
+//
+// What an empty key MEANS is slog's, not ours, and the sanitizer keeps out of
+// it: a zero Attr is dropped (the slog.Handler contract, which TextHandler
+// applies only if the key is still empty after ReplaceAttr), and a group with
+// an empty key is INLINED rather than becoming a group named "_". An empty key
+// on a real value is still rendered as "_" — see emptyKey.
+//
 // Sanitizing is deliberately visible: an unsafe byte becomes '_', so a mangled
 // key shows up in a grep for the concept rather than corrupting the record.
 //
@@ -145,15 +175,22 @@ func (h logfmtHandler) WithAttrs(as []slog.Attr) slog.Handler {
 }
 
 // WithGroup sanitizes the group NAME: it is prepended to every key under it
-// ("g.k=v"), and ReplaceAttr never sees it.
+// ("g.k=v"), and ReplaceAttr never sees it. An empty name returns the receiver,
+// as the slog.Handler contract requires (slog.Logger never passes one, but a
+// caller holding the Handler can) — sanitizing it would open a real group
+// called "_".
 func (h logfmtHandler) WithGroup(name string) slog.Handler {
+	if name == "" {
+		return h
+	}
 	return logfmtHandler{h.Handler.WithGroup(safeKey(name))}
 }
 
-// Handle sanitizes the group names of a record's own attrs — one of the three
-// group doors ReplaceAttr does not cover. Nothing is rebuilt unless a group
-// name somewhere in the record is unsafe, so the overwhelmingly common record
-// (no groups at all; this repo uses none) pays one Kind check per attribute.
+// Handle sanitizes the group names of a record's own attrs — one of the group
+// doors ReplaceAttr does not cover. Nothing is rebuilt unless a group name
+// somewhere in the record is unsafe, or a value is a LogValuer whose shape is
+// only known once resolved, so the overwhelmingly common record (no groups and
+// no LogValuers; this repo uses neither) pays one Kind check per attribute.
 func (h logfmtHandler) Handle(ctx context.Context, r slog.Record) error {
 	unsafe := false
 	r.Attrs(func(a slog.Attr) bool {
@@ -174,56 +211,101 @@ func (h logfmtHandler) Handle(ctx context.Context, r slog.Record) error {
 	return h.Handler.Handle(ctx, out)
 }
 
-// hasUnsafeGroupName reports whether a is a group needing a rewrite — its own
-// name, or the name of a group nested anywhere beneath it. The recursion is the
-// point: slog renders a nested group as "outer.inner.key", so a name at ANY
-// depth is a segment of a key on the line, and a scan that looked only at the
-// top level left `slog.Group("ok", slog.Group("bad key", …))` to corrupt the
-// record. It answers false for a non-group attr, whose key is ReplaceAttr's.
+// hasUnsafeGroupName reports whether a needs the rebuild — a group whose own
+// name, or the name of a group nested anywhere beneath it, is unsafe. The
+// recursion is the point: slog renders a nested group as "outer.inner.key", so
+// a name at ANY depth is a segment of a key on the line, and a scan that looked
+// only at the top level left `slog.Group("ok", slog.Group("bad key", …))` to
+// corrupt the record. An empty group name is safe: slog inlines that group.
+//
+// A LogValuer answers true without being resolved: what it resolves to — a
+// group whose names nobody has judged, since TextHandler skips ReplaceAttr for
+// it — is only known by calling LogValue, and calling it here would call it
+// twice per record (once to look, once in TextHandler). The rebuild resolves it
+// once. It answers false for any other non-group attr, whose key is
+// ReplaceAttr's.
 func hasUnsafeGroupName(a slog.Attr) bool {
-	if a.Value.Kind() != slog.KindGroup {
+	switch a.Value.Kind() {
+	case slog.KindLogValuer:
+		return true
+	case slog.KindGroup:
+	default:
 		return false
 	}
-	if safeKey(a.Key) != a.Key {
+	if a.Key != "" && safeKey(a.Key) != a.Key {
 		return true
 	}
-	for _, sub := range a.Value.Group() {
-		if hasUnsafeGroupName(sub) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(a.Value.Group(), hasUnsafeGroupName)
 }
 
-// safeGroupNames rewrites unsafe group names, recursing into nested groups.
-// Non-group attrs are returned untouched — their keys are ReplaceAttr's job.
+// safeGroupNames rewrites unsafe group names, recursing into nested groups and
+// resolving LogValuers at every depth — slog resolves nested values too, so a
+// LogValuer inside a group is the same door one level down. The RESOLVED value
+// is what it returns, so TextHandler's own Resolve is a no-op and LogValue runs
+// once. A non-group attr keeps its key: that is ReplaceAttr's job, and slog
+// calls it for a resolved non-group value. An empty group name stays empty, so
+// slog still inlines the group.
 func safeGroupNames(a slog.Attr) slog.Attr {
-	if a.Value.Kind() != slog.KindGroup {
-		return a
+	v := a.Value.Resolve()
+	if v.Kind() != slog.KindGroup {
+		return slog.Attr{Key: a.Key, Value: v}
 	}
-	src := a.Value.Group()
+	src := v.Group()
 	dst := make([]slog.Attr, len(src))
 	for i, sub := range src {
 		dst[i] = safeGroupNames(sub)
 	}
-	return slog.Attr{Key: safeKey(a.Key), Value: slog.GroupValue(dst...)}
+	key := a.Key
+	if key != "" {
+		key = safeKey(key)
+	}
+	return slog.Attr{Key: key, Value: slog.GroupValue(dst...)}
 }
 
 // safeKeyAttr is the ReplaceAttr hook: sanitize the key, leave the value alone.
 // It runs for the built-in time/level/msg attrs too, where it is a no-op.
-func safeKeyAttr(_ []string, a slog.Attr) slog.Attr {
+//
+// The ZERO Attr is returned untouched. slog's contract is that a handler
+// ignores it, and TextHandler does so only when the key is still empty AFTER
+// this hook — so renaming it to emptyKey is what printed `_=<nil>` for it.
+//
+// A top-level `err` key becomes `error`. The vocabulary (cli.go) says `error=`
+// finds every failure and forbids `err`, and no log call in this repo writes it
+// — but the DEPENDENCIES routed into this handler do: client-go logs through
+// klog, klog through logr, and logr's slog bridge keys an error `err`
+// (klog.ErrorS, runtime.HandleError, the reflector's watch errors, leader
+// election). Those are exactly the failures an operator greps for, and they
+// were the ones `error=` missed. Only the top level is renamed: a nested key
+// is a segment of "group.err", which nothing in the vocabulary claims.
+func safeKeyAttr(groups []string, a slog.Attr) slog.Attr {
+	if a.Key == "" && a.Value.Equal(slog.Value{}) {
+		return a
+	}
+	if a.Key == dependencyErrKey && len(groups) == 0 {
+		a.Key = "error"
+		return a
+	}
 	a.Key = safeKey(a.Key)
 	return a
 }
 
-// emptyKey is what an empty key becomes. A bare "=v" is not a logfmt pair at
-// all, and an attribute with no name is a bug worth seeing rather than hiding.
+// dependencyErrKey is the error key logr (and so klog, and so client-go) writes;
+// see safeKeyAttr.
+const dependencyErrKey = "err"
+
+// emptyKey is what an empty key on a real value becomes. A bare "=v" is not a
+// logfmt pair at all, and an attribute with no name is a bug worth seeing
+// rather than hiding. (The zero Attr and an empty-named group are slog's own
+// shapes and are left to it — see safeKeyAttr and safeGroupNames.)
 const emptyKey = "_"
 
-// safeKey replaces every byte that would break a logfmt KEY with '_': anything
-// at or below a space (the reader's key stops), '=' (the separator), a double
-// quote and DEL. Non-ASCII is left alone — a UTF-8 key parses fine, and
-// mangling it would only make it unfindable.
+// safeKey replaces every rune TextHandler would QUOTE in a key with '_' —
+// quoting is what corrupts a logfmt KEY (see NewLogfmtHandler). In ASCII that
+// is anything at or below a space (the reader's key stops), '=' (the
+// separator), a double quote and DEL; beyond ASCII it is TextHandler's own
+// rule: invalid UTF-8, a Unicode space (U+00A0, U+2028, …) and anything not
+// printable (U+200B, …). Printable, non-space non-ASCII is left alone — a UTF-8
+// key like "nöde" parses fine, and mangling it would only make it unfindable.
 func safeKey(k string) string {
 	if k == "" {
 		return emptyKey
@@ -239,6 +321,14 @@ func safeKey(k string) string {
 	}, k)
 }
 
+// unsafeKeyRune mirrors log/slog's needsQuoting for a single rune, with the
+// ASCII case first so a key made of ordinary characters — every key this repo
+// writes — never reaches the unicode tables. strings.ContainsFunc and
+// strings.Map both hand an invalid byte over as utf8.RuneError, so invalid
+// UTF-8 is caught by the same test.
 func unsafeKeyRune(r rune) bool {
-	return r <= ' ' || r == '=' || r == '"' || r == 0x7f
+	if r < utf8.RuneSelf {
+		return r <= ' ' || r == '=' || r == '"' || r == 0x7f
+	}
+	return r == utf8.RuneError || unicode.IsSpace(r) || !unicode.IsPrint(r)
 }

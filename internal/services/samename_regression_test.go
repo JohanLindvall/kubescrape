@@ -37,7 +37,7 @@ func TestRecreatedServiceReplacesItsPredecessor(t *testing.T) {
 	// Delete for the predecessor — the relist-gap case.
 	ix.Upsert(svcNamed("uid-new", "web", nil))
 
-	matched := ix.Matching("ns", map[string]string{"app": "web"})
+	matched := matching(ix, "ns", map[string]string{"app": "web"})
 	if len(matched) != 1 {
 		t.Fatalf("want exactly one record for a recreated Service, got %d: %+v", len(matched), matched)
 	}
@@ -60,12 +60,12 @@ func TestLateDeleteOfPredecessorKeepsSuccessor(t *testing.T) {
 	ix.Upsert(svcNamed("uid-new", "web", nil))
 	ix.Delete("ns", "uid-old")
 
-	if matched := ix.Matching("ns", map[string]string{"app": "web"}); len(matched) != 1 || matched[0].UID != "uid-new" {
+	if matched := matching(ix, "ns", map[string]string{"app": "web"}); len(matched) != 1 || matched[0].UID != "uid-new" {
 		t.Fatalf("successor lost to a late predecessor delete: %+v", matched)
 	}
 	// And deleting the successor really does empty the index.
 	ix.Delete("ns", "uid-new")
-	if matched := ix.Matching("ns", map[string]string{"app": "web"}); len(matched) != 0 {
+	if matched := matching(ix, "ns", map[string]string{"app": "web"}); len(matched) != 0 {
 		t.Fatalf("index not empty after deleting the live service: %+v", matched)
 	}
 }
@@ -116,7 +116,7 @@ func TestSameNameInDifferentNamespacesCoexist(t *testing.T) {
 	ix.Upsert(b)
 
 	for _, tc := range []struct{ ns, uid string }{{"a", "a1"}, {"b", "b1"}} {
-		got := ix.Matching(tc.ns, map[string]string{"app": "web"})
+		got := matching(ix, tc.ns, map[string]string{"app": "web"})
 		if len(got) != 1 || got[0].UID != tc.uid {
 			t.Fatalf("namespace %q: %+v, want exactly uid %s", tc.ns, got, tc.uid)
 		}
@@ -126,10 +126,10 @@ func TestSameNameInDifferentNamespacesCoexist(t *testing.T) {
 	a2 := svcNamed("a2", "web", nil)
 	a2.Namespace = "a"
 	ix.Upsert(a2)
-	if got := ix.Matching("a", map[string]string{"app": "web"}); len(got) != 1 || got[0].UID != "a2" {
+	if got := matching(ix, "a", map[string]string{"app": "web"}); len(got) != 1 || got[0].UID != "a2" {
 		t.Errorf("namespace a: %+v, want exactly uid a2", got)
 	}
-	if got := ix.Matching("b", map[string]string{"app": "web"}); len(got) != 1 || got[0].UID != "b1" {
+	if got := matching(ix, "b", map[string]string{"app": "web"}); len(got) != 1 || got[0].UID != "b1" {
 		t.Errorf("namespace b was disturbed by a replacement in namespace a: %+v", got)
 	}
 }
@@ -139,7 +139,7 @@ func TestDistinctNamesCoexist(t *testing.T) {
 	ix := NewIndex()
 	ix.Upsert(svcNamed("uid-a", "web", nil))
 	ix.Upsert(svcNamed("uid-b", "api", nil))
-	if matched := ix.Matching("ns", map[string]string{"app": "web"}); len(matched) != 2 {
+	if matched := matching(ix, "ns", map[string]string{"app": "web"}); len(matched) != 2 {
 		t.Fatalf("want both services, got %d: %+v", len(matched), matched)
 	}
 }
@@ -150,7 +150,7 @@ func TestUpdateInPlaceKeepsOneRecord(t *testing.T) {
 	ix := NewIndex()
 	ix.Upsert(svcNamed("uid-a", "web", map[string]string{"prometheus.io/scrape": "true"}))
 	ix.Upsert(svcNamed("uid-a", "web", map[string]string{"prometheus.io/scrape": "false"}))
-	matched := ix.Matching("ns", map[string]string{"app": "web"})
+	matched := matching(ix, "ns", map[string]string{"app": "web"})
 	if len(matched) != 1 {
 		t.Fatalf("want 1 record, got %d", len(matched))
 	}

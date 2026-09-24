@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"testing"
 
+	ljson "github.com/JohanLindvall/lightning/pkg/json"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
@@ -193,22 +194,88 @@ func TestLogfmtValueSurvivesReset(t *testing.T) {
 // labelled by it, and a selector written for one spelling stopped matching.
 func TestRawScalarStringMatchesAttributeRendering(t *testing.T) {
 	t.Parallel()
-	for _, tok := range []string{"5e-7", "0.0000005", "1e21", "2.5e22", "1e-6", "1.5e-7", "-3e21", "42.5"} {
+	for _, tok := range []string{
+		"5e-7", "0.0000005", "1e21", "2.5e22", "1e-6", "1.5e-7", "-3e21", "42.5",
+		// Integers and zeros: the canonical spelling is the attribute's.
+		"0", "-0", "-0.0", "0.0", "00", "007", "-01", "-007", "1.0", "1e2", "-0.5",
+	} {
 		got, ok := RawScalarString([]byte(tok))
 		if !ok {
 			t.Fatalf("RawScalarString(%q) rejected a number", tok)
 		}
-		f, err := strconv.ParseFloat(tok, 64)
-		if err != nil {
-			t.Fatal(err)
+		want, lifted := liftedRendering(t, tok)
+		if !lifted {
+			t.Fatalf("logattrs did not lift %q", tok)
 		}
-		if want := pcommon.NewValueDouble(f).AsString(); got != want {
-			t.Errorf("RawScalarString(%q) = %q, but the same value on a record reads %q", tok, got, want)
-		}
-		if want := logattrs.FloatString(f); got != want {
-			t.Errorf("RawScalarString(%q) = %q, logattrs.FloatString = %q", tok, got, want)
+		if got != want {
+			t.Errorf("RawScalarString(%q) = %q, but the attribute lifted from the same field reads %q", tok, got, want)
 		}
 	}
+}
+
+// liftedRendering is the RECORD-ATTRIBUTE path for a JSON scalar token: the
+// logAttributes extractor lifts field "a" of {"a":tok}, logattrs.Put stores it
+// on a record, and pcommon renders it — which is what a selector or a label
+// reading that attribute sees.
+func liftedRendering(t testing.TB, tok string) (string, bool) {
+	t.Helper()
+	e, err := logattrs.New(&logattrs.Config{Rules: []logattrs.Rule{{Key: "a"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := e.Extract(`{"a":` + tok + `}`)
+	if len(r.Log) == 0 {
+		return "", false
+	}
+	m := pcommon.NewMap()
+	logattrs.Put(m, r.Log)
+	v, ok := m.Get("a")
+	if !ok {
+		return "", false
+	}
+	return v.AsString(), true
+}
+
+// A line field read straight off the line (KeyIndex.Get: selectors, metric
+// labels) and the attribute lifted from the same field must render the same
+// text, for ANY token, or adding an unrelated logAttributes rule renames every
+// series labelled by that key. The one documented residual is an integer token
+// past int64's range (IsIntegerToken's doc), which is skipped.
+func FuzzKeyIndexMatchesLiftedRendering(f *testing.F) {
+	for _, seed := range []string{
+		"-0", "-0.0", "00", "007", "-01", "0", "1.0", "1e2", "-0.5", "5e-7", "1e21",
+		`"s"`, `"esc\"aped"`, "true", "false", "null", "[1]", `{"b":1}`, "1e400", "9007199254740993",
+	} {
+		f.Add(seed)
+	}
+	ki := NewKeyIndex()
+	ki.Add("a")
+	f.Fuzz(func(t *testing.T, tok string) {
+		line := `{"a":` + tok + `}`
+		// The value token itself, as the parser hands it to both paths (tok
+		// may carry whitespace, a trailing comma, …).
+		raws, err := ljson.GetPaths([]byte(line), [][]string{{"a"}}, nil)
+		if err == nil && len(raws) == 1 && logattrs.IsIntegerToken(raws[0]) {
+			if _, err := strconv.ParseInt(string(raws[0]), 10, 64); err != nil {
+				t.Skip("past int64: the documented residual")
+			}
+		}
+		var lf Fields
+		lf.Reset(line)
+		got := ki.Get(&lf, "a")
+		want, lifted := liftedRendering(t, tok)
+		if !lifted {
+			// A field no attribute is lifted from reads as absent on the line
+			// too — an object, an array, null, or a malformed token.
+			if got != "" {
+				t.Fatalf("token %q: the line field reads %q but nothing is lifted from it", tok, got)
+			}
+			return
+		}
+		if got != want {
+			t.Fatalf("token %q: the line field reads %q, the lifted attribute %q", tok, got, want)
+		}
+	})
 }
 
 // A BARE logfmt key yields the sentinel "true", which is prose, not a field:

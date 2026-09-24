@@ -19,7 +19,8 @@ package azurediag
 // and Debug become slog Debug, which is where "why did it do that" belongs.
 //
 // SECRETS. kgo logs broker addresses, mechanism names, error strings and
-// timings; it does not log SASL credentials (audited against franz-go v1.21.6:
+// timings; it does not log SASL credentials (audited against franz-go v1.21.6
+// and re-checked on v1.22.0, whose SASL log statements are unchanged:
 // the SASL path logs the mechanism NAME, the broker, an "authenticate" bool and
 // a step number, never the client write that carries the password or the
 // bearer token). What this adapter must never do is

@@ -47,50 +47,66 @@ package otlpingest
 //
 // WHAT THE DECODED BUDGET CHARGES, and what it deliberately leaves to the other
 // two, since the split is the whole design (decodedLogsSize and its two
-// siblings, one per signal — there is deliberately no `decodedSize(any)`
-// dispatcher: see the note on WHERE the charge is taken, below):
+// siblings, one per signal, in decodedsize.go):
 //
-//   - STRUCTURE — one heap object per resource, scope, record/point/span — is
-//     charged here, because it is exactly what the raw budget cannot see: 30
-//     wire bytes can mint a ResourceLogs, and the ratio between the two is
-//     unbounded from the receiver's side.
-//   - CONTENT (the strings a decode copies out of the body) is NOT charged
-//     here, because it is bounded transitively and charging it twice would
-//     shed honest senders: on HTTP the raw body is charged to the byte budget
-//     for the SAME lifetime (the release is deferred to the handler's return),
-//     and content measures ~1.8x the wire bytes it came from, so 64 MiB of
-//     admitted body is ~115 MiB of strings. On gRPC the message buffer is
-//     freed by the codec at decode, and what remains is bounded by the
-//     in-flight count times the per-message cap (32 x 4 MiB, ~230 MiB of
+//   - STRUCTURE — every object the decode allocates that is not a copy of wire
+//     bytes: a resource, a scope, a record/point/span, and below them every
+//     KeyValue, array element, value wrapper, exemplar, span event and link,
+//     quantile, entity ref and varint bucket count — is charged here, because
+//     it is exactly what the raw budget cannot see: 30 wire bytes can mint a
+//     ResourceLogs, TWO can mint a 40-byte KeyValue, and the ratio between the
+//     two is unbounded from the receiver's side. A KeyValue is structure, not
+//     content. This comment used to file everything below the item under
+//     CONTENT, and the estimate followed it: one 16 MiB push of empty
+//     attributes (~16 KB gzipped) decoded to 385 MiB of live heap charged
+//     512 B, and exemplars, span events and links amplify ~40x.
+//   - CONTENT (the strings and byte slices a decode copies out of the body) is
+//     NOT charged here, because it is bounded transitively and charging it
+//     twice would shed honest senders: on HTTP the raw body is charged to the
+//     byte budget for the SAME lifetime (the release is deferred to the
+//     handler's return), and a copied string costs at most ~2x the wire bytes
+//     it came from (a two-byte string is four wire bytes and one 8-byte
+//     allocation; the runtime interns one-byte strings), ~1.8x in practice, so
+//     64 MiB of admitted body is ~115 MiB of strings. On gRPC the message
+//     buffer is freed by the codec at decode, and what remains is bounded by
+//     the in-flight count times the per-message cap (32 x 4 MiB, ~230 MiB of
 //     strings in the worst case) — the residual this pair of bounds does not
-//     tighten, and the reason limitUnary now takes the slot BEFORE handing the
+//     tighten, and the reason limitUnary takes the slot BEFORE handing the
 //     reservation over rather than after.
 //
-// WHERE THE CHARGE IS TAKEN, and why it is not the obvious place. On HTTP it is
-// servePush, which has the typed request because it did the unmarshal itself. On
-// gRPC it is the three Export methods (server.go), NOT the unary interceptor:
-// grpc-go hands an interceptor the message its GENERATED handler decoded into,
-// which for pdata is *pdata/internal.ExportLogsServiceRequest — the public
-// plogotlp.ExportRequest wrapper is built one layer further in, by
-// rawLogsServer.Export. That type lives in pdata's internal/, so a type switch
-// in the interceptor can never name it: the charge that used to live there
-// matched nothing, reserved nothing, and left a decoded gRPC payload bounded by
-// the in-flight COUNT alone — the exact thing the top of this file says a count
-// structurally cannot bound. Charge where the typed request exists.
+// WHEN AND WHERE THE CHARGE IS TAKEN: from the WIRE bytes, BEFORE the decode.
+// It used to be taken after, from a walk over the decoded pdata, which bounded
+// how long a payload stayed resident and nothing about its peak — four pushes
+// the budget refused were still four decoded payloads on the heap together.
+// On HTTP the charge is servePush's, between the read and the unmarshal. On
+// gRPC it is the codec's (depthGuardCodec.Unmarshal), the only code grpc-go
+// runs between receiving a message and decoding it. The codec cannot answer a
+// refusal itself — grpc-go rewrites every codec error to codes.Internal, which
+// a conformant sender reads as PERMANENT — so an over-budget message is left
+// UNDECODED and the verdict travels to the unary interceptor (limitUnary)
+// through decodedClaims, which answers the retryable ResourceExhausted +
+// RetryInfo and otherwise holds the admitted charge until the handler returns.
+// The claim is keyed by the message's IDENTITY because its TYPE cannot be
+// named: grpc-go decodes into pdata's unexported
+// *internal.ExportLogsServiceRequest (the public wrapper is built one layer
+// further in, by rawLogsServer.Export), which is why a type switch in the
+// interceptor once charged nothing at all.
 
 import (
-	"context"
 	"errors"
 	"io"
+	"net/http"
+	"strconv"
 	"sync/atomic"
 	"time"
 
-	"go.opentelemetry.io/collector/pdata/plog"
-	"go.opentelemetry.io/collector/pdata/pmetric"
-	"go.opentelemetry.io/collector/pdata/ptrace"
-	"google.golang.org/grpc/tap"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/internal/peerip"
 )
 
 // maxBufferBytes bounds the raw payload bytes both transports may hold at once,
@@ -124,205 +140,28 @@ const budgetGranule = 64 << 10
 // estimates past the whole budget can never be admitted, and is answered the
 // same retryable refusal (there is no permanent answer that is safe here — a
 // shed that loses data is worse than the OOM it prevents, and the estimate is a
-// model, not a measurement). At the coefficients below that takes ~130 000
-// resources or ~500 000 records in ONE push, an order of magnitude past what a
-// batching SDK emits; the sender must split. It is warned about, once a minute,
+// model, not a measurement). At decodedsize.go's coefficients that takes
+// ~130 000 minimal resources, ~500 000 bare records or ~1.6 million attributes
+// in ONE push, an order of magnitude past what a batching SDK emits; the sender
+// must split. It is warned about, once a minute,
 // because "every push from this sender is 429" is otherwise indistinguishable
 // from ordinary back-pressure.
 const decodedBudgetFactor = 2
 
-// What one decoded object costs on the heap, measured (Go 1.26, pdata v1.65) as
-// the live-heap delta of UnmarshalProto with the result kept alive:
-//
-//	logs    200k resources x 1 tiny record   8.0 MB wire -> 97.9 MB  (489 B/resource-chain)
-//	logs    1 resource x 400k tiny records   4.4 MB wire -> 61.3 MB  (153 B/record)
-//	logs    60k records, 200 B body, 4 attrs 17.6 MB wire -> 38.9 MB (648 B/record, mostly content)
-//	metrics 200k resources x 1 point        11.0 MB wire -> 131.5 MB (657 B/resource-chain)
-//	metrics 1 resource x 400k points         8.8 MB wire -> 74.1 MB  (185 B/point)
-//	traces  200k resources x 1 span         17.8 MB wire -> 139.5 MB (697 B/resource-chain)
-//	traces  1 resource x 200k spans         12.0 MB wire -> 72.3 MB  (361 B/span)
-//
-// The coefficients round those UP, and deliberately so on the resource term:
-// resources are the multiplier a hostile sender reaches for (30 wire bytes
-// each), records are what an honest one has a lot of, and an estimate that is
-// generous where the attack lives and tight where the traffic lives sheds the
-// right one. They are a MODEL of a shape that varies by an order of magnitude,
-// not a measurement of any particular payload — which is why the refusal they
-// drive stays retryable.
-const (
-	decodedResourceBytes = 512
-	decodedScopeBytes    = 256
-	decodedItemBytes     = 256
-)
-
-// decodedLogsSize and its two siblings estimate the STRUCTURAL heap of a
-// decoded payload: one charge per resource, per scope, and per record / data
-// point / span. Content is charged by nobody here, on purpose — see the file
-// comment. There is one per SIGNAL and no `any`-taking dispatcher over them,
-// because the only caller that would have needed one — the gRPC unary
-// interceptor — is handed a type it can never name (see limitUnary).
-//
-// It walks resources and scopes (never the items themselves), which is the same
-// walk plog.Logs.LogRecordCount already does and costs 3.5 ms for a hostile
-// 600 000-node payload against the ~170 ms that payload's decode took. Counting
-// SCOPES rather than trusting a per-resource constant is not tidiness: one
-// resource holding 500 000 empty ScopeLogs is a legal payload whose item count
-// is zero.
-func decodedLogsSize(ld plog.Logs) int64 {
-	rls := ld.ResourceLogs()
-	n := int64(rls.Len()) * decodedResourceBytes
-	for i := 0; i < rls.Len(); i++ {
-		sls := rls.At(i).ScopeLogs()
-		n += int64(sls.Len()) * decodedScopeBytes
-		for j := 0; j < sls.Len(); j++ {
-			n += int64(sls.At(j).LogRecords().Len()) * decodedItemBytes
-		}
-	}
-	return n
-}
-
-func decodedMetricsSize(md pmetric.Metrics) int64 {
-	rms := md.ResourceMetrics()
-	n := int64(rms.Len()) * decodedResourceBytes
-	for i := 0; i < rms.Len(); i++ {
-		sms := rms.At(i).ScopeMetrics()
-		n += int64(sms.Len()) * decodedScopeBytes
-		for j := 0; j < sms.Len(); j++ {
-			ms := sms.At(j).Metrics()
-			// A metric SHELL is charged like an item: a payload of a million
-			// point-less metrics is legal (emptymetrics.go prunes them, but
-			// only after they are resident).
-			n += int64(ms.Len()) * decodedItemBytes
-			for k := 0; k < ms.Len(); k++ {
-				n += int64(metricPointCount(ms.At(k))) * decodedItemBytes
-			}
-		}
-	}
-	return n
-}
-
-func decodedTracesSize(td ptrace.Traces) int64 {
-	rss := td.ResourceSpans()
-	n := int64(rss.Len()) * decodedResourceBytes
-	for i := 0; i < rss.Len(); i++ {
-		sss := rss.At(i).ScopeSpans()
-		n += int64(sss.Len()) * decodedScopeBytes
-		for j := 0; j < sss.Len(); j++ {
-			n += int64(sss.At(j).Spans().Len()) * decodedItemBytes
-		}
-	}
-	return n
-}
-
-// One gRPC push reserves Server.grpcMaxRecv before grpc-go reads it. The size
-// of the message is not knowable at that point — the tap runs on the HEADERS
-// frame — so the reservation is the worst case the transport will accept
-// (MaxRecvMsgSize). It is released as soon as the message is decoded and the
-// interceptor takes over, so this bounds concurrent RECEIVES rather than
-// concurrent pushes: it does NOT span the seconds a slow collector holds a
-// processing slot, which is the count bound's job.
-//
-// What it DOES span is the upload, and that correction matters: this used to
-// say "microseconds of unmarshal", which is true only of the decode at the end
-// of it. grpc-go runs the unary interceptor once the whole message has been
-// received, so the reservation covers every DATA frame — which is why the
-// window that bounds it has to scale with the message cap (reserveWindowFor).
-
-// grpcReserveWindow bounds how long ONE reservation may live, and it is the
-// difference between a bound and a gift.
-//
-// The reservation is taken on the HEADERS frame and handed over in the
-// interceptor once the message is decoded. A peer that opens a stream and then
-// sends NOTHING reaches neither: the interceptor never runs, and the stream
-// context that backstops the reservation is not cancelled until the stream ENDS
-// — which is the same peer's choice. MaxConnectionIdle does not help, because a
-// connection carrying an open stream is not idle. So sixteen headers-only
-// streams, from one unauthenticated socket, at zero cost in bytes, pinned the
-// whole budget for the process' life and shed gRPC AND HTTP ingest with it.
-//
-// The window is therefore a DEADLINE ON THE PRE-DECODE READ: armed at HEADERS,
-// disarmed the moment the interceptor takes over, so it never runs against the
-// far longer time a handler spends waiting for the collector to ack. Expiry
-// releases the reservation AND cancels the stream (reservation.expire); the
-// cancel is what makes the reclaim honest, since releasing alone would leave
-// grpc-go free to decode a message the budget no longer accounts for, and would
-// still let the peer re-arm the pin by simply opening another stream. The
-// sender sees codes.Canceled, which the OTLP spec lists as retryable, so an
-// honest-but-slow sender re-pushes rather than losing data.
-//
-// 10s to deliver at most maxIngestGRPCMessage is 3.4 Mbit/s from a pod on this
-// node (or, on the trace tier, from a pod in this cluster) — two orders of
-// magnitude of slack — and it is the same clock, on the same question, as the
-// HTTP arm's ReadHeaderTimeout: the peer has connected and shown no intent.
-//
-// It does not make the budget unspendable by a hostile peer: nothing can, on a
-// listener with no credentials. It removes the asymmetry, which is the part
-// that mattered — spending it now costs a stream open per 4 MiB per 10s, and
-// the budget recovers on its own.
-//
-// It is the window for the DEFAULT message cap. reserveWindowFor scales it,
-// because the sentence above is a BIT RATE and the numerator is a flag.
-const grpcReserveWindow = 10 * time.Second
-
-// maxReserveWindow caps what reserveWindowFor will scale to. The window's whole
-// job is to reclaim a pin a peer would otherwise hold for the process' life, so
-// it has to stay finite however large the configured message is — a reservation
-// is grpcMaxRecv bytes of a budget only four of them fit in, and the peer that
-// takes them needs no credentials.
-//
-// Five minutes is where the scaling stops being a rate and starts being a gift:
-// at the default's 3.4 Mbit/s it is a 128 MiB message, an order of magnitude
-// past anything a batching SDK emits and well past what -ingest-grpc-max-recv-bytes
-// is documented for. Above that the flag buys bytes, not time.
-const maxReserveWindow = 5 * time.Minute
-
-// reserveWindowFor sizes the pre-decode window against the message it has to
-// carry, which is what grpcReserveWindow's own justification assumes and what a
-// constant cannot do.
-//
-// The window is armed on the HEADERS frame and disarmed in the unary
-// interceptor, which grpc-go runs only once the whole message has been received
-// and decoded — so it spans the ENTIRE upload, not the "microseconds of
-// unmarshal" the paragraph above reservation once claimed. The reservation SIZE
-// already scales with -ingest-grpc-max-recv-bytes (tapAdmit reserves
-// grpcMaxRecv, and NewServer grows the budget with it); leaving the window fixed
-// turned that flag into a silent per-byte deadline. A tier told to accept 64 MiB
-// messages gave a sender 10s to deliver one — 54 Mbit/s per stream — and reaped
-// every push that could not, under a counter and a Warn that both say the peer
-// "delivered no message", which is the opposite of what happened.
-//
-// So the rate is held constant instead of the time: the window is
-// grpcReserveWindow scaled by MaxRecvBytes/maxIngestGRPCMessage, never shorter
-// than grpcReserveWindow (a receiver configured for SMALLER messages keeps the
-// full grace — the flag exists to raise the cap, and shrinking the window would
-// make a lowered cap reap honest senders for a bound they never asked to
-// tighten) and never longer than maxReserveWindow.
-//
-// The rate is derived by dividing FIRST and the ceiling is applied BEFORE the
-// multiply, so no value of the flag — an operator may pass math.MaxInt, and the
-// trace tier passes math.MaxInt32 for an uncapped hop — can overflow the
-// arithmetic into a short window, which would be the failure this function
-// exists to remove wearing a different hat. Truncating the per-byte rate costs
-// well under a millisecond of a ten-second base.
-func reserveWindowFor(recv int) time.Duration {
-	if recv <= maxIngestGRPCMessage {
-		return grpcReserveWindow
-	}
-	const perByte = int64(grpcReserveWindow) / int64(maxIngestGRPCMessage) // ns per byte
-	if int64(recv) > int64(maxReserveWindow)/perByte {
-		return maxReserveWindow
-	}
-	return time.Duration(perByte * int64(recv))
-}
-
 // errBufferBudget is the refusal: retryable, and mapped to 429 + Retry-After by
-// bodyErrorStatus / writeBodyError.
+// BodyErrorStatus / WriteBodyError.
 var errBufferBudget = errors.New("receiver is holding its maximum buffered payload bytes; retry")
 
 // errDecodedBudget is its sibling one layer in: the bytes were admitted, and
 // what they decode to does not fit. Same shape of answer for the same reason —
 // the sender still holds the payload.
 var errDecodedBudget = errors.New("receiver is holding its maximum decoded payload; retry")
+
+// errInFlight is the COUNT bound's refusal (-ingest-max-in-flight), spelled once
+// so both transports describe it identically: one condition, one description,
+// whichever transport a sender used (exhaustedStatus on gRPC, writeShed on
+// HTTP). They had drifted by a word.
+var errInFlight = errors.New("too many concurrent pushes; retry")
 
 // byteBudget is a non-blocking counting semaphore over bytes. Reserving is
 // add-then-check-then-undo, so concurrent reservers can transiently overshoot
@@ -384,224 +223,150 @@ func (br *budgetReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// maxPresizeBytes bounds what an UNVERIFIED size hint may allocate before the
-// sender has produced a single byte. Content-Length is the sender's claim, not
-// a fact: sizing the destination from it let four idle sockets declaring 16 MiB
-// each add 64 MiB of heap while sending nothing. Below this, one allocation
-// still covers the overwhelming majority of real OTLP pushes; above it, the
-// buffer grows only as the sender proves it is good for the bytes.
-const maxPresizeBytes = 64 << 10
+// acquire takes an in-flight slot without waiting. A sender that is refused
+// gets a RETRYABLE answer (429 / ResourceExhausted): the payload is intact and
+// the sender owns the retry — far better than accepting it and running the
+// node out of memory, or queueing it and turning back-pressure into latency
+// the sender cannot see.
+func (s *Server) acquire() bool {
+	select {
+	case s.inFlight <- struct{}{}:
+		return true
+	default:
+		obs.IngestRejected.WithLabelValues(shedInFlight).Inc()
+		return false
+	}
+}
 
-// readAllCapped is io.ReadAll with a bounded pre-sized destination. A body that
-// fits the pre-sized head lands in ONE allocation instead of the log2(n)
-// doublings io.ReadAll performs; past it the buffer doubles, and only the LAST
-// step is trimmed to the declared length so a full-size body finishes on an
-// exact fit rather than an overshoot. Growth therefore stays proportional to the
-// bytes the sender has actually produced — the reason it may not simply jump to
-// the declaration is that a peer would then buy the whole allocation with one
-// pre-sized head's worth of real bytes, which is the same trade that made
-// crediting Content-Length a denial of service. Sizes are grown by one byte
-// because the loop needs a final short read to see EOF, and an exactly-sized
-// buffer would double for it.
+func (s *Server) release() { <-s.inFlight }
+
+// chargeDecoded reserves a push's estimated decoded structure, reporting
+// whether it fits. A refusal is the same event as a full byte budget or a full
+// slot table — obs.IngestRejected, answered retryably by both transports — with
+// one addition: a push too big for the WHOLE budget is a sender that must batch
+// smaller, and no amount of back-pressure will teach it that, so it gets a line.
+func (s *Server) chargeDecoded(n int64) bool {
+	if n <= 0 || s.decoded.reserve(n) {
+		return true
+	}
+	obs.IngestRejected.WithLabelValues(shedDecoded).Inc()
+	if n > s.decoded.limit && s.decodedWarns.Allow(decodedWarnEvery) {
+		s.log.Warn("ingest: refused a push whose decoded structure alone exceeds the receiver's whole "+
+			"decoded budget; every retry of it will be refused too — the sender must batch smaller",
+			"estimatedBytes", n, "budgetBytes", s.decoded.limit)
+	}
+	return false
+}
+
+// decodedWarnEvery paces that line: a sender batching this large batches this
+// large on every push.
+const decodedWarnEvery = time.Minute
+
+// exhaustedStatus builds the gRPC refusal. ResourceExhausted ALONE reads as
+// PERMANENT to conformant senders — the OTLP spec makes it retryable only with
+// RetryInfo attached, and both the OTel SDK and the Collector drop the batch
+// without it. A shed that loses the data is worse than the OOM it prevents, so
+// the hint rides along, mirroring the HTTP arm's Retry-After: 1.
+func exhaustedStatus(msg string) error {
+	st, err := status.New(codes.ResourceExhausted, msg).
+		WithDetails(&errdetails.RetryInfo{RetryDelay: durationpb.New(time.Second)})
+	if err != nil {
+		return status.Error(codes.ResourceExhausted, msg)
+	}
+	return st.Err()
+}
+
+// writeShed answers an HTTP push refused by an admission bound: 429 with
+// Retry-After, the retryable answer the sender keeps its payload for — the HTTP
+// half of exhaustedStatus, and the one spelling of it for all three bounds
+// (servePush's two, and WriteBodyError's byte-budget arm).
+func writeShed(w http.ResponseWriter, err error) {
+	w.Header().Set("Retry-After", "1")
+	http.Error(w, err.Error(), http.StatusTooManyRequests)
+}
+
+// --- shedding: the CONTEXT half of obs.IngestRejected ---
+
+// The three admission bounds, as throttle keys and as the `reason` on the line.
+// They are the counter's three causes, spelled the same way, because "the
+// receiver is shedding" has three different fixes: too many senders at once,
+// too many raw bytes resident, or too much structure inflated out of them.
+const (
+	shedInFlight = "in_flight"
+	shedBuffer   = "buffer_bytes"
+	shedDecoded  = "decoded_bytes"
+)
+
+// shedWarnEvery paces the shedding line. A receiver at a bound stays at it for
+// as long as the load lasts, and every refused push would otherwise produce a
+// line — on an UNAUTHENTICATED listener, i.e. a log volume a stranger chooses.
+const shedWarnEvery = time.Minute
+
+// noteShed narrates a push refused by an admission bound. The COUNT is taken at
+// each bound (obs.IngestRejected, whose per-bound comments argue for it); this
+// is the half a counter cannot carry — which bound bound, what its limit is,
+// which flag moves it, and who was pushing.
 //
-// limit is the reader's own cap (16 MiB for application pushes, 4 MiB on the
-// trace tier's internal hop) rather than a constant: the two receivers offer
-// different limits deliberately.
-func readAllCapped(r io.Reader, hint, limit int64) ([]byte, error) {
-	if hint > limit {
-		// An over-cap declaration is rejected once the read confirms it, but
-		// the read still happens: never size past what the LimitReader will
-		// hand over.
-		hint = limit
-	}
-	start := hint
-	if start > maxPresizeBytes {
-		start = maxPresizeBytes
-	}
-	if start <= 0 {
-		start = 511 // unknown length: start where io.ReadAll does
-	}
-	buf := make([]byte, 0, start+1)
-	for {
-		if len(buf) == cap(buf) {
-			// Already past the cap: the caller rejects this body (413), so
-			// every further byte is bought and thrown away. Stop here rather
-			// than doubling into it.
-			//
-			// The growth loop cannot see that on its own. The trim below lands
-			// the last step exactly on a declared length, so an identity-encoded
-			// body declaring the cap fills a buffer of exactly limit+1 — the
-			// LimitReader's one byte of over-cap evidence — and the next
-			// iteration found len==cap with the hint no longer ahead of it and
-			// doubled to ~2x the cap, copying the ~16 MiB predecessor into it
-			// while both were live. That is ~3x the body's byte-budget charge
-			// for a request that is refused two lines later, and maxBufferBytes
-			// admits four of them at once (measured: cap 33,554,435 for a
-			// 16 MiB limit).
-			//
-			// Returning a nil error is right: the buffer already carries the
-			// over-cap evidence (limit+1 bytes), and BodyReader.Read tests
-			// len(buf) > max unconditionally, so the answer is the same 413 by
-			// the same route — the compressed-cap arm above it is reached only
-			// on an error, and it would have answered 413 as well.
-			if int64(len(buf)) > limit {
-				return buf, nil
-			}
-			// Double, except for the step that would overshoot a declared
-			// length still ahead of us — that one lands exactly on it.
-			next := int64(cap(buf)) * 2
-			if hint > int64(cap(buf)) && hint < next {
-				next = hint
-			}
-			grown := make([]byte, len(buf), next+1)
-			copy(grown, buf)
-			buf = grown
-		}
-		n, err := r.Read(buf[len(buf):cap(buf)])
-		buf = buf[:len(buf)+n]
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				err = nil
-			}
-			return buf, err
-		}
-	}
-}
-
-// reservation is one gRPC push's budget claim. It is returned by whichever of
-// three paths comes first: the interceptor (the fast path — the message is
-// decoded and the count bound takes over), the stream context's cancellation
-// (every abort path that the peer or the transport drives), and grpcReserveWindow
-// elapsing (the peer that drives NEITHER). A leaked reservation sheds the whole
-// listener for the process' life, so the last of those is not optional.
+// It matters because the refusal is INVISIBLE to everything except the sender:
+// the answer is retryable by design (429 + Retry-After / ResourceExhausted +
+// RetryInfo), so a well-behaved SDK simply retries and the operator sees
+// telemetry arriving late, or not at all, with nothing in this process's log
+// saying it refused anything. That was true of all three bounds.
 //
-// held is the interlock: every path claims through the same Swap, so exactly one
-// of them ever sees a non-zero value. That is what makes the window safe to add
-// — no double release, no negative budget, and no cancel fired at a handler that
-// has already been handed over.
-type reservation struct {
-	b      *byteBudget
-	held   atomic.Int64
-	cancel context.CancelFunc
-	// expired is called by expire, and ONLY by expire, so the window elapsing
-	// stays distinguishable from an admission refusal (see there). nil is
-	// tolerated: the package's own tests build bare reservations.
-	expired func()
-	// timer is written after it is armed and read by release, which can run on
-	// another goroutine; a nil load simply skips the Stop and leaves a timer
-	// whose expire finds held already at zero.
-	timer atomic.Pointer[time.Timer]
-}
-
-// release returns the reservation without touching the stream: the handover to
-// the count bound, or an RPC that ended on its own.
-func (r *reservation) release() {
-	if n := r.held.Swap(0); n > 0 {
-		r.b.release(n)
-		if t := r.timer.Load(); t != nil {
-			t.Stop()
-		}
+// peer is empty where the transport cannot supply one. The gRPC pre-decode tap
+// is the real case: grpc-go runs it before the peer reaches the stream context
+// (server.go's peer.NewContext happens per RPC, after the tap) and tap.Info
+// carries no address, so the one refusal taken before any decode is also the
+// one that cannot name its sender. An empty key is omitted rather than logged
+// blank.
+func (s *Server) noteShed(reason, peer string) {
+	if allow, _ := s.shedWarns.Allow(reason); !allow {
+		return
 	}
+	args := []any{"reason", reason}
+	var limit int64
+	switch reason {
+	case shedInFlight:
+		limit = int64(s.maxInFlight)
+		args = append(args, "limit", limit, "flag", "-ingest-max-in-flight")
+	case shedBuffer:
+		limit = s.buffer.limit
+		args = append(args, "limitBytes", limit)
+		args = append(args, s.budgetSourceArgs()...)
+	case shedDecoded:
+		limit = s.decoded.limit
+		args = append(args, "limitBytes", limit)
+		args = append(args, s.budgetSourceArgs()...)
+	}
+	if peer != "" {
+		args = append(args, "peer", peerip.ForLog(peer))
+	}
+	s.log.Warn("ingest: shedding pushes at an admission bound; senders are answered retryably and keep their "+
+		"payloads, so telemetry arrives late or not at all while this lasts", args...)
 }
 
-// expire is grpcReserveWindow elapsing with no message decoded. It reclaims the
-// bytes and REAPS the stream, so the peer cannot hold a decode window open
-// without paying for one, and so nothing is decoded outside the accounting. The
-// sender sees codes.Canceled — retryable per the OTLP spec — which is the
-// degradation an honest-but-slow sender gets.
+// budgetSourceArgs says where the byte budget that just bound came FROM, which
+// is not the same question as which flag exists. Both budgets derive from
+// max(maxBufferBytes, 4 x MaxRecvBytes) (NewServer), so at the default 4 MiB
+// receive cap the built-in floor is what binds and
+// -ingest-grpc-max-recv-bytes moves NOTHING until it is set above
+// maxBufferBytes/4. Naming the flag unconditionally — which this line used to
+// do — sends an operator to raise a value that cannot change the limit they
+// are reading in the same record, and the only evidence that it did nothing is
+// the shedding continuing.
 //
-// It deliberately does NOT count obs.IngestRejected. That counter means one
-// thing — a push refused because an admission bound was REACHED, answered
-// 429/ResourceExhausted with the payload still in the sender's hands — and it
-// is read as "this node cannot keep up with what is being pushed at it". An
-// expiry is the opposite shape: the budget had room, and a peer that opened a
-// stream and then delivered nothing inside the decode window was reaped. One
-// headers-only prober, at zero cost in bytes, could therefore drive the rate
-// an operator scales on.
-//
-// The two causes need different responses, so they are two series — NOT one
-// cause made invisible. Separating them by dropping the count would be the
-// worse of the two errors this seam can make: the reclaim cancels a peer's
-// stream and hands its bytes back, and a listener nothing authenticates is
-// exactly where that has to be visible to Prometheus. expired is the seam
-// (Server.noteReserveExpired → obs.IngestReserveExpired).
-func (r *reservation) expire() {
-	if n := r.held.Swap(0); n > 0 {
-		r.b.release(n)
-		if r.expired != nil {
-			r.expired()
-		}
-		r.cancel()
+// It reads the RESOLVED budget rather than re-deriving NewServer's formula: the
+// budget is above the floor exactly when the receive cap raised it, and a
+// second copy of the factor would name the wrong source the day one of the two
+// changed.
+func (s *Server) budgetSourceArgs() []any {
+	if s.buffer.limit > int64(maxBufferBytes) {
+		return []any{"flag", "-ingest-grpc-max-recv-bytes", "recvBytes", s.grpcMaxRecv}
 	}
-}
-
-type reservationKey struct{}
-
-// tapAdmit reserves buffer budget for a gRPC push BEFORE grpc-go reads its
-// message. tap.ServerInHandle is the only pre-decode hook the server exposes;
-// it is marked experimental, and the one property this use depends on —
-// that a status returned here reaches the client intact — is real:
-// http2Server.writeEarlyAbort emits grpc-status-details-bin whenever the status
-// carries details, so the RetryInfo that keeps a ResourceExhausted retryable
-// survives (TestGRPCBufferBudgetRefusalCarriesRetryInfo pins it).
-//
-// It runs with the transport's own mutex held, so it must not block: what
-// follows is two atomics, a context and an armed timer.
-func (s *Server) tapAdmit(ctx context.Context, _ *tap.Info) (context.Context, error) {
-	reserve := int64(s.grpcMaxRecv)
-	if !s.buffer.reserve(reserve) {
-		obs.IngestRejected.WithLabelValues(shedBuffer).Inc()
-		// No peer: see noteShed. This is the one refusal taken before grpc-go
-		// has put the address anywhere this code can reach.
-		s.noteShed(shedBuffer, "")
-		// The same refusal text as the HTTP arm's (errBufferBudget, which
-		// WriteBodyError answers 429 with): one condition, one description,
-		// whichever transport a sender used.
-		return nil, exhaustedStatus(errBufferBudget.Error())
-	}
-	// grpc-go makes the context returned here the STREAM's context and reads the
-	// message through it (http2Server.operateHeaders wires s.ctxDone into the
-	// recvBufferReader), so cancelling it aborts a read that is waiting for DATA
-	// frames that never arrive. That is what gives expire something to reap.
-	ctx, cancel := context.WithCancel(ctx)
-	r := &reservation{b: s.buffer, cancel: cancel, expired: s.noteReserveExpired}
-	r.held.Store(reserve)
-	ctx = context.WithValue(ctx, reservationKey{}, r)
-	// The stream context is cancelled on every RPC outcome, so this is the
-	// backstop for the paths that never reach the interceptor but do end.
-	context.AfterFunc(ctx, r.release)
-	// And this is the bound for the peer that ends nothing (see
-	// grpcReserveWindow). Armed last: expire is a no-op until held is non-zero,
-	// and release tolerates a not-yet-stored timer.
-	r.timer.Store(time.AfterFunc(s.reserveWindow, r.expire))
-	return ctx, nil
-}
-
-// reserveExpiryWarnEvery is the re-warn cadence for reaped decode windows. The
-// condition is a peer's behaviour, not an event worth a line each: one slow or
-// probing sender can produce one per stream open.
-const reserveExpiryWarnEvery = time.Minute
-
-// noteReserveExpired reports a reaped pre-decode reservation: it counts the
-// metric that is the condition's ONLY standing signal — see reservation.expire
-// for why it may not fold into obs.IngestRejected — and warns, throttled,
-// because the condition is a peer's behaviour rather than an event worth a line
-// each (one probing sender produces one per stream open). The local total is
-// kept only to put a magnitude on that one line; the series is obs's.
-func (s *Server) noteReserveExpired() {
-	obs.IngestReserveExpired.Inc()
-	total := s.reserveExpiries.Add(1)
-	if s.reserveExpiryWarns.Allow(reserveExpiryWarnEvery) {
-		s.log.Warn("reclaimed a gRPC pre-decode buffer reservation and cancelled the stream: "+
-			"a peer opened a stream and delivered no message inside the decode window",
-			"window", s.reserveWindow, "reservedBytes", s.grpcMaxRecv, "total", total)
-	}
-}
-
-// releaseReservation hands the accounting over from the decode window to the
-// processing bound.
-func releaseReservation(ctx context.Context) {
-	if r, ok := ctx.Value(reservationKey{}).(*reservation); ok {
-		r.release()
+	return []any{
+		"recvBytes", s.grpcMaxRecv,
+		"floorBytes", int64(maxBufferBytes),
+		"note", "the budget is at its built-in floor; -ingest-grpc-max-recv-bytes raises it only once set above " +
+			strconv.Itoa(maxBufferBytes/4) + " bytes, so shrink the senders' batches instead",
 	}
 }

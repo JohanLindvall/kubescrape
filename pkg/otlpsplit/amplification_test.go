@@ -21,8 +21,24 @@ import (
 // push, all on the goroutine holding the sender's in-flight slot, with the
 // parts slice materialised in full before the first send.
 //
-// The bound is amplification, not part count: parts may total at most
-// minChunkRoomDiv times the input, whatever shape the sender chose.
+// The bound is amplification, not part count. These shapes take the ABANDON
+// path at its first decision — the re-copied framing is past splitPaysOff's
+// threshold before a single leaf is placed — so nothing is ever chunked: the
+// resource ships as ONE part, byte for byte the input (shippedWhole). That is
+// not the general bound. A split that runs part of the way before abandoning,
+// or never abandons, is held to the constant minChunkRoomDiv derives (7x for
+// logs and spans, 19x for metrics, NOT minChunkRoomDiv itself, since packing
+// is next-fit), pinned shape by shape in amplification_bound_test.go.
+
+// shippedWhole asserts the abandon-at-the-first-decision outcome: one part,
+// exactly the input's size — no framing re-copied at all.
+func shippedWhole(t *testing.T, parts, total, in int) {
+	t.Helper()
+	if parts != 1 || total != in {
+		t.Fatalf("%d parts totalling %d bytes for a %d-byte input (%.2fx); an abandon at the first decision ships the input as ONE part of the same size",
+			parts, total, in, float64(total)/float64(in))
+	}
+}
 
 // nearCapAttr is a value that leaves less than one chunk's worth of room under
 // the cap once it is framed — the attacker's choice.
@@ -45,7 +61,7 @@ func TestNearCapResourceFramingDoesNotAmplifyLogs(t *testing.T) {
 	rl := ld.ResourceLogs().AppendEmpty()
 	rl.Resource().Attributes().PutStr("sender.chosen", nearCapAttr(maxBytes))
 	sl := rl.ScopeLogs().AppendEmpty()
-	for i := 0; i < records; i++ {
+	for range records {
 		sl.LogRecords().AppendEmpty()
 	}
 
@@ -54,10 +70,7 @@ func TestNearCapResourceFramingDoesNotAmplifyLogs(t *testing.T) {
 	parts, rep := LogsWithReport(ld, maxBytes)
 
 	// Before the splitPaysOff guard this was `records` parts and ~20 GiB.
-	if total := totalLogBytes(parts); total > minChunkRoomDiv*in {
-		t.Fatalf("%d parts totalling %d bytes for a %d-byte input (%.0fx, bound %dx)",
-			len(parts), total, in, float64(total)/float64(in), minChunkRoomDiv)
-	}
+	shippedWhole(t, len(parts), totalLogBytes(parts), in)
 	if rep.Abandoned != 1 {
 		t.Fatalf("abandoned split not reported: %+v (parts=%d)", rep, len(parts))
 	}
@@ -87,17 +100,14 @@ func TestNearCapScopeFramingDoesNotAmplifyLogs(t *testing.T) {
 	rl.Resource().Attributes().PutStr("k8s.namespace.name", "team-a")
 	sl := rl.ScopeLogs().AppendEmpty()
 	sl.Scope().Attributes().PutStr("sender.chosen", nearCapAttr(maxBytes))
-	for i := 0; i < records; i++ {
+	for range records {
 		sl.LogRecords().AppendEmpty()
 	}
 
 	var m plog.ProtoMarshaler
 	in := m.LogsSize(ld)
 	parts, rep := LogsWithReport(ld, maxBytes)
-	if total := totalLogBytes(parts); total > minChunkRoomDiv*in {
-		t.Fatalf("%d parts totalling %d bytes for a %d-byte input (%.0fx, bound %dx)",
-			len(parts), total, in, float64(total)/float64(in), minChunkRoomDiv)
-	}
+	shippedWhole(t, len(parts), totalLogBytes(parts), in)
 	if rep.Abandoned != 1 {
 		t.Fatalf("abandoned split not reported: %+v (parts=%d)", rep, len(parts))
 	}
@@ -111,7 +121,7 @@ func TestNearCapResourceFramingDoesNotAmplifyTraces(t *testing.T) {
 	rs := td.ResourceSpans().AppendEmpty()
 	rs.Resource().Attributes().PutStr("sender.chosen", nearCapAttr(maxBytes))
 	ss := rs.ScopeSpans().AppendEmpty()
-	for i := 0; i < spans; i++ {
+	for range spans {
 		ss.Spans().AppendEmpty()
 	}
 
@@ -122,10 +132,7 @@ func TestNearCapResourceFramingDoesNotAmplifyTraces(t *testing.T) {
 	for _, p := range parts {
 		total += m.TracesSize(p)
 	}
-	if total > minChunkRoomDiv*in {
-		t.Fatalf("%d parts totalling %d bytes for a %d-byte input (%.0fx, bound %dx)",
-			len(parts), total, in, float64(total)/float64(in), minChunkRoomDiv)
-	}
+	shippedWhole(t, len(parts), total, in)
 	if rep.Abandoned != 1 {
 		t.Fatalf("abandoned split not reported: %+v (parts=%d)", rep, len(parts))
 	}
@@ -142,7 +149,7 @@ func TestNearCapResourceFramingDoesNotAmplifyMetrics(t *testing.T) {
 	g := sm.Metrics().AppendEmpty()
 	g.SetName("q")
 	dps := g.SetEmptyGauge().DataPoints()
-	for i := 0; i < points; i++ {
+	for i := range points {
 		dps.AppendEmpty().SetIntValue(int64(i))
 	}
 
@@ -153,10 +160,7 @@ func TestNearCapResourceFramingDoesNotAmplifyMetrics(t *testing.T) {
 	for _, p := range parts {
 		total += m.MetricsSize(p)
 	}
-	if total > minChunkRoomDiv*in {
-		t.Fatalf("%d parts totalling %d bytes for a %d-byte input (%.0fx, bound %dx)",
-			len(parts), total, in, float64(total)/float64(in), minChunkRoomDiv)
-	}
+	shippedWhole(t, len(parts), total, in)
 	if rep.Abandoned == 0 {
 		t.Fatalf("abandoned split not reported: %+v (parts=%d)", rep, len(parts))
 	}
@@ -177,7 +181,7 @@ func TestNearCapMetricShellDoesNotAmplify(t *testing.T) {
 	g.SetName("q")
 	g.SetDescription(nearCapAttr(maxBytes))
 	dps := g.SetEmptyGauge().DataPoints()
-	for i := 0; i < points; i++ {
+	for i := range points {
 		dps.AppendEmpty().SetIntValue(int64(i))
 	}
 
@@ -188,10 +192,7 @@ func TestNearCapMetricShellDoesNotAmplify(t *testing.T) {
 	for _, p := range parts {
 		total += m.MetricsSize(p)
 	}
-	if total > minChunkRoomDiv*in {
-		t.Fatalf("%d parts totalling %d bytes for a %d-byte input (%.0fx, bound %dx)",
-			len(parts), total, in, float64(total)/float64(in), minChunkRoomDiv)
-	}
+	shippedWhole(t, len(parts), total, in)
 	if rep.Abandoned == 0 {
 		t.Fatalf("abandoned split not reported: %+v (parts=%d)", rep, len(parts))
 	}
@@ -218,7 +219,7 @@ func TestOrdinaryFramingStillSplitsCleanly(t *testing.T) {
 	// 1 MiB cap (in production the cap is 3.75 MiB).
 	rl.Resource().Attributes().PutStr("k8s.pod.annotation.config", strings.Repeat("y", 16<<10))
 	sl := rl.ScopeLogs().AppendEmpty()
-	for i := 0; i < 4000; i++ {
+	for range 4000 {
 		sl.LogRecords().AppendEmpty().Body().SetStr(strings.Repeat("z", 2000))
 	}
 

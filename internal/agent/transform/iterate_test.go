@@ -23,7 +23,7 @@ import (
 func benchTraces(n int) ptrace.Traces {
 	td := ptrace.NewTraces()
 	sps := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans()
-	for i := 0; i < n; i++ {
+	for range n {
 		sps.AppendEmpty().SetName("op")
 	}
 	return td
@@ -35,7 +35,7 @@ func benchMetrics(points int) pmetric.Metrics {
 	m := ms.AppendEmpty()
 	m.SetName("m")
 	dps := m.SetEmptyGauge().DataPoints()
-	for i := 0; i < points; i++ {
+	for i := range points {
 		dps.AppendEmpty().SetDoubleValue(float64(i))
 	}
 	return md

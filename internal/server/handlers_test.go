@@ -1,15 +1,18 @@
-// Tests for the request handlers (handlers.go): wait budgets and the
-// metadata response caching (Cache-Control/ETag) behavior.
+// Tests for the lookup handlers (handlers.go): wait budgets, and the
+// metadata response caching (Cache-Control/ETag, httpcache.go) they serve
+// through.
 package server
 
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/internal/store"
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 // A client-supplied wait must only ever SHORTEN the server budget. Both the
@@ -79,7 +82,7 @@ func TestETagStableAcrossIdenticalResponses(t *testing.T) {
 	if first == "" {
 		t.Fatal("no ETag")
 	}
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if got := get(); got != first {
 			t.Fatalf("ETag changed across identical responses: %q -> %q", first, got)
 		}
@@ -126,6 +129,38 @@ func TestIfNoneMatchMultipleETags(t *testing.T) {
 	}
 	// A non-matching list is a full 200.
 	condGet(t, srv.URL+"/v1/containers/cafe01", `"nope", W/"other"`, http.StatusOK)
+}
+
+// etagMatches runs on every cached revalidation of every unauthenticated
+// metadata route, over a header the client wrote: splitting it into a slice
+// first cost an allocation per request, and a header of nothing but commas
+// (bounded only by MaxHeaderBytes) a ~200 KB transient one. Matching,
+// non-matching and hostile lists alike must allocate nothing — and still
+// answer what the list says.
+func TestETagMatchesIsAllocationFree(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("the race detector adds bookkeeping allocations")
+	}
+	const etag = `"0123456789abcdef0123456789abcdef"`
+	hostile := strings.Repeat(",", 12000) + etag
+	for _, tc := range []struct {
+		name, header string
+		want         bool
+	}{
+		{"single", etag, true},
+		{"weak in a list", `"a", W/` + etag + `, "b"`, true},
+		{"star", `*`, true},
+		{"no match", `"a", "b", W/"c"`, false},
+		{"empty members", `,, ,`, false},
+		{"commas then the tag", hostile, true},
+	} {
+		if got := etagMatches(tc.header, etag); got != tc.want {
+			t.Errorf("%s: etagMatches = %v, want %v", tc.name, got, tc.want)
+		}
+		if allocs := testing.AllocsPerRun(20, func() { etagMatches(tc.header, etag) }); allocs != 0 {
+			t.Errorf("%s: etagMatches allocated %.0f times per call, want 0", tc.name, allocs)
+		}
+	}
 }
 
 // max-age has second granularity, so a sub-second -metadata-cache-ttl used to
@@ -379,7 +414,7 @@ func TestNodeTargetsCachedWithStableETag(t *testing.T) {
 	// however the handler behaved, which is what it did for its whole life.
 	// Enough targets that an unsorted body would differ across requests with
 	// overwhelming probability.
-	for i := 0; i < 12; i++ {
+	for i := range 12 {
 		addTargetPod(st, i)
 	}
 	srv := cachingServer(t, st, 10*time.Second)
@@ -389,7 +424,7 @@ func TestNodeTargetsCachedWithStableETag(t *testing.T) {
 	if etag == "" {
 		t.Fatal("no ETag on the targets response")
 	}
-	for i := 0; i < 20; i++ { // deterministic body → stable tag
+	for range 20 { // deterministic body → stable tag
 		if e := condGet(t, url, "", http.StatusOK); e != etag {
 			t.Fatalf("ETag changed across identical requests: %q vs %q "+
 				"(the targets response must be sorted before hashing)", e, etag)

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/textproto"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/JohanLindvall/kubescrape/internal/peerip"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/internal/store"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -124,7 +124,8 @@ func TestSelfNeverResolvesTheForwardedForAddress(t *testing.T) {
 // this route answers with the hop's own pod. Nothing in an HTTP request can
 // separate the two — the connection is the only evidence there is — so the
 // deployments that consume /v1/self must reach the service directly, which is
-// what the shipped agent does (metaclient sets Proxy: nil).
+// what the shipped agent does (metaclient sets Proxy: nil, pinned by
+// pkg/metaclient's TestClientNeverUsesAnEnvironmentProxy).
 func TestASilentReOriginatingHopIsAnsweredWithTheHopsOwnIdentity(t *testing.T) {
 	st := store.New(time.Minute)
 	addNamedPod(st, "egress-proxy", "uid-proxy", "10.0.0.9")
@@ -161,22 +162,18 @@ func addNamedPod(st *store.Store, name, uid, ip string) {
 	})
 }
 
-// The table above must cover forwardedHeaders — a name added to the list with
-// no case here is a refusal nothing exercises — and every name in it must be in
-// net/http's canonical form, since forwardedVia indexes the header map directly
-// rather than going through Header.Get (which canonicalises for you, and which
-// is what could not tell an empty header from an absent one).
-func TestForwardedHeaderNamesAreCanonicalAndExercised(t *testing.T) {
+// The table above must cover every forwarding header /v1/self refuses on — a
+// name added to peerip's list with no case here is a refusal nothing exercises
+// through this route. (That each name is in net/http's canonical form is
+// peerip's own test.)
+func TestForwardingHeadersAreExercisedBySelfHopCases(t *testing.T) {
 	covered := map[string]bool{}
 	for _, tc := range selfHopCases {
 		covered[tc.header] = true
 	}
-	for _, h := range forwardedHeaders {
-		if got := textproto.CanonicalMIMEHeaderKey(h); got != h {
-			t.Errorf("forwardedHeaders has %q, which net/http stores as %q: the refusal never fires for it", h, got)
-		}
+	for _, h := range peerip.ForwardingHeaders() {
 		if !covered[h] {
-			t.Errorf("forwardedHeaders names %q and selfHopCases does not exercise it", h)
+			t.Errorf("peerip.ForwardingHeaders names %q and selfHopCases does not exercise it", h)
 		}
 	}
 }

@@ -109,30 +109,44 @@ func TestAuthSecretRefsFollowsEveryMutation(t *testing.T) {
 		t.Fatal("an unparseable update was accepted")
 	}
 	has("an unparseable update", "sm-0/tok/rotated", false)
+	// (The PodMonitor arm of the unparseable-update removal is pinned with a
+	// warm memo by TestPodMonitorUnparseableUpdateRemoves.)
+
+	// A re-created ServiceMonitor, then a same-resourceVersion re-delivery of
+	// it — the informer resync — which must neither drop the ref nor rebuild
+	// the allowlist.
+	recreated := monitorWithSecret("sm", 0)
+	recreated.SetResourceVersion("4")
+	if err := ix.Upsert(recreated); err != nil {
+		t.Fatal(err)
+	}
+	has("a re-created ServiceMonitor", "sm-0/tok/token", true)
+	builds := ix.authBuilds.Load()
+	if err := ix.Upsert(recreated.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	has("a re-delivery of the same ServiceMonitor", "sm-0/tok/token", true)
+	if got := ix.authBuilds.Load() - builds; got != 0 {
+		t.Errorf("a same-resourceVersion re-delivery rebuilt the allowlist %d times", got)
+	}
+
+	// A DELETED ServiceMonitor: the one mutation the steps above did not make.
+	ix.Delete("sm-0", "mon")
+	has("a deleted ServiceMonitor", "sm-0/tok/token", false)
 }
 
 // monitorWithSecret builds a monitor in namespace "<kind>-<i>" whose single
-// endpoint references Secret "tok" key "token". kind "pm" spells the endpoint
-// list the PodMonitor way (podMetricsEndpoints).
+// endpoint references Secret "tok" key "token". kind is "sm" (a
+// ServiceMonitor) or "pm" (a PodMonitor), and names the namespace too.
 func monitorWithSecret(kind string, i int) *unstructured.Unstructured {
-	field := "endpoints"
-	if kind == "pm" {
-		field = "podMetricsEndpoints"
-	}
-	return &unstructured.Unstructured{Object: map[string]any{
-		"metadata": map[string]any{
-			"name":            "mon",
-			"namespace":       fmt.Sprintf("%s-%d", kind, i),
-			"resourceVersion": "1",
-		},
-		"spec": map[string]any{
-			"selector": map[string]any{"matchLabels": map[string]any{"app": "x"}},
-			field: []any{map[string]any{
-				"port":              "metrics",
-				"bearerTokenSecret": map[string]any{"name": "tok", "key": "token"},
-			}},
-		},
-	}}
+	crKind := map[string]string{"sm": "ServiceMonitor", "pm": "PodMonitor"}[kind]
+	return crObject(crKind, fmt.Sprintf("%s-%d", kind, i), "mon", "1", map[string]any{
+		"selector": map[string]any{"matchLabels": map[string]any{"app": "x"}},
+		endpointsKey(crKind): []any{map[string]any{
+			"port":              "metrics",
+			"bearerTokenSecret": map[string]any{"name": "tok", "key": "token"},
+		}},
+	})
 }
 
 // BenchmarkAuthSecretRefs reports what the memo above is worth, at a cluster

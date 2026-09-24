@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -38,8 +38,9 @@ const (
 	verdictAbstain verdict = iota
 	// verdictSample: keep the trace, stop evaluating.
 	verdictSample
-	// verdictVeto: drop the trace, stop evaluating. Only an inverted policy
-	// produces one, directly or by propagation through and/composite.
+	// verdictVeto: drop the trace, stop evaluating. Only an inverted policy or
+	// a script whose decide(trace) returns False produces one, directly or by
+	// propagation through and/composite.
 	verdictVeto
 )
 
@@ -90,15 +91,14 @@ func compilePolicies(list []PolicyConfig, sub bool, alloc *bucketAlloc) ([]named
 		if pc.Name == "" {
 			return nil, false, errPolicy(where, "name is required (it is what a Decision and its metric label report)")
 		}
-		// "none" is the metric label the buffering layer renders for the
-		// UNATTRIBUTED default drop (tailbuffer.policyLabel(""))*, so a policy
-		// literally named "none" would share those counter objects and make
+		// NoPolicyLabel ("none") is the metric label the buffering layer
+		// renders for the UNATTRIBUTED default drop, so a policy literally
+		// named that would share those counter objects and make
 		// kubescrape_tail_sampling_traces_total{policy="none"} conflate its
 		// decisions with every no-opinion drop. Refuse the reserved name rather
-		// than silently merge. (*Hardcoded here because tailsample cannot import
-		// tailbuffer, which imports it.)
-		if pc.Name == "none" {
-			return nil, false, errPolicy(where, "\"none\" is reserved (it is the metric label for the unattributed default drop); pick another name")
+		// than silently merge.
+		if pc.Name == NoPolicyLabel {
+			return nil, false, errPolicy(where, "%q is reserved (it is the metric label for the unattributed default drop); pick another name", NoPolicyLabel)
 		}
 		// A sub-policy is labelled "<composite>/<sub>", and a top-level name is
 		// a free string, so a policy called "outer/inner" produces the SAME
@@ -205,12 +205,7 @@ func allTypes() []string {
 }
 
 func knownType(t string) bool {
-	for _, k := range allTypes() {
-		if k == t {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(allTypes(), t)
 }
 
 // checkBody requires the body matching pc.Type and refuses any other. A body
@@ -400,21 +395,19 @@ func compileStringAttribute(where string, cfg *StringAttributeConfig) (policy, e
 }
 
 func (p *stringAttrPolicy) eval(t Trace, _ time.Time) (verdict, string, ChargedMask) {
-	for i := range t.Spans {
-		v, ok := lookup(t.Spans[i], p.key)
-		if !ok || v.Type() != pcommon.ValueTypeStr {
-			// A non-string value is not a match, not an error: see
-			// StringAttributeConfig.Values for why no coercion happens.
-			continue
-		}
-		if p.match(v.Str()) {
-			if p.invert {
-				return verdictVeto, "", 0
-			}
-			return verdictSample, "", 0
-		}
+	if !anySpanMatches(t, p.key, p) {
+		return verdictAbstain, "", 0
 	}
-	return verdictAbstain, "", 0
+	if p.invert {
+		return verdictVeto, "", 0
+	}
+	return verdictSample, "", 0
+}
+
+// matchValue is the valueMatcher half: a non-string value is not a match, not
+// an error — see StringAttributeConfig.Values for why no coercion happens.
+func (p *stringAttrPolicy) matchValue(v pcommon.Value) bool {
+	return v.Type() == pcommon.ValueTypeStr && p.match(v.Str())
 }
 
 func (p *stringAttrPolicy) match(s string) bool {
@@ -478,9 +471,15 @@ func (c *regexCache) put(s string, v bool) {
 
 // numericPolicy matches an int or double attribute within inclusive bounds. An
 // unset bound is the type's extreme, so the comparison is branchless.
+//
+// The double arm has bounds of its own: an unset side is an INFINITY there, not
+// float64 of the int64 extreme. float64(math.MaxInt64) is 2^63, so reusing the
+// int bounds made an open side closed at ±9.2e18 — a double above it (1e19,
+// +Inf) failed a maxValue the operator never set.
 type numericPolicy struct {
-	key      string
-	min, max int64
+	key        string
+	min, max   int64
+	minF, maxF float64
 }
 
 func compileNumericAttribute(where string, cfg *NumericAttributeConfig) (policy, error) {
@@ -490,12 +489,15 @@ func compileNumericAttribute(where string, cfg *NumericAttributeConfig) (policy,
 	if cfg.MinValue == nil && cfg.MaxValue == nil {
 		return nil, errPolicy(where, "numericAttribute needs minValue and/or maxValue")
 	}
-	p := &numericPolicy{key: cfg.Key, min: math.MinInt64, max: math.MaxInt64}
+	p := &numericPolicy{key: cfg.Key, min: math.MinInt64, max: math.MaxInt64,
+		minF: math.Inf(-1), maxF: math.Inf(1)}
 	if cfg.MinValue != nil {
 		p.min = *cfg.MinValue
+		p.minF = float64(*cfg.MinValue)
 	}
 	if cfg.MaxValue != nil {
 		p.max = *cfg.MaxValue
+		p.maxF = float64(*cfg.MaxValue)
 	}
 	if p.min > p.max {
 		return nil, errPolicy(where, "numericAttribute.minValue %d is above maxValue %d (the range is empty)", p.min, p.max)
@@ -503,29 +505,29 @@ func compileNumericAttribute(where string, cfg *NumericAttributeConfig) (policy,
 	return p, nil
 }
 
-// eval accepts Int and Double values. The Collector reads only Int; a double is
-// accepted here because an SDK recording a duration or a size as a float would
-// otherwise never match a policy that looks correct, and the widening
-// comparison is exact for every magnitude either side can express to within the
-// float's own precision.
+// eval (through matchValue) accepts Int and Double values. The Collector reads
+// only Int; a double is accepted here because an SDK recording a duration or a
+// size as a float would otherwise never match a policy that looks correct, and
+// the widening comparison is exact for every magnitude either side can express
+// to within the float's own precision.
 func (p *numericPolicy) eval(t Trace, _ time.Time) (verdict, string, ChargedMask) {
-	for i := range t.Spans {
-		v, ok := lookup(t.Spans[i], p.key)
-		if !ok {
-			continue
-		}
-		switch v.Type() {
-		case pcommon.ValueTypeInt:
-			if n := v.Int(); n >= p.min && n <= p.max {
-				return verdictSample, "", 0
-			}
-		case pcommon.ValueTypeDouble:
-			if d := v.Double(); d >= float64(p.min) && d <= float64(p.max) {
-				return verdictSample, "", 0
-			}
-		}
+	if anySpanMatches(t, p.key, p) {
+		return verdictSample, "", 0
 	}
 	return verdictAbstain, "", 0
+}
+
+func (p *numericPolicy) matchValue(v pcommon.Value) bool {
+	switch v.Type() {
+	case pcommon.ValueTypeInt:
+		n := v.Int()
+		return n >= p.min && n <= p.max
+	case pcommon.ValueTypeDouble:
+		// NaN compares false both ways, so it matches nothing.
+		d := v.Double()
+		return d >= p.minF && d <= p.maxF
+	}
+	return false
 }
 
 // --- booleanAttribute -------------------------------------------------------
@@ -546,13 +548,14 @@ func compileBooleanAttribute(where string, cfg *BooleanAttributeConfig) (policy,
 }
 
 func (p *boolPolicy) eval(t Trace, _ time.Time) (verdict, string, ChargedMask) {
-	for i := range t.Spans {
-		v, ok := lookup(t.Spans[i], p.key)
-		if ok && v.Type() == pcommon.ValueTypeBool && v.Bool() == p.want {
-			return verdictSample, "", 0
-		}
+	if anySpanMatches(t, p.key, p) {
+		return verdictSample, "", 0
 	}
 	return verdictAbstain, "", 0
+}
+
+func (p *boolPolicy) matchValue(v pcommon.Value) bool {
+	return v.Type() == pcommon.ValueTypeBool && v.Bool() == p.want
 }
 
 // --- probabilistic ----------------------------------------------------------
@@ -814,7 +817,7 @@ func compositeOrder(where string, cfg *CompositeConfig, subs []namedPolicy) ([]i
 				missing = append(missing, s.name)
 			}
 		}
-		sort.Strings(missing)
+		slices.Sort(missing)
 		return nil, errPolicy(where, "composite.policyOrder omits %s (it must list every compositeSubPolicy)", strings.Join(missing, ", "))
 	}
 	return order, nil

@@ -3,9 +3,9 @@ package otlpingest
 // The logs.rules / logMetrics / line-enrichment half of the ingest LOG path.
 //
 // The four log PRODUCERS run the shared chain (internal/agent/logchain):
-// scrub → lift → enrich → log-metrics → rules. Ingest scrubs in EnrichLogs
-// (before anything reads the body) and runs the REST of the chain here, over
-// ONE bounded text rendering of each body — the lift, enrichment, metric
+// scrub → lift → enrich → log-metrics → rules. Ingest runs the same chain
+// here: the scrub first, over the WHOLE body (before anything reads it), and
+// the rest over ONE bounded text rendering of each body — the lift, enrichment, metric
 // observation and the rules all read the same view, in the chain's order, so
 // the same config selects identically however the line arrived. The LIFT is
 // the newest of those and was missing for a while: without it a logAttributes
@@ -37,9 +37,20 @@ package otlpingest
 //   - maxChainBodyBytes: a structured body's AsString rendering costs 14-18x
 //     its wire bytes in transient heap (a 16 MiB map body is ~230 MB live,
 //     ~40 KiB on the wire after gzip), and rule regexes cost 40-70 ms/MiB of
-//     text. Bodies whose text view exceeds the bound skip line-derived
-//     processing — the tailer never feeds lines past -logs-max-entry-bytes
-//     either — while attribute/severity-keyed rules still apply.
+//     text. A STRING body over the bound is processed on its first
+//     maxChainBodyBytes — exactly what the tailer does with a joined entry
+//     past -logs-max-entry-bytes — and a STRUCTURED one, whose rendering is
+//     the amplification, gets an empty text view. Either way the rules STILL
+//     RUN: attribute/severity-keyed rules exactly, line-keyed ones against the
+//     truncated (or empty) line, so they can drop the record.
+//   - maxResourceValueTextBytes: the rules and the log-metric labels resolve a
+//     resource key PER RECORD, and a map/array/bytes value renders through
+//     AsString on every such read — sender-chosen structure multiplied by the
+//     record count (measured: a 100k-element array service.name and 1000
+//     records, 211 KB of wire, allocated ~3 GB). Such a value is rendered ONCE
+//     per resource into the view the chain reads (resourceTextView), and one
+//     whose text exceeds the bound resolves empty and is left off the
+//     log-derived series' resource.
 //   - maxObservedResourceAttrs: the metric store retains a serialization of
 //     the WHOLE resource per admitted series, so sender-chosen attribute
 //     width is sender-chosen retained heap (measured: 4000-attr resources
@@ -51,28 +62,28 @@ package otlpingest
 //     observed into the metric set. It slows — it cannot stop — a sender
 //     minting distinct resources to latch maxCardinality (the cap counts
 //     series and holds them for maxAge); the honest boundary here is
-//     visibility, and the store's own DroppedCapped counter plus this one
-//     are the alert surface.
+//     visibility, and the store's own kubescrape_log_metrics_dropped_capped_total
+//     plus this one are the alert surface.
 import (
 	"time"
 	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
-	"go.opentelemetry.io/collector/pdata/pmetric"
-	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
+	"github.com/JohanLindvall/kubescrape/internal/clip"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
 const (
-	maxChainBodyBytes        = 1 << 20
-	maxObservedResourceAttrs = 64
-	maxObservedResources     = 256
+	maxChainBodyBytes         = 1 << 20
+	maxObservedResourceAttrs  = 64
+	maxObservedResources      = 256
+	maxResourceValueTextBytes = 64 << 10
 )
 
 // chainCommit holds the side effects of one push's chain that may only be
@@ -112,14 +123,17 @@ func (c chainCommit) commit() {
 	}
 }
 
-// applyLogChain enriches, observes and filters an ingested payload in place. It
+// applyLogChain scrubs, enriches, observes and filters an ingested payload in place. It
 // reports whether anything is left to forward — false means the push is acked
 // without a send, exactly as a producer commits an all-dropped batch — plus the
 // side effects the caller commits once the payload is delivered (chainCommit).
 func (s *Server) applyLogChain(ld plog.Logs) (chainCommit, bool) {
 	var cc chainCommit
-	enrich := s.cfg.Enricher.LinesEnabled()
-	if !enrich && s.cfg.Rules == nil && s.cfg.LogMetrics == nil && s.cfg.LogAttrs == nil {
+	enrich := s.cfg.EnrichLines
+	// chain: whether anything past the scrub reads the body. A scrub-only
+	// configuration walks every record but never renders a body.
+	chain := enrich || s.cfg.Rules != nil || s.cfg.LogMetrics != nil || s.cfg.LogAttrs != nil
+	if s.cfg.Scrub == nil && !chain {
 		return cc, ld.ResourceLogs().Len() > 0
 	}
 	var resolver *logchain.Resolver
@@ -147,17 +161,25 @@ func (s *Server) applyLogChain(ld plog.Logs) (chainCommit, bool) {
 			skipped.tooWide++
 			observe = false
 		}
+		// The resource as the rules, the metric labels and Bind READ it. Its
+		// keys are already unique: forwardLogs deduped them before enrichment
+		// (dedupeLogResources), under the same condition that makes resolver
+		// non-nil here.
+		rview := rattrs
 		if resolver != nil {
-			// Not for the store's identity — that fold handles a repeated key
-			// itself now — but for the resolver reading this resource (Get is
-			// FIRST-wins, while the store renders last-wins) and for the
-			// payload forwarded on. Independent of `observe`: a rules-only
-			// config (no LogMetrics), or a resource past the observe cap/width,
-			// still reads the resource through the resolver and still forwards
-			// it, so gating the dedupe on the metric-observation eligibility
-			// let a drop rule evaluate against the wrong value. See
-			// dedupeResourceKeys.
-			dedupeResourceKeys(rattrs)
+			var tooLarge int
+			rview, tooLarge = resourceTextView(rattrs)
+			if tooLarge > 0 {
+				obs.IngestChainSkipped.WithLabelValues(chainSkipValueTooLarge).Inc()
+				skipped.valueTooLarge++
+			}
+		}
+		// What the RULES read of the resource, and the lookup they read it
+		// through: rview itself, unless the resource is wide (ruleResource).
+		var ruleRes pcommon.Map
+		var ruleFn func(string) string
+		if s.cfg.Rules != nil {
+			ruleRes, ruleFn = ruleResource(rview, resolver)
 		}
 		// Bound once per resource: Bind hashes the attribute set, and a push
 		// groups many records under few resources.
@@ -166,10 +188,24 @@ func (s *Server) applyLogChain(ld plog.Logs) (chainCommit, bool) {
 		sls := rl.ScopeLogs()
 		for j := 0; j < sls.Len(); j++ {
 			sls.At(j).LogRecords().RemoveIf(func(lr plog.LogRecord) bool {
+				// SCRUB first, and on the whole body whatever its size: the
+				// size bound below limits what the rest of the chain READS,
+				// never what is redacted before the record is forwarded.
+				if s.cfg.Scrub != nil {
+					s.scrubBody(lr.Body(), 0)
+				}
+				if !chain {
+					return false
+				}
 				body, ok := chainBody(lr)
+				// A text view to READ: the whole body, or — for a STRING
+				// body over the cap — its bounded prefix. Only an over-cap
+				// STRUCTURED body has none (rendering it is the cost).
+				hasText := ok
 				if !ok {
 					obs.IngestChainSkipped.WithLabelValues(chainSkipBody).Inc()
 					skipped.bodies++
+					hasText = lr.Body().Type() == pcommon.ValueTypeStr
 				}
 				// LIFT, before enrichment and before anything selects on the
 				// record: the producers' chain is scrub -> lift -> enrich ->
@@ -180,23 +216,29 @@ func (s *Server) applyLogChain(ld plog.Logs) (chainCommit, bool) {
 				// pushed line than for the identical tailed one — an allowlist
 				// ruleset silently DISCARDED pushed records the tailer keeps.
 				var lifted logattrs.Result
-				if s.cfg.LogAttrs != nil && ok {
+				if s.cfg.LogAttrs != nil && hasText {
 					lifted = s.cfg.LogAttrs.Extract(body)
 					logattrs.Put(lr.Attributes(), lifted.Log)
 				}
-				if enrich && ok {
+				if enrich && hasText {
 					logenrich.ApplyBodyText(lr, body)
 				}
 				if observe {
 					if !bound {
-						bm = s.cfg.LogMetrics.Bind(rattrs)
+						// The VIEW, not the resource: identical for every
+						// value within the bound (a rendered map/array is the
+						// string its AsString would have produced), so no
+						// series moves — and the store never re-renders a
+						// sender's structure when it admits a series.
+						bm = s.cfg.LogMetrics.Bind(rview)
 						bound = true
 					}
 					// Severity empty, as in logchain.Chain.Emit: __severity__
 					// is a RULE key, and a label resolver must not invent one.
-					// A capped body observes as "": attribute-keyed labels
-					// and values still resolve; the record still counts.
-					resolver.Set(lr.Attributes(), rattrs, "")
+					// An over-cap body observes on its bounded view (see
+					// chainBody): attribute-keyed labels and values still
+					// resolve; the record still counts.
+					resolver.Set(lr.Attributes(), rview, "")
 					// Set clears the lifted set, so this follows every Set.
 					// The line's RESOURCE-target attributes rank between the
 					// record's and the resource's, exactly as in Chain.Emit.
@@ -206,9 +248,9 @@ func (s *Server) applyLogChain(ld plog.Logs) (chainCommit, bool) {
 				if s.cfg.Rules == nil {
 					return false
 				}
-				resolver.Set(lr.Attributes(), rattrs, logchain.RecordSeverity(lr))
+				resolver.Set(lr.Attributes(), ruleRes, logchain.RecordSeverity(lr))
 				resolver.SetLifted(lifted.Resource)
-				if s.cfg.Rules.Keep(resolver.RuleFn(), body) {
+				if s.cfg.Rules.Keep(ruleFn, body) {
 					return false
 				}
 				// Staged, not counted: see chainCommit.
@@ -222,21 +264,82 @@ func (s *Server) applyLogChain(ld plog.Logs) (chainCommit, bool) {
 	return cc, ld.ResourceLogs().Len() > 0
 }
 
+// ruleResource returns the resource map the RULES should resolve against for
+// one pushed resource, and the rule lookup to hand logline.LineFilter.Keep.
+//
+// For an ordinary resource that is the view itself and the resolver's own
+// RuleFn. A WIDE one (more attributes than maxObservedResourceAttrs, the
+// chain's own notion of "wider than any real SDK resource") gets a lazily
+// filled PROJECTION instead, because the resolver reads a resource key with
+// pcommon.Map.Get — a linear walk — once per record, and a key the rules
+// reference that the record does not carry falls through to it every time. The
+// width and the record count are both the sender's choice, so rule evaluation
+// was O(records x width) per push: measured, one drop rule keyed on an absent
+// k8s.namespace.name over a 40k-attribute resource and 40k records (a ~400 KB
+// push) took 2.17 s of the handler's in-flight slot, quadratically more per
+// doubling. The observation half never reads a wide resource (it is not
+// observed at all — maxObservedResourceAttrs), so the rules are the one reader
+// to fix, and they are the half that still runs on it.
+//
+// The projection holds exactly the view's entries for every key the rules
+// have asked about so far: the wrapper copies a key's entry in (one linear Get
+// per DISTINCT key per resource — the key set is the operator's rule config)
+// before delegating to the resolver, whose ranking (record, then lifted, then
+// resource) it therefore reads unchanged. The resource's keys are unique by
+// here (dedupeLogResources), so first-wins Get and the projection agree.
+//
+// The resolver's ranking is not re-implemented here on purpose:
+// internal/agent/logchain owns it, and a copy is how the four producers once
+// came to select the same line differently.
+func ruleResource(view pcommon.Map, resolver *logchain.Resolver) (pcommon.Map, func(string) string) {
+	if view.Len() <= maxObservedResourceAttrs {
+		return view, resolver.RuleFn()
+	}
+	p := &ruleProjection{src: view, proj: pcommon.NewMap(), asked: map[string]struct{}{}, next: resolver.RuleFn()}
+	return p.proj, p.lookup
+}
+
+// ruleProjection is ruleResource's lazily filled projection of a wide resource.
+type ruleProjection struct {
+	src   pcommon.Map
+	proj  pcommon.Map
+	asked map[string]struct{}
+	next  func(string) string
+}
+
+func (p *ruleProjection) lookup(k string) string {
+	if _, ok := p.asked[k]; !ok && k != logchain.SeverityKey {
+		p.asked[k] = struct{}{}
+		if v, ok := p.src.Get(k); ok {
+			v.CopyTo(p.proj.PutEmpty(k))
+		}
+	}
+	return p.next(k)
+}
+
 // The reason label of obs.IngestChainSkipped, and the keys the skip warning
 // throttles on. Named constants because the counter and the line must agree:
 // an operator reading the metric's reason and grepping for it has to find the
 // line that explains it.
 const (
-	chainSkipResources = "resources_capped"
-	chainSkipTooWide   = "resource_too_wide"
-	chainSkipBody      = "body_too_large"
+	chainSkipResources     = "resources_capped"
+	chainSkipTooWide       = "resource_too_wide"
+	chainSkipBody          = "body_too_large"
+	chainSkipValueTooLarge = "resource_value_too_large"
 )
+
+// chainSkipReasons is the label set of obs.IngestChainSkipped, listed so the
+// warning table (Server.chainSkipWarns) is sized from it: a Table admits a new
+// key only once a resident one lapses, so one reason past its size would warn
+// never while the others kept binding. One entry per chainSkips field.
+var chainSkipReasons = []string{chainSkipResources, chainSkipTooWide, chainSkipBody, chainSkipValueTooLarge}
 
 // chainSkips tallies one push's line-derived-processing skips.
 type chainSkips struct {
-	resources int
-	tooWide   int
-	bodies    int
+	resources     int
+	tooWide       int
+	bodies        int
+	valueTooLarge int
 }
 
 // chainSkipWarnEvery paces the skip warning per reason. Each bound is a
@@ -246,13 +349,15 @@ const chainSkipWarnEvery = time.Minute
 
 // noteChainSkipped narrates the abuse bounds that silently degrade a pushed
 // payload. The data is still forwarded, which is exactly why this is easy to
-// miss: nothing is dropped, nothing 429s, the sender sees success — but the
-// records skipped here were NOT observed into logMetrics and NOT evaluated
-// against logs.rules, so a metric silently under-counts and a drop rule
-// silently fails to fire, for pushed lines only. The counter carries the rate;
-// this says which bound and how far past it the sender is.
+// miss: nothing 429s, the sender sees success — but what the chain saw of these
+// records was not the record, so a log-derived metric silently under-counts
+// (or labels on an empty value) and a line-keyed rule decides on a truncated or
+// empty line, for pushed lines only. Every bound here degrades what a record is
+// OBSERVED or MATCHED as; none of them exempts a record from the rules, which
+// run on every record and can still drop it. The counter carries the rate; this
+// says which bound and how far past it the sender is.
 func (s *Server) noteChainSkipped(sk chainSkips) {
-	if sk.resources == 0 && sk.tooWide == 0 && sk.bodies == 0 {
+	if sk.resources == 0 && sk.tooWide == 0 && sk.bodies == 0 && sk.valueTooLarge == 0 {
 		return
 	}
 	warn := func(reason, msg string, args ...any) {
@@ -263,40 +368,59 @@ func (s *Server) noteChainSkipped(sk chainSkips) {
 	}
 	if sk.resources > 0 {
 		warn(chainSkipResources,
-			"ingest: a push carried more resources than log-derived metrics observe, so the remainder was "+
-				"forwarded WITHOUT being observed or rule-evaluated; have the sender batch fewer resources",
+			"ingest: a push carried more resources than log-derived metrics observe, so the remainder's records "+
+				"were NOT observed into log-derived metrics (the rules still ran on them); have the sender batch "+
+				"fewer resources",
 			"resources", sk.resources, "maxResources", maxObservedResources)
 	}
 	if sk.tooWide > 0 {
 		warn(chainSkipTooWide,
 			"ingest: a pushed resource declares more attributes than log-derived metrics will retain, so its "+
-				"records were forwarded WITHOUT being observed or rule-evaluated (the store retains a "+
-				"serialization of the whole resource per series, so its width is retained heap)",
+				"records were NOT observed into log-derived metrics (the rules still ran on them; the store "+
+				"retains a serialization of the whole resource per series, so its width is retained heap)",
 			"resources", sk.tooWide, "maxAttributes", maxObservedResourceAttrs)
 	}
 	if sk.bodies > 0 {
 		warn(chainSkipBody,
-			"ingest: pushed log bodies exceeded the size line-derived processing will render, so they were "+
-				"forwarded WITHOUT enrichment, log-metric observation or rule evaluation",
+			"ingest: pushed log bodies exceeded the size line-derived processing reads: a string body was "+
+				"enriched, observed and rule-matched on its first maxBytes only, a structured one on an EMPTY "+
+				"line — so a line-keyed rule decided on text that is not the whole record, and can have dropped it",
 			"records", sk.bodies, "maxBytes", maxChainBodyBytes)
+	}
+	if sk.valueTooLarge > 0 {
+		warn(chainSkipValueTooLarge,
+			"ingest: a pushed resource carries a map/array/bytes attribute whose text exceeds what the log "+
+				"chain renders, so that attribute resolved EMPTY for logs.rules and log-metric labels and is left "+
+				"off the log-derived series' resource (the payload itself is forwarded unchanged)",
+			"resources", sk.valueTooLarge, "maxBytes", maxResourceValueTextBytes)
 	}
 }
 
 // chainBody renders the ONE text view of a body that enrichment, log-metrics
 // and the rules all share. A string body is used as-is; a structured body
 // (map/slice — an SDK's legal shape) renders through AsString, which is the
-// text the tailer would have seen for the equivalent logged line. false means
-// the body exceeds maxChainBodyBytes — or nests past the depth the estimate
-// walks, which is the same thing since an unmeasured subtree cannot be shown
-// to fit — and line-derived processing is skipped. The size of a STRUCTURED
-// body is estimated by a materialization-free walk, because rendering first
-// and then measuring is the exact amplification the bound exists to prevent.
+// text the tailer would have seen for the equivalent logged line.
+//
+// false means the body exceeds maxChainBodyBytes, and the view is then BOUNDED
+// rather than absent where that costs nothing: a STRING body is cut to its
+// first maxChainBodyBytes on a rune boundary — a reslice, the cost of an
+// at-cap body exactly, and what the tailer does with a joined entry past
+// -logs-max-entry-bytes — while a STRUCTURED body gets "", because rendering
+// it is the amplification the bound exists to prevent. An over-cap string body
+// used to get "" too, which made an allowlist ruleset (keep <content>, then
+// drop everything else) DROP a record whose text matched the keep rule, under a
+// warning claiming such records were not rule-evaluated at all.
+//
+// A structured body nested past the depth the estimate walks is over the cap
+// by definition (an unmeasured subtree cannot be shown to fit). Its size is
+// estimated by a materialization-free walk, because rendering first and then
+// measuring is the exact amplification the bound exists to prevent.
 func chainBody(lr plog.LogRecord) (string, bool) {
 	b := lr.Body()
 	if b.Type() == pcommon.ValueTypeStr {
 		s := b.Str()
 		if len(s) > maxChainBodyBytes {
-			return "", false
+			return clip.Runes(s, maxChainBodyBytes), false
 		}
 		return s, true
 	}
@@ -369,10 +493,11 @@ func renderedSizeOver(v pcommon.Value, rem *int, depth int) bool {
 		// back tiny and AsString then materialized it in full — the 14-18x
 		// amplification the bound exists to prevent, with body_too_large flat
 		// while it happened. It is also the depth scrubValue stops at, so a
-		// subtree below it is UNSCRUBBED and must not reach the text view that
-		// enrichment, log-metrics (whose labels can lift the raw line) and the
-		// rules all read. The cost is that an honest body nested deeper than
-		// this skips line-derived processing — counted, and still forwarded.
+		// subtree below it would be UNSCRUBBED and must not reach the text view
+		// that enrichment, log-metrics (whose labels can lift the raw line) and
+		// the rules all read — though maxBodyScrubDepth is derived from the
+		// wire guard, so no PUSHED body reaches past it; only an in-process
+		// caller could.
 		*rem = -1
 		return true
 	}
@@ -428,28 +553,61 @@ func renderedSizeOver(v pcommon.Value, rem *int, depth int) bool {
 	return *rem < 0
 }
 
+// dedupeLogResources normalises every pushed resource's repeated attribute keys
+// (dedupeResourceKeys) BEFORE enrichment, whenever the chain will read the
+// resource through a resolver — the condition applyLogChain builds one under.
+//
+// Before enrichment, not inside the chain, because enrichment READS the
+// resource too: its lookup takes the first value under the configured id keys
+// (valueUnder, first-wins), so a resource repeating container.id [A, B] was
+// resolved as A and then deduped to B after the fact — forwarded carrying B's
+// id beside A's k8s.* attributes. Deduping first makes the lookup, the
+// resolver, the metric store and the forwarded payload read one value — on the
+// pushes it runs for (see dedupeResourceKeys for why that is not all of them).
+func (s *Server) dedupeLogResources(ld plog.Logs) {
+	if s.cfg.Rules == nil && s.cfg.LogMetrics == nil {
+		return
+	}
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		dedupeResourceKeys(rls.At(i).Resource().Attributes())
+	}
+}
+
 // dedupeResourceKeys rewrites a resource whose attributes repeat a key. OTLP
 // encodes attributes as a repeated KeyValue and pdata does not dedupe on
 // decode, and nothing downstream of here agrees about what such a resource
 // MEANS: a Go-map-shaped consumer takes the last entry, pcommon.Map.Get takes
-// the first, and this chain reads the resource both ways.
+// the first, and this receiver reads the resource both ways.
 //
 // It is NO LONGER what keeps the metric store's identity honest — the store's
 // fold proves key-uniqueness itself now (metrics.resourceAccum), so an
 // undeduped resource keys as the identity it renders whether or not this ran.
-// It stays for the two readers the store cannot speak for:
+// It stays for the readers the store cannot speak for:
 //
-//   - logchain.Resolver resolves a metric LABEL or a rule key off the resource
-//     with Get, i.e. FIRST-wins, while the store renders the resource last-wins.
-//     Undeduped, a label lifted from the resource would disagree with the
-//     resource the series carries.
-//   - the payload FORWARDED to the collector, which is passed through
-//     untouched and would hand the same ambiguity to whatever receives it.
+//   - the enricher's lookup, which takes the FIRST value under an id key
+//     (dedupeLogResources says why that has to agree with the rest);
+//   - logchain.Resolver, which resolves a metric LABEL or a rule key off the
+//     resource with Get, i.e. FIRST-wins, while the store renders the resource
+//     last-wins. Undeduped, a label lifted from the resource would disagree
+//     with the resource the series carries.
+//
+// The payload FORWARDED to the collector is deduped too, but only as a side
+// effect and not as a guarantee: this runs only when logs.rules or logMetrics
+// is configured (dedupeLogResources) and only on logs, so metrics, traces and
+// an unconfigured logs push forward a repeated key exactly as the sender wrote
+// it. Making it unconditional would add a per-resource scan to every push on
+// all three signals for a property nothing downstream relies on.
 //
 // Every agent-built resource comes from a map and cannot repeat a key, so this
 // stays at the boundary rather than taxing every producer's hot path.
 // Last-wins, which is what any map-shaped consumer reads anyway and what the
-// store's identity applies; the rewrite is visible only as attribute order.
+// store's identity applies. The compaction keeps each key's LAST entry in
+// place and removes the earlier ones, so the surviving attributes keep their
+// order and their values untouched. It used to round-trip the map through
+// AsRaw/FromRaw, which boxed every value of the resource into Go types —
+// sender-chosen structure, allocated again in full, for any payload repeating
+// one key — and re-emitted the attributes in Go's randomised map order.
 func dedupeResourceKeys(m pcommon.Map) {
 	if m.Len() < 2 {
 		return
@@ -488,61 +646,118 @@ func dedupeResourceKeys(m pcommon.Map) {
 	if !dup {
 		return
 	}
-	// AsRaw builds a Go map (later entries overwrite — last-wins), FromRaw
-	// rebuilds the attribute list from it. Boxing the tree is acceptable on
-	// this path: it only runs for a payload that actually repeated a key.
-	_ = m.FromRaw(m.AsRaw())
+	// Each key's LAST position, then drop every entry that is not it. Range and
+	// RemoveIf both visit the entries in order, so the counter names the same
+	// entry in both walks. The map is proportional to the key COUNT, and only
+	// a payload that actually repeated a key pays for it.
+	last := make(map[string]int, m.Len())
+	i := 0
+	m.Range(func(k string, _ pcommon.Value) bool {
+		last[k] = i
+		i++
+		return true
+	})
+	i = 0
+	m.RemoveIf(func(k string, _ pcommon.Value) bool {
+		drop := last[k] != i
+		i++
+		return drop
+	})
 }
 
-// admitLogs/admitMetrics/admitTraces apply the operator's ingest admission
-// hook (ServerConfig.Admit — the transforms file's ingest: section) per
-// pushed RESOURCE, AFTER the reserved strip and BEFORE enrichment: a rejected
-// resource is removed and counted, the push is still acked, and an emptied
-// payload acks without a send.
+// resourceTextView is the resource as the rules, the log-metric labels and Bind
+// read it, and reports how many of its values were too large to render.
 //
-// Before enrichment deliberately — a rejected sender must not spend a metadata
-// lookup per resource on its way out (the same argument as RejectTraces). AFTER
-// the strip equally deliberately, and it is the half that was wrong: the hook
-// was reading the sender's unverified identity claim one line before the
-// receiver deleted it, so an operator policy keyed on k8s.namespace.name gated
-// nothing at all. The strip costs no lookup, so putting it first preserves the
-// pre-enrichment argument intact. See ServerConfig.Admit for what the hook can
-// therefore key on.
-func (s *Server) admitLogs(ld plog.Logs) {
-	if s.cfg.Admit == nil {
-		return
-	}
-	ld.ResourceLogs().RemoveIf(func(rl plog.ResourceLogs) bool {
-		if s.cfg.Admit(rl.Resource().Attributes()) {
-			return false
+// A resolver reads a resource key once PER RECORD (logchain.Resolver.label ->
+// Get -> AsString), and for a map, array or bytes value AsString RENDERS: it
+// boxes the whole value through AsRaw and marshals it. The value's size is the
+// sender's choice and so is the record count, so the two multiplied — measured,
+// a rules config keyed on service.name, a 100k-element array service.name and
+// 1000 records (211 KB of wire) allocated ~3 GB in 6.9 s — and Bind, plus every
+// series the store admits, rendered the same value again.
+//
+// So each such value is rendered ONCE per resource, here, into a copy of the
+// resource whose values are all scalars: per-record reads then find a string
+// and allocate nothing. A value whose text would exceed
+// maxResourceValueTextBytes (estimated by renderedSizeOver, which never
+// materialises it) is not rendered at all and resolves EMPTY — a rule keyed on
+// it matches as it would against a missing value, and the store, which drops
+// empty values from the identity, leaves it off the log-derived series'
+// resource (the store keeps only 256 bytes of any value anyway). Nothing about
+// the FORWARDED payload changes.
+//
+// A resource with only scalar values — every agent-built one, and every SDK
+// resource in practice — is returned as-is and costs one Range. A STRING value
+// is never rendered either way (AsString returns it), so it is not bounded
+// here: its per-record cost is a rule's own scan of it, like a record
+// attribute's.
+func resourceTextView(res pcommon.Map) (pcommon.Map, int) {
+	n := 0
+	res.Range(func(_ string, v pcommon.Value) bool {
+		if isStructuredValue(v) {
+			n++
 		}
-		obs.IngestAdmissionRejected.Inc()
 		return true
 	})
+	if n == 0 {
+		return res, 0
+	}
+	// The view is a CopyTo of the resource — not a Put per key, which scans
+	// for an existing key and is quadratic in the width a sender chose (the
+	// keys are unique already: dedupeLogResources). But a copy of a structured
+	// value is a deep copy of sender-chosen structure, only to be replaced, so
+	// those values are PARKED first (MoveTo is a pointer move, O(1)), the
+	// resource is copied with empty values in their place, and they are moved
+	// back. The forwarded payload ends exactly as it started.
+	parked := pcommon.NewSlice()
+	parked.EnsureCapacity(n)
+	at := make([]int, 0, n)
+	i := 0
+	res.Range(func(_ string, v pcommon.Value) bool {
+		if isStructuredValue(v) {
+			at = append(at, i)
+			v.MoveTo(parked.AppendEmpty())
+		}
+		i++
+		return true
+	})
+	view := pcommon.NewMap()
+	res.CopyTo(view)
+	tooLarge := 0
+	i, j := 0, 0
+	view.Range(func(_ string, v pcommon.Value) bool {
+		if j < len(at) && at[j] == i {
+			pv := parked.At(j)
+			rem := maxResourceValueTextBytes
+			if renderedSizeOver(pv, &rem, 0) {
+				tooLarge++
+				v.SetStr("")
+			} else {
+				v.SetStr(pv.AsString())
+			}
+			j++
+		}
+		i++
+		return true
+	})
+	i, j = 0, 0
+	res.Range(func(_ string, v pcommon.Value) bool {
+		if j < len(at) && at[j] == i {
+			parked.At(j).MoveTo(v)
+			j++
+		}
+		i++
+		return true
+	})
+	return view, tooLarge
 }
 
-func (s *Server) admitMetrics(md pmetric.Metrics) {
-	if s.cfg.Admit == nil {
-		return
-	}
-	md.ResourceMetrics().RemoveIf(func(rm pmetric.ResourceMetrics) bool {
-		if s.cfg.Admit(rm.Resource().Attributes()) {
-			return false
-		}
-		obs.IngestAdmissionRejected.Inc()
+// isStructuredValue reports whether AsString has to RENDER v rather than
+// return or format it.
+func isStructuredValue(v pcommon.Value) bool {
+	switch v.Type() {
+	case pcommon.ValueTypeMap, pcommon.ValueTypeSlice, pcommon.ValueTypeBytes:
 		return true
-	})
-}
-
-func (s *Server) admitTraces(td ptrace.Traces) {
-	if s.cfg.Admit == nil {
-		return
 	}
-	td.ResourceSpans().RemoveIf(func(rs ptrace.ResourceSpans) bool {
-		if s.cfg.Admit(rs.Resource().Attributes()) {
-			return false
-		}
-		obs.IngestAdmissionRejected.Inc()
-		return true
-	})
+	return false
 }

@@ -247,7 +247,9 @@ func TestExplainReportsARepeatedOfferAsAlreadyFolded(t *testing.T) {
 
 // Parity is about the VERDICTS, not about the telemetry: /v1/explain derives
 // through the same targetDedup as nodeTargets, and the package comment, README
-// and AGENTS.md all promise it "moves no obs counters". It leaked exactly one —
+// and AGENTS.md all promise it moves none of that DERIVATION's decision
+// counters (the owner/namespace enrichment it shares with /v1/pods still counts
+// resolve failures, as that route does). It leaked exactly one —
 // the ceiling refusal inside targetDedup.add, which the two sibling decision
 // signals on this same derivation (obs.TargetIdentityCollisions via
 // reportInstanceCollision, obs.MonitorTargetShadowed via the auth-conflict
@@ -261,7 +263,7 @@ func TestExplainReportsARepeatedOfferAsAlreadyFolded(t *testing.T) {
 func TestExplainMovesNoCappedCounterWhileTheServedPathStillDoes(t *testing.T) {
 	const endpoints = 20
 	eps := make([]any, 0, endpoints)
-	for i := 0; i < endpoints; i++ {
+	for i := range endpoints {
 		eps = append(eps, map[string]any{"port": "http", "path": "/m" + strconv.Itoa(i)})
 	}
 	monitors := newMonitorIndex(t, "sm-many", eps)
@@ -269,7 +271,7 @@ func TestExplainMovesNoCappedCounterWhileTheServedPathStillDoes(t *testing.T) {
 
 	before := obs.ScrapeTargetsCapped.Value()
 	var doc explainDoc
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		getJSON(t, srv.URL+"/v1/explain/default/web-1", http.StatusOK, &doc)
 	}
 	if moved := obs.ScrapeTargetsCapped.Value() - before; moved != 0 {

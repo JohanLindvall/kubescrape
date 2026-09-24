@@ -275,7 +275,7 @@ func TestValidateRejectsBadShapes(t *testing.T) {
 		}()}, []string{"minValue and/or maxValue"}},
 		{"numeric inverted bounds", []PolicyConfig{func() PolicyConfig {
 			p := pol("p", TypeNumericAttribute)
-			p.NumericAttribute = &NumericAttributeConfig{Key: "k", MinValue: i64p(10), MaxValue: i64p(1)}
+			p.NumericAttribute = &NumericAttributeConfig{Key: "k", MinValue: new(int64(10)), MaxValue: new(int64(1))}
 			return p
 		}()}, []string{"minValue", "above maxValue"}},
 
@@ -371,6 +371,49 @@ func TestEmptyConfigIsDisabledNotInvalid(t *testing.T) {
 	}
 }
 
+// UsesScript is what the agent's validateConfig asks to require a transforms
+// file with a sample: section. Validate cannot catch a missing one (it compiles
+// with a placeholder body, so -check-config needs no wiring) while a real start
+// refuses it — so a script policy UsesScript misses, NESTED inside and or
+// composite, passes -check-config and then fails the rollout.
+func TestUsesScriptFindsNestedPolicies(t *testing.T) {
+	t.Parallel()
+	and := func(subs ...PolicyConfig) PolicyConfig {
+		p := pol("and", TypeAnd)
+		p.And = &AndConfig{SubPolicies: subs}
+		return p
+	}
+	for _, tc := range []struct {
+		name     string
+		policies []PolicyConfig
+		want     bool
+	}{
+		{"top level", []PolicyConfig{pol("s", TypeScript)}, true},
+		{"inside and", []PolicyConfig{and(pol("a", TypeAlwaysSample), pol("s", TypeScript))}, true},
+		{"inside composite", []PolicyConfig{compositeCfg(10, nil, nil, pol("a", TypeAlwaysSample), pol("s", TypeScript))}, true},
+		{"none anywhere", []PolicyConfig{
+			and(pol("a", TypeAlwaysSample)),
+			compositeCfg(10, nil, nil, pol("b", TypeAlwaysSample)),
+			pol("c", TypeAlwaysSample),
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Policies: tc.policies}
+			if got := cfg.UsesScript(); got != tc.want {
+				t.Fatalf("UsesScript = %v, want %v", got, tc.want)
+			}
+			// The property UsesScript stands in for: without an injected body,
+			// the real start refuses exactly the lists it reports.
+			if _, err := New(cfg); (err != nil) != tc.want {
+				t.Fatalf("New without a script body: err = %v, want an error = %v", err, tc.want)
+			}
+		})
+	}
+	if (*Config)(nil).UsesScript() {
+		t.Fatal("a nil section uses no script")
+	}
+}
+
 // First match wins, in configured order, and the Decision names the policy that
 // won — that name is the metric label an operator answers "why was this trace
 // kept" with, so it has to be the one rule, not a set.
@@ -443,14 +486,14 @@ func TestEarlierMatchDoesNotSpendTheRateBudget(t *testing.T) {
 	fixedClock(e, &now)
 
 	errTrace := mkTrace(1, nil, spanDef{start: 0, end: 1, status: ptrace.StatusCodeError})
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		if got := e.Decide(errTrace); !got.Sampled || got.Policy != "errors" {
 			t.Fatalf("iteration %d: %+v, want errors", i, got)
 		}
 	}
 	plain := mkTrace(2, nil, spanDef{start: 0, end: 1})
 	kept := 0
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		if e.Decide(plain).Sampled {
 			kept++
 		}
@@ -517,11 +560,11 @@ func TestDecideIsSafeForConcurrentUse(t *testing.T) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	byPolicy := map[string]int{}
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			for i := 0; i < each; i++ {
+			for i := range each {
 				// Distinct route values keep the bounded regex cache churning.
 				tr := mkTrace(byte(w), nil, spanDef{attrs: map[string]any{
 					"http.route": "/orders/" + string(rune('a'+i%26)),
@@ -553,7 +596,7 @@ func TestProbabilisticNestsWithTheHeadSampler(t *testing.T) {
 	const n = 2000
 	td := ptrace.NewTraces()
 	ss := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
-	for i := uint64(0); i < n; i++ {
+	for i := range uint64(n) {
 		sp := ss.Spans().AppendEmpty()
 		sp.SetTraceID(traceID(i))
 		sp.SetStartTimestamp(ts(0))
@@ -582,7 +625,7 @@ func TestProbabilisticNestsWithTheHeadSampler(t *testing.T) {
 	}
 
 	tail := mustNew(t, probPol(50))
-	for i := uint64(0); i < n; i++ {
+	for i := range uint64(n) {
 		id := traceID(i)
 		if got, want := tail.Decide(Trace{TraceID: id}).Sampled, headKept[id]; got != want {
 			t.Fatalf("trace %d: tail kept=%v, head kept=%v — the two stages no longer nest", i, got, want)

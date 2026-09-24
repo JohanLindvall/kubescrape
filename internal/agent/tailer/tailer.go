@@ -39,14 +39,12 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
-	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
-	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
-	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
 // maxReadWarnPaths bounds the distinct paths the read-failure warn throttles
@@ -112,24 +110,19 @@ type Config struct {
 	// Multiline joins application-level multi-line entries (stack traces,
 	// ...); CRI partial-line rejoining is always on.
 	Multiline bool
-	// Enrich parses metadata out of each line (timestamp, severity,
-	// trace/span IDs, exception details, ...) into the record's OTLP fields
-	// and attributes.
-	Enrich bool
+	// Chain is the per-record log chain every producer runs (scrub → lift →
+	// enrich → log-metrics → rules; see logchain.Config for each lever), the
+	// same levers in the same order as journald, events and azurediag. Here
+	// LogMetrics keys resolve against the record's attributes and the file's
+	// resolved resource attributes; Rules run after enrichment (severity is
+	// matchable via the synthetic __severity__ key) and after LogMetrics, so
+	// metrics still see every line, and a dropped record advances offsets like
+	// an exported one. A pod's own kubescrape.io/logs rules run before them.
+	Chain logchain.Config
 	// FileAttributes stamps log.file.name (the file's basename) and
 	// log.file.position (the record's START byte offset) on every emitted
 	// record, for any file source. Opt-in.
 	FileAttributes bool
-	// Scrub redacts sensitive values from log bodies before anything copies
-	// from them (nil disables).
-	Scrub *logscrub.Scrubber
-	// LogAttrs lifts configured keys out of structured lines onto the record
-	// as resource/scope/log attributes (nil = none).
-	LogAttrs *logattrs.Extractor
-	// LogMetrics derives configured metrics from each exported log record
-	// (nil = none). Its keys resolve against the record's attributes and the
-	// file's resolved resource attributes.
-	LogMetrics *metrics.DynamicMetricSet
 	// MultilineTimeout flushes buffered fragment runs and multi-line groups
 	// that have not completed within this duration.
 	MultilineTimeout time.Duration
@@ -170,11 +163,6 @@ type Config struct {
 	// and "start" mean adding a new source to a long-running agent ingests
 	// those files' existing content.
 	UnknownFiles string
-	// Rules filters exported records (ordered keep/drop/sample, nil = keep
-	// all). Evaluated after enrichment — severity is matchable via the
-	// synthetic __severity__ key — and after LogMetrics, so metrics still see
-	// every line. Dropped records advance offsets like exported ones.
-	Rules *logline.LineFilter
 	// Transform applies the exporter-seam log transform to a just-built batch
 	// IN PLACE, once, before the retry loop (nil = none; wired from
 	// transform.Wrapper.TransformLogs — a func field so the tailer needs no
@@ -184,8 +172,12 @@ type Config struct {
 	// it just built, so no copy is needed; a batch transformed to nothing
 	// commits its offsets without a send, and a script error behaves like a
 	// failed export — the rewound bytes are re-read and re-transformed under
-	// whatever program is active by then.
-	Transform func(ld plog.Logs) error
+	// whatever program is active by then. It REPORTS how many records the
+	// script dropped and the tailer counts them into
+	// kubescrape_transform_dropped_total{signal="logs"} when the batch commits
+	// (or is dropped as permanently rejected), never on a rewind, whose re-read
+	// drops the same records again.
+	Transform func(ld plog.Logs) (dropped int, err error)
 	// ParseLine is the transforms file's parse: hook (a func field for the
 	// same no-dependency reason as Transform), consulted per line ONLY for
 	// plain sources flagged parseScript. ok=false leaves the line untouched.
@@ -201,8 +193,11 @@ type Config struct {
 	Logger       *slog.Logger
 }
 
-// Tailer tails all container logs in a directory. All methods run on the
-// single Run goroutine.
+// Tailer tails the files matched by its configured sources (Config.Sources;
+// with none, one containerd source over Config.Dir): CRI container logs,
+// plain files and gzip archives alike. Every method except Status runs on the
+// single Run goroutine; Status reads an atomically published snapshot and is
+// safe from any goroutine.
 type Tailer struct {
 	cfg      Config
 	log      *slog.Logger
@@ -236,33 +231,28 @@ type Tailer struct {
 	// warning, the aggregate half of the same condition (see
 	// obs.LogFilesUnresolved).
 	unresolvedWarn logdedupe.Throttle
-	// exportWarn throttles failBatch's export-failure Error. A collector outage
-	// fails every flush for its whole duration — one Error every couple of
-	// seconds per node — and the rate is already
-	// kubescrape_log_export_failures_total. The FIRST failure of an outage
-	// always logs (the throttle's window has not opened), and the recovery
-	// logs once at Info: transition, throttled re-warn, recovery, exactly the
-	// shape cmd/kubescrape/apiserver.go uses for a persisting condition.
-	exportWarn logdedupe.Throttle
-	// exportFailures counts consecutive failed flushes since the last
-	// successful one, and exportFailingSince stamps the first of them; both are
-	// zeroed by commitBatch, which is what makes the recovery line possible.
-	exportFailures     int
-	exportFailingSince time.Time
+	// exportOutage narrates a run of failed flushes: failBatch's first Error
+	// of a run, its throttled restatement (exportWarnEvery) carrying the run's
+	// failures and duration, and commitBatch's one recovery Info. A collector
+	// outage fails every flush for its whole duration — one line every couple
+	// of seconds per node — and the rate is already
+	// kubescrape_log_export_failures_total.
+	exportOutage logdedupe.Outage
 	// skipped is the previous discovery pass's declined files (path -> reason),
 	// diffed by reportSkips so a skipped file is counted and logged once rather
 	// than once per pass.
 	skipped map[string]string
-	// positionsWarn throttles saveCheckpoints' failed-write Warn, and
-	// positionsFailing is what makes the recovery Info possible. The save runs
-	// on a 10s cadence against a condition that does not change between
-	// attempts (a read-only mount, a full disk), so the unthrottled line was a
-	// permanent 6/minute/node flood for one fact; the rate lives in
-	// kubescrape_positions_save_errors_total. Its OWN gate, not shared with
-	// any other condition — a shared one lets whichever fired first suppress
-	// the other for the window.
-	positionsWarn    logdedupe.Throttle
-	positionsFailing bool
+	// positionsOutage narrates a run of failed positions-file writes:
+	// saveCheckpoints' first Warn of a run, at most one a minute after it, and
+	// one recovery Info. The save runs on a 10s cadence against a condition
+	// that does not change between attempts (a read-only mount, a full disk),
+	// so an unthrottled line was a permanent 6/minute/node flood for one fact;
+	// the rate lives in kubescrape_positions_save_errors_total. Its OWN run,
+	// not shared with any other condition — a shared gate lets whichever fired
+	// first suppress the other for the window. A run, not a bare throttle: a
+	// second outage opening within a minute of the first's last Warn must
+	// still announce itself.
+	positionsOutage logdedupe.Outage
 	// statErrWarn throttles the Warn for a log file that could not be stat'd.
 	// Keyless: a wrongly-mounted log directory fails every file in it for the
 	// same reason and takes one remedy, so the line names one example and how
@@ -318,6 +308,11 @@ type Tailer struct {
 	// per hop (see reopen).
 	hopsUnsaved bool
 
+	// goneDrains is the sweep's scratch list of vanished files drained this
+	// sweep, settled together after ONE flush (see sweep). Reused across
+	// sweeps and cleared after each, so it pins no file.
+	goneDrains []goneDrain
+
 	// discoveryUnsaved: a discovery pass claimed a file whose entry no save has
 	// persisted yet, because a save from less than discoverySaveWindow ago
 	// coalesced it. housekeeping flushes it once the window has elapsed.
@@ -327,6 +322,7 @@ type Tailer struct {
 	lastFlush      time.Time
 	lastCheckpoint time.Time
 	retryBackoff   time.Duration // initial export retry backoff
+	dirScanEvery   time.Duration // discovery pass cadence (defaultDirScanEvery)
 	resolveBudget  time.Duration // ceiling on one sweep's metadata resolutions
 	shutdownBudget time.Duration // ceiling on the final sweep+drain+flush
 	// segmentStallLimit bounds how long one segment's replay may make no
@@ -336,6 +332,14 @@ type Tailer struct {
 	segmentStallLimit time.Duration
 	// drainCap bounds one drainReader call (see defaultDrainCap).
 	drainCap int64
+	// rateLimited is kubescrape_log_rate_limited_total for the configured
+	// action — see rateLimitedCounter.
+	rateLimited *metrics.RegCounter
+	// initialScanned, when non-nil, is closed by Run right after its startup
+	// discovery pass — a TEST hook (startTailer waits on it so a file written
+	// afterwards is certainly new, not skipped to its end as pre-existing);
+	// nil in production.
+	initialScanned chan struct{}
 
 	// status is the published per-file snapshot for /debug/tailer (written by
 	// the sweep goroutine in publishStatus, read from HTTP handlers).
@@ -385,6 +389,12 @@ const defaultShutdownBudget = 10 * time.Second
 // EMFILE or an EACCES from a runtime mid-rotation is worth waiting out, and the
 // alternative to waiting is losing those lines.
 const defaultSegmentStallLimit = 2 * time.Minute
+
+// defaultDirScanEvery is the discovery pass cadence (the dirTicker in Run): how
+// long a new file waits to be noticed when no fsnotify event reports it. Read
+// through Tailer.dirScanEvery so the Run-driven tests, which run without a
+// watcher, do not wait it out for every file they create after start.
+const defaultDirScanEvery = 2 * time.Second
 
 // defaultDrainCap bounds ONE drain call (drainReader), so a source that outruns
 // the drain cannot pin the single sweep goroutine indefinitely. It is not a
@@ -444,7 +454,7 @@ func New(cfg Config) *Tailer {
 			scanDirs[d] = struct{}{}
 		}
 	}
-	return &Tailer{
+	t := &Tailer{
 		cfg: cfg,
 		log: log,
 		// Until a scan runs, treat the listing as good: a save before any
@@ -456,12 +466,39 @@ func New(cfg Config) *Tailer {
 		files:             make(map[string]*file),
 		readWarn:          logdedupe.New(maxReadWarnPaths, time.Minute),
 		retryBackoff:      time.Second,
+		dirScanEvery:      defaultDirScanEvery,
 		resolveBudget:     defaultResolveBudget,
 		shutdownBudget:    defaultShutdownBudget,
 		segmentStallLimit: defaultSegmentStallLimit,
 		drainCap:          defaultDrainCap,
 		statusEvery:       10 * time.Second,
 	}
+	if cfg.RateLimit > 0 {
+		t.rateLimitedCounter()
+	}
+	return t
+}
+
+// rateLimitedCounter is kubescrape_log_rate_limited_total for this tailer's
+// configured action (drop and pause are exclusive by configuration), resolved
+// ONCE rather than per refusal: in DROP mode a refusal is per discarded line,
+// and WithLabelValues takes the vec's mutex and a string-keyed map probe.
+//
+// New binds it when rate limiting is configured, which also publishes the
+// series at zero — the registry's contract that binding states what THIS
+// process is configured to do. Never a package-level var for the same reason:
+// that would publish {action="drop"} 0 from every agent, rate limiting off and
+// -logs=false included. It is bound on first use here for a tailer whose
+// config changed after New (tests do).
+func (t *Tailer) rateLimitedCounter() *metrics.RegCounter {
+	if t.rateLimited == nil {
+		action := "pause"
+		if t.cfg.RateDrop {
+			action = "drop"
+		}
+		t.rateLimited = obs.LogRateLimited.WithLabelValues(action)
+	}
+	return t.rateLimited
 }
 
 // Run tails until ctx is done, then flushes what it has.
@@ -499,9 +536,12 @@ func (t *Tailer) Run(ctx context.Context) {
 	}
 
 	t.scanDir(t.loadCheckpoints(), true)
+	if t.initialScanned != nil {
+		close(t.initialScanned)
+	}
 	t.lastFlush = time.Now()
 
-	dirTicker := time.NewTicker(2 * time.Second)
+	dirTicker := time.NewTicker(t.dirScanEvery)
 	defer dirTicker.Stop()
 	poll := time.NewTicker(t.cfg.PollInterval)
 	defer poll.Stop()
@@ -673,14 +713,13 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 				// behind our fd. Drain, export, and only let the inode go once
 				// the offsets commit — a failed export must be able to re-read
 				// it (rewind seeks the still-open fd back), or a pod deleted
-				// during a collector outage would lose its final lines.
-				gen, committedBefore := f.rewindGen, f.committed
+				// during a collector outage would lose its final lines. The
+				// export and the settle decision happen once for the whole
+				// sweep, after this loop (settleGone).
+				t.goneDrains = append(t.goneDrains, goneDrain{
+					path: path, f: f, gen: f.rewindGen, committedBefore: f.committed,
+				})
 				t.drainGone(ctx, f)
-				t.flush(ctx)
-				if t.settledGone(f) || t.chargeGoneStall(f, gen, committedBefore) {
-					t.release(f)
-					delete(t.files, path)
-				}
 				continue
 			}
 		}
@@ -786,6 +825,7 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 		// iteration is over.
 		_ = t.maybeFlush(ctx, f)
 	}
+	t.settleGone(ctx)
 	if budgetSkipped > 0 {
 		// ONCE PER SWEEP, not once per unreached file, so a rate is comparable
 		// with the sweep cadence — promscrape's ScrapeMetaBudgetExhausted rule.

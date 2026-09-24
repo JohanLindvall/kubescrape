@@ -30,7 +30,7 @@ func TestTypeBombIsCountedMalformed(t *testing.T) {
 	// value of it: this is the reported attack's own name length.
 	name := strings.Repeat("a", 16<<10)
 	var sb strings.Builder
-	for i := 0; i < lines; i++ {
+	for range lines {
 		sb.WriteString("# TYPE " + name + " counter\n")
 	}
 	sb.WriteString("real_metric 1\n") // one honest sample, so the export path runs

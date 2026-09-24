@@ -44,17 +44,31 @@ func (t *Tailer) boundGroup(ctx context.Context, f *file, st *streamState, key s
 	return f.traces.Flush(ctx, key)
 }
 
-// newPipeline (re)creates the file's aggregation stages with empty state.
-// Incomplete segments (if any) are no longer present in the fresh pipeline
-// and must be re-read (feedSegments) before the current inode is consumed.
+// newPipeline (re)creates the file's aggregation stages with empty state,
+// DISCARDING whatever the old ones buffered. Incomplete segments (if any) are
+// no longer present in the fresh pipeline and must be re-read (feedSegments)
+// before the current inode is consumed — purgeSegmentFeeds records exactly
+// that.
 func (t *Tailer) newPipeline(f *file) {
+	f.purgeSegmentFeeds()
+	t.rebuildPipeline(f)
+}
+
+// rebuildPipeline is newPipeline WITHOUT the segment purge: fresh stages and
+// stream states, the segments' feed state untouched. It is only correct for a
+// caller that DRAINED the old stages into the batch (stopPipeline) rather than
+// discarding them, so every line that was live is still live — reopen's
+// non-carry rotation, which purges nothing. Anything that discards the
+// pipeline (a rewind above all) must use newPipeline, or the segments it
+// purged are left claiming lines nothing will re-feed.
+func (t *Tailer) rebuildPipeline(f *file) {
 	if f.tail == 0 {
 		// First pipeline for this file: issue its tail segment id. Files
 		// restored from a checkpoint re-issue a higher tail in initFile,
 		// above their loaded segments' ids.
 		f.newTail()
 	}
-	f.reset()
+	f.resetStreams()
 	f.keyStdout = f.containerID + "/stdout"
 	f.keyStderr = f.containerID + "/stderr"
 	if f.source.containerd {
@@ -341,6 +355,26 @@ func (t *Tailer) stopPipeline(ctx context.Context, f *file) {
 // would feed as a record what the live path discarded (or vice versa).
 const oversizeSlack = 4096
 
+// overCap reports whether an unterminated line of n carried bytes has passed
+// the oversize bound, so its accumulated prefix must be discarded. consume and
+// replaySegment both ask it, which is what keeps oversizeSlack's "the SAME
+// bound" true by construction rather than by two spellings of one sum.
+func (t *Tailer) overCap(n int) bool { return n > t.cfg.MaxEntryBytes+oversizeSlack }
+
+// noteOversized records one discarded oversized LINE: the aggregate
+// kubescrape_log_oversized_dropped_total and this file's own tally, which
+// /debug/tailer and the status summary report because the aggregate cannot say
+// WHICH file. Called on the FIRST over-cap slab of a line only — consume runs
+// per read chunk, so counting every slab reported one 10 MiB line as ~10
+// dropped lines — by the live path and the segment replay alike: the replay
+// used to bump the aggregate alone, so a line dropped there moved the counter
+// while the file's Oversized stayed 0. Off the per-line path (one increment
+// per oversized line), so the allocation budgets are untouched.
+func (f *file) noteOversized() {
+	obs.LogOversizedDropped.Inc()
+	f.oversized++
+}
+
 // maxIdlePendingBytes caps the carry buffer a file keeps between reads. One
 // oversized line grows it to MaxEntryBytes+oversizeSlack plus a chunk; pinning
 // that per file forever (a node tracks thousands) costs more than re-growing it
@@ -348,13 +382,23 @@ const oversizeSlack = 4096
 // steady-state working set, so normal files never hit this path.
 const maxIdlePendingBytes = 128 * 1024
 
+// appendCompact appends one read chunk to a carry buffer consumed by
+// RE-SLICING (rem is the unconsumed tail of base's backing array). The
+// remainder is moved back to the front of base first — a memmove, since the two
+// slices alias — so the chunk lands in the capacity that frees up. Appending to
+// rem directly allocates a fresh array per READ once re-slicing has walked rem
+// to the end of its capacity. The caller keeps the result's full capacity as
+// the next call's base (buf[:0:cap(buf)]). Shared by the live carry
+// (appendPending) and a segment replay's pass-local one (replaySegment).
+func appendCompact(base, rem, chunk []byte) []byte {
+	buf := append(base[:0], rem...) // in-place when it aliases
+	return append(buf, chunk...)
+}
+
 // appendPending appends one read chunk to the file's carry-over buffer,
-// reusing ONE array per file: the unconsumed remainder is moved back to the
-// front of pendingBase (a memmove — the two slices alias) so the chunk lands
-// in the capacity that frees up, rather than in a freshly allocated array.
+// reusing ONE array per file (see appendCompact).
 func (f *file) appendPending(chunk []byte) {
-	buf := append(f.pendingBase[:0], f.pending...) // in-place when it aliases
-	buf = append(buf, chunk...)
+	buf := appendCompact(f.pendingBase, f.pending, chunk)
 	f.pendingBase = buf[:0:cap(buf)]
 	f.pending = buf
 }
@@ -420,25 +464,16 @@ func (t *Tailer) consume(ctx context.Context, f *file, draining bool) bool {
 		i := bytes.IndexByte(f.pending, '\n')
 		if i < 0 {
 			// Bound the carried incomplete physical line.
-			if len(f.pending) > t.cfg.MaxEntryBytes+oversizeSlack {
+			if t.overCap(len(f.pending)) {
 				f.lineStart += int64(len(f.pending))
 				f.pending = f.pending[:0]
 				// The line's REMAINDER (everything up to its eventual newline)
 				// is part of the same oversized line: without this flag it
 				// would be fed as a "line" of its own — an arbitrary mid-line
-				// suffix, exported as a garbage record.
-				//
-				// Which is also why the counter is bumped only on the FIRST
-				// slab: consume runs per 64 KiB read chunk, so counting each
-				// over-cap flush reported one 10 MiB line as ~10 dropped LINES,
-				// which is what the metric says it counts.
+				// suffix, exported as a garbage record. It is also what makes
+				// the count once-per-LINE (see noteOversized).
 				if !f.discarding {
-					obs.LogOversizedDropped.Inc()
-					// Which FILE, which the counter cannot say. One integer
-					// increment on the FIRST over-cap slab of a line (not per
-					// read chunk and not per line), so the per-line allocation
-					// budget is untouched; publishStatus names the files.
-					f.oversized++
+					f.noteOversized()
 				}
 				f.discarding = true
 			}
@@ -471,11 +506,12 @@ func (t *Tailer) consume(ctx context.Context, f *file, draining bool) bool {
 			// "lines discarded" — a non-record inflating the operator's loss
 			// signal, on a workload that pads with blank lines by the thousand.
 			//
-			// Clearing f.limited is what the allow path below does on every
-			// consumed line, and it is load-bearing here: pending whose whole
-			// remainder is blank would otherwise drain with the pause flag
-			// still set and nothing left to clear it, and readFile would never
-			// read the file again.
+			// f.limited is never set on entry here: a pause returns with the
+			// refused NON-blank terminated line at pending[0], and the next
+			// pass leaves it only through the allow path (which clears the
+			// flag) or restartAt (likewise). FuzzIngestChunk pins that
+			// invariant ("limited implies pending begins with a whole,
+			// non-blank line"); the clear below is purely defensive.
 			f.limited = false
 			f.pending = f.pending[1:]
 			f.lineStart++
@@ -487,7 +523,7 @@ func (t *Tailer) consume(ctx context.Context, f *file, draining bool) bool {
 				// Pause: keep pending, stop reading until tokens refill.
 				if !f.limited {
 					f.limited = true
-					obs.LogRateLimited.WithLabelValues("pause").Inc()
+					t.rateLimitedCounter().Inc()
 				}
 				return false
 			}
@@ -495,7 +531,7 @@ func (t *Tailer) consume(ctx context.Context, f *file, draining bool) bool {
 			f.pending = f.pending[i+1:]
 			f.lineStart += int64(i + 1)
 			f.skipEnd = f.lineStart
-			obs.LogRateLimited.WithLabelValues("drop").Inc()
+			t.rateLimitedCounter().Inc()
 			continue
 		}
 		f.limited = false

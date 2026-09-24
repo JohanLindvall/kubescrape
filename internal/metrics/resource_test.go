@@ -158,7 +158,7 @@ func TestOverrideCancelsTheValueTheResourceRenders(t *testing.T) {
 func TestWideResourcesHashAsTheirRenderedIdentity(t *testing.T) {
 	build := func(n int, dupAt int) pcommon.Map {
 		var kv []string
-		for i := 0; i < n; i++ {
+		for i := range n {
 			kv = append(kv, fmt.Sprintf("attr.%03d", i), fmt.Sprintf("v%03d", i))
 		}
 		if dupAt >= 0 {
@@ -226,7 +226,7 @@ func TestResourceAccumIsAllocationFree(t *testing.T) {
 		t.Skip("-race perturbs allocation counts")
 	}
 	wide := pcommon.NewMap()
-	for i := 0; i < resourceIdentityAttrs; i++ {
+	for i := range resourceIdentityAttrs {
 		wide.PutStr(fmt.Sprintf("attr.%03d", i), fmt.Sprintf("value-%03d", i))
 	}
 	for _, tc := range []struct {

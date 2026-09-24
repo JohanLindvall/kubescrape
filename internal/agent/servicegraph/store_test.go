@@ -36,7 +36,7 @@ func newTestStore(t *testing.T, cfg Config) (*edgeStore, *[]Edge) {
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
-	st := newEdgeStore(cfg.withDefaults(), wait, func(e Edge) { got = append(got, cloneEdge(e)) }, nil)
+	st := newEdgeStore(cfg.withDefaults().MaxItems, wait, func(e Edge, _ time.Time) { got = append(got, cloneEdge(e)) }, nil)
 	return st, &got
 }
 
@@ -175,8 +175,11 @@ func TestStoreFailedFromEitherSide(t *testing.T) {
 	}
 }
 
-// The first non-empty classification sticks: a plain server half must not clear
-// the messaging/database type its partner established.
+// A plain server half must not clear the messaging/database type its partner
+// established, and database — the explicit statement — beats the kind-derived
+// messaging_system. Every case runs in BOTH arrival orders: a request's two
+// halves reach the shard in whatever order the network delivers them, and an
+// answer that depends on it splits one edge across two connection_type series.
 func TestStoreConnectionTypeSticks(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
@@ -187,16 +190,33 @@ func TestStoreConnectionTypeSticks(t *testing.T) {
 		{"client classifies", ConnectionMessagingSystem, ConnectionUnknown, ConnectionMessagingSystem},
 		{"server classifies", ConnectionUnknown, ConnectionMessagingSystem, ConnectionMessagingSystem},
 		{"both classify", ConnectionDatabase, ConnectionDatabase, ConnectionDatabase},
+		// A producer carrying db.* (database, authoritative on the client side)
+		// paired with its consumer (messaging_system, from the kind alone).
+		{"database beats messaging", ConnectionDatabase, ConnectionMessagingSystem, ConnectionDatabase},
+		{"database beats unknown", ConnectionDatabase, ConnectionUnknown, ConnectionDatabase},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			st, got := newTestStore(t, Config{})
-			k := makeEdgeKey(traceID(1), spanID(1))
-			st.upsert(t0, k, sideClient, halfSpan{service: "a", connection: tc.client}, nil)
-			st.upsert(t0, k, sideServer, halfSpan{service: "b", connection: tc.server}, nil)
-			if (*got)[0].Connection != tc.want {
-				t.Fatalf("connection = %q, want %q", (*got)[0].Connection, tc.want)
+		for _, serverFirst := range []bool{false, true} {
+			order := "client first"
+			if serverFirst {
+				order = "server first"
 			}
-		})
+			t.Run(tc.name+"/"+order, func(t *testing.T) {
+				st, got := newTestStore(t, Config{})
+				k := makeEdgeKey(traceID(1), spanID(1))
+				client := func() { st.upsert(t0, k, sideClient, halfSpan{service: "a", connection: tc.client}, nil) }
+				server := func() { st.upsert(t0, k, sideServer, halfSpan{service: "b", connection: tc.server}, nil) }
+				if serverFirst {
+					server()
+					client()
+				} else {
+					client()
+					server()
+				}
+				if (*got)[0].Connection != tc.want {
+					t.Fatalf("connection = %q, want %q", (*got)[0].Connection, tc.want)
+				}
+			})
+		}
 	}
 }
 
@@ -294,7 +314,7 @@ func TestStoreDimensionlessEdgeCarriesNoSlice(t *testing.T) {
 // not.)
 func TestStoreDimensionsAreLiveDuringRecord(t *testing.T) {
 	var seen []EdgeDimension
-	st := newEdgeStore(Config{}.withDefaults(), time.Second, func(e Edge) {
+	st := newEdgeStore(Config{}.withDefaults().MaxItems, time.Second, func(e Edge, _ time.Time) {
 		seen = append(seen, e.Dimensions...) // copies during the call, as a sink must
 	}, nil)
 	k := makeEdgeKey(traceID(1), spanID(1))
@@ -453,7 +473,7 @@ func TestStoreExpiresInInsertionOrder(t *testing.T) {
 // The sweep must be bounded: it holds the mutex every concurrent Consume needs.
 func TestStoreExpireIsBounded(t *testing.T) {
 	st, got := newTestStore(t, Config{Wait: "1s", MaxItems: 1000})
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		st.upsert(t0, makeEdgeKey(traceID(byte(i/10)), spanID(byte(i%10))), sideClient, halfSpan{service: "a"}, nil)
 	}
 	if st.stats().Items != 100 {

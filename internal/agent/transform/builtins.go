@@ -5,13 +5,15 @@ package transform
 // addition below keeps that property:
 //
 //   - re.match/find/findall/replace/groups — RE2 over strings, with a
-//     bounded compiled-pattern cache (the attrs builder's eviction shape).
+//     bounded compiled-pattern cache (lock-free hits, arbitrary eviction at
+//     its entry, byte and instruction bounds — see compiledPattern).
 //     This was the single most-hit wall in real migrations: OTTL conditions
 //     are IsMatch/replace_pattern shaped, and string methods only cover the
 //     patterns that happen to be closed alternations.
 //   - log(msg) — a THROTTLED line into the agent log for script debugging
 //     (1/s per signal; a script logging per record must not turn the export
-//     path into a log flood of its own).
+//     path into a log flood of its own). The universe print() is shadowed onto
+//     the same gate, and it and fail() project what they render, like str().
 //
 // Plus, since name resolution consults predeclared BEFORE the universe, the
 // bounded shadows of the amplifying universe builtins and the two guards the
@@ -22,6 +24,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	resyntax "regexp/syntax"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +32,9 @@ import (
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
 
+	"github.com/JohanLindvall/kubescrape/internal/clip"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
+	"github.com/JohanLindvall/kubescrape/internal/regexcost"
 )
 
 // maxCachedPatterns bounds the compiled-regex cache. Scripts use literal
@@ -38,24 +43,79 @@ import (
 // attacker-influenced strings is a leak.
 const maxCachedPatterns = 1024
 
-// maxPatternBytes bounds ONE pattern. A count is not a memory bound: the cache
-// key is the pattern STRING, and `re.match(r.attributes["p"], r.body)` keys it
-// on data, so 1024 entries of whatever size happened to land there is 1024x
-// that size retained for the process' lifetime on a DaemonSet pod the chart
-// limits to 512Mi. 8 KiB is far past any pattern a human writes — the longest
-// realistic shape is one alternation of names — and it also bounds the compile
-// itself, which is what keeps a dynamic pattern from being a CPU amplifier.
+// maxPatternBytes bounds ONE pattern's TEXT. A count is not a memory bound:
+// the cache key is the pattern STRING, and `re.match(r.attributes["p"],
+// r.body)` keys it on data, so 1024 entries of whatever size happened to land
+// there is 1024x that size retained for the process' lifetime on a DaemonSet
+// pod the chart limits to 512Mi. 8 KiB is far past any pattern a human writes
+// — the longest realistic shape is one alternation of names, which the parser
+// factors down to a few hundred instructions.
+//
+// What the length does NOT bound is what the pattern compiles INTO, and this
+// comment used to claim it did: a counted repeat multiplies, so the 8,000-byte
+// `\w{1000}` x 1000 is a million-instruction program (42 MB retained, 263 ms of
+// compile inside one interpreter step), and 2,700 capture groups fit in the
+// same 8 KiB. maxPatternInsts and maxPatternGroups are those bounds.
 const maxPatternBytes = 8 << 10
 
 // maxCachedPatternBytes bounds the pattern strings the cache retains, so
-// eviction bounds MEMORY and not just entries. The compiled programs beside
-// them are bounded by regexp's own ErrLarge ceiling.
+// eviction bounds MEMORY and not just entries — which holds only because a
+// miss stores a COPY of the pattern (compiledPattern), never the caller's
+// view into a larger string. It bounds the KEYS only: the
+// compiled programs beside them are maxCachedInsts' job. regexp's own ErrLarge
+// ceiling is no bound worth the name here — it admits ~3.3M instructions, i.e.
+// ~130 MB, per pattern.
 const maxCachedPatternBytes = 1 << 20
 
+// maxPatternInsts bounds ONE pattern's compiled program, ESTIMATED from its
+// parse tree before anything is compiled (regexcost.Insts — the same
+// arithmetic regexp/syntax applies for its own ErrLarge check, so the estimate
+// tracks the real program to within the instructions every program carries). It is
+// the bound on both costs a data-derived pattern can amplify: the compile (and
+// the memory it retains in the cache), and every MATCH, since RE2's matcher is
+// linear in the subject with a constant proportional to the program. 16Ki is
+// ~8x the largest counted repeat a human writes (`.{0,1000}` is 2000) and two
+// orders past a factored alternation of names; the million-instruction shape
+// above is refused, in O(pattern) time, before it compiles.
+const maxPatternInsts = 1 << 14
+
+// maxPatternGroups bounds capture groups. The submatch paths — re.groups, and
+// re.replace with a `$` reference — copy the capture slots per matcher thread
+// per step, which makes one call roughly cubic in the group count on an
+// adversarial subject: measured at 2.09 s for 1,200 groups over a 1,200-byte
+// subject, with 2,700 fitting in maxPatternBytes. At 64 the same shape costs
+// ~2.6x a group-free match of the same subject (160 ms against 61 ms over 64
+// KiB), and real parsers — an access-log line — use a dozen.
+const maxPatternGroups = 64
+
+// maxCachedInsts bounds the compiled programs the cache retains, measured in
+// the same estimated instructions: 16 maximum-size patterns, ~11 MB at the
+// ~42 bytes per instruction a compiled program measured.
+const maxCachedInsts = 1 << 18
+
+// cachedPattern is one cache entry: the program and the instruction estimate
+// it was admitted (and must be evicted) under.
+type cachedPattern struct {
+	re    *regexp.Regexp
+	insts int
+}
+
 var (
-	reMu       sync.Mutex
-	reCache    = map[string]*regexp.Regexp{}
-	reCacheLen int // sum of the cached patterns' lengths
+	// reCache maps a pattern to its *cachedPattern. A sync.Map rather than a
+	// mutex-guarded map because the HIT is the hot path — every re verb on
+	// every signal, from every export goroutine — and under a mutex every
+	// lookup in the process serialised on one lock: aggregate throughput of an
+	// anchored lookup+match went from ~90 ns/op at one CPU to ~150 at sixteen,
+	// while the match alone scaled from ~64 to ~9. Keys are written once and
+	// read many times, which is the case sync.Map is built for.
+	reCache sync.Map
+	// reMu serialises insertion and eviction, and guards the three tallies
+	// below. A load never takes it; the tallies change only under it, beside
+	// the Store/Delete they account for, so they always describe the map.
+	reMu         sync.Mutex
+	reCacheN     int // entries
+	reCacheLen   int // sum of the cached patterns' lengths
+	reCacheInsts int // sum of their instruction estimates
 )
 
 func compiledPattern(pat string) (*regexp.Regexp, error) {
@@ -63,100 +123,148 @@ func compiledPattern(pat string) (*regexp.Regexp, error) {
 		return nil, fmt.Errorf("pattern of %d bytes is over the %d-byte limit (patterns are cached for the life of the process, so a data-derived one must not be arbitrarily large)",
 			len(pat), maxPatternBytes)
 	}
-	reMu.Lock()
-	if re, ok := reCache[pat]; ok {
-		reMu.Unlock()
-		return re, nil
+	if c, ok := reCache.Load(pat); ok {
+		return c.(*cachedPattern).re, nil
 	}
-	reMu.Unlock()
-	// Compiled OUTSIDE the lock: this cache is shared by every re verb on
-	// every signal, so a compile under it serialises every concurrent
-	// invocation in the process — and a pattern that FAILS to compile is
-	// never cached, so a stream of malformed ones would pay it per call. A
-	// racing duplicate compile is wasted work and nothing worse.
+	// Everything below runs on a MISS only, OUTSIDE the lock: this cache is
+	// shared by every re verb on every signal, so a compile under it would
+	// serialise every concurrent invocation in the process — and a pattern
+	// that fails to compile (or is refused) is never cached, so a stream of
+	// them pays this per call. A racing duplicate compile is wasted work and
+	// nothing worse.
+	insts, err := patternCost(pat)
+	if err != nil {
+		return nil, err
+	}
+	// A COPY, exactly len(pat) long, before anything retains it: the cache
+	// keeps the string twice — as the map key, and as the compiled Regexp's
+	// source text — and a data-derived pattern is usually a VIEW of something
+	// much larger (r.body[0:16] slices the body; an escape-free lifted JSON
+	// attribute aliases the whole line), so without the copy each entry pinned
+	// its subject for the life of the process while reCacheLen counted only
+	// the pattern: 32 sixteen-byte patterns sliced from 1 MiB bodies kept 32
+	// MiB live under a tally reading 512 bytes.
+	pat = strings.Clone(pat)
 	re, err := regexp.Compile(pat)
 	if err != nil {
 		return nil, err
 	}
 	reMu.Lock()
 	defer reMu.Unlock()
-	if cached, ok := reCache[pat]; ok {
-		return cached, nil // lost the race; one *Regexp per pattern
+	if c, ok := reCache.Load(pat); ok {
+		return c.(*cachedPattern).re, nil // lost the race; one *Regexp per pattern
 	}
-	// Evict arbitrarily (map order) until both bounds hold: correctness never
-	// depends on the cache, only cost does.
-	for len(reCache) >= maxCachedPatterns || reCacheLen+len(pat) > maxCachedPatternBytes {
-		k, ok := anyKey(reCache)
-		if !ok {
+	// Evict arbitrarily until every bound holds: correctness never depends on
+	// the cache, only cost does. Arbitrary is not the attrs builder's shape —
+	// its generational genCache promotes a hot entry across a rotation, where
+	// here a working set above the bounds recompiles on most misses — and is
+	// tolerable only because scripts use literal patterns, so the working set
+	// is tiny.
+	for reCacheN >= maxCachedPatterns || reCacheLen+len(pat) > maxCachedPatternBytes ||
+		reCacheInsts+insts > maxCachedInsts {
+		if !evictOnePattern() {
 			break
 		}
-		delete(reCache, k)
-		reCacheLen -= len(k)
 	}
-	reCache[pat] = re
+	reCache.Store(pat, &cachedPattern{re: re, insts: insts})
+	reCacheN++
 	reCacheLen += len(pat)
+	reCacheInsts += insts
 	return re, nil
 }
 
-func anyKey(m map[string]*regexp.Regexp) (string, bool) {
-	for k := range m {
-		return k, true
-	}
-	return "", false
+// evictOnePattern removes an arbitrary entry and its tallies. The caller holds
+// reMu, which is what keeps a concurrent insertion from being evicted twice or
+// its tallies from drifting.
+func evictOnePattern() bool {
+	evicted := false
+	reCache.Range(func(k, v any) bool {
+		reCache.Delete(k)
+		reCacheN--
+		reCacheLen -= len(k.(string))
+		reCacheInsts -= v.(*cachedPattern).insts
+		evicted = true
+		return false
+	})
+	return evicted
 }
 
-// maxMatchProbe bounds how many matches one PREDICTIVE probe may collect
-// before it gives up and answers with the worst case. The probe exists to
-// rescue a call whose worst case is enormous but whose real match count is
-// small (a long replacement applied at a handful of places); past this many
-// matches the answer is the same either way, so paying for a longer scan buys
-// nothing. 64Ki index pairs is ~2.6 MB of transient scratch, an order below
-// what the call it is deciding about would allocate.
-const maxMatchProbe = 1 << 16
+// patternCost parses pat — as regexp.Compile will, with the Perl flags — and
+// refuses it when its capture groups or its ESTIMATED program exceed the
+// bounds above, returning the estimate the cache accounts it under. It costs a
+// second parse on a cache miss, and the walk is O(pattern): what it must not
+// do is compile to count (Simplify + syntax.Compile measured 297 ms for the
+// million-instruction shape, as much as the compile it would guard).
+func patternCost(pat string) (int, error) {
+	tree, err := resyntax.Parse(pat, resyntax.Perl)
+	if err != nil {
+		return 0, err // regexp.Compile would fail identically; same error text
+	}
+	if g := tree.MaxCap(); g > maxPatternGroups {
+		return 0, fmt.Errorf("pattern with %d capture groups is over the %d-group limit (each submatch step copies every group's slots, so the cost grows much faster than the count) — use (?:...) for groups nothing reads",
+			g, maxPatternGroups)
+	}
+	n := regexcost.Insts(tree, maxPatternInsts)
+	if n > maxPatternInsts {
+		return 0, fmt.Errorf("pattern compiles to more than %d instructions (a counted repeat multiplies what it repeats: x{1000} is a thousand copies of x) — the program is retained in the cache and walked per subject byte, so a data-derived pattern must not be arbitrarily large",
+			maxPatternInsts)
+	}
+	return n, nil
+}
 
 // bytesPerMatch is what one re.findall match costs: the []string entry the
 // regexp package returns, the boxed starlark.String and the list's own
 // element word. The match TEXT is a slice of the subject and is not copied.
 const bytesPerMatch = 3 * bytesPerValue
 
-// replExpansion is an upper bound on ONE expanded replacement. len(repl) is
-// not it: Go's $1/${name} references expand to a capture group's text, so a
-// short repl full of references expands to a multiple of the SUBJECT. Every
-// `$` starts at most one reference and a group is at most the whole subject.
-func replExpansion(repl string, subj int) int64 {
-	refs := int64(strings.Count(repl, "$"))
-	return satAdd(int64(len(repl)), satMul(refs, int64(max(subj, 1))))
-}
-
-// replaceSize projects re.replace's output BEFORE ReplaceAllString builds it.
-// Without this the `re` module is the one amplifier in the predeclared
-// environment with no predictive cap at all: the output is (matches x expanded
-// replacement) bytes, an empty pattern matches at every position, and the
-// charge landed after the string existed — measured at 805 MiB allocated for a
-// 129 MiB result that was then refused. Neither step guard can help, because
-// the whole growth happens inside ONE interpreter step.
+// replaceSize is an upper bound on what re.replace will build, computed BEFORE
+// ReplaceAllString builds it. Without it the `re` module is the one amplifier
+// in the predeclared environment with no predictive cap at all: an empty
+// pattern matches at every position, a `$1` expands to a capture group's text,
+// and the charge used to land after the string existed — measured at 805 MiB
+// allocated for a 129 MiB result that was then refused. Neither step guard can
+// help, because the whole growth happens inside ONE interpreter step.
 //
-// Two tiers, because the cheap bound alone would refuse honest scripts. A
-// pattern matches at most once per position (empty matches included), so the
-// output is at most len(s) + (len(s)+1) x one expanded replacement — and when
-// THAT already fits, nothing needs to be scanned. When it does not, the
-// matches are COUNTED, with the probe itself bounded: it asks for one more
-// match than the ceiling could pay for, so the scan allocates in proportion to
-// what we were prepared to let the call build, and reaching its cap means the
-// projection is over the ceiling anyway.
+// The bound, and why it is not a multiple of the subject PER MATCH (which is
+// what an earlier version charged, refusing an ordinary `$1=***` redaction of
+// a 1 MiB log line from its fifteenth match on — and a refusal is a script
+// error, which on the tailer rewinds and rebuilds the same batch every sweep,
+// i.e. stops log shipping on the node). With m matches covering M bytes of s
+// and refs = the number of `$` in repl:
+//
+//   - the unmatched text is copied once: len(s) - M;
+//   - each match writes repl's literal bytes, at most len(repl): m*len(repl);
+//   - each `$` starts at most one reference ($$ and a malformed $ write one
+//     byte and are already counted in len(repl)), and a reference expands to a
+//     capture group, which RE2 — having no lookaround — places INSIDE its own
+//     match. Matches do not overlap, so across ALL matches one reference
+//     position expands to at most M bytes in total: refs*M.
+//
+// So out <= len(s) - M + m*len(repl) + refs*M, and with M <= len(s) and
+// m <= len(s)+1 (a pattern matches at most once per position, empty matches
+// included) the no-scan worst case is len(s)*max(1, refs) + (len(s)+1)*len(repl).
+// When THAT fits the ceiling nothing is scanned — the common case, a short
+// replacement over a log line. When it does not, m and M are measured exactly
+// by one pass through the same match loop ReplaceAllString uses (so anchors,
+// word boundaries and empty-match rules agree), whose scratch is the unmatched
+// text — at most the subject, which the real call copies anyway. There is no
+// cap on that pass: an earlier probe stopped at 64Ki matches and read "the
+// probe filled up" as "over the limit", refusing a digit redaction whose real
+// output was 2 MiB.
 func replaceSize(re *regexp.Regexp, repl, s string, limit int64) int64 {
-	l := replExpansion(repl, len(s))
-	worst := satAdd(int64(len(s)), satMul(int64(len(s))+1, l))
-	if worst <= limit {
-		return worst
+	n, r := int64(len(s)), int64(len(repl))
+	refs := int64(strings.Count(repl, "$"))
+	worst := satAdd(satMul(n, max(refs, 1)), satMul(n+1, r))
+	if worst <= limit || r == 0 {
+		return worst // r == 0 means no references either: the output is at most s
 	}
-	n := limit/max(l, 1) + 1 // matches the ceiling can still pay for
-	n = min(n, maxMatchProbe, int64(len(s))+1)
-	locs := re.FindAllStringIndex(s, int(n))
-	if int64(len(locs)) >= n {
-		return worst
-	}
-	return satAdd(int64(len(s)), satMul(int64(len(locs)), l))
+	var m, matched int64
+	re.ReplaceAllStringFunc(s, func(match string) string {
+		m++
+		matched += int64(len(match))
+		return ""
+	})
+	return satAdd(satAdd(n-matched, satMul(m, r)), satMul(refs, matched))
 }
 
 // rePatternAndString unpacks the (pattern, s) argument shape shared by most
@@ -264,14 +372,21 @@ func reModule() *starlarkstruct.Module {
 				if err != nil {
 					return nil, fmt.Errorf("%s: %w", b.Name(), err)
 				}
-				bud := budgetOf(th)
-				limit := int64(maxStringBytes)
-				if r := bud.remaining(); r < limit {
-					limit = r
+				// A subject the pattern does not match comes back AS IT IS, and
+				// uncharged: nothing is built, while ReplaceAllString would copy
+				// it twice and the charge below would bill a full body per call.
+				// That charge is per INVOCATION, i.e. per batch, so a redaction
+				// list run over every record spent patterns x (the batch's body
+				// bytes) of the 128 MiB budget whether or not anything matched —
+				// ten patterns over a 16 MiB push refused the batch, and a refused
+				// batch fails the same way on every retry.
+				if re.FindStringIndex(s) == nil {
+					return starlark.String(s), nil
 				}
-				if sz := replaceSize(re, repl, s, limit); sz > maxStringBytes {
-					return nil, positioned(th, fmt.Errorf("%s: a %d-byte subject and a replacement expanding to up to %d bytes could build past the %d-byte limit for one value — replace less per call",
-						b.Name(), len(s), replExpansion(repl, len(s)), int64(maxStringBytes)))
+				bud := budgetOf(th)
+				if sz := replaceSize(re, repl, s, bud.valueCeiling(0)); sz > maxStringBytes {
+					return nil, positioned(th, fmt.Errorf("%s: replacing in a %d-byte subject could build up to %d bytes, over the %d-byte limit for one value — replace less per call",
+						b.Name(), len(s), sz, int64(maxStringBytes)))
 				} else if err := bud.project(sz); err != nil {
 					return nil, positioned(th, err)
 				}
@@ -289,10 +404,43 @@ func reModule() *starlarkstruct.Module {
 // the surface exists for debugging a predicate, and a script calling it per
 // record on a busy node would flood the agent's own log stream — which is
 // itself collected, so the flood is also input.
-var scriptLogGates sync.Map // signal -> *logdedupe.Throttle
+//
+// A fixed struct over the closed signal set, like runWarnGates, and not the
+// sync.Map it was: LoadOrStore built its &Throttle{} candidate and boxed the
+// signal into an `any` key on EVERY call, i.e. two heap allocations per
+// log()/print() — including the suppressed calls, which are the ones the
+// throttle exists to make cheap (a script logging per record paid 2048 per
+// 1024-record batch).
+var scriptLogGates struct {
+	logs, metrics, traces, ingest, targets, sample, parse logdedupe.Throttle
+	// other is for a signal this list does not name; none is compiled today.
+	other logdedupe.Throttle
+}
+
+// scriptLogGate is the signal's gate in scriptLogGates.
+func scriptLogGate(signal string) *logdedupe.Throttle {
+	switch signal {
+	case "logs":
+		return &scriptLogGates.logs
+	case "metrics":
+		return &scriptLogGates.metrics
+	case "traces":
+		return &scriptLogGates.traces
+	case "ingest":
+		return &scriptLogGates.ingest
+	case "targets":
+		return &scriptLogGates.targets
+	case "sample":
+		return &scriptLogGates.sample
+	case "parse":
+		return &scriptLogGates.parse
+	}
+	return &scriptLogGates.other
+}
 
 // scriptLog is the ONE path a script's output takes into the agent log, shared
-// by log(msg) and by print(): the universe's print is reachable from every
+// by log(msg), print() and — as the backstop Thread.Print — anything else that
+// reaches the thread's printer: the universe's print is reachable from every
 // script, and with Thread.Print unset starlark-go falls back to
 // fmt.Fprintln(os.Stderr) — unstructured lines injected raw into the agent's
 // own stream, unthrottled. One in-cluster minute measured 68 such print lines
@@ -308,13 +456,45 @@ var scriptLogGates sync.Map // signal -> *logdedupe.Throttle
 // exists to prevent.
 func scriptLog(signal, msg string) {
 	if scriptLogAllowed(signal) {
-		slog.Info("transform script log", "signal", signal, "output", msg)
+		writeScriptLog(signal, msg)
 	}
 }
 
+// writeScriptLog writes one already-admitted line: the builtins below take the
+// gate BEFORE they render, so they must not pass through scriptLog's gate a
+// second time — it would suppress the line it had just allowed.
+//
+// The line is clipped (scriptText). The throttle bounds how OFTEN a script
+// writes here and nothing bounded how MUCH: a debugging `log(r.body)` wrote the
+// whole body — up to the 16 MiB ingest cap — once a second per signal, into a
+// stream the agent itself collects and the kubelet rotates at 10Mi.
+func writeScriptLog(signal, msg string) {
+	slog.Info("transform script log", "signal", signal, "output", scriptText(msg))
+}
+
+// maxScriptLogBytes bounds any script-authored text this package writes into
+// the agent's own log — a log()/print() line, the text of a script's runtime
+// error. 4 KiB is a screenful: enough to debug a predicate by, far short of a
+// body.
+const maxScriptLogBytes = 4 << 10
+
+// scriptText clips script-authored text for the agent's log, on a rune
+// boundary and marked, like every caller-supplied log attribute (internal/clip).
+func scriptText(s string) string { return clip.Ellipsis(s, maxScriptLogBytes) }
+
+// scriptError is a script failure whose TEXT is clipped (scriptText) while the
+// error it wraps stays reachable: errors.As still finds the *starlark.EvalError
+// scriptPos reads the position from. The text is what leaves this package — in
+// the runtime-error and hook-error Warns, in the error every producer logs
+// when its export fails, in the gRPC status an ingest sender receives — and a
+// script's own words are in it: `fail(r.body)` put the body in all of them.
+type scriptError struct{ err error }
+
+func (e scriptError) Error() string { return scriptText(e.err.Error()) }
+func (e scriptError) Unwrap() error { return e.err }
+
 func scriptLogAllowed(signal string) bool {
-	gate, _ := scriptLogGates.LoadOrStore(signal, &logdedupe.Throttle{})
-	return gate.(*logdedupe.Throttle).Allow(time.Second)
+	return scriptLogGate(signal).Allow(time.Second)
 }
 
 // logBuiltin returns the per-signal log(msg) function. The gate is taken
@@ -340,27 +520,134 @@ func logBuiltin(signal string) *starlark.Builtin {
 			// The render is str()'s amplifier under another name, and this one
 			// ends up in the agent's OWN log stream — which is collected — so
 			// it is projected before it is built.
-			limit := int64(maxStringBytes)
-			if r := bud.remaining(); r < limit {
-				limit = r
-			}
-			if sz := renderSize(msg, 0, limit); sz > maxStringBytes {
-				return nil, positioned(th, fmt.Errorf("%s: the argument would render at least %d bytes, over the %d-byte limit for one value", b.Name(), sz, int64(maxStringBytes)))
-			} else if err := bud.project(sz); err != nil {
-				return nil, positioned(th, err)
+			sz, deep := renderSize(msg, bud.valueCeiling(0))
+			if err := bud.checkRender(sz, deep, 0); err != nil {
+				return nil, positioned(th, fmt.Errorf("%s: %w", b.Name(), err))
 			}
 			s = msg.String()
 		}
-		slog.Info("transform script log", "signal", signal, "output", s)
+		writeScriptLog(signal, s)
 		return starlark.None, nil
+	})
+}
+
+// joinedRenderSize projects the message print() and fail() build: prefix, then
+// every argument separated by sep — a string written as it is (and, for
+// print, bytes too), anything else rendered as str() of a container would
+// render it. It stops once it passes limit.
+func joinedRenderSize(prefix string, args starlark.Tuple, sep string, rawBytes bool, limit int64) (int64, bool) {
+	total := int64(len(prefix))
+	for i := 0; i < len(args) && total <= limit; i++ {
+		if i > 0 {
+			total = satAdd(total, int64(len(sep)))
+		}
+		if s, ok := starlark.AsString(args[i]); ok {
+			total = satAdd(total, int64(len(s)))
+			continue
+		}
+		if bs, ok := args[i].(starlark.Bytes); ok && rawBytes {
+			total = satAdd(total, int64(len(bs)))
+			continue
+		}
+		sz, deep := renderSize(args[i], max(0, limit-total))
+		if deep {
+			return total, true
+		}
+		total = satAdd(total, sz)
+	}
+	return total, false
+}
+
+// printBuiltin shadows the universe print(*args, sep=" "), which renders every
+// argument — a container through the same writeValue str() uses — into one
+// string BEFORE it calls Thread.Print, i.e. before the throttle can suppress
+// it and with no projection at all. So `print([body] * 64)` built and logged a
+// 64 MiB line where `str()` of the same value is refused, and did it at module
+// level too, inside Compile at every startup and every reload, where a process
+// that dies dies before there is a last-good program. Here the gate is taken
+// first and the message is projected before it is built, as log() does, and
+// the line is written directly (writeScriptLog) because the gate is already
+// spent. Thread.Print stays wired (engine.go) as the backstop.
+func printBuiltin(signal string) *starlark.Builtin {
+	return starlark.NewBuiltin("print", func(th *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		bud := budgetOf(th)
+		if err := bud.overtime(); err != nil {
+			return nil, positioned(th, err)
+		}
+		sep := " "
+		if err := starlark.UnpackArgs(b.Name(), nil, kwargs, "sep?", &sep); err != nil {
+			return nil, err
+		}
+		if !scriptLogAllowed(signal) {
+			return starlark.None, nil
+		}
+		sz, deep := joinedRenderSize("", args, sep, true, bud.valueCeiling(0))
+		if err := bud.checkRender(sz, deep, 0); err != nil {
+			return nil, positioned(th, fmt.Errorf("%s: %w", b.Name(), err))
+		}
+		// Only what the line can carry is built: writeScriptLog clips at
+		// maxScriptLogBytes, so one byte past it (enough for the clip to
+		// notice and mark the cut) is all that is ever written out. A
+		// container argument still renders whole — that render is what the
+		// projection above bounds.
+		const carry = maxScriptLogBytes + 1
+		var buf strings.Builder
+		buf.Grow(int(min(sz, carry)))
+		for i, v := range args {
+			if i > 0 {
+				buf.WriteString(sep[:min(len(sep), max(0, carry-buf.Len()))])
+			}
+			room := carry - buf.Len()
+			if room <= 0 {
+				break
+			}
+			s, ok := starlark.AsString(v)
+			if !ok {
+				if bs, isBytes := v.(starlark.Bytes); isBytes {
+					s = string(bs)
+				} else {
+					s = v.String()
+				}
+			}
+			buf.WriteString(s[:min(len(s), room)])
+		}
+		writeScriptLog(signal, buf.String())
+		return starlark.None, nil
+	})
+}
+
+// failBuiltin shadows the universe fail(*args, sep=" "), which renders its
+// arguments into the error text exactly as print() does — str()'s amplifier
+// with no projection — so `fail([body] * 40)` built a 40 MiB error that was
+// then copied through the error wrapping and into a Warn line, while `str()` of
+// the same value is refused after a megabyte. The message is projected here
+// and the universe builtin then builds it, so the error text is unchanged.
+func failBuiltin() *starlark.Builtin {
+	inner := starlark.Universe["fail"].(*starlark.Builtin)
+	return starlark.NewBuiltin("fail", func(th *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		bud := budgetOf(th)
+		if err := bud.overtime(); err != nil {
+			return nil, positioned(th, err)
+		}
+		sep := " "
+		if err := starlark.UnpackArgs(b.Name(), nil, kwargs, "sep?", &sep); err != nil {
+			return nil, err
+		}
+		sz, deep := joinedRenderSize("fail: ", args, sep, false, bud.valueCeiling(0))
+		if err := bud.checkRender(sz, deep, 0); err != nil {
+			return nil, positioned(th, fmt.Errorf("%s: %w", b.Name(), err))
+		}
+		return inner.CallInternal(th, args, kwargs)
 	})
 }
 
 // predeclared is the environment a signal's script compiles against.
 func predeclared(signal string) starlark.StringDict {
 	d := starlark.StringDict{
-		"re":  reModule(),
-		"log": logBuiltin(signal),
+		"re":    reModule(),
+		"log":   logBuiltin(signal),
+		"print": printBuiltin(signal),
+		"fail":  failBuiltin(),
 		// The `*` and `+` rewrite targets. Named, not anonymous, because the
 		// resolver only binds names — checkReservedNames keeps a script from
 		// binding them itself.

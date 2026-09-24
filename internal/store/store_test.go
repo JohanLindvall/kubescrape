@@ -28,8 +28,8 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.t = c.t.Add(d)
 }
 
-func newTestStore(ttl time.Duration) (*Store, *fakeClock) {
-	s := New(ttl)
+func newTestStore(ttl time.Duration, opts ...Option) (*Store, *fakeClock) {
+	s := New(ttl, opts...)
 	clk := &fakeClock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 	s.now = clk.Now
 	return s, clk
@@ -97,7 +97,7 @@ func TestDeletedPodTombstone(t *testing.T) {
 	clk.Advance(time.Minute + time.Second)
 	mustMiss(t, s, "abc123")
 
-	s.Sweep()
+	s.sweep()
 	pods, containers := s.Stats()
 	if pods != 0 || containers != 0 {
 		t.Fatalf("sweep left pods=%d containers=%d", pods, containers)

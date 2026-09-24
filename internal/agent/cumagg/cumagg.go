@@ -37,9 +37,11 @@
 // contract in each: the metric NAMES, shells and label sets (servicegraph's are
 // Grafana-Tempo-verbatim, spanmetrics' are OTel-dotted); the cardinality and
 // eviction COUNTERS, one pair per aggregator, so an operator can see WHICH cap
-// bound; the per-series aggregate and its histograms (one there, two here); and
-// the render's locking strategy, which is a performance decision about that
-// aggregator's receive path rather than part of the state machine.
+// bound; and the per-series aggregate (one latency histogram there, two here)
+// with its snapshot element. The latency histogram itself (Hist, HistSnap,
+// PutHistPoint) and the render's chunked snapshot (Snapshotter) are shared:
+// both aggregators had written them out line for line, made the same decisions
+// for the same reasons with the same constants, and only one copy was tested.
 package cumagg
 
 import (
@@ -52,6 +54,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/pkg/otlpsplit"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
@@ -159,10 +162,13 @@ type Store[S Series] struct {
 
 	mu     sync.Mutex
 	series map[string]S
-	// markPtrs is afterDelivered's reused pointer scratch. Export holds the
-	// exportGate for render, send and mark together, so nothing else can be
-	// walking it.
-	markPtrs []S
+	// rendered is every series the current render marked (MarkRenderedLocked
+	// appends; guarded by mu), and it is the whole of what the delivery mark
+	// walks — see afterDelivered. Export empties it on the way in and on every
+	// way out, so it never outlives the export whose render filled it: a failed
+	// send's list would otherwise pin series that eviction has since dropped.
+	// The backing array is reused across exports.
+	rendered []S
 	// capRefused counts cardinality-cap refusals since the last time the export
 	// loop reported them. The COUNTER (Options.Dropped) carries the rate; this
 	// is what lets the loop emit ONE throttled line per interval instead of one
@@ -173,10 +179,6 @@ type Store[S Series] struct {
 	// capWarn throttles that line: the cap, once reached, is reached on every
 	// admission until eviction frees a slot.
 	capWarn logdedupe.Throttle
-	// exportFailed latches a failed export so the recovery can be reported.
-	// Without it an outage is a Warn per interval and the end of it is silence,
-	// which reads the same as the process having stopped exporting.
-	exportFailed atomic.Bool
 
 	// exportGate holds ONE token, taken for the whole of an Export — render,
 	// send and delivery mark together. Export is otherwise NOT safe against
@@ -251,9 +253,13 @@ func (st *Store[S]) ObservedLocked(s S, now time.Time) {
 	m.State = Observed
 }
 
-// MarkRenderedLocked records that s' current values went into a payload. Only a
-// series that reaches Delivered from here may ever be evicted.
-func (st *Store[S]) MarkRenderedLocked(s S) { s.meta().State = Rendered }
+// MarkRenderedLocked records that s' current values went into a payload, and
+// lists s for the delivery mark that follows a successful send. Only a series
+// that reaches Delivered from here may ever be evicted.
+func (st *Store[S]) MarkRenderedLocked(s S) {
+	s.meta().State = Rendered
+	st.rendered = append(st.rendered, s)
+}
 
 // LivePointersLocked evicts the stale series and appends every survivor to dst,
 // in ONE walk of the map.
@@ -293,30 +299,7 @@ func (st *Store[S]) LivePointersLocked(dst []S, now time.Time) []S {
 	return dst
 }
 
-// pointersLocked appends every live series to dst. One pointer write each, which
-// is the cheapest whole-map pass there is — and the only kind worth holding the
-// mutex for uninterrupted, since a map cannot be walked across lock releases and
-// a slice can.
-func (st *Store[S]) pointersLocked(dst []S) []S {
-	for _, s := range st.series {
-		dst = append(dst, s)
-	}
-	return dst
-}
-
-// CountLocked is the number of live series.
-func (st *Store[S]) CountLocked() int { return len(st.series) }
-
-// EachLocked calls f for every live series, in map order. It does NOT mark
-// anything rendered: a caller that is building a payload calls
-// MarkRenderedLocked as it goes, and one that is only looking must not.
-func (st *Store[S]) EachLocked(f func(S)) {
-	for _, s := range st.series {
-		f(s)
-	}
-}
-
-// Len is CountLocked for a caller that holds nothing.
+// Len is the number of live series, taken under the lock.
 func (st *Store[S]) Len() int {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -324,7 +307,8 @@ func (st *Store[S]) Len() int {
 }
 
 // Range calls f for every live series under the lock, stopping early on false.
-// Diagnostics and tests; a render uses the *Locked steps directly.
+// Only tests call it (the aggregators' own, from their packages); a render uses
+// the *Locked steps directly, and f runs under the lock, so it must not take it.
 func (st *Store[S]) Range(f func(key string, s S) bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -380,23 +364,8 @@ func (st *Store[S]) Render(res pcommon.Resource, now time.Time) pmetric.Metrics 
 }
 
 // noDataPoints reports whether m carries no data points, across every metric
-// type and including an untyped one.
-func noDataPoints(m pmetric.Metric) bool {
-	switch m.Type() {
-	case pmetric.MetricTypeGauge:
-		return m.Gauge().DataPoints().Len() == 0
-	case pmetric.MetricTypeSum:
-		return m.Sum().DataPoints().Len() == 0
-	case pmetric.MetricTypeHistogram:
-		return m.Histogram().DataPoints().Len() == 0
-	case pmetric.MetricTypeExponentialHistogram:
-		return m.ExponentialHistogram().DataPoints().Len() == 0
-	case pmetric.MetricTypeSummary:
-		return m.Summary().DataPoints().Len() == 0
-	default:
-		return true
-	}
-}
+// type and including an untyped one: the predicate Render's prune turns on.
+func noDataPoints(m pmetric.Metric) bool { return otlpsplit.DataPointCount(m) == 0 }
 
 // Export renders the current cumulative aggregate under res and sends it once.
 // The order is the contract: render, send, and only THEN mark delivered — the
@@ -414,6 +383,12 @@ func (st *Store[S]) Export(ctx context.Context, exp Exporter, res pcommon.Resour
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	// The delivery mark walks exactly what THIS render marked, so the list
+	// starts empty and is dropped on every way out — a failed send included,
+	// whose series stay Rendered and are re-marked (and re-listed) by the next
+	// render.
+	st.resetRendered()
+	defer st.resetRendered()
 	md := st.Render(res, st.opt.Now())
 	if md.ResourceMetrics().Len() == 0 {
 		return nil
@@ -421,74 +396,94 @@ func (st *Store[S]) Export(ctx context.Context, exp Exporter, res pcommon.Resour
 	// Handoff to the transform seam: md is fresh pdata this Render just built
 	// and is never re-offered — a failed send leaves the series Rendered and
 	// the next export renders again — so the transform wrapper may run its
-	// script in place instead of deep-copying the payload.
-	if err := exp.ExportMetrics(transform.Handoff(ctx), md); err != nil {
+	// script in place instead of deep-copying the payload. Consumed: the next
+	// render is a new point, never these again, so a failed send's script
+	// drops are counted now or never.
+	if err := exp.ExportMetrics(transform.Consumed(ctx), md); err != nil {
 		return err
 	}
 	st.afterDelivered()
 	return nil
 }
 
-// markChunk is how many series one lock-hold of the delivery mark touches. Both
-// callers chunk their snapshot at the same width and for the same reason; the
-// constant is theirs to tune independently, which is why it is spelled twice.
-const markChunk = 512
-
 // afterDelivered records that the rendered values reached the collector (only
-// those may later be evicted) and resets every recorded exemplar. A series
-// OBSERVED between the render and this call is back in Observed and is
+// those may later be evicted) and resets the exemplars the payload carried. A
+// series OBSERVED between the render and this call is back in Observed and is
 // deliberately not marked: its new values must still be exported before
-// eviction may touch them. An exemplar recorded in that same window is dropped
-// unseen — the one-interval recency window an exemplar has by nature.
+// eviction may touch them. An exemplar recorded on a rendered series in that
+// same window is dropped unseen — the one-interval recency window an exemplar
+// has by nature. A series ADMITTED in that window was in no payload, so it is
+// not in the list and its exemplars are left alone.
 //
-// CHUNKED, for the reason both callers chunk their snapshot: this mutex is the
-// one Record/observe take per edge and per span — the pairing store takes it
-// from inside its OWN mutex — so every millisecond held here is a millisecond
-// in which no shard goroutine can pair or aggregate. Held whole it was a pass
-// nothing bounded: about one snapChunk hold at the 20000-series default, and
-// linear in MaxCardinality above it, i.e. the one part of an export whose stall
-// grew while the render's stayed fixed. The pointer pass is the same trick as
-// the snapshot's — a slice can be walked across lock releases, a map cannot.
+// It walks the list the render built (st.rendered) rather than the map, so it
+// makes no whole-map pass of its own. It used to take every live series' pointer
+// in a second unchunked hold, although the only series it can promote are the
+// ones this export's render just marked — only MarkRenderedLocked sets Rendered,
+// the exportGate keeps any other render out, and eviction happens only inside
+// the render's own LivePointersLocked walk. That walk is the one whole-map hold
+// an export makes, and the one a map forces (it cannot be iterated across lock
+// releases); the second one was 25-40% more of the same stall for nothing.
 //
-// Serialized with itself and with the render by Export's exportGate, so the
-// scratch below is not shared with anything.
+// CHUNKED (eachChunked, the snapshot's own walker), for the reason the snapshot
+// is: this mutex is the one Record/observe take per edge and per span — the
+// pairing store takes it from inside its OWN mutex — so every millisecond held
+// here is a millisecond in which no shard goroutine can pair or aggregate. Held
+// whole it was linear in MaxCardinality with nothing bounding it; a slice can be
+// walked across lock releases where a map cannot.
 func (st *Store[S]) afterDelivered() {
 	st.mu.Lock()
-	ptrs := st.pointersLocked(st.markPtrs[:0])
-	st.markPtrs = ptrs
+	// Appended to only under mu, and nothing rewrites the entries below this
+	// length before Export's deferred reset.
+	ptrs := st.rendered
 	st.mu.Unlock()
 
-	for start := 0; start < len(ptrs); start += markChunk {
-		end := min(start+markChunk, len(ptrs))
-		st.mu.Lock()
-		for _, s := range ptrs[start:end] {
-			// A series observed between the render and this chunk is back in
-			// Observed and is left alone, exactly as one observed before the
-			// first chunk always was; one evicted in between is no longer in
-			// the map and marking it changes nothing.
-			if m := s.meta(); m.State == Rendered {
-				m.State = Delivered
-			}
-			if st.opt.ResetExemplars != nil {
-				st.opt.ResetExemplars(s)
-			}
-		}
-		st.mu.Unlock()
+	st.eachChunked(ptrs, st.markDeliveredLocked)
+}
+
+// markDeliveredLocked is afterDelivered's step for one series. A series
+// observed between the render and its chunk is back in Observed and is left
+// alone, exactly as one observed before the first chunk always was.
+func (st *Store[S]) markDeliveredLocked(_ int, s S) {
+	if m := s.meta(); m.State == Rendered {
+		m.State = Delivered
 	}
-	clear(ptrs) // do not pin evicted series until the next export
+	if st.opt.ResetExemplars != nil {
+		st.opt.ResetExemplars(s)
+	}
+}
+
+// resetRendered empties the delivery mark's list, dropping its references so it
+// pins nothing between exports.
+func (st *Store[S]) resetRendered() {
+	st.mu.Lock()
+	clear(st.rendered)
+	st.rendered = st.rendered[:0]
+	st.mu.Unlock()
 }
 
 // Run exports every interval until ctx is done, then once more. A non-positive
-// interval falls back to one minute (NewTicker would panic).
+// interval falls back to one minute — NewTicker would panic — and SAYS so: the
+// operator's flag reads one value while the loop runs on another, and the
+// startup lines print the flag. cmd/kubescrape-agent's validateConfig refuses a
+// typed non-positive interval, so this is the guard for a value arriving any
+// other way, not the operator-facing answer.
 func (st *Store[S]) Run(ctx context.Context, exp Exporter, interval time.Duration, res pcommon.Resource, log *slog.Logger) {
 	if log == nil {
 		log = slog.Default()
 	}
 	if interval <= 0 {
+		log.Warn("a non-positive cumulative-metrics export interval has no meaning (it is not 'off' and not 'as fast as possible'); exporting every minute instead",
+			"aggregate", st.opt.Name, "interval", interval)
 		interval = time.Minute
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	// The run of failed exports, LOCAL because Run is one goroutine per store:
+	// the first failure of a run warns, the repeats are restated at most every
+	// exportWarnEvery (Debug in between) carrying the run's cost, and the
+	// recovery is one Info. It used to be a Warn per interval for the whole
+	// outage, with nothing saying how long it had lasted.
+	var outage logdedupe.Outage
 	for {
 		select {
 		case <-ctx.Done():
@@ -509,12 +504,20 @@ func (st *Store[S]) Run(ctx context.Context, exp Exporter, interval time.Duratio
 			return
 		case <-ticker.C:
 			err := st.Export(ctx, exp, res)
-			if err != nil {
-				log.Warn("exporting cumulative metrics failed; the series are cumulative, so the next export carries them",
-					"error", err, "aggregate", st.opt.Name)
-				st.exportFailed.Store(true)
-			} else if st.exportFailed.Swap(false) {
-				log.Info("cumulative-metrics export recovered", "aggregate", st.opt.Name)
+			now := time.Now()
+			switch {
+			case err != nil:
+				if _, loud := outage.Fail(now, exportWarnEvery); loud {
+					log.Warn("exporting cumulative metrics failed; the series are cumulative, so the next export carries them",
+						"error", err, "aggregate", st.opt.Name, "failures", outage.Failures(), "outage", outage.Lasted(now))
+				} else {
+					log.Debug("exporting cumulative metrics failed", "error", err, "aggregate", st.opt.Name,
+						"failures", outage.Failures())
+				}
+			case outage.Failing():
+				failures, lasted, _ := outage.Recover(now)
+				log.Info("cumulative-metrics export recovered", "aggregate", st.opt.Name,
+					"failures", failures, "outage", lasted)
 			}
 			st.reportCapPressure(log)
 		}
@@ -558,3 +561,7 @@ func (st *Store[S]) reportCapPressure(log *slog.Logger) {
 
 // capWarnEvery re-warns while the cardinality cap is binding.
 const capWarnEvery = 5 * time.Minute
+
+// exportWarnEvery restates a persisting export failure; the attempts between
+// restatements are Debug.
+const exportWarnEvery = 5 * time.Minute

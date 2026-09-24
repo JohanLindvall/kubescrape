@@ -36,6 +36,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/pkg/otlpsplit"
 )
 
 // emptyMetricWarnEvery is the re-warn cadence. The condition is a STATE — an
@@ -55,7 +56,7 @@ func dropEmptyMetrics(md pmetric.Metrics) int {
 	// prune's own cost scale with the payload's structure — which is the
 	// sender's choice, not ours.
 	dropMetric := func(m pmetric.Metric) bool {
-		if metricPointCount(m) > 0 {
+		if otlpsplit.DataPointCount(m) > 0 {
 			return false
 		}
 		dropped++

@@ -22,7 +22,7 @@ func TestARejectedMonitorIsNewsOncePerVersion(t *testing.T) {
 	ix := NewIndex()
 	upsert := func(what string, u *unstructured.Unstructured, wantNews, wantErr bool) {
 		t.Helper()
-		news, err := ix.UpsertChanged(u)
+		_, news, err := ix.UpsertChanged(u)
 		if (err != nil) != wantErr {
 			t.Fatalf("%s: err = %v, wantErr %v", what, err, wantErr)
 		}
@@ -60,10 +60,10 @@ func TestARejectedMonitorIsNewsOncePerVersion(t *testing.T) {
 // ServiceMonitor is its own first sighting.
 func TestRejectionStateIsPerMonitorKind(t *testing.T) {
 	ix := NewIndex()
-	if news, err := ix.UpsertChanged(brokenMonitor("1")); err == nil || !news {
+	if _, news, err := ix.UpsertChanged(brokenMonitor("1")); err == nil || !news {
 		t.Fatalf("ServiceMonitor: news=%v err=%v; want the first rejection reported", news, err)
 	}
-	news, err := ix.UpsertPodMonitorChanged(brokenMonitor("1"))
+	_, news, err := ix.UpsertPodMonitorChanged(brokenMonitor("1"))
 	if err == nil {
 		t.Fatal("the broken fixture parsed as a PodMonitor")
 	}

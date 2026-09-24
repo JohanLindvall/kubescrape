@@ -10,6 +10,7 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -90,7 +91,7 @@ func TestAuditByteCapCountsBodiesOnly(t *testing.T) {
 	line := `{"@l":"Error","@mt":"boom","pad":"` + strings.Repeat("p", 60) + `"}`
 	ident := strings.Repeat("i", 900) // a record attribute; charged to nothing
 	var entries []rawEntry
-	for i := 0; i < 40; i++ {
+	for i := range 40 {
 		e := mkEntry(mkCursor(i), "a.service", line, "6")
 		e.ident = ident
 		entries = append(entries, e)
@@ -98,7 +99,7 @@ func TestAuditByteCapCountsBodiesOnly(t *testing.T) {
 	// Not startReader: its 20ms flush interval could split a batch before the
 	// byte cap does, and this test is about what the byte cap admits.
 	exp := &captureExporter{}
-	r := New(Config{Exporter: exp, Enrich: true, MaxBatchBytes: capBytes, BatchSize: 1000,
+	r := New(Config{Exporter: exp, Chain: logchain.Config{Enrich: true}, MaxBatchBytes: capBytes, BatchSize: 1000,
 		FlushInterval: 200 * time.Millisecond, RestartBackoff: 10 * time.Millisecond})
 	r.open = fakeOpener(entries, false)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -159,6 +160,36 @@ func (s *erroringSource) next(ctx context.Context) (rawEntry, bool, error) {
 }
 
 func (s *erroringSource) close() error { return nil }
+
+// drainedSource replays a fixed list and then blocks like a live follower,
+// closing drained on the first next() call that finds nothing left. That call
+// is the proof the Run loop has RECEIVED the last entry: the reader goroutine
+// hands entries over an unbuffered channel, so it asks again only once the
+// previous send completed, and the loop ingests a received entry before it
+// next selects on ctx.Done. (A signal on handing out the last entry would fire
+// before that send, while the entry could still be lost to the cancel.)
+type drainedSource struct {
+	mu      sync.Mutex
+	entries []rawEntry
+	once    sync.Once
+	drained chan struct{}
+}
+
+func (s *drainedSource) next(ctx context.Context) (rawEntry, bool, error) {
+	s.mu.Lock()
+	if len(s.entries) > 0 {
+		e := s.entries[0]
+		s.entries = s.entries[1:]
+		s.mu.Unlock()
+		return e, true, nil
+	}
+	s.mu.Unlock()
+	s.once.Do(func() { close(s.drained) })
+	<-ctx.Done()
+	return rawEntry{}, false, ctx.Err()
+}
+
+func (s *drainedSource) close() error { return nil }
 
 type recordingOpener struct {
 	mu     sync.Mutex
@@ -241,12 +272,20 @@ func TestAuditShutdownFlushesPendingBatch(t *testing.T) {
 	exp := &captureExporter{}
 	// Nothing flushes on its own (huge size + interval); only the shutdown flush can.
 	r := New(Config{Exporter: exp, BatchSize: 1000, FlushInterval: time.Hour, RestartBackoff: 5 * time.Millisecond})
-	r.open = fakeOpener(entries, false)
+	src := &drainedSource{entries: entries, drained: make(chan struct{})}
+	r.open = func(Config, string) (source, error) { return src, nil }
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); r.Run(ctx) }()
 
-	time.Sleep(60 * time.Millisecond) // let the entries get ingested
+	// Cancel once the loop has RECEIVED every entry, not after a guessed delay:
+	// an entry still in the source when ctx ends is never read, and the final
+	// flush would be blamed for it.
+	select {
+	case <-src.drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the reader never drained the source")
+	}
 	if got := len(exp.records()); got != 0 {
 		t.Fatalf("entries exported before shutdown (%d); the flush isolation is broken", got)
 	}

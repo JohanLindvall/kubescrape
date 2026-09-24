@@ -60,6 +60,87 @@ func TestNegativeStaleAfterRejectedByBothConfigSurfaces(t *testing.T) {
 	}
 }
 
+// The dimension rule drifted too, on the EMPTY name: servicegraph refused a ""
+// dimension in a loop of its own while spanmetrics — through the shared rule,
+// which did not know about it — rendered an attribute with an empty KEY on
+// every calls, size and duration point. Both surfaces now read the same rule,
+// and both REPORT the same entry through the pure function configWarnings
+// emits, so -check-config says it for either section.
+func TestEmptyDimensionIsDroppedAndReportedByBothSurfaces(t *testing.T) {
+	dims := []string{"http.route", ""}
+	sg := (&servicegraph.Config{Dimensions: dims}).DimensionWarnings()
+	sm := spanmetrics.Config{Dimensions: dims}.DimensionWarnings()
+	for _, c := range []struct {
+		name, field string
+		warns       []string
+	}{
+		{"serviceGraph", `serviceGraph.dimensions[1] ""`, sg},
+		{"traceMetrics", `traceMetrics.dimensions[1] ""`, sm},
+	} {
+		if len(c.warns) != 1 || !strings.Contains(c.warns[0], c.field) || !strings.Contains(c.warns[0], "empty") {
+			t.Errorf("%s: warnings = %q, want one naming %s as empty", c.name, c.warns, c.field)
+		}
+	}
+
+	// And the empty name never reaches a rendered point.
+	g := spanmetrics.New(spanmetrics.Config{Dimensions: dims})
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("service.name", "checkout")
+	sp := rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	sp.SetName("GET /")
+	g.Consume(td)
+	exp := &captureMetrics{}
+	if err := g.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	if exp.md.ResourceMetrics().Len() == 0 {
+		t.Fatal("nothing exported")
+	}
+	ms := exp.md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
+	for i := 0; i < ms.Len(); i++ {
+		m := ms.At(i)
+		var attrs pcommon.Map
+		switch m.Type() {
+		case pmetric.MetricTypeSum:
+			attrs = m.Sum().DataPoints().At(0).Attributes()
+		case pmetric.MetricTypeHistogram:
+			attrs = m.Histogram().DataPoints().At(0).Attributes()
+		default:
+			continue
+		}
+		if _, ok := attrs.Get(""); ok {
+			t.Errorf("%s carries an attribute with an empty key: %v", m.Name(), attrs.AsRaw())
+		}
+	}
+}
+
+// The empty-name and repeat rules are ONE rule on both surfaces: the same list
+// yields the same verdicts, entry for entry, differing only in the section the
+// sentence names (neither list here meets a built-in).
+func TestDimensionRulesAgreeAcrossBothSurfaces(t *testing.T) {
+	dims := []string{"", "x", "x"}
+	sg := (&servicegraph.Config{Dimensions: dims}).DimensionWarnings()
+	sm := spanmetrics.Config{Dimensions: dims}.DimensionWarnings()
+	if len(sg) != 2 || len(sm) != 2 {
+		t.Fatalf("want the empty entry and the repeat reported on both surfaces, got serviceGraph %q and traceMetrics %q", sg, sm)
+	}
+	for i := range sg {
+		if a, b := strings.TrimPrefix(sg[i], "serviceGraph."), strings.TrimPrefix(sm[i], "traceMetrics."); a != b {
+			t.Errorf("the surfaces disagree on entry %d:\n  serviceGraph: %s\n  traceMetrics: %s", i, sg[i], sm[i])
+		}
+	}
+}
+
+// captureMetrics keeps the last exported payload.
+type captureMetrics struct{ md pmetric.Metrics }
+
+func (c *captureMetrics) ExportMetrics(_ context.Context, md pmetric.Metrics) error {
+	c.md = pmetric.NewMetrics()
+	md.CopyTo(c.md)
+	return nil
+}
+
 // The other half of the same drift: a valid value, and the "0 disables it"
 // escape hatch, must also read identically on both surfaces.
 func TestStaleAfterSpellingsAgree(t *testing.T) {

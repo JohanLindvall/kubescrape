@@ -48,11 +48,11 @@ func clusterRoleResources(t *testing.T, path string) map[string]bool {
 		t.Fatalf("reading %s: %v", path, err)
 	}
 	out := map[string]bool{}
-	for _, doc := range strings.Split(string(b), "\n---") {
+	for doc := range strings.SplitSeq(string(b), "\n---") {
 		if !isClusterRole(doc) {
 			continue
 		}
-		for _, line := range strings.Split(doc, "\n") {
+		for line := range strings.SplitSeq(doc, "\n") {
 			line = strings.TrimSpace(line)
 			if strings.HasPrefix(line, "#") {
 				continue
@@ -62,7 +62,7 @@ func clusterRoleResources(t *testing.T, path string) map[string]bool {
 			if !ok {
 				continue
 			}
-			for _, item := range strings.Split(strings.Trim(strings.TrimSpace(rest), "[]"), ",") {
+			for item := range strings.SplitSeq(strings.Trim(strings.TrimSpace(rest), "[]"), ",") {
 				if name := strings.Trim(strings.TrimSpace(item), `"'`); name != "" {
 					out[name] = true
 				}
@@ -75,7 +75,7 @@ func clusterRoleResources(t *testing.T, path string) map[string]bool {
 // isClusterRole matches the kind LINE exactly: "kind: ClusterRoleBinding"
 // contains "kind: ClusterRole" as a prefix and grants nothing.
 func isClusterRole(doc string) bool {
-	for _, line := range strings.Split(doc, "\n") {
+	for line := range strings.SplitSeq(doc, "\n") {
 		if strings.TrimSpace(line) == "kind: ClusterRole" {
 			return true
 		}

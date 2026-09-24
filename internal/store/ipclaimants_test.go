@@ -18,7 +18,7 @@ func BenchmarkDeletePodWithManyPods(b *testing.B) {
 	for _, n := range []int{1000, 10000} {
 		b.Run(strconv.Itoa(n), func(b *testing.B) {
 			s := New(time.Minute)
-			for i := 0; i < n; i++ {
+			for i := range n {
 				s.UpsertPod(ipPod(strconv.Itoa(i), "p-"+strconv.Itoa(i), fmt.Sprintf("10.%d.%d.%d", i/65536, (i/256)%256, i%256)))
 			}
 			i := 0
@@ -36,14 +36,14 @@ func BenchmarkDeletePodWithManyPods(b *testing.B) {
 // shadowed claimant must not outlive its pod.
 func TestIPClaimantsDoNotLeak(t *testing.T) {
 	s := New(time.Minute)
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		uid := strconv.Itoa(i)
 		s.UpsertPod(ipPod(uid, "p-"+uid, "10.0.0.5")) // all claim ONE address
 	}
 	if got := len(s.ipClaimants["10.0.0.5"]); got != 200 {
 		t.Fatalf("claimants = %d, want 200", got)
 	}
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		s.DeletePod(types.UID(strconv.Itoa(i)))
 	}
 	if got := len(s.ipClaimants); got != 0 {
@@ -91,7 +91,7 @@ func TestDualStackAddressesResolve(t *testing.T) {
 	// Deleting it releases both, leaving nothing behind. GetPodByIP alone does
 	// NOT prove that: with a tombstone TTL the record keeps a DeletedAt stamp
 	// and the lookup's tombstone guard rejects it whether or not the index
-	// entry is still there. The INDEX is what has to be empty — Sweep never
+	// entry is still there. The INDEX is what has to be empty — sweep never
 	// revisits byPodIP, so an entry left behind pins the whole kubemeta.Pod for
 	// the process lifetime and blocks the live pod that later takes the
 	// address from ever being promoted onto it.
@@ -111,7 +111,7 @@ func TestDualStackAddressesResolve(t *testing.T) {
 }
 
 // Deleting a dual-stack pod must release EVERY address from byPodIP, not just
-// the primary. Sweep never revisits byPodIP, so a leftover entry serves a
+// the primary. sweep never revisits byPodIP, so a leftover entry serves a
 // deleted pod for the process lifetime — and with -cache-ttl 0 the record is
 // removed without a DeletedAt stamp, so even the tombstone guard cannot catch
 // it.

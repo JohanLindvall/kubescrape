@@ -9,6 +9,7 @@ package transform
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -22,7 +23,7 @@ func benchLogs(n int) plog.Logs {
 	rl := ld.ResourceLogs().AppendEmpty()
 	rl.Resource().Attributes().PutStr("k8s.namespace.name", "ns1")
 	lrs := rl.ScopeLogs().AppendEmpty().LogRecords()
-	for i := 0; i < n; i++ {
+	for range n {
 		lr := lrs.AppendEmpty()
 		lr.Body().SetStr("GET /api/v1/things 200 12ms client=10.0.0.1")
 		lr.Attributes().PutStr("level", "info")
@@ -82,9 +83,12 @@ func (discardExp) ExportTraces(context.Context, ptrace.Traces) error    { return
 
 // BenchmarkWrapperNoopScript is the whole-seam cost of a `def
 // transform(batch): return` script: "copy" is the unmarked path (deep copy +
-// invocation — the package doc's headline number), "handoff" the marked
-// in-place path (invocation only; a no-op script leaves the reused payload
-// untouched, so iterating over one object is sound).
+// invocation + prune — the package doc's headline number), "handoff" the
+// marked in-place path (invocation + the post-script prune sweep; a no-op
+// script leaves the reused payload untouched, so iterating over one object is
+// sound). The prune looks the drop marker up in every element's attributes,
+// so "metrics-10k-8attrs" carries attributes on its points: without them the
+// sweep's real cost does not show.
 func BenchmarkWrapperNoopScript(b *testing.B) {
 	noop := "  def transform(batch):\n      return\n"
 	prog, err := Compile([]byte("logs: |\n" + noop + "metrics: |\n" + noop))
@@ -125,6 +129,23 @@ func BenchmarkWrapperNoopScript(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
 			if err := w.ExportMetrics(marked, md); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	wide := benchMetrics(10_000)
+	dps := wide.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints()
+	for i := 0; i < dps.Len(); i++ {
+		attrs := dps.At(i).Attributes()
+		for k := range 8 {
+			attrs.PutStr(fmt.Sprintf("label_%d", k), "value")
+		}
+	}
+	b.Run("metrics-10k-8attrs/handoff", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if err := w.ExportMetrics(marked, wide); err != nil {
 				b.Fatal(err)
 			}
 		}

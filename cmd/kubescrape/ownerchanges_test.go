@@ -38,10 +38,17 @@ func ownerRef(kind, name, uid string, controller bool) metav1.OwnerReference {
 	}
 }
 
+func withAPIVersion(ref metav1.OwnerReference, apiVersion string) metav1.OwnerReference {
+	ref.APIVersion = apiVersion
+	return ref
+}
+
 // The one that matters. Everything these informers serve is UID + labels +
 // annotations + owner references (owners.Resolver.clusterScoped/Resolve via
-// kubemeta.CopyMeta), and UID is immutable — so an update touching none of
-// those cannot change any response, and must not advance the token.
+// kubemeta.CopyMeta) — so an update touching none of those cannot change any
+// response, and must not advance the token. (The UID is immutable per OBJECT,
+// but the informer is keyed by namespace/name, so a recreated object CAN arrive
+// as an update with a new one; TestServedChangesAdvanceTheOwnerToken holds that.)
 //
 // A resourceVersion comparison is NOT sufficient for that, which is the trap
 // this test exists to hold shut: the API server changes the resourceVersion on
@@ -127,6 +134,15 @@ func TestServedChangesAdvanceTheOwnerToken(t *testing.T) {
 			partial("101", nil, map[string]string{"team": "sre"})},
 		{"an annotation added", partial("100", nil, nil),
 			partial("101", nil, map[string]string{"team": "obs"})},
+		// The object's OWN UID. Immutable per object, but the informer is
+		// keyed by namespace/name: an owner deleted and recreated under the
+		// same name inside a relist gap arrives as an UPDATE with a new UID
+		// and, from a template, identical maps. Resolve's answer changes —
+		// the uid_mismatch arm stops lending its labels to pods naming the
+		// old UID, and a Namespace's UID is served verbatim.
+		{"the object itself was recreated under its name (new UID only)",
+			partial("100", map[string]string{"app": "web"}, nil),
+			withUID(partial("101", map[string]string{"app": "web"}, nil), "uid-2")},
 		// The owner-reference cases. owners.Resolve reads the CACHED OWNER
 		// OBJECT's OwnerReferences to append the followed parent, so an
 		// ownerReferences-only rewrite of a ReplicaSet or Job changes the
@@ -151,6 +167,17 @@ func TestServedChangesAdvanceTheOwnerToken(t *testing.T) {
 		{"the controller flag was cleared",
 			owned("100", ownerRef("Deployment", "web", "dep-uid", true)),
 			owned("101", ownerRef("Deployment", "web", "dep-uid", false))},
+		// The apiVersion is served verbatim AND decides whether Resolve
+		// recognises the reference at all (ownerRow matches on its group), so
+		// moving it to a group this service does not watch stops the parent
+		// being enriched or followed. No other field changes here, which is
+		// what makes this the case that pins the comparison's APIVersion term.
+		{"the owner reference changed apiVersion",
+			owned("100", ownerRef("Deployment", "web", "dep-uid", true)),
+			owned("101", withAPIVersion(ownerRef("Deployment", "web", "dep-uid", true), "example.com/v1"))},
+		{"the owner reference changed version within its group",
+			owned("100", ownerRef("Deployment", "web", "dep-uid", true)),
+			owned("101", withAPIVersion(ownerRef("Deployment", "web", "dep-uid", true), "apps/v1beta2"))},
 		{"two references were reordered (the chain is emitted in their order)",
 			owned("100", ownerRef("Deployment", "web", "a", true), ownerRef("Deployment", "api", "b", false)),
 			owned("101", ownerRef("Deployment", "api", "b", false), ownerRef("Deployment", "web", "a", true))},
@@ -196,4 +223,37 @@ func TestServedChangesAdvanceTheOwnerToken(t *testing.T) {
 func withBlock(ref metav1.OwnerReference, block bool) metav1.OwnerReference {
 	ref.BlockOwnerDeletion = &block
 	return ref
+}
+
+// withUID sets the object's own UID (partial() hard-codes "uid-1").
+func withUID(p *metav1.PartialObjectMetadata, uid string) *metav1.PartialObjectMetadata {
+	p.UID = types.UID(uid)
+	return p
+}
+
+// The Node informer feeds NO owner token. No node-targets derivation reads Node
+// metadata (only GET /v1/nodes/{node}/metadata does, and its ETag is a body
+// hash), so a Node add, delete or label edit — autoscaler churn is routine —
+// lapsed every node's targets memo for a change no targets document can show.
+// Every other resource main wires is read by the derivation and must feed it.
+func TestNodeInformerFeedsNoOwnerToken(t *testing.T) {
+	var c owners.Changes
+	for _, gvr := range owners.AllGVRs {
+		got := ownerTokenFor(gvr, &c)
+		switch {
+		case gvr == owners.NodeGVR && got != nil:
+			t.Errorf("%s feeds the owner token: every node's targets memo lapses on node churn, "+
+				"which no targets document can show", gvr.Resource)
+		case gvr != owners.NodeGVR && got != &c:
+			t.Errorf("%s does not feed the owner token: a change to it would leave the targets memo stale", gvr.Resource)
+		}
+	}
+	// And the handler it gets is still safe to drive: a nil token accepts Bump.
+	h := ownerChangeHandler(ownerTokenFor(owners.NodeGVR, &c), func() {})
+	h.AddFunc(partial("1", nil, nil))
+	h.UpdateFunc(partial("1", nil, nil), partial("2", map[string]string{"a": "b"}, nil))
+	h.DeleteFunc(partial("2", nil, nil))
+	if c.Generation() != 0 {
+		t.Fatalf("Node events moved the shared owner token to %d", c.Generation())
+	}
 }

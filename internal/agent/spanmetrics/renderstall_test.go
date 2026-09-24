@@ -19,7 +19,7 @@ import (
 func TestRenderDoesNotStallConsume(t *testing.T) {
 	const series = 20000
 	g := New(Config{MaxCardinality: series + 1})
-	for i := 0; i < series; i++ {
+	for i := range series {
 		g.Consume(traces(fmt.Sprintf("svc-%05d", i),
 			spanSpec{name: "op", kind: ptrace.SpanKindServer, status: ptrace.StatusCodeOk, dur: 0.01}))
 	}

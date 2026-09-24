@@ -71,6 +71,21 @@ type Config struct {
 	Rules *logline.LineFilter
 }
 
+// CountsRecords reports whether this configuration moves any counter whose
+// unit is a RECORD — the counters Input.Observed gates (its comment is the
+// authoritative list): LogMetrics, the rules' drop tally, scrubbing's and
+// enrichment's. LogAttrs alone counts nothing.
+//
+// It is what a producer asks before it spends anything on proving a record was
+// already observed: with nothing counted there is nothing to observe twice.
+// One predicate, next to the gate it mirrors, because the events reader's
+// hand-written copy left enrichment out — the one that is on by default — and
+// so re-counted every buffered event on every redelivering restart of a
+// default configuration.
+func (c Config) CountsRecords() bool {
+	return c.LogMetrics != nil || c.Rules != nil || c.Scrub != nil || c.Enrich
+}
+
 // Producer is the half of record building that stays with the pipeline.
 type Producer interface {
 	// Dest returns the record slice a KEPT record lands in. It is called at
@@ -139,6 +154,12 @@ type Input[K comparable] struct {
 	//   - obs.LogEnriched and obs.LogEnrichTimeRejected, a package away in
 	//     logenrich — reached through ApplyUncounted rather than Apply, which
 	//     is why Emit branches on this field around one call.
+	//   - obs.LogScrubbed, a package away in logscrub, bumped from Line rather
+	//     than Emit: redaction has to precede grouping, so it happens before
+	//     the Input exists, and the producer passes the same flag to Line
+	//     (ScrubUncounted for an observed record). It used to be the one
+	//     record-unit counter left ungated — 6 for 3 delivered records across
+	//     one rewind.
 	//
 	// The enrichment pair is worth the extra entry point because it is read
 	// AGAINST a delivery count: sum(kubescrape_log_enriched_total) is the
@@ -154,12 +175,6 @@ type Input[K comparable] struct {
 	// anything counted where this field cannot reach still multiplies by the
 	// number of passes a rewind spans:
 	//
-	//   - kubescrape_log_scrubbed_total, bumped inside logscrub.Scrub from
-	//     Chain.Line — 6 for 3 delivered records across one rewind. Redaction
-	//     has to precede grouping, so it happens in Line, which takes a body
-	//     rather than an Input and so never sees this field. Same shape as the
-	//     enrichment pair and the same fix: carry the flag into Line and give
-	//     logscrub an uncounted entry point beside the counting one.
 	//   - the producer's READ side, before a record exists and so before this
 	//     chain can be told anything: for the tailer,
 	//     kubescrape_log_rate_limited_total (both label values, in consume),
@@ -222,9 +237,17 @@ func NewChain[K comparable](cfg Config, perRecordRules bool) *Chain[K] {
 // extracting the line's configured attributes. The caller needs the result's
 // Resource and Scope halves to pick or build the group a record belongs to, so
 // they cannot happen inside Emit.
-func (c *Chain[K]) Line(body string) (string, logattrs.Result) {
+//
+// observed is the record's Input.Observed, known before the record exists:
+// the redaction is the same either way, but an observed record's
+// kubescrape_log_scrubbed_total was counted by the pass that first saw it.
+func (c *Chain[K]) Line(body string, observed bool) (string, logattrs.Result) {
 	if c.cfg.Scrub != nil {
-		body = c.cfg.Scrub.Scrub(body)
+		if observed {
+			body = c.cfg.Scrub.ScrubUncounted(body)
+		} else {
+			body = c.cfg.Scrub.Scrub(body)
+		}
 	}
 	var extracted logattrs.Result
 	if c.cfg.LogAttrs != nil {
@@ -284,8 +307,9 @@ func (c *Chain[K]) Emit(p Producer, in Input[K]) bool {
 	if c.cfg.LogMetrics != nil && !in.Observed {
 		// Metric label/value keys resolve against the record's attributes
 		// (line-derived + enriched) first, then this line's lifted resource
-		// attributes, then the resource; the resource itself becomes the
-		// metric's OTLP resource (hashed once per group via Bind).
+		// attributes, then the resource — a resolved-identity key the other
+		// way round (Resolver); the resource itself becomes the metric's OTLP
+		// resource (hashed once per group via Bind).
 		//
 		// The severity is deliberately left as it was: __severity__ is a RULE
 		// key only, and a resolver used for labels must not invent one.

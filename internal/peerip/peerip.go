@@ -9,12 +9,18 @@
 // peer-IP ingest fallback look pods up in the same index and have to agree byte
 // for byte on the form. They used to canonicalise differently, which only
 // stayed harmless because no transport in use produced the divergent form.
+//
+// It also owns the one other fact both binaries read off an incoming request to
+// decide whether its address is the caller's: the forwarding headers a
+// re-originating hop declares itself with (ForwardingHeader).
 package peerip
 
 import (
 	"net"
 	"net/netip"
 	"strings"
+
+	"github.com/JohanLindvall/kubescrape/internal/clip"
 )
 
 // From extracts the bare, CANONICAL IP from a connection's remote address
@@ -34,6 +40,26 @@ func From(remoteAddr string) string {
 		return ""
 	}
 	return ip
+}
+
+// maxLogPeerBytes bounds a RAW peer address in a log line — the repo's clip for
+// a log attribute (internal/clip). A RemoteAddr that parses never gets near it.
+const maxLogPeerBytes = 96
+
+// ForLog renders a connection's remote address as the value of the `peer` log
+// key (internal/cli's vocabulary): the bare canonical IP From extracts, so one
+// grep for a sender finds every line about it whichever listener wrote it —
+// never "10.0.0.5:34512" on one line and "10.0.0.5" on the next, nor an IPv6
+// peer bracketed here and bare there. The ephemeral port is dropped on purpose:
+// it names one connection, and the question a peer= line answers is WHO.
+//
+// An address that does not parse (a Unix-socket peer, a custom listener) is
+// logged raw, clipped, because it is then the only evidence of who connected.
+func ForLog(remoteAddr string) string {
+	if ip := From(remoteAddr); ip != "" {
+		return ip
+	}
+	return clip.Ellipsis(remoteAddr, maxLogPeerBytes)
 }
 
 // Canonical is that same normalisation applied to a bare address: the zone is

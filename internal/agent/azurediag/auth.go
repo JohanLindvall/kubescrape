@@ -113,7 +113,7 @@ type connString struct {
 // case-insensitively, as the Azure SDKs' own parsers do.
 func parseConnectionString(cs string) connString {
 	var out connString
-	for _, part := range strings.Split(cs, ";") {
+	for part := range strings.SplitSeq(cs, ";") {
 		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
 		if !ok {
 			continue
@@ -121,14 +121,27 @@ func parseConnectionString(cs string) connString {
 		v = strings.TrimSpace(v)
 		switch strings.ToLower(strings.TrimSpace(k)) {
 		case "endpoint":
-			v = strings.TrimPrefix(v, "sb://")
-			v = strings.TrimPrefix(v, "amqps://")
-			out.Namespace = strings.Trim(v, "/")
+			out.Namespace = normalizeNamespace(v)
 		case "entitypath":
 			out.EntityPath = strings.Trim(v, "/")
 		}
 	}
 	return out
+}
+
+// normalizeNamespace reduces a namespace to the bare host[:port] the broker
+// address is built from. The portal hands out the namespace as its Endpoint
+// value (sb://myns.servicebus.windows.net/), and a connection string carries
+// the same form — so both doors take it: parseConnectionString for the
+// Endpoint, Resolve for -azure-eventhub-namespace. Only the connection-string
+// door used to, so the flag given the portal's value passed -check-config and
+// then never connected: its ':' suppressed the :9093 append, the raw URL became
+// the seed broker, and the managed-identity audience host came out as "sb".
+func normalizeNamespace(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "sb://")
+	v = strings.TrimPrefix(v, "amqps://")
+	return strings.Trim(v, "/")
 }
 
 // tokenSource caches one Entra token and refreshes it ahead of expiry. get
@@ -196,6 +209,12 @@ func (t *tokenSource) get(ctx context.Context) (string, error) {
 	tok, ttl, err := t.fetch(ctx)
 	if err != nil {
 		obs.AzureTokenRefreshes.WithLabelValues("error").Inc()
+		// The failure that OPENS a run always logs, on whichever line it
+		// takes: a throttle alone fires once per interval, so a second outage
+		// opening within a minute of the first one's last line stayed silent
+		// directly under its "recovered" line. Each throttle is still
+		// consulted first, so the opening line claims its slot.
+		first := !t.failing
 		t.lastErr, t.nextRetry, t.failing = err, t.retryAt(now), true
 		if t.token != "" && now.Before(t.expiry) {
 			// Inside the refresh margin but not yet expired: the stale token
@@ -203,7 +222,7 @@ func (t *tokenSource) get(ctx context.Context) (string, error) {
 			// every new Kafka connection. The FALLBACK is the thing to say —
 			// the pipeline is fine right now and will stop being fine at the
 			// expiry printed here if the endpoint does not come back.
-			if t.staleWarn.Allow(tokenWarnEvery) {
+			if t.staleWarn.AllowAt(now, tokenWarnEvery) || first {
 				t.logger().Warn("refreshing the event hubs entra token failed; serving the last good token until it expires",
 					"error", err, "source", t.what, "expiry", t.expiry.UTC().Format(time.RFC3339))
 			}
@@ -212,7 +231,7 @@ func (t *tokenSource) get(ctx context.Context) (string, error) {
 		// No usable token: every new Kafka connection now fails SASL, and kgo
 		// retries that internally — so without this line the consumer simply
 		// goes quiet (kgolog.go carries the same argument).
-		if t.failWarn.Allow(tokenWarnEvery) {
+		if t.failWarn.AllowAt(now, tokenWarnEvery) || first {
 			t.logger().Warn("acquiring an entra token for event hubs failed; the consumer cannot authenticate",
 				"error", err, "source", t.what)
 		}
@@ -251,8 +270,11 @@ func (t *tokenSource) retryAt(now time.Time) time.Time {
 //
 // It is what makes the consumer REBUILD honest. A rebuild happens for the one
 // class of fetch error no further fetch can clear (kafka.go's fatalFetchErr: a
-// cluster-wide authorization or SASL failure), and both that log line and
-// Run's promise credentials read afresh. The connection-string path delivers
+// group or cluster authorization refusal, which kgo reports inside an
+// ErrGroupSession), and both that log line and Run's promise credentials read
+// afresh. It does NOT cover a token the broker rejects at the SASL handshake:
+// kgo retries that inside the connection without ever surfacing a fetch error,
+// so no rebuild is triggered and the cached token stands until its own expiry. The connection-string path delivers
 // that for free — plain.Plain re-reads its file per SASL session — while an
 // Entra token is cached for up to ~55 minutes, so without this the new client
 // re-presents the very credential the broker just rejected and an operator who
@@ -371,7 +393,9 @@ func roundTripToken(hc *http.Client, req *http.Request, what string) (string, ti
 		return "", 0, fmt.Errorf("%s: %w", what, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", 0, fmt.Errorf("%s: HTTP %d: %s", what, resp.StatusCode, truncate(string(body), 200))
+		// Cut on a rune boundary: a bare body[:n] could split a multibyte rune
+		// and put invalid UTF-8 into the error string.
+		return "", 0, fmt.Errorf("%s: HTTP %d: %s", what, resp.StatusCode, clip.Ellipsis(string(body), 200))
 	}
 	return parseTokenResponse(body, what)
 }
@@ -419,8 +443,3 @@ func parseTokenResponse(body []byte, what string) (string, time.Duration, error)
 	}
 	return tok, ttl, nil
 }
-
-// truncate caps an HTTP body copied into an error, cutting on a rune
-// boundary (a bare s[:n] could split a multibyte rune and put invalid UTF-8
-// into the error string).
-func truncate(s string, n int) string { return clip.Ellipsis(s, n) }

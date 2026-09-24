@@ -152,7 +152,7 @@ func BenchmarkNodeTargetsBuild(b *testing.B) {
 			}
 		})
 		targets, _ := s.nodeTargets(node)
-		doc := map[string]any{"node": node, "targets": targets}
+		doc := kubemeta.NodeTargets{Node: node, Targets: targets}
 		body, err := json.Marshal(doc)
 		if err != nil {
 			b.Fatal(err)
@@ -175,7 +175,7 @@ func BenchmarkNodeTargetsBuild(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				t, _ := s.nodeTargets(node)
-				bodySink, _ = json.Marshal(map[string]any{"node": node, "targets": t})
+				bodySink, _ = json.Marshal(kubemeta.NodeTargets{Node: node, Targets: t})
 				etagSink = entityTag(bodySink)
 			}
 		})

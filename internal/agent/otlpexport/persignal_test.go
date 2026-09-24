@@ -76,13 +76,26 @@ func TestPerSignalRoutesAndMergesHeaders(t *testing.T) {
 	}
 }
 
-// Shape validation is dry (no files touched) and rejects half a client cert
-// and unknown protocols.
+// Shape validation is dry (no files touched) and rejects half a client cert —
+// the section's own (Validate) and an override's (on the merged destination,
+// ValidateAgainst) — and unknown protocols.
 func TestExportConfigValidate(t *testing.T) {
+	base := Config{Endpoint: "collector:4317", Protocol: "grpc"}
 	if err := (&ExportConfig{ClientCertFile: "c.pem"}).Validate(); err == nil {
 		t.Fatal("half a client cert pair must be rejected")
 	}
-	if err := (&ExportConfig{Logs: &ExportOverride{Protocol: "carrier-pigeon"}}).Validate(); err == nil {
+	// A lone KEY is the half the merge used to drop silently (a pair was taken
+	// only when its certificate was set), so it must reach Config.Validate.
+	for _, o := range []*ExportOverride{
+		{ClientKeyFile: "k.pem"},
+		{Endpoint: "https://loki.example.com:443", Protocol: "http", ClientKeyFile: "k.pem"},
+		{ClientCertFile: "c.pem"},
+	} {
+		if err := (&ExportConfig{Logs: o}).ValidateAgainst(base); err == nil || !strings.Contains(err.Error(), "export.logs") {
+			t.Errorf("half an override client pair %+v must be refused naming the signal, got %v", o, err)
+		}
+	}
+	if err := (&ExportConfig{Logs: &ExportOverride{Protocol: "carrier-pigeon"}}).ValidateAgainst(base); err == nil {
 		t.Fatal("unknown protocol must be rejected")
 	}
 	var nilCfg *ExportConfig
@@ -112,9 +125,9 @@ func TestClientCertOnPlaintextRefused(t *testing.T) {
 		&ExportConfig{ClientCertFile: cert, ClientKeyFile: key}); err == nil {
 		t.Fatal("BuildExporter must refuse a base client cert on a plaintext base")
 	}
-	// Validate (shape-only) catches a scheme-less http override endpoint.
-	if err := (&ExportConfig{Logs: &ExportOverride{Protocol: "http", Endpoint: "loki:3100"}}).Validate(); err == nil {
-		t.Fatal("http override endpoint without a scheme must fail Validate")
+	// The dry run (shape-only) catches a scheme-less http override endpoint.
+	if err := (&ExportConfig{Logs: &ExportOverride{Protocol: "http", Endpoint: "loki:3100"}}).ValidateAgainst(Config{Endpoint: "h:4317"}); err == nil {
+		t.Fatal("http override endpoint without a scheme must fail ValidateAgainst")
 	}
 }
 
@@ -195,18 +208,18 @@ func writePEM(t *testing.T, path string, b *pem.Block) {
 	}
 }
 
-// Validate walks the three signals in a FIXED order, so a section with two
-// mistakes is refused for the same one on every run (the walk used to range a
-// map, and a test of the wording could only pin whichever came first).
+// ValidateAgainst walks the three signals in a FIXED order, so a section with
+// two mistakes is refused for the same one on every run (the walk used to
+// range a map, and a test of the wording could only pin whichever came first).
 func TestExportConfigValidateRefusesSignalsInOrder(t *testing.T) {
 	cfg := &ExportConfig{
 		Logs:   &ExportOverride{Protocol: "carrier-pigeon"},
 		Traces: &ExportOverride{Compression: "brotli"},
 	}
 	for range 20 {
-		err := cfg.Validate()
-		if err == nil || !strings.Contains(err.Error(), "export.logs.protocol") {
-			t.Fatalf("Validate = %v, want the logs override refused first", err)
+		err := cfg.ValidateAgainst(Config{Endpoint: "collector:4317"})
+		if err == nil || !strings.Contains(err.Error(), "export.logs: protocol") {
+			t.Fatalf("ValidateAgainst = %v, want the logs override refused first", err)
 		}
 	}
 }
@@ -350,7 +363,7 @@ func TestDroppedBaseCredentialsNamesOnlyWhatActuallyStopped(t *testing.T) {
 	base := Config{Endpoint: "collector:4317", BearerTokenFile: "/tok", CAFile: "/ca", InsecureSkipVerify: true}
 	own := "https://tempo.example.com/otlp"
 
-	got := droppedBaseCredentials(&ExportOverride{Endpoint: own}, base)
+	got := DroppedBaseCredentials(&ExportOverride{Endpoint: own}, base)
 	want := []string{"-otlp-bearer-token-file", "-otlp-tls-ca-file", "-otlp-tls-insecure-skip-verify"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("dropped = %v, want %v (in flag order, so two runs name them the same way)", got, want)
@@ -368,8 +381,115 @@ func TestDroppedBaseCredentialsNamesOnlyWhatActuallyStopped(t *testing.T) {
 			Endpoint: own, BearerTokenFile: "/t2", CAFile: "/ca2", InsecureSkipVerify: &no}, base},
 		{"a base carrying no credential", &ExportOverride{Endpoint: own}, Config{Endpoint: base.Endpoint}},
 	} {
-		if got := droppedBaseCredentials(tc.o, tc.base); got != nil {
+		if got := DroppedBaseCredentials(tc.o, tc.base); got != nil {
 			t.Errorf("%s: dropped = %v, want nothing to warn about", tc.name, got)
+		}
+	}
+}
+
+// A routing route and an export.<signal> override are ONE derivation
+// (destinationConfig): carrying the same destination fields, they derive the
+// same client config on every arm — no endpoint, the base's endpoint
+// repeated, an endpoint of their own — with the single deliberate difference
+// that the section's client pair never reaches a route naming its own
+// endpoint. Two copies used to exist, and they disagreed on which endpoint is
+// another host, on whether skip-verify crossed to it, and on what an
+// endpoint-less route did with its own credentials.
+func TestRouteAndSignalDeriveTheSameDestination(t *testing.T) {
+	base := Config{
+		Endpoint:           "otel-collector.monitoring:4317",
+		Protocol:           "grpc",
+		Insecure:           true,
+		InsecureSkipVerify: true,
+		CAFile:             "/etc/certs/collector-ca.crt",
+		BearerTokenFile:    "/var/run/secrets/collector-token",
+		Timeout:            9 * time.Second,
+		RetryAttempts:      4,
+	}
+	no := false
+	creds := func(o ExportOverride) ExportOverride {
+		o.Headers = map[string]string{"X-Scope-OrgID": "tenant"}
+		o.BearerTokenFile, o.CAFile, o.InsecureSkipVerify = "/own/token", "/own/ca.crt", &no
+		return o
+	}
+	overrides := map[string]ExportOverride{
+		"no endpoint":                        {},
+		"no endpoint, own credentials":       creds(ExportOverride{}),
+		"the base endpoint repeated":         {Endpoint: base.Endpoint},
+		"the base repeated, own credentials": creds(ExportOverride{Endpoint: base.Endpoint}),
+		"an endpoint of its own":             {Endpoint: "tenant.example.com:4317"},
+		"its own endpoint and credentials":   creds(ExportOverride{Endpoint: "tenant.example.com:4317"}),
+		"its own client pair":                {Endpoint: "tenant.example.com:4317", ClientCertFile: "/own/c.crt", ClientKeyFile: "/own/c.key"},
+		"a lone key":                         {ClientKeyFile: "/own/c.key"},
+	}
+	sections := map[string]*ExportConfig{
+		"no section":            nil,
+		"section headers":       {Headers: map[string]string{"X-Scope-OrgID": "platform", "X-Base": "1"}},
+		"section mTLS identity": {Headers: map[string]string{"X-Base": "1"}, ClientCertFile: "/sec/c.crt", ClientKeyFile: "/sec/c.key"},
+	}
+	for sname, sec := range sections {
+		for oname, o := range overrides {
+			route, signal := sec.RouteConfig(&o, base), sec.signalConfig(&o, base)
+			if sec != nil && sec.ClientCertFile != "" && OwnEndpoint(o.Endpoint, base) && o.ClientCertFile == "" && o.ClientKeyFile == "" {
+				// The one deliberate difference: the section's mTLS identity is
+				// the export: block author's to present, not a route's.
+				if route.ClientCertFile != "" || route.ClientKeyFile != "" {
+					t.Errorf("%s / %s: the section's client pair reached a route naming its own endpoint: %+v", sname, oname, route)
+				}
+				if signal.ClientCertFile != sec.ClientCertFile {
+					t.Errorf("%s / %s: an export.<signal> naming its own endpoint lost the section's client pair: %+v", sname, oname, signal)
+				}
+				signal.ClientCertFile, signal.ClientKeyFile = "", ""
+			}
+			if !reflect.DeepEqual(route, signal) {
+				t.Errorf("%s / %s: a route and an export.<signal> with the same fields derived different destinations:\n route: %+v\nsignal: %+v", sname, oname, route, signal)
+			}
+		}
+	}
+}
+
+// Overrides is the one walk over the three signals, on both sides of the
+// package boundary: fixed order, nil entries kept, nil for no section.
+func TestOverridesWalkTheSignalsInAFixedOrder(t *testing.T) {
+	var none *ExportConfig
+	if got := none.Overrides(); got != nil {
+		t.Errorf("no section: Overrides = %v, want nil", got)
+	}
+	cfg := &ExportConfig{Metrics: &ExportOverride{Endpoint: "m:4317"}}
+	var names []string
+	for _, s := range cfg.Overrides() {
+		names = append(names, s.Name)
+		if (s.Override != nil) != (s.Name == "metrics") {
+			t.Errorf("%s: override = %v", s.Name, s.Override)
+		}
+	}
+	if want := []string{"logs", "metrics", "traces"}; !reflect.DeepEqual(names, want) {
+		t.Errorf("names = %v, want %v", names, want)
+	}
+}
+
+// The flag base is unused only when every signal is overridden with an
+// endpoint of its OWN: an override that inherits the base endpoint (none set)
+// or repeats it still dials the base.
+func TestBaseEndpointUnusedOnlyWhenEverySignalNamesItsOwnEndpoint(t *testing.T) {
+	base := Config{Endpoint: "collector:4317"}
+	own := func(ep string) *ExportOverride { return &ExportOverride{Endpoint: ep} }
+	for _, tc := range []struct {
+		name string
+		cfg  *ExportConfig
+		want bool
+	}{
+		{"no section", nil, false},
+		{"one signal left to the base", &ExportConfig{Logs: own("l:4317"), Metrics: own("m:4317")}, false},
+		{"an override inheriting the base endpoint", &ExportConfig{
+			Logs: own("l:4317"), Metrics: own("m:4317"), Traces: &ExportOverride{Compression: "none"}}, false},
+		{"an override repeating the base endpoint", &ExportConfig{
+			Logs: own("l:4317"), Metrics: own("m:4317"), Traces: own(base.Endpoint)}, false},
+		{"every signal elsewhere", &ExportConfig{
+			Logs: own("l:4317"), Metrics: own("m:4317"), Traces: own("t:4317")}, true},
+	} {
+		if got := tc.cfg.BaseEndpointUnused(base); got != tc.want {
+			t.Errorf("%s: BaseEndpointUnused = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }

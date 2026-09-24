@@ -44,10 +44,10 @@ func TestSplitLogsCarriesChunksAcrossScopes(t *testing.T) {
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()
 	rl.Resource().Attributes().PutStr("service.name", "svc")
-	for s := 0; s < scopes; s++ {
+	for s := range scopes {
 		sl := rl.ScopeLogs().AppendEmpty()
 		sl.Scope().SetName(fmt.Sprintf("io.opentelemetry.instrumentation.lib-%d", s))
-		for i := 0; i < perScope; i++ {
+		for range perScope {
 			sl.LogRecords().AppendEmpty().Body().SetStr(strings.Repeat("x", bodyBytes))
 		}
 	}
@@ -84,10 +84,10 @@ func TestSplitTracesCarriesChunksAcrossScopes(t *testing.T) {
 	td := ptrace.NewTraces()
 	rs := td.ResourceSpans().AppendEmpty()
 	rs.Resource().Attributes().PutStr("service.name", "svc")
-	for s := 0; s < scopes; s++ {
+	for s := range scopes {
 		ss := rs.ScopeSpans().AppendEmpty()
 		ss.Scope().SetName(fmt.Sprintf("lib-%d", s))
-		for i := 0; i < perScope; i++ {
+		for range perScope {
 			sp := ss.Spans().AppendEmpty()
 			sp.SetName("span")
 			sp.Attributes().PutStr("pad", strings.Repeat("x", padBytes))
@@ -125,10 +125,10 @@ func TestSplitMetricsCarriesChunksAcrossScopes(t *testing.T) {
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
 	rm.Resource().Attributes().PutStr("service.name", "svc")
-	for s := 0; s < scopes; s++ {
+	for s := range scopes {
 		sm := rm.ScopeMetrics().AppendEmpty()
 		sm.Scope().SetName(fmt.Sprintf("lib-%d", s))
-		for i := 0; i < perScope; i++ {
+		for range perScope {
 			m := sm.Metrics().AppendEmpty()
 			m.SetName("m")
 			dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
@@ -168,11 +168,11 @@ func buildFatScopeLogs(scopes, perScope, scopeAttrBytes, bodyBytes int) plog.Log
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()
 	rl.Resource().Attributes().PutStr("service.name", "svc")
-	for s := 0; s < scopes; s++ {
+	for s := range scopes {
 		sl := rl.ScopeLogs().AppendEmpty()
 		sl.Scope().SetName(fmt.Sprintf("scope-%d", s))
 		sl.Scope().Attributes().PutStr("scope.pad", strings.Repeat("s", scopeAttrBytes))
-		for i := 0; i < perScope; i++ {
+		for range perScope {
 			sl.LogRecords().AppendEmpty().Body().SetStr(strings.Repeat("x", bodyBytes))
 		}
 	}

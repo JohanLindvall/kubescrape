@@ -11,12 +11,12 @@ import (
 )
 
 // The OTLP/HTTP ingest listener is unauthenticated by design, and net/http
-// admits a request line plus header block up to Server.MaxHeaderBytes — 1 MiB
-// by default. Every value this refusal line carries from the request is
-// therefore sender-chosen and sender-sized, and the throttle around it bounds
-// only how OFTEN the line is written, never how big it is. One megabyte per
-// reason per window per node is a log bill and a stalled collector, not a
-// diagnostic.
+// admits a request line plus header block up to Server.MaxHeaderBytes — 64 KiB
+// on NewPushHTTPServer, 1 MiB on a server that forgets to set it (the probe
+// below uses the larger shape, since noteRejected cannot know which it runs
+// behind). Every value this refusal line carries from the request is therefore
+// sender-chosen and sender-sized, and the throttle around it bounds only how
+// OFTEN the line is written, never how big it is.
 //
 // Reverse-patch check: drop the clipForLog calls in noteRejected and this
 // fails on the line length.
@@ -29,7 +29,7 @@ func TestRefusalLineClipsSenderSuppliedValues(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-"+huge)
 	req.Header.Set("Content-Encoding", "br-"+huge)
 
-	br := newBodyReader(1<<20, nil, log)
+	br := newIngestBodyReader(1<<20, nil, log)
 	br.noteRejected(req, ErrBodyTooLarge)
 
 	out := buf.String()

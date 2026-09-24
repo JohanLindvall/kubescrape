@@ -1,52 +1,17 @@
 package metrics
 
 import (
+	"cmp"
 	"context"
 	"log/slog"
-	"sync/atomic"
+	"slices"
+	"strings"
 	"time"
 
-	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
-// Exporter sends OTLP metrics; implemented by the agent's otlpexport.Client.
-type Exporter interface {
-	ExportMetrics(ctx context.Context, md pmetric.Metrics) error
-}
-
 var metricsMarshaler pmetric.ProtoMarshaler
-
-// ScopeName is the instrumentation scope of log-derived metrics. Every other
-// producer in the repo names its scope; this one shipped an empty one, so its
-// series were the only ones a consumer could not attribute to the code that
-// made them.
-const ScopeName = "github.com/JohanLindvall/kubescrape/internal/metrics"
-
-// RegistryScopeName is the instrumentation scope of the self-metrics Registry
-// (the metrics internal/obs registers).
-const RegistryScopeName = "github.com/JohanLindvall/kubescrape/internal/obs"
-
-// scopeVersion is the build version stamped on every scope this package emits.
-// internal/obs owns BuildVersion but IMPORTS this package, so it pushes the
-// value down at init rather than being imported back — that would be a cycle.
-// Empty (a test binary, or any importer that is not a kubescrape binary) means
-// no version is set at all, which is what an unknown version must look like on
-// the wire.
-var scopeVersion atomic.Pointer[string]
-
-// SetScopeVersion records the build version to stamp on exported scopes. Called
-// once, from obs's init.
-func SetScopeVersion(v string) { scopeVersion.Store(&v) }
-
-// setScope names and versions one ScopeMetrics.
-func setScope(sm pmetric.ScopeMetrics, name string) {
-	sc := sm.Scope()
-	sc.SetName(name)
-	if v := scopeVersion.Load(); v != nil && *v != "" {
-		sc.SetVersion(*v)
-	}
-}
 
 // Run exports the set's metrics to exp every interval until ctx is done. The
 // caller should Export once more after every producer has stopped (the
@@ -106,61 +71,45 @@ func (s *DynamicMetricSet) Run(ctx context.Context, exp Exporter, interval time.
 func (s *DynamicMetricSet) noteExport(dropped int, err error) {
 	s.exportMu.Lock()
 	if err != nil {
-		s.exportFailures++
-		if s.exportFailures == 1 {
-			s.exportFailedAt = time.Now()
-		}
-		n, since := s.exportFailures, time.Since(s.exportFailedAt).Round(time.Second)
+		now := time.Now()
+		_, loud := s.exportOutage.Fail(now, reWarnInterval)
+		n, lasted := s.exportOutage.Failures(), s.exportOutage.Lasted(now)
 		s.exportMu.Unlock()
-		if n == 1 {
-			// Claim the slot this Warn occupies, or the SECOND failure — a
-			// millisecond later, on the next tick — wins an unclaimed throttle
-			// and warns again.
-			s.exportWarn.Allow(reWarnInterval)
-		}
-		if n == 1 || s.exportWarn.Allow(reWarnInterval) {
+		if loud {
 			if dropped > 0 {
 				s.logger().Warn("exporting log metrics failed; part of the payload was rejected PERMANENTLY and those observations are LOST, "+
 					"and any remaining undelivered samples are retained and re-offered",
-					"error", err, "attempts", n, "since", since, "resources", dropped)
+					"error", err, "failures", n, "outage", lasted, "resources", dropped)
 				return
 			}
 			s.logger().Warn("exporting log metrics failed; the undelivered samples are retained and re-offered",
-				"error", err, "attempts", n, "since", since)
+				"error", err, "failures", n, "outage", lasted)
 			return
 		}
-		s.logger().Debug("exporting log metrics failed", "error", err, "attempts", n, "resources", dropped)
+		s.logger().Debug("exporting log metrics failed", "error", err, "failures", n, "resources", dropped)
 		return
 	}
-	n, since := s.exportFailures, time.Duration(0)
-	if n > 0 {
-		since = time.Since(s.exportFailedAt).Round(time.Second)
-		s.exportFailures = 0
-	}
+	n, lasted, recovered := s.exportOutage.Recover(time.Now())
 	s.exportMu.Unlock()
-	if n > 0 {
-		s.logger().Info("exporting log metrics succeeded again", "attempts", n, "since", since)
+	if recovered {
+		s.logger().Info("exporting log metrics succeeded again", "failures", n, "outage", lasted)
 	}
 }
 
-// logger is the set's logger, defaulting to slog.Default().
+// logger is the set's logger, defaulting to slog.Default() at the call.
 //
-// NewDynamicMetricSet always fills the field, but a set built literally (this
-// package's own tests do it, to reach retain and the export loop without
-// compiling a rule set) leaves it nil, and a nil *slog.Logger panics on use —
-// which is a bad trade for a line whose whole purpose is diagnostics.
+// The field is nil unless WithLogger set it — and in a set built literally
+// (this package's own tests do it, to reach retain and the export loop without
+// compiling a rule set) — and a nil *slog.Logger panics on use, which is a bad
+// trade for a line whose whole purpose is diagnostics. Resolving the default
+// here rather than at construction is also what keeps a set built before the
+// process installs its handler logging through that handler (series.logger).
 func (s *DynamicMetricSet) logger() *slog.Logger {
 	if s.log == nil {
 		return slog.Default()
 	}
 	return s.log
 }
-
-// reWarnInterval is how often a persisting export or retention failure
-// restates itself. Long against the export interval (so a node contributes at
-// most a line per five minutes to a fleet-wide outage) and short against an
-// operator's attention.
-const reWarnInterval = 5 * time.Minute
 
 // seriesSamples pairs a series with the samples that belong to one resource.
 type seriesSamples struct {
@@ -207,14 +156,15 @@ func (s *DynamicMetricSet) export(ctx context.Context, exp Exporter, maxBytes in
 	defer s.exportMu.Unlock()
 	ts := time.Now()
 	byResource, order := s.groupByResource(ts)
-	// Re-offer whatever a previous export failed to deliver. snapshot() is
-	// DESTRUCTIVE — it seals aggregation windows, zeroes idled samples and
-	// deletes expired ones — so for those the store no longer holds the value
-	// and a failed send used to end the observation's life. (A plain cumulative
-	// series is unaffected either way: the next export re-reads its running
-	// total.) Retaining the samples is what makes this at-least-once, like
-	// every other producer in this repo; each retained generation renders at
-	// its OWN snapshot time (seriesSamples.ts).
+	// Re-offer whatever a previous export failed to deliver and the store no
+	// longer holds. snapshot() is DESTRUCTIVE for exactly those values — it
+	// seals aggregation windows, zeroes idled gauges and deletes expired
+	// samples — so a failed send used to end those observations' lives. A live
+	// series needs no copy: the store still holds it and this snapshot has just
+	// re-read it (a failed export hands its consumed flags back instead; see
+	// retain). Retaining the rest is what makes this at-least-once, like every
+	// other producer in this repo; each retained generation renders at its OWN
+	// snapshot time (seriesSamples.ts).
 	order = s.mergeRetry(byResource, order)
 
 	md := pmetric.NewMetrics()
@@ -224,6 +174,11 @@ func (s *DynamicMetricSet) export(ctx context.Context, exp Exporter, maxBytes in
 	// only widen the outage. Each chunk's samples are retained on ITS OWN
 	// failure (below), so nothing is lost by continuing.
 	var firstErr error
+	// permErr is the first PERMANENT rejection, returned in preference to
+	// firstErr: the caller's narration branches on droppedPermanently, and a
+	// Warn saying "rejected PERMANENTLY and those observations are LOST" must
+	// carry the error that says why, not an earlier chunk's transient one.
+	var permErr error
 	// chunk names the resources rendered into md since the last flush, so a
 	// failed send retains exactly those and not the ones that landed.
 	var chunk []string
@@ -244,10 +199,26 @@ func (s *DynamicMetricSet) export(ctx context.Context, exp Exporter, maxBytes in
 				// re-sent the same refused chunk every interval forever while
 				// the pile grew. Drop it counted, the way every other producer
 				// classifies (the tailer's advanceBatch, the buffer's drain).
-				s.drops.addRetained(uint64(len(chunk)))
+				if permErr == nil {
+					permErr = err
+				}
+				n := chunkSamples(byResource, chunk)
+				s.drops.addRetained(uint64(n))
 				droppedPermanently += len(chunk)
-				s.logger().Error("dropping a permanently rejected log-metrics chunk",
-					"resources", len(chunk), "error", err)
+				// THROTTLED: the store keeps every live series, so the next
+				// snapshot re-renders the same resources into the same refused
+				// chunk — a persisting rejection recurs every interval on every
+				// node, which unthrottled was one Error per chunk per interval
+				// per node. The counter carries the rate; the line restates the
+				// running total. noteExport's Warn is the transition narration
+				// beside it, on its own throttle.
+				if s.permanentWarn.Allow(reWarnInterval) {
+					s.logger().Error("dropping a permanently rejected log-metrics chunk",
+						"resources", len(chunk), "samples", n, "dropped", s.drops.Retained(), "error", err)
+				} else {
+					s.logger().Debug("dropping a permanently rejected log-metrics chunk",
+						"resources", len(chunk), "samples", n, "error", err)
+				}
 			} else {
 				s.retain(byResource, chunk)
 			}
@@ -280,7 +251,22 @@ func (s *DynamicMetricSet) export(ctx context.Context, exp Exporter, maxBytes in
 		size += rmSize
 	}
 	flush()
+	if permErr != nil {
+		return droppedPermanently, permErr
+	}
 	return droppedPermanently, firstErr
+}
+
+// chunkSamples counts the samples a chunk's resources carry — the unit
+// kubescrape_log_metrics_dropped_undelivered_total counts in.
+func chunkSamples(byResource map[string][]seriesSamples, chunk []string) int {
+	n := 0
+	for _, resStr := range chunk {
+		for _, ss := range byResource[resStr] {
+			n += len(ss.samples)
+		}
+	}
+	return n
 }
 
 // WithPermanentClassifier installs the export-error classifier (nil = every
@@ -291,24 +277,40 @@ func WithPermanentClassifier(f func(error) bool) Option {
 	return func(c *setConfig) { c.permanent = f }
 }
 
-// maxRetainedResources bounds the undelivered snapshot held for the next
-// export. A collector outage is exactly when this fills, and holding a growing
+// maxRetainedResources bounds the distinct resources the re-offer buffer
+// holds. A collector outage is exactly when this fills, and holding a growing
 // pile of dead windows would turn a delivery problem into an OOM — which is the
 // failure the retention exists to avoid, arrived at from the other side. Past
-// the cap the STALEST retained resources are dropped and counted (see
+// the cap the STALEST whole resources are dropped and counted (see
 // stalestRetained), so the loss is visible rather than silent.
 const maxRetainedResources = 4096
 
-// maxRetainedSamples bounds the retained SAMPLES across all resources. The
-// resource cap alone never bound on a node — a handful of distinct log
-// resources, so a multi-hour outage grew one generation of every live series
-// per failed export inside a cap that counts resources. 50k samples is ~20 MB
-// worst case (per-sample struct plus its share of the interned label/resource
-// strings), an amount worth holding for a recovery and safe to hold through
-// an outage.
+// maxRetainedSamples bounds the retained SAMPLES across all resources. 50k
+// samples is ~20 MB worst case (per-sample struct plus its share of the
+// interned label/resource strings), an amount worth holding for a recovery and
+// safe to hold through an outage. Only values the store no longer holds are
+// retained (see retain), so what fills it is irreplaceable, and past it the
+// OLDEST generations go first (evictOldestGenerations).
 const maxRetainedSamples = 50_000
 
-// retain keeps a failed chunk's samples so the next Export re-offers them.
+// retain handles a transiently failed chunk: it keeps the samples the store
+// can no longer produce, so the next Export re-offers them, and hands every
+// other sample's consumed flags back to the store.
+//
+// ONLY FINAL SAMPLES ARE KEPT (sample.final: a grace-deleted series' last
+// value, an idled gauge's, the first emission of an aggregation window). A
+// live series' sample is a READ of a value the store still holds and re-reads
+// at every export, and keeping it cost everything the bound exists to protect:
+// one more copy of every live series per failed cycle, so 4000 live series
+// filled the 50k-sample cap in about thirteen cycles of an outage, after which
+// the eviction threw out whole resources — counting as lost the counters the
+// next export delivers in full, and throwing out with them the final values
+// that really had no other copy. The price is the intermediate points of a live
+// series across an outage (no backfill), which for a cumulative stream costs no
+// observation at all. Instead, the live sample gets back what the failed
+// snapshot consumed (series.rearm): `initial`, so the baseline zeros ride the
+// next export, and `exported`, so a series that goes quiet or expires before a
+// delivery is still emitted — as a final sample, which this then keeps.
 //
 // What is retained is the raw SAMPLES (seriesSamples over the store's sample
 // structs), never the rendered pdata: the next Export folds them back in via
@@ -320,43 +322,58 @@ const maxRetainedSamples = 50_000
 // output. If retention ever starts keeping pdata subtrees and merging them
 // into the next payload, those marks become wrong before this comment does.
 func (s *DynamicMetricSet) retain(byResource map[string][]seriesSamples, chunk []string) {
-	if s.retryBy == nil {
-		s.retryBy = map[string][]seriesSamples{}
-	}
 	for _, resStr := range chunk {
-		ss := byResource[resStr]
-		if len(ss) == 0 {
-			continue
-		}
-		if _, ok := s.retryBy[resStr]; !ok {
-			s.retryOrder = append(s.retryOrder, resStr)
-		}
-		s.retryBy[resStr] = append(s.retryBy[resStr], ss...)
-		for _, e := range ss {
-			s.retainedSamples += len(e.samples)
+		for _, ss := range byResource[resStr] {
+			if ss.series != nil {
+				ss.series.rearm(ss.samples)
+			}
+			kept := finalSamples(ss.samples)
+			if len(kept) == 0 {
+				continue
+			}
+			if s.retryBy == nil {
+				s.retryBy = map[string][]seriesSamples{}
+			}
+			if _, ok := s.retryBy[resStr]; !ok {
+				s.retryOrder = append(s.retryOrder, resStr)
+			}
+			s.retryBy[resStr] = append(s.retryBy[resStr], seriesSamples{series: ss.series, samples: kept, ts: ss.ts})
+			s.retainedSamples += len(kept)
 		}
 	}
 	evicted, lastVictim := 0, ""
-	for len(s.retryOrder) > maxRetainedResources || (s.retainedSamples > maxRetainedSamples && len(s.retryOrder) > 0) {
+	for len(s.retryOrder) > maxRetainedResources {
 		i := s.stalestRetained()
 		victim := s.retryOrder[i]
-		s.retryOrder = append(s.retryOrder[:i], s.retryOrder[i+1:]...)
+		s.retryOrder = slices.Delete(s.retryOrder, i, i+1)
+		n := 0
 		for _, e := range s.retryBy[victim] {
-			s.retainedSamples -= len(e.samples)
+			n += len(e.samples)
 		}
+		s.retainedSamples -= n
 		delete(s.retryBy, victim)
-		s.drops.addRetained(1)
-		evicted, lastVictim = evicted+1, victim
+		evicted, lastVictim = evicted+n, victim
 	}
+	if s.retainedSamples > maxRetainedSamples {
+		n, victim := s.evictOldestGenerations()
+		evicted += n
+		if victim != "" {
+			lastVictim = victim
+		}
+	}
+	if evicted == 0 {
+		return
+	}
+	s.drops.addRetained(uint64(evicted))
 	// THIS IS LOSS, and it was counted without ever being described: the
-	// retention is what makes a failed export at-least-once, so a resource
-	// evicted from it is observations that no export will ever carry. The
-	// counter (kubescrape_log_metrics_dropped_undelivered_total) says how many;
-	// only a line can say which resource and against which of the two bounds —
-	// the resource cap and the sample cap bind for different reasons and are
-	// tuned separately. Aggregated per retain call and throttled, because a
-	// deep outage evicts on every cycle.
-	if evicted > 0 && s.evictWarn.Allow(reWarnInterval) {
+	// retention is what makes a failed export at-least-once, so a sample
+	// evicted from it is an observation no export will ever carry. The counter
+	// (kubescrape_log_metrics_dropped_undelivered_total) says how many; only a
+	// line can say which resource and against which of the two bounds — the
+	// resource cap and the sample cap bind for different reasons and are tuned
+	// separately. Aggregated per retain call and throttled, because a deep
+	// outage evicts on every cycle.
+	if s.evictWarn.Allow(reWarnInterval) {
 		s.logger().Warn("dropping undelivered log-metrics samples: the re-offer buffer is full, so these observations are lost",
 			"dropped", evicted, "resource", lastVictim,
 			"resources", len(s.retryOrder), "maxResources", maxRetainedResources,
@@ -364,9 +381,96 @@ func (s *DynamicMetricSet) retain(byResource map[string][]seriesSamples, chunk [
 	}
 }
 
-// stalestRetained picks the eviction victim: the retained resource whose most
-// recent generation is oldest — the one that has gone quietest — with the
-// resource string breaking ties so the choice is deterministic.
+// finalSamples returns the samples a failed export must keep (sample.final):
+// the slice itself when every one is (a retained generation passing through
+// again), a filtered copy when only some are, nil when none is.
+func finalSamples(samples []sample) []sample {
+	n := 0
+	for i := range samples {
+		if samples[i].final {
+			n++
+		}
+	}
+	switch n {
+	case 0:
+		return nil
+	case len(samples):
+		return samples
+	}
+	out := make([]sample, 0, n)
+	for i := range samples {
+		if samples[i].final {
+			out = append(out, samples[i])
+		}
+	}
+	return out
+}
+
+// evictOldestGenerations drops retained generations, OLDEST SNAPSHOT FIRST,
+// until the pile fits maxRetainedSamples, and reports how many samples it
+// dropped and the last resource it took them from. A tie on the snapshot time
+// goes to the resource that has gone quietest (its freshest generation oldest),
+// then to the resource string, so the choice is deterministic.
+//
+// Generations, not whole resources: the retention is a sliding window over an
+// outage, and dropping a resource's whole pile to make room emptied it — a
+// single busy resource lost every retained point at once, about every
+// thirteen cycles, rather than its oldest one.
+func (s *DynamicMetricSet) evictOldestGenerations() (evicted int, lastVictim string) {
+	type gen struct {
+		ts, newest time.Time
+		res        string
+		i          int
+	}
+	var gens []gen
+	for _, res := range s.retryOrder {
+		newest := s.newestRetainedTS(res)
+		for i, g := range s.retryBy[res] {
+			gens = append(gens, gen{ts: g.ts, newest: newest, res: res, i: i})
+		}
+	}
+	slices.SortFunc(gens, func(a, b gen) int {
+		return cmp.Or(a.ts.Compare(b.ts), a.newest.Compare(b.newest), strings.Compare(a.res, b.res), cmp.Compare(a.i, b.i))
+	})
+	gone := map[string][]bool{}
+	for _, g := range gens {
+		if s.retainedSamples <= maxRetainedSamples {
+			break
+		}
+		marks := gone[g.res]
+		if marks == nil {
+			marks = make([]bool, len(s.retryBy[g.res]))
+			gone[g.res] = marks
+		}
+		marks[g.i] = true
+		n := len(s.retryBy[g.res][g.i].samples)
+		s.retainedSamples -= n
+		evicted, lastVictim = evicted+n, g.res
+	}
+	for res, marks := range gone {
+		kept := s.retryBy[res][:0]
+		for i, g := range s.retryBy[res] {
+			if !marks[i] {
+				kept = append(kept, g)
+			}
+		}
+		if len(kept) == 0 {
+			delete(s.retryBy, res)
+			continue
+		}
+		clear(s.retryBy[res][len(kept):])
+		s.retryBy[res] = kept
+	}
+	s.retryOrder = slices.DeleteFunc(s.retryOrder, func(res string) bool {
+		_, ok := s.retryBy[res]
+		return !ok
+	})
+	return evicted, lastVictim
+}
+
+// stalestRetained picks the resource-cap eviction victim: the retained resource
+// whose most recent generation is oldest — the one that has gone quietest —
+// with the resource string breaking ties so the choice is deterministic.
 //
 // SLICE POSITION IS NOT AGE, which is what this replaced. mergeRetry nils
 // retryBy/retryOrder on every Export, so nothing about the previous order
@@ -452,206 +556,4 @@ func (s *DynamicMetricSet) groupByResource(ts time.Time) (map[string][]seriesSam
 		}
 	}
 	return byResource, order
-}
-
-// renderSeries appends the given samples' data points to scope, reusing the
-// Metric an earlier call for the same name already created: a retained
-// (undelivered) generation and the fresh snapshot of one series render into
-// ONE Metric, because two same-named Metrics in one ScopeMetrics violate
-// OTLP's one-metric-per-name rule and a strict consumer may reject the chunk
-// or dedupe order-dependently. Generations arrive oldest-first (mergeRetry
-// prepends), so a series' points stay in ascending timestamp order. The
-// linear name scan is bounded by the configured metric count.
-func renderSeries(scope pmetric.ScopeMetrics, s *series, samples []sample, ts time.Time) {
-	var m pmetric.Metric
-	found := false
-	ms := scope.Metrics()
-	for i := 0; i < ms.Len(); i++ {
-		if ms.At(i).Name() == s.name {
-			m, found = ms.At(i), true
-			break
-		}
-	}
-	if !found {
-		m = ms.AppendEmpty()
-		m.SetName(s.name)
-		m.SetDescription(s.desc)
-	}
-
-	switch s.kind {
-	case kindHistogram:
-		renderHistogram(m, s, samples, ts)
-	case kindSummary:
-		renderSummary(m, samples, ts)
-	case kindGauge:
-		if m.Type() != pmetric.MetricTypeGauge {
-			m.SetEmptyGauge()
-		}
-		renderNumber(m.Gauge().DataPoints(), samples, ts, false)
-	default: // counter
-		if m.Type() != pmetric.MetricTypeSum {
-			sum := m.SetEmptySum()
-			sum.SetIsMonotonic(true)
-			sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-		}
-		renderNumber(m.Sum().DataPoints(), samples, ts, true)
-	}
-}
-
-// startOf renders a sample's start-of-accumulation stamp (sample.start, epoch
-// seconds) as an OTLP timestamp, BOUNDED BY the point timestamp it is about to
-// be stamped beside. A sample that somehow never went through admit falls back
-// to ts, which is the old always-a-reset behaviour — wrong, but never AHEAD of
-// the point's own timestamp.
-//
-// The clamp exists for one narrow race, the same one internal/agent/cumagg's
-// ClampStart was written for (this package cannot call it: cumagg imports
-// transform, which imports obs, which imports this package). Both exports read
-// their clock ONCE, before the first snapshot (Export above, and Registry.Export),
-// so a sample ADMITTED in that window — its start stamped from a later read of
-// the coarse clock, on a producer goroutine — renders StartTimestamp >
-// Timestamp on its very first export. COUNTERS are safe on their own
-// (counterBaselineSeconds backdates the stream three minutes), which is why
-// this went unseen; a gauge, histogram or summary stamps the admission instant
-// and inverts. OTLP requires a cumulative point's start at or before its time,
-// and a consumer may reject the payload or read the inversion as a reset.
-//
-// Clamping the STAMP is the OTLP first-point spelling of "the stream began
-// now"; sample.start itself is untouched, so the true start renders from the
-// next export on, whose ts lies past it.
-func startOf(s sample, ts time.Time) pcommon.Timestamp {
-	now := pcommon.Timestamp(ts.UnixNano())
-	if s.start <= 0 {
-		return now
-	}
-	if start := pcommon.Timestamp(time.Unix(s.start, 0).UnixNano()); start < now {
-		return start
-	}
-	return now
-}
-
-// baselineBack is how far before the export the OLDER of a counter's two
-// synthetic zeros is stamped (the younger is at half of it). It is also the
-// bound startOf clamps a first counter point's start against: clamping to the
-// export instant instead would put the inversion the clamp removes straight
-// back onto the two points that exist to BE a baseline, which sit before it.
-const baselineBack = 2 * time.Minute
-
-// renderNumber writes gauge or counter samples as number data points. Counters
-// additionally emit two synthetic zero points before a series' first real
-// point so downstream rate() has a baseline (one minute is too short given
-// timestamp normalization — Mimir takes the max value for a counter).
-//
-// A correct StartTimeUnixNano does NOT replace those zeros. It is advisory
-// metadata that the Prometheus-lineage backends this ships into discard unless
-// created-timestamp injection is explicitly enabled, and rate()/increase()
-// need two real SAMPLES either way — a start timestamp cannot be the second
-// one. What it does fix is the zeros themselves: they used to stamp their own
-// timestamp as their start, i.e. announce a reset one and two minutes back, so
-// the whole baseline they exist to provide was the thing a delta consumer
-// threw away. All three points now carry the stream's single start, which
-// counterBaselineSeconds keeps strictly below the earliest of them.
-func renderNumber(dps pmetric.NumberDataPointSlice, samples []sample, ts time.Time, counter bool) {
-	now := pcommon.Timestamp(ts.UnixNano())
-	for _, s := range samples {
-		// The clamp bound is the EARLIEST timestamp this sample will render
-		// at, not the export instant: a first counter point brings two zeros
-		// stamped before ts along with it.
-		earliest := ts
-		if counter && s.initial {
-			earliest = ts.Add(-baselineBack)
-		}
-		start := startOf(s, earliest)
-		if counter && s.initial {
-			for _, back := range [...]time.Duration{baselineBack, baselineBack / 2} {
-				prev := pcommon.Timestamp(ts.Add(-back).UnixNano())
-				zero := dps.AppendEmpty()
-				zero.SetDoubleValue(0)
-				zero.SetStartTimestamp(start)
-				zero.SetTimestamp(prev)
-				putLabels(zero.Attributes(), s.labels)
-			}
-		}
-		dp := dps.AppendEmpty()
-		dp.SetDoubleValue(s.value)
-		dp.SetStartTimestamp(start)
-		dp.SetTimestamp(now)
-		putLabels(dp.Attributes(), s.labels)
-	}
-}
-
-// renderSummary writes summary samples as OTLP summary data points carrying the
-// running count and sum (no quantiles).
-func renderSummary(m pmetric.Metric, samples []sample, ts time.Time) {
-	now := pcommon.Timestamp(ts.UnixNano())
-	// Reuse an earlier generation's shape — SetEmptySummary would wipe its
-	// points (see renderSeries).
-	if m.Type() != pmetric.MetricTypeSummary {
-		m.SetEmptySummary()
-	}
-	dps := m.Summary().DataPoints()
-	for _, s := range samples {
-		dp := dps.AppendEmpty()
-		dp.SetStartTimestamp(startOf(s, ts))
-		dp.SetTimestamp(now)
-		dp.SetCount(s.count)
-		dp.SetSum(s.value)
-		putLabels(dp.Attributes(), s.labels)
-	}
-}
-
-// renderHistogram writes one cumulative OTLP histogram point per sample — a
-// histogram sample IS one label set's whole distribution (sample.counts) —
-// converting the stored cumulative bucket counts to the absolute per-bucket
-// counts OTLP wants (absoluteBuckets).
-func renderHistogram(m pmetric.Metric, s *series, samples []sample, ts time.Time) {
-	now := pcommon.Timestamp(ts.UnixNano())
-
-	// Reuse an earlier generation's shape — SetEmpty* would wipe its points
-	// (see renderSeries).
-	if m.Type() != pmetric.MetricTypeHistogram {
-		m.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-	}
-	hist := m.Histogram()
-
-	for _, samp := range samples {
-		dp := hist.DataPoints().AppendEmpty()
-		dp.SetStartTimestamp(startOf(samp, ts))
-		dp.SetTimestamp(now)
-		putLabels(dp.Attributes(), samp.labels)
-		dp.ExplicitBounds().FromRaw(s.bounds())
-		dp.SetSum(samp.value)
-		dp.SetCount(samp.count)
-		dp.BucketCounts().FromRaw(absoluteBuckets(samp.counts, samp.count))
-	}
-}
-
-// absoluteBuckets converts a sample's cumulative bucket counts into the
-// absolute per-bucket counts OTLP wants: a value counted in its bucket was
-// also counted in every higher one, so each slot is its cumulative count
-// minus the previous bound's, and the +Inf slot is the total minus the last
-// bound's. total >= counts[last] by construction — record increments them
-// together and the idle reset clears them together — so the unsigned
-// subtraction cannot underflow (the partial-family case the old per-bucket
-// layout had to defend against is unrepresentable in one sample).
-func absoluteBuckets(counts []uint64, total uint64) []uint64 {
-	out := make([]uint64, len(counts)+1)
-	var prev uint64
-	for i, c := range counts {
-		out[i] = c - prev
-		prev = c
-	}
-	out[len(counts)] = total - prev
-	return out
-}
-
-// putLabels parses a serialized label set and copies its pairs into a pdata map.
-func putLabels(dst pcommon.Map, serialized string) {
-	lbls, _ := parseLabels(serialized)
-	dst.EnsureCapacity(len(lbls))
-	for _, e := range lbls {
-		if e.key != "" && e.value != "" {
-			dst.PutStr(e.key, e.value)
-		}
-	}
 }

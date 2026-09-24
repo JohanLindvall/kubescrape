@@ -3,6 +3,7 @@ package otlpingest
 import (
 	"bytes"
 	"context"
+	"fmt"
 	mathrand "math/rand"
 	"net"
 	"net/http"
@@ -25,8 +26,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	grpcpeer "google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 type captureExporter struct {
@@ -54,13 +58,21 @@ func (c *captureExporter) ExportMetrics(_ context.Context, md pmetric.Metrics) e
 // httpTestServer wires the ingest HTTP handlers to a captured exporter.
 func httpTestServer(t *testing.T, exp Exporter) *httptest.Server {
 	t.Helper()
+	srv, _ := probedHTTPTestServer(t, exp)
+	return srv
+}
+
+// probedHTTPTestServer is httpTestServer behind a handlerProbe (admit_test.go).
+func probedHTTPTestServer(t *testing.T, exp Exporter) (*httptest.Server, *handlerProbe) {
+	t.Helper()
 	s := NewServer(ServerConfig{Enricher: newEnricher(newMeta(), MetricsAuto), Exporter: exp})
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/logs", s.handleHTTPLogs)
 	mux.HandleFunc("POST /v1/metrics", s.handleHTTPMetrics)
-	srv := httptest.NewServer(mux)
+	probe := &handlerProbe{next: mux}
+	srv := httptest.NewServer(probe)
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, probe
 }
 
 func TestHTTPLogsRoundTrip(t *testing.T) {
@@ -312,7 +324,7 @@ func TestServerGRPC(t *testing.T) {
 	rl.Resource().Attributes().PutStr("container.id", "cafe01")
 	rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
 	var lastErr error
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		if _, lastErr = logs.Export(context.Background(), plogotlp.NewExportRequestFromLogs(ld)); lastErr == nil {
 			break
 		}
@@ -643,6 +655,101 @@ func TestPeerIPFallbackSplitMode(t *testing.T) {
 	}
 }
 
+// The peer address reaches the enricher through BOTH transports when the
+// fallback is on — and is not stamped at all when it is off, which is the
+// default. The stamp was unconditional: five allocations per gRPC push (the
+// address rendered, parsed and boxed into a context value) and two per HTTP
+// push, for a value whose one reader (peerAttrs) looks at it only under
+// Config.PeerIPFallback.
+func TestPeerAddressIsStampedOnlyWhenTheFallbackReadsIt(t *testing.T) {
+	peerCtx := grpcpeer.NewContext(context.Background(),
+		&grpcpeer.Peer{Addr: &net.TCPAddr{IP: net.ParseIP("10.1.2.3"), Port: 41234}})
+	idLess := func() plog.Logs {
+		ld := plog.NewLogs()
+		ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
+		return ld
+	}
+	server := func(fallback bool) (*Server, *captureExporter) {
+		exp := &captureExporter{}
+		return NewServer(ServerConfig{
+			Enricher: NewEnricher(Config{Meta: newMeta(), PeerIPFallback: fallback}),
+			Exporter: exp,
+		}), exp
+	}
+	podName := func(t *testing.T, exp *captureExporter) string {
+		t.Helper()
+		if len(exp.logs) != 1 {
+			t.Fatalf("forwarded %d payloads, want 1", len(exp.logs))
+		}
+		v, _ := exp.logs[0].ResourceLogs().At(0).Resource().Attributes().Get("k8s.pod.name")
+		return v.Str()
+	}
+
+	for _, fallback := range []bool{true, false} {
+		want, wantPod := "", ""
+		if fallback {
+			want, wantPod = "10.1.2.3", "web-3"
+		}
+		t.Run(fmt.Sprintf("fallback=%v", fallback), func(t *testing.T) {
+			// What the forward step is handed, on each transport.
+			s, _ := server(fallback)
+			var got string
+			if err := s.grpcExport(peerCtx, "logs", func(ctx context.Context) error {
+				got = peerIP(ctx)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if got != want {
+				t.Errorf("gRPC: the forward saw peer %q, want %q", got, want)
+			}
+
+			// End to end: an id-less resource is attributed by its peer on both
+			// arms when the fallback is on, and on neither when it is off.
+			s, exp := server(fallback)
+			if _, err := (&logsGRPC{s: s}).Export(peerCtx, plogotlp.NewExportRequestFromLogs(idLess())); err != nil {
+				t.Fatal(err)
+			}
+			if got := podName(t, exp); got != wantPod {
+				t.Errorf("gRPC: k8s.pod.name = %q, want %q", got, wantPod)
+			}
+
+			s, exp = server(fallback)
+			body, err := plogotlp.NewExportRequestFromLogs(idLess()).MarshalProto()
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := httptest.NewRequest(http.MethodPost, "/v1/logs", bytes.NewReader(body))
+			r.Header.Set("Content-Type", "application/x-protobuf")
+			r.RemoteAddr = "10.1.2.3:41234"
+			w := httptest.NewRecorder()
+			s.handleHTTPLogs(w, r)
+			if w.Code != http.StatusOK {
+				t.Fatalf("HTTP: status %d", w.Code)
+			}
+			if got := podName(t, exp); got != wantPod {
+				t.Errorf("HTTP: k8s.pod.name = %q, want %q", got, wantPod)
+			}
+		})
+	}
+
+	t.Run("off costs nothing", func(t *testing.T) {
+		if testrace.Enabled {
+			t.Skip("the race detector's bookkeeping allocations make the ceiling meaningless")
+		}
+		s, _ := server(false)
+		forward := func(context.Context) error { return nil }
+		got := testing.AllocsPerRun(100, func() {
+			if err := s.grpcExport(peerCtx, "logs", forward); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if got != 0 {
+			t.Errorf("an admitted gRPC push with the fallback off allocates %.0f times in the peer stamp, want 0", got)
+		}
+	})
+}
+
 // The gRPC traces service enriches and forwards, wired through Server.Run.
 func TestServerGRPCTraces(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -673,7 +780,7 @@ func TestServerGRPCTraces(t *testing.T) {
 	traces := ptraceotlp.NewGRPCClient(conn)
 	td := tracesWith(map[string]string{"container.id": "cafe01"})
 	var lastErr error
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		if _, lastErr = traces.Export(context.Background(), ptraceotlp.NewExportRequestFromTraces(td)); lastErr == nil {
 			break
 		}
@@ -797,7 +904,7 @@ func TestTracesOnlyServerDoesNotServeLogsOrMetrics(t *testing.T) {
 	rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty().SetName("GET /")
 	tc := ptraceotlp.NewGRPCClient(conn)
 	var lastErr error
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		if _, lastErr = tc.Export(context.Background(), ptraceotlp.NewExportRequestFromTraces(td)); lastErr == nil {
 			break
 		}

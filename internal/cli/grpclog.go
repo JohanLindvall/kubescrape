@@ -131,11 +131,21 @@ func clipMessage(s string) string {
 type grpcLogger struct{ log *slog.Logger }
 
 // enabled is the guard every method below takes before it formats anything.
-// slog evaluates arguments eagerly, so an unguarded fmt.Sprintf in Infof would
-// be paid on every channel state change at the DEFAULT level, for a record the
-// handler then throws away. It guards the Warning trio for a sharper reason
-// still: those arguments are the peer's bytes, so at the default level the
-// header that arrives is never rendered at all.
+// slog evaluates arguments eagerly, so an unguarded fmt.Sprint/Sprintf here
+// would be paid for a record the handler then throws away.
+//
+// What it saves is only THIS adapter's render, and for most of grpc's own
+// lines that is a re-Sprint of a string that is already finished: grpc
+// formats its messages itself before calling in — a transport's
+// Warningf("Failed to decode metadata header (%q, %q)…") is Sprintf'd by
+// grpc's prefix logger, forwarded as WarningDepth, and (this type implements
+// no DepthLoggerV2) arrives at Warningln as one rendered string, the peer's
+// header bytes inside it. So the guard decides what is EMITTED, not what is
+// rendered: at the default level the Debug-mapped Warning trio keeps that
+// line out of the stream, but the peer's bytes have already been formatted by
+// the time it runs. What bounds the cost of that render is the header list
+// bound on the servers (otlpingest.MaxHeaderListSizeOption, 64 KiB), not this
+// adapter.
 func (g grpcLogger) enabled(l slog.Level) bool {
 	return g.log.Enabled(context.Background(), l)
 }
@@ -226,12 +236,12 @@ func sprintln(args ...any) string {
 	return strings.TrimSuffix(fmt.Sprintln(args...), "\n")
 }
 
-// SetGRPCLogger routes grpc-go's package-level logger into log.
+// setGRPCLogger routes grpc-go's package-level logger into log.
 //
 // grpclog.SetLoggerV2 writes a package global with no lock and documents that
-// it must be called before any gRPC function; both mains call it through
+// it must be called before any gRPC function; both mains reach it only through
 // SetupLogging, at the top of run(), before any client, listener or dial
-// exists.
-func SetGRPCLogger(log *slog.Logger) {
+// exists — which is why it is unexported.
+func setGRPCLogger(log *slog.Logger) {
 	grpclog.SetLoggerV2(grpcLogger{log})
 }

@@ -7,6 +7,7 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/cumagg"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -84,7 +85,9 @@ type halfSpan struct {
 	connection ConnectionType
 	// peer names the far side of the call, resolved from the configured peer
 	// attributes in precedence order. It matters only if this half expires
-	// unpaired, when it becomes the synthesized virtual node.
+	// unpaired, when it becomes the synthesized virtual node. It arrives UNCUT
+	// (the sender's whole string); insert cuts it with a copy only when the
+	// entry keeps this half.
 	peer string
 	// traceID and spanID are what an exemplar needs, and nothing else is
 	// carried for one: the trace id is the same on both halves by construction
@@ -135,11 +138,19 @@ type pendingEdge struct {
 
 // Stats are the pairing store's counters, snapshotted under its mutex.
 //
-// They are plain values rather than internal/obs metrics because the metric
-// surface of this package belongs to metrics.go, which publishes them the way
-// obs.RegisterBufferStats publishes the disk buffer's — every bound in Config
-// has a counter that moves when it binds, so a too-small Wait or MaxItems is
-// visible rather than silent.
+// They are plain values rather than internal/obs metrics because this package
+// does not register metrics of its own: cmd/kubescrape-agent publishes Items,
+// Completed, VirtualNode and Unkeyable through obs.RegisterServiceGraphStats,
+// the way obs.RegisterBufferStats publishes the disk buffer's — every bound in
+// Config has a counter that moves when it binds, so a too-small Wait or
+// MaxItems is visible rather than silent.
+//
+// Dropped and Unpaired are NOT published from here: they are per-store mirrors
+// of process-wide counters the store bumps directly (Dropped of
+// kubescrape_service_graph_store_full_total; Unpaired of
+// kubescrape_service_graph_expired_total minus VirtualNode), kept so a test can
+// assert one store's behaviour without reading a counter every other test in
+// the process also moves.
 type Stats struct {
 	// Items is the number of half-edges currently awaiting a partner.
 	Items int
@@ -152,16 +163,22 @@ type Stats struct {
 	// the partner never arrived (dropped span, uninstrumented peer with no
 	// peer attribute, a Wait shorter than the request) and nothing named it.
 	Unpaired uint64
-	// Dropped counts spans refused because the store was at MaxItems.
+	// Dropped counts spans refused because the store was at MaxItems (they are
+	// still forwarded; only their pairing is lost).
 	Dropped uint64
-	// Unkeyable counts spans that could not be keyed at all (no trace id).
+	// Unkeyable counts spans that could not be keyed: no trace id, or a
+	// client/producer span with no span id of its own (its key would collide
+	// with every root server span of its trace).
 	Unkeyable uint64
 }
 
 type edgeStore struct {
 	wait     time.Duration
 	maxItems int
-	onEdge   func(Edge)
+	// onEdge receives each finished edge with the `now` the pairing pass holds
+	// (see Registry.RecordAt): the caller's batch clock, already read, so the
+	// sink need not read another under this mutex.
+	onEdge func(Edge, time.Time)
 
 	mu         sync.Mutex
 	items      map[edgeKey]*pendingEdge
@@ -186,17 +203,18 @@ type edgeStore struct {
 // storeFullWarnEvery re-warns while the pairing store is refusing spans.
 const storeFullWarnEvery = time.Minute
 
-// newEdgeStore builds the store from an already-defaulted config plus the
-// RESOLVED pairing window (Config.Wait is a string — see Config.wait — so the
-// caller parses it once at construction rather than per store method).
-func newEdgeStore(cfg Config, wait time.Duration, onEdge func(Edge), log *slog.Logger) *edgeStore {
+// newEdgeStore builds the store from the two bounds it enforces: the (already
+// defaulted) Config.MaxItems and the RESOLVED pairing window (Config.Wait is a
+// string — see Config.wait — so the caller parses it once at construction
+// rather than per store method).
+func newEdgeStore(maxItems int, wait time.Duration, onEdge func(Edge, time.Time), log *slog.Logger) *edgeStore {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &edgeStore{
 		log:      log,
 		wait:     wait,
-		maxItems: cfg.MaxItems,
+		maxItems: maxItems,
 		onEdge:   onEdge,
 		items:    make(map[edgeKey]*pendingEdge),
 	}
@@ -212,7 +230,7 @@ func newEdgeStore(cfg Config, wait time.Duration, onEdge func(Edge), log *slog.L
 // consistent snapshot, are maintained inside.
 //
 // This is NOT a claim that the pairing path holds one lock at a time — it holds
-// the pairing mutex across sink.Record by design (see metrics.go's render
+// the pairing mutex across sink.RecordAt by design (see metrics.go's render
 // strategy), so the cardinality-cap refusal is counted inside
 // cumagg.AdmitLocked, under the cumagg store's lock, with this one held.
 // cumagg.Lock owns that rule ("nothing here ever takes another lock while
@@ -268,12 +286,20 @@ func (s *edgeStore) insert(now time.Time, k edgeKey, side edgeSide, h halfSpan, 
 		// so reading them afterwards would read the next half-edge's. Nothing
 		// else on the Edge aliases the entry — the strings are values — but the
 		// slice does, which is the whole reason a sink must not retain an Edge.
-		s.onEdge(edge)
+		s.onEdge(edge, now)
 		s.dimBuf = clearDims(s.dimBuf)
 		s.retire(e)
 	} else {
 		// Not complete: this side is the one the entry holds until its partner
-		// arrives.
+		// arrives — for up to a whole Wait, so what it keeps is cut WITH A COPY
+		// here (cumagg.Retain) and not per span in the processor: the arriving
+		// half that completes a pair (the branch above) is emitted on the spot,
+		// its values reach the sink untouched (RecordAt Truncs its key and
+		// edgeLabels Retains its labels), and cloning them first would allocate
+		// per span for strings that are dropped at once. The peer is re-cut
+		// even when an earlier arrival set it: Retain on an already-cut value is
+		// a length compare.
+		e.peer = cumagg.Retain(e.peer)
 		e.setDims(dims)
 	}
 	return false
@@ -300,6 +326,27 @@ func (s *edgeStore) expire(now time.Time, budget int) int {
 	return n
 }
 
+// expireInPasses spends up to total retirements in passes of at most
+// expirePerHold, releasing the pairing mutex between them, and stops at the
+// first SHORT pass: expire returns how many it took, and fewer than asked means
+// nothing more is due at now. Stopping there is not an optimisation: ignoring
+// the return spent the full budget in up-to-16 lock acquire/release cycles of
+// the pairing mutex on every Consume, even with nothing due — pure contention
+// against every concurrent Consume and RecordAt.
+//
+// It is the one spelling of the loop both callers need — Consume's bounded
+// incremental pass and the sweeps' unbounded one (total = math.MaxInt) — which
+// were two loops over two constants holding the same value and meaning.
+func (s *edgeStore) expireInPasses(now time.Time, total int) {
+	for total > 0 {
+		n := min(total, expirePerHold)
+		if s.expire(now, n) < n {
+			return
+		}
+		total -= n
+	}
+}
+
 // sweep is expire under the mutex (see upsert on why the counter bump is not).
 func (s *edgeStore) sweep(now time.Time, budget int) int {
 	s.mu.Lock()
@@ -315,8 +362,9 @@ func (s *edgeStore) sweep(now time.Time, budget int) int {
 		if promoted {
 			s.counts.VirtualNode++
 			// Before retirement, for the same reason as in insert: the Edge's
-			// Dimensions alias the entry's buffer.
-			s.onEdge(edge)
+			// Dimensions alias the entry's buffer. `now` is this sweep's one
+			// clock read, the moment the half-edge was given up on.
+			s.onEdge(edge, now)
 		} else {
 			s.counts.Unpaired++
 		}
@@ -345,12 +393,23 @@ func (s *edgeStore) stats() Stats {
 // merged here — see setDims and joinDims, which decide between storing and
 // emitting them.
 func (e *pendingEdge) merge(side edgeSide, h halfSpan) {
-	// The first non-empty classification sticks. A later half can only ever
-	// supply the same one (both spans of a messaging hop are producer/consumer)
-	// or none, and letting a plain SERVER span clear the database/messaging
-	// classification its client established would erase the only signal
-	// Grafana colours the edge by.
-	if e.connection == ConnectionUnknown {
+	// The processor's own precedence, applied across the two halves: database
+	// beats messaging_system beats unknown. A classification is never CLEARED —
+	// letting a plain SERVER span erase the database/messaging type its client
+	// established would drop the only signal Grafana colours the edge by — but
+	// database, the explicit statement, always wins over the kind-derived
+	// default.
+	//
+	// "First non-empty sticks" was the rule here, on the argument that a later
+	// half can only supply the same classification or none. That stopped being
+	// true when the processor made db.* authoritative on the client side: a
+	// PRODUCER carrying db.* classifies database while its CONSUMER classifies
+	// messaging_system, so first-wins labelled one request database or
+	// messaging_system depending on which half reached the shard first — one
+	// edge split across two connection_type series under ordinary reordering.
+	// Only a client half can carry database (processor.go skips db.* on the
+	// server side), so this cannot promote a server's view over its client's.
+	if h.connection == ConnectionDatabase || e.connection == ConnectionUnknown {
 		e.connection = h.connection
 	}
 	e.failed = e.failed || h.failed
@@ -390,8 +449,14 @@ func (e *pendingEdge) setDims(in []EdgeDimension) {
 	was := len(e.dims)
 	// Copied, never aliased: `in` is the caller's stack scratch (see halfSpan on
 	// why the dimensions travel as their own parameter), and retaining it would
-	// both dangle and force that scratch onto the heap once per span.
+	// both dangle and force that scratch onto the heap once per span. The VALUES
+	// are cut here too, with a copy, because this is where they start being
+	// kept (see insert): a value past cumagg.MaxLabelBytes is still the
+	// sender's whole string until now.
 	e.dims = append(e.dims[:0], in...)
+	for i := range e.dims {
+		e.dims[i].Value = cumagg.Retain(e.dims[i].Value)
+	}
 	if was > len(e.dims) {
 		// A shorter replacement leaves the tail's strings reachable from the
 		// entry, which may now sit here for a whole Wait pinning an OTLP batch.

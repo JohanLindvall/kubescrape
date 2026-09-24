@@ -34,21 +34,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"net"
-	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/ptrace"
-	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/tap"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
 	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
@@ -56,10 +49,8 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailbuffer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
-	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
-	"github.com/JohanLindvall/kubescrape/pkg/otlpsplit"
 )
 
 // gateServiceGraph is satisfied once the tier's INTERNAL receiver is BOUND —
@@ -82,13 +73,12 @@ const gateServiceGraphIngest = "service-graph-ingest"
 // metric export loop. Off unless -service-graph.
 func (p *pipelines) startServiceGraph(ctx context.Context) error {
 	if !*serviceGraphOn {
-		// The "configured but ignored" warnings for the four tier-only sections
-		// and -ingest-span-metrics used to live here. They are configWarnings'
-		// now: a start reached them and -check-config did not, which is exactly
-		// the divergence configWarnings' doc comment promises cannot happen —
-		// and the dry run is where an operator asks whether a section of the
-		// ConfigMap shared by the DaemonSet, the singleton and the tier is
-		// being applied.
+		// The "configured but ignored" reports for the tier-only sections
+		// and -ingest-span-metrics used to live here. They are emitted from the
+		// config summary (tierOnlySections, Info) and configWarnings (the flag,
+		// Warn) now: a start reached them and -check-config did not, and the
+		// dry run is where an operator asks whether a section of the ConfigMap
+		// shared by the DaemonSet, the singleton and the tier is being applied.
 		return nil
 	}
 	var cfg servicegraph.Config
@@ -102,8 +92,10 @@ func (p *pipelines) startServiceGraph(ctx context.Context) error {
 	// the READ is fatal here for the metadata service's reason, which is
 	// bearer.NewRotating's contract: an unreadable or empty token file must stop
 	// the process, never open the listener with nothing to check against. Same
-	// package, same per-minute re-read and same rotation grace as the metadata
-	// service's /v1/scrape-auth — one auth model in this repo rather than two.
+	// package, same re-read (about once a second —
+	// bearer.DefaultRefreshInterval — on use, plus Rotating.Run's ticker below)
+	// and same rotation grace as the metadata service's /v1/scrape-auth — one
+	// auth model in this repo rather than two.
 	tok, err := bearer.NewRotating(*serviceGraphToken, p.log)
 	if err != nil {
 		return fmt.Errorf("-service-graph-token-file: %w", err)
@@ -113,26 +105,19 @@ func (p *pipelines) startServiceGraph(ctx context.Context) error {
 	// rotation went unnoticed until the next request, which armed the revoked
 	// token's grace window at THAT moment — accepting it far past the five
 	// minutes the model documents, indefinitely while the listener stayed
-	// quiet. The comment above claimed the parity; only Run delivers it.
+	// quiet. The comment above claimed the parity; only Run delivers it. It is
+	// also the ONLY thing that moves the set the gRPC auth tap reads
+	// (sgReceiver.cached): the tap never refreshes, so without Run a rotation
+	// would reach the interceptor and the HTTP arm and never the tap.
 	go tok.Run(ctx)
 
-	proc := servicegraph.NewProcessor(cfg, p.log)
 	reg := servicegraph.NewRegistry(cfg, p.log)
-	// Before the first Consume, as the package requires: the sink is read on
-	// the pairing path under the store's mutex.
-	proc.SetSink(reg)
-	// ONE snapshot per export, not four. RegisterServiceGraphStats turns this
-	// into four independent gauge registrations, and the metrics Registry
-	// evaluates them back to back in one loop — so an unmemoised closure took
-	// the PAIRING mutex four times per export (edgeStore.stats() locks it) and
-	// published four separately-sampled readings of a struct whose whole point
-	// is that it is one instant: a completed count from before a pairing beside
-	// a virtual-node count from after it. The window is far shorter than any
-	// export or scrape interval and far longer than the microseconds between
-	// the four evaluations of one of them.
-	sgStats := &sgStatsMemo{stats: proc.Stats}
+	proc := servicegraph.NewProcessor(cfg, reg, p.log)
+	// One snapshot serves all four gauges of an export: the hook memoises per
+	// evaluation pass (metrics.PerPass), so the pairing mutex is taken once per
+	// export and the final export after SweepAll reads the store afresh.
 	obs.RegisterServiceGraphStats(func() obs.ServiceGraphStat {
-		st := sgStats.get()
+		st := proc.Stats()
 		return obs.ServiceGraphStat{
 			Pending:     st.Items,
 			Completed:   st.Completed,
@@ -154,11 +139,25 @@ func (p *pipelines) startServiceGraph(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// ACQUIRE BEFORE SERVING. The resharder is the last thing here that can
+	// fail, and it used to be built inside startServiceGraphIngest — AFTER the
+	// internal receiver below was already accepting sibling pushes into the
+	// owner chain, whose tail buffer acks BEFORE it decides. A failure there
+	// returned out of run() without ever reaching the shutdown sequence's
+	// Flush, so spans a sibling had been told had landed were dropped with no
+	// counter moving.
+	var resharder *servicegraph.Resharder
+	if tierIngestOn() {
+		if resharder, err = p.startResharder(); err != nil {
+			return err
+		}
+	}
 
 	rcv := &sgReceiver{
 		grpcAddr: *serviceGraphListen,
 		httpAddr: *serviceGraphHTTPListen,
 		tokens:   tok.Tokens,
+		cached:   tok.Cached,
 		consume:  ownerReceive(owner),
 		ready:    p.ready.gate(gateServiceGraph),
 		log:      p.log,
@@ -171,9 +170,7 @@ func (p *pipelines) startServiceGraph(ctx context.Context) error {
 			p.fatal("service-graph receiver", err)
 		}
 	})
-	if err := p.startServiceGraphIngest(ctx, owner); err != nil {
-		return err
-	}
+	p.startServiceGraphIngest(ctx, owner, resharder)
 	p.log.Info("trace tier started", "serviceGraphInternalGRPC", *serviceGraphListen, "serviceGraphInternalHTTP", *serviceGraphHTTPListen,
 		"wait", proc.Wait(), "interval", *serviceGraphIv)
 	return nil
@@ -253,11 +250,19 @@ func (p *pipelines) buildOwnerChain(ctx context.Context, proc *servicegraph.Proc
 		p.log.Info("tail sampling enabled", "policies", len(cfg.Policies), "decisionWait", tb.Wait(),
 			"note", "buffered spans are acked to their senders before they are decided; a hard kill of this pod loses them (kubescrape_tail_sampling_buffered_spans)")
 	}
+	var sampler *tracesample.Sampler
 	if cfg := p.fileCfg.TraceSampling; cfg != nil && cfg.Enabled() {
-		if err := cfg.Validate(); err != nil {
-			return nil, err
+		// Validated by compileConfig before anything started (and New still
+		// warns rather than refuses on a value that somehow got past it).
+		sampler = tracesample.New(*cfg, chain)
+		chain = sampler
+		// Both aggregators above sample nothing (they count every request)
+		// but their exemplars are LINKS to traces, and a link to a trace this
+		// sampler drops resolves to nothing. The Registry was built before
+		// this sampler existed, hence a setter; the generator is built below.
+		if p.serviceGraphReg != nil {
+			p.serviceGraphReg.SetExemplarKeep(sampler.TraceKept)
 		}
-		chain = tracesample.New(*cfg, chain)
 		p.log.Info("trace sampling enabled", "probability", cfg.Probability,
 			"maxSpansPerSecond", cfg.MaxSpansPerSecond, "keepSlowerThan", cfg.KeepSlowerThan)
 	}
@@ -266,6 +271,9 @@ func (p *pipelines) buildOwnerChain(ctx context.Context, proc *servicegraph.Proc
 		if p.fileCfg.TraceMetrics != nil {
 			smCfg = *p.fileCfg.TraceMetrics
 		}
+		if sampler != nil {
+			smCfg.ExemplarKeep = sampler.SpanKept
+		}
 		gen := spanmetrics.New(smCfg)
 		chain = gen.Tap(chain)
 		smRes := agentSelfResource(*nodeName)
@@ -273,38 +281,25 @@ func (p *pipelines) buildOwnerChain(ctx context.Context, proc *servicegraph.Proc
 		p.spawn(func() { gen.Run(ctx, p.selfOut, *spanMetricsIv, smRes, p.log) })
 		p.log.Info("span metrics from traces enabled", "interval", *spanMetricsIv)
 	}
-	return &sgPairTap{proc: proc, inner: chain}, nil
-}
-
-// sgPairTap feeds the pairing store after a successful export. Consume runs on
-// the concurrent receiver goroutines; the pairing store is mutex-guarded for
-// exactly that.
-type sgPairTap struct {
-	proc  *servicegraph.Processor
-	inner servicegraph.TracesExporter
-}
-
-func (t *sgPairTap) ExportTraces(ctx context.Context, td ptrace.Traces) error {
-	if err := t.inner.ExportTraces(ctx, td); err != nil {
-		return err
-	}
-	t.proc.Consume(td)
-	return nil
+	return proc.Tap(chain), nil
 }
 
 // --- the application-facing listeners ---
 
-// startServiceGraphIngest starts the tier's OTLP trace receiver for
-// applications: enrich, re-shard, and hand this shard's own share to the owner
-// chain.
-func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegraph.TracesExporter) error {
-	if !*serviceGraphIngest || (*serviceGraphIngestGRPC == "" && *serviceGraphIngestHTTP == "") {
-		p.log.Warn("the trace tier accepts no application pushes (-service-graph-ingest=false, or both -service-graph-ingest-grpc and -service-graph-ingest-http are empty); it will only receive spans re-sharded by sibling shards")
-		return nil
-	}
+// tierIngestOn reports whether the trace tier serves the application-facing
+// ports at all: -service-graph-ingest, with at least one of its listeners set.
+func tierIngestOn() bool {
+	return *serviceGraphIngest && (*serviceGraphIngestGRPC != "" || *serviceGraphIngestHTTP != "")
+}
+
+// startResharder builds the application ports' resharder (nil for a
+// single-shard tier) and publishes its counters. Split out of
+// startServiceGraphIngest so startServiceGraph can build it — the one step that
+// can fail — BEFORE any receiver is serving.
+func (p *pipelines) startResharder() (*servicegraph.Resharder, error) {
 	resharder, err := serviceGraphResharder(p.fileCfg.ServiceGraphShards, p.log)
 	if err != nil {
-		return fmt.Errorf("service-graph shards: %w", err)
+		return nil, fmt.Errorf("service-graph shards: %w", err)
 	}
 	p.sgResharder = resharder
 	obs.RegisterServiceGraphResharder(func() obs.ServiceGraphReshardStat {
@@ -323,7 +318,19 @@ func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegr
 	} else {
 		p.log.Info("trace re-sharding is off: a single-shard tier owns every trace locally")
 	}
+	return resharder, nil
+}
 
+// startServiceGraphIngest starts the tier's OTLP trace receiver for
+// applications: enrich, re-shard (resharder, built by startResharder before any
+// receiver serves; nil for a single-shard tier), and hand this shard's own
+// share to the owner chain. Nothing here can fail: whatever could is acquired
+// by the caller first.
+func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegraph.TracesExporter, resharder *servicegraph.Resharder) {
+	if !tierIngestOn() {
+		// configWarnings says so, for -check-config and every start alike.
+		return
+	}
 	ecfg := p.enricherBase()
 	// The tier's one delta on the shared base: veto a peer-IP attribution that
 	// resolves to our own workload (a sibling shard's hop, a proxy on the tier).
@@ -338,26 +345,15 @@ func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegr
 	// perfectly and is wrong on every one. The same argument the events reader
 	// records for leaving actx.Node nil: a described object's node is the
 	// object's property, never the reader's.
-	enr := otlpingest.NewEnricher(ecfg)
+	//
+	// The admission base (in-flight and message caps, the reserved strip, the
+	// ingest: hook) is newAppIngestServer's, shared with the DaemonSet's
+	// receiver. The strip matters here at least as much: these ports take
+	// pushes from every pod in the cluster, and a span resource declaring
+	// another tenant's k8s.namespace.name would route the whole trace there.
 	scfg := otlpingest.ServerConfig{
 		GRPCAddr: *serviceGraphIngestGRPC,
 		HTTPAddr: *serviceGraphIngestHTTP,
-		// The application ports share the DaemonSet receiver's admission
-		// knobs: trace pushes are the LARGEST payloads a fleet sends, so the
-		// raised message cap matters here first.
-		MaxInFlight:  *ingestMaxInFlight,
-		MaxRecvBytes: *ingestGRPCMaxRecv,
-		Enricher:     enr,
-		// The application ports are first receipt for traces, so the same
-		// reserved strip as the DaemonSet's receiver applies — the plumbing
-		// markers AND the sender's identity claim, which matters here at least
-		// as much: these ports take pushes from every pod in the cluster, and a
-		// span resource declaring another tenant's k8s.namespace.name would
-		// route the whole trace there. The INTERNAL receiver (sgReceiver)
-		// deliberately does not strip — what arrives there was sanitized when
-		// an application pushed it, and re-stripping would delete the identity
-		// the entry shard resolved.
-		ReservedAttrs: ingestReservedAttrs(enr),
 		// Exporter nil: this listener serves TRACES only. Logs and metrics belong
 		// on the node-local DaemonSet, where the sender is a pod on the same node
 		// and the payload crosses no network to be attributed.
@@ -376,18 +372,9 @@ func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegr
 		RejectTraces: func(_ context.Context, td ptrace.Traces) error {
 			return refuseForwarded(resharder, td)
 		},
-		Ready:  p.ready.gate(gateServiceGraphIngest),
-		Logger: p.log,
+		Ready: p.ready.gate(gateServiceGraphIngest),
 	}
-	if p.transforms != nil {
-		// The ingest: admission hook (per resource, pre-enrichment; hot
-		// reload adds/removes it without a restart — AdmitResource resolves
-		// the active program per call and admits when no hook exists). The
-		// same wiring as the DaemonSet's receiver (startIngest): the hook's
-		// contract covers all three signals, and trace pushes arrive HERE.
-		scfg.Admit = p.transforms.AdmitResource
-	}
-	srv := otlpingest.NewServer(scfg)
+	srv := p.newAppIngestServer(ecfg, scfg)
 	p.spawn(func() {
 		if err := srv.Run(ctx); err != nil {
 			p.fatal("service-graph trace ingest", err)
@@ -395,7 +382,6 @@ func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegr
 	})
 	p.log.Info("trace ingest listening", "serviceGraphIngestGRPC", *serviceGraphIngestGRPC, "serviceGraphIngestHTTP", *serviceGraphIngestHTTP,
 		"peerIPFallback", *ingestPeerIP)
-	return nil
 }
 
 // msgForwardedToAppPort is the loop guard's refusal, spelled once for the
@@ -550,349 +536,10 @@ func sweepServiceGraph(ctx context.Context, proc *servicegraph.Processor) {
 // spinning (a millisecond wait) or letting a quiet shard sit on promotable
 // half-edges for minutes (an hour-long wait).
 func sweepInterval(wait time.Duration) time.Duration {
-	d := wait / 2
-	if d < time.Second {
-		return time.Second
-	}
-	if d > 30*time.Second {
-		return 30 * time.Second
-	}
-	return d
+	return min(max(wait/2, time.Second), 30*time.Second)
 }
 
 // --- the tier's INTERNAL receiver ---
-
-// sgReceiver is the tier's internal intake: a TRACES-ONLY OTLP receiver, gRPC on
-// -service-graph-listen plus optional OTLP/HTTP protobuf on
-// -service-graph-http-listen, both behind the shared bearer token.
-//
-// It is the port that says "this payload is final". What arrives here has
-// already been enriched and routed by the shard that received it from an
-// application, so this path never enriches (the peer is a sibling shard, not the
-// sender) and never re-shards (we are the owner). Both are structural: there is
-// no Enricher and no Resharder in this path at all.
-//
-// # Why not internal/agent/otlpingest
-//
-// That receiver is what the APPLICATION listeners use, and this one is its
-// opposite on the two axes that matter. It is unauthenticated, because its
-// senders are every instrumented pod in the cluster; this one must
-// authenticate, because what it accepts skips enrichment and routing and a
-// forged payload would be exported unattributed. And it enriches by peer
-// address, which is exactly the thing that is meaningless here. Reusing it
-// would have meant bolting an auth mode and a skip-enrichment mode onto the
-// ingest path so neither could be changed without re-reasoning about the other.
-//
-// The SERVER is separate; the HTTP request seam is NOT. Reading a body, mapping
-// a read failure to a status and mapping a forward failure to one are the same
-// decisions on both ports and are shared (otlpingest.BodyReader,
-// WriteBodyError, GRPCForwardStatus, HTTPForwardStatus) — this file's copies of
-// them had already drifted: an over-cap gzip answered 400 "malformed" here and
-// 413 there, and 400 tells a kubescrape sender to DROP the batch.
-//
-// No in-flight shed here, for the reason the application listener needs one:
-// that one holds a slot for as long as the whole owner chain takes (a
-// re-shard hop plus the collector's ack, up to -otlp-timeout), from senders it
-// cannot identify. This one is authenticated and shorter — it runs the owner
-// chain, whose one blocking step is the collector export — and the gRPC message
-// cap below bounds what a single request can allocate.
-type sgReceiver struct {
-	grpcAddr string
-	httpAddr string
-	// tokens is the accepted set, re-read and rotation-aware.
-	tokens func() []string
-	// consume runs the owner chain (strip the marker, pair, RED metrics, sample,
-	// export). Safe to call from the concurrent handler goroutines. It RETURNS AN
-	// ERROR, and that error becomes the sending shard's — which becomes the
-	// application's, whose retry is the only thing standing between a failed
-	// export and a lost span.
-	consume func(context.Context, ptrace.Traces) error
-	ready   func()
-	log     *slog.Logger
-
-	// body reads one OTLP/HTTP body under sgMaxRecvBytes. Lazily built by Run
-	// so a zero-value sgReceiver (tests construct one directly) still works.
-	body *otlpingest.BodyReader
-
-	// warnGate throttles the rejected-push log; see warnUnauthorized.
-	warnGate logdedupe.Throttle
-}
-
-// sgAuthRealm is sent on 401s so a client can tell "wrong credentials" from
-// "wrong URL".
-const sgAuthRealm = `Bearer realm="kubescrape service-graph"`
-
-// sgUnauthorizedMsg is the internal receiver's refusal, spelled once for the
-// gRPC tap, the gRPC interceptor and the HTTP handler alike: three sites
-// re-typing it is how one drifts into naming a different flag.
-const sgUnauthorizedMsg = "missing or invalid bearer token (-service-graph-token-file)"
-
-// msgShardNoListener is the "shard would receive nothing" refusal, spelled
-// ONCE: validateConfig raises it so -check-config catches the config before
-// the StatefulSet CrashLoops, and sgReceiver.Run raises it again at the real
-// start. One const is what keeps the two paths' wording from drifting.
-const msgShardNoListener = "-service-graph is set but -service-graph-listen (and -service-graph-http-listen) are empty: the shard would receive nothing"
-
-// sgMaxRecvFloor is the receive cap when the sender's split size is unknown or
-// small: the historical 4 MiB, matching a collector's own default. Derived
-// with the sender's default split cap as a lower bound so a future raise of
-// otlpsplit.DefaultMaxBytes can never silently out-size the internal hop's
-// receive floor — today DefaultMaxBytes is 3.75 MiB, so the value is
-// unchanged at 4 MiB.
-const sgMaxRecvFloor = max(4<<20, otlpsplit.DefaultMaxBytes)
-
-// sgMaxRecvBytes caps one decoded payload on the internal hop.
-//
-// It must be at least what the SENDING shard will produce, and the sender is
-// another kubescrape splitting at -otlp-max-send-bytes. That flag is the
-// operator's, tuned for the COLLECTOR's receive limit — so pinning this at a
-// constant meant raising it for a collector that accepts 8 MiB silently made
-// every over-4-MiB shard-to-shard payload fail, breaking the ring for exactly
-// the large traces the raise was for. Derived from the same flag instead, with
-// the floor as a lower bound so a small or unset value cannot shrink it.
-//
-// A NEGATIVE flag disables splitting outright, so "what the sender will
-// produce" stops being a split cap and becomes the whole enriched payload —
-// bounded by no constant this side can name (the application ports cap what
-// enters the ring per push, but enrichment grows a payload by its resource
-// count). The receive cap is therefore disabled WITH the splitting: they are
-// one decision, and the flag spells it. Reading the negative form as "use the
-// floor" instead sent unsplit shares into a sibling capped at 4 MiB — every
-// large trace deterministically rejected on the ring, a rejection
-// sgForwardStatus hands the application as retryable, so its SDK re-pushed an
-// undeliverable payload until the retry budget dropped the spans, with only
-// SendsFailed moving.
-func sgMaxRecvBytes() int {
-	n := *otlpMaxSendBytes
-	if n < 0 {
-		// grpc-go's own ceiling; the internal hop's BodyReader shares it (Run).
-		return math.MaxInt32
-	}
-	if n > sgMaxRecvFloor {
-		return n
-	}
-	return sgMaxRecvFloor
-}
-
-// sgWarnEvery throttles the rejected-push warning: a fleet pointed at the
-// wrong token would otherwise write one line per forwarded batch — thousands a
-// second — burying the diagnosis in its own symptom.
-const sgWarnEvery = 30 * time.Second
-
-// Run serves until ctx is cancelled. A runtime listener failure propagates to
-// the caller (fatal there); a cancelled shutdown returns nil.
-//
-// The bind-then-ready-then-serve-then-drain skeleton is otlpingest.Listeners —
-// the SERVERS stay this receiver's own (the auth tap and interceptor on gRPC,
-// the bearer check in the HTTP handler, no in-flight shed — see the type doc),
-// only the run shape is shared. This file's hand-rolled copy of that shape is
-// how the keepalive policy below drifted in the first place.
-func (r *sgReceiver) Run(ctx context.Context) error {
-	if r.body == nil {
-		r.body = otlpingest.NewBodyReader(int64(sgMaxRecvBytes()))
-	}
-	if r.grpcAddr == "" && r.httpAddr == "" {
-		// A shard with no listener pairs nothing, and would report ready and
-		// idle forever. Refuse instead — indistinguishable-from-working is the
-		// failure mode this whole feature's counters exist to avoid. (Refused
-		// HERE, because Listeners.Run treats nothing-configured as a no-op.)
-		return errors.New(msgShardNoListener)
-	}
-
-	l := otlpingest.Listeners{Name: "service-graph internal", Logger: r.log, Ready: r.ready}
-	if r.grpcAddr != "" {
-		l.GRPCAddr = r.grpcAddr
-		l.GRPC = grpc.NewServer(
-			// Reap connections a peer opened and abandoned, and bound a
-			// socket's AGE (otlpingest.KeepaliveOption, the policy every
-			// kubescrape OTLP receiver shares). The MaxConnectionAge/AgeGrace
-			// half is a deliberate behavior change with this adoption: this
-			// port used to set only MaxConnectionIdle — a documented drift, an
-			// authenticated peer's abandoned stream had no age bound, since a
-			// connection carrying an open stream is never idle.
-			otlpingest.KeepaliveOption(),
-			grpc.MaxRecvMsgSize(sgMaxRecvBytes()),
-			// The header-block bound (otlpingest.MaxHeaderListSizeOption).
-			// This hop authenticates, but the credential arrives IN the header
-			// block, so grpc-go has already decoded 16 MiB of it — at the
-			// default — by the time the tap can read the token.
-			otlpingest.MaxHeaderListSizeOption(),
-			// The wire-SHAPE guard, which MaxRecvMsgSize cannot give: pdata's
-			// generated unmarshaller recurses per nesting level, so a small
-			// message of deeply nested groups costs unbounded goroutine stack
-			// and only the codec — which runs before the decode — can refuse
-			// it. Every OTLP gRPC listener in this repo carries it; this one
-			// assembles its own grpc.Server, so it takes the option form.
-			//
-			// nil onRefused, deliberately: this hop is authenticated
-			// kubescrape-to-kubescrape, and the refusal series means "an
-			// APPLICATION push was refused at a listener nothing
-			// authenticates" — the same reason NewBodyReader counts nothing
-			// here.
-			otlpingest.NestingGuardOption(nil),
-			// Authenticate on the HEADERS frame, BEFORE grpc-go reads the
-			// message. A UnaryInterceptor runs only after recvAndDecompress has
-			// pulled the whole thing into memory, so an unauthenticated peer
-			// could make this process allocate sgMaxRecvBytes per stream and be
-			// refused afterwards — the credential bought nothing it was there
-			// to buy. tap.Info carries the request headers (grpc/tap/tap.go),
-			// which is exactly what the check needs, and the ingest server
-			// already uses a tap for its byte budget for the same reason.
-			grpc.InTapHandle(r.authTap),
-			// A cap on concurrent streams PER CONNECTION. grpc-go's default is
-			// math.MaxUint32, so without it one authenticated connection could
-			// hold unbounded concurrent decodes; this receiver has no in-flight
-			// semaphore of its own (its senders are sibling shards, not
-			// arbitrary applications).
-			grpc.MaxConcurrentStreams(sgMaxConcurrentStreams),
-			grpc.UnaryInterceptor(r.authUnary),
-		)
-		ptraceotlp.RegisterGRPCServer(l.GRPC, &sgTraces{r: r})
-	}
-	if r.httpAddr != "" {
-		mux := http.NewServeMux()
-		mux.HandleFunc("POST /v1/traces", r.handleHTTPTraces)
-		// The shared push-server shape: Slowloris header bound, trickled-body
-		// bound, keep-alive reaping, and deliberately no WriteTimeout (its
-		// clock would race a slow but legal upload).
-		l.HTTP = otlpingest.NewPushHTTPServer(r.httpAddr, mux)
-	}
-	// Graceful on shutdown: in-flight forwards are already-paid-for spans, and
-	// pairing them costs microseconds.
-	return l.Run(ctx)
-}
-
-// sgMaxConcurrentStreams bounds concurrent RPCs per connection on the internal
-// hop. The senders are sibling shards issuing one synchronous forward per push,
-// so this is far above the working set; it exists so a single connection cannot
-// pin an unbounded number of in-flight sgMaxRecvBytes decodes.
-const sgMaxConcurrentStreams = 64
-
-// authorized reports whether the metadata carries an accepted bearer token.
-//
-// gRPC lower-cases metadata keys and otlpexport sends `authorization: Bearer
-// <token>` (otlpexport.grpcAuth), which is the same header its HTTP arm sets —
-// one credential, two transports.
-func (r *sgReceiver) authorized(md metadata.MD) bool {
-	tokens := r.tokens()
-	for _, v := range md.Get("authorization") {
-		if bearer.Authorized(v, tokens) {
-			return true
-		}
-	}
-	return false
-}
-
-// authTap rejects an unauthenticated push on the HEADERS frame, before grpc-go
-// reads (and allocates) the message. It runs in the transport's I/O goroutine
-// with its mutex held, so it must not block: a token read and a constant-time
-// compare, both of which internal/bearer already does without I/O (the file is
-// re-read on its own schedule).
-// The returned context BECOMES the stream's context (http2Server.operateHeaders
-// assigns it), so the success path must hand back the one it was given —
-// returning nil leaves the stream with no context at all.
-func (r *sgReceiver) authTap(ctx context.Context, info *tap.Info) (context.Context, error) {
-	if info != nil && r.authorized(info.Header) {
-		return ctx, nil
-	}
-	r.warnUnauthorized("grpc")
-	return nil, status.Error(codes.Unauthenticated, sgUnauthorizedMsg)
-}
-
-// authUnary re-checks the token after decode. The tap above is what actually
-// keeps an unauthenticated peer from spending memory; this stays as the second
-// line, so a future grpc-go that stopped running taps (they are marked
-// experimental) could not silently open the listener.
-func (r *sgReceiver) authUnary(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-	md, _ := metadata.FromIncomingContext(ctx)
-	if r.authorized(md) {
-		return handler(ctx, req)
-	}
-	r.warnUnauthorized("grpc")
-	return nil, status.Error(codes.Unauthenticated, sgUnauthorizedMsg)
-}
-
-// warnUnauthorized logs a rejected push at most once per sgWarnEvery. Silence
-// would be worse than noise here: a token mismatch after a botched rotation
-// produces no other symptom on either side — the agents' forwards "fail" into
-// a counter, and the graph is simply empty.
-func (r *sgReceiver) warnUnauthorized(transport string) {
-	if !r.warnGate.Allow(sgWarnEvery) {
-		return
-	}
-	r.log.Warn("rejected a service-graph push with a missing or invalid bearer token; the agents' -service-graph-token-file must match this shard's",
-		"transport", transport)
-}
-
-// sgTraces is the gRPC trace service. Only traces are registered: logs and
-// metrics on this port would be an unhandled method, which is the honest
-// answer — this listener exists to pair spans.
-type sgTraces struct {
-	ptraceotlp.UnimplementedGRPCServer
-	r *sgReceiver
-}
-
-func (g *sgTraces) Export(ctx context.Context, req ptraceotlp.ExportRequest) (ptraceotlp.ExportResponse, error) {
-	// The ack is honest only if the whole owner chain succeeded: the sending
-	// shard holds no copy after we answer, and its own sender is the only thing
-	// that can produce these spans again. An error travels back to the
-	// application, whose retry re-pushes the identical batch — which is safe
-	// because the taps count only after a successful export.
-	if err := g.r.consume(ctx, req.Traces()); err != nil {
-		return ptraceotlp.ExportResponse{}, sgForwardStatus(err)
-	}
-	return ptraceotlp.NewExportResponse(), nil
-}
-
-// sgForwardStatus maps an owner-chain failure onto a gRPC status the sending
-// shard's exporter classifies correctly. A bare error surfaces as codes.Unknown,
-// which otlpexport reads as NON-permanent — fine — but a genuinely permanent
-// upstream rejection has to stay permanent, or the sending shard's application
-// retries a payload nothing will ever accept.
-//
-// It is the ingest receiver's classification verbatim, so it IS it now: the two
-// receivers must answer the same way, or the same collector failure reads as
-// retryable on one port and permanent on the other.
-func sgForwardStatus(err error) error { return otlpingest.GRPCForwardStatus(err) }
-
-func (r *sgReceiver) handleHTTPTraces(w http.ResponseWriter, req *http.Request) {
-	if !bearer.Authorized(req.Header.Get("Authorization"), r.tokens()) {
-		r.warnUnauthorized("http")
-		w.Header().Set("WWW-Authenticate", sgAuthRealm)
-		w.Header().Set("Cache-Control", "no-store")
-		http.Error(w, sgUnauthorizedMsg, http.StatusUnauthorized)
-		return
-	}
-	// otlpingest owns the body reader for BOTH receivers. This one used to
-	// have its own copy, and the fix that makes an over-cap GZIP report 413
-	// instead of 400 "malformed" landed only in the other — on the one hop
-	// whose sender is another kubescrape, whose exporter reads 400 as PERMANENT
-	// and drops the batch. The CAP is the parameter (4 MiB here, 16 MiB for
-	// application pushes); the byte budget is deliberately absent, as is the
-	// in-flight semaphore — see the type doc. So is the door COUNTER: this
-	// process serves the unauthenticated application ports too, and
-	// kubescrape_ingest_body_rejected_total means "an application push was
-	// refused at a listener nothing authenticates" (otlpingest.NewBodyReader).
-	body, charged, err := r.body.Read(req)
-	if err != nil {
-		otlpingest.WriteBodyError(w, err)
-		return
-	}
-	defer r.body.Release(charged)
-	er := ptraceotlp.NewExportRequest()
-	if err := er.UnmarshalProto(body); err != nil {
-		http.Error(w, "malformed OTLP traces payload", http.StatusBadRequest)
-		return
-	}
-	if err := r.consume(req.Context(), er.Traces()); err != nil {
-		// The HTTP counterpart of sgForwardStatus: a permanent upstream rejection
-		// is 400 (do not retry this batch), everything else 503 (retryable). The
-		// sending shard's exporter reads both correctly.
-		http.Error(w, err.Error(), otlpingest.HTTPForwardStatus(err))
-		return
-	}
-	otlpingest.WriteProto(w, ptraceotlp.NewExportResponse())
-}
 
 // --- the internal hop's configuration ---
 
@@ -1019,170 +666,6 @@ func shardRingReachesThisShard(cfg servicegraph.ReshardConfig) error {
 		return fmt.Errorf("serviceGraphShards addresses each shard on port %d but %s binds %q: a sibling's forward would reach nothing", port, flagName, listen)
 	}
 	return nil
-}
-
-// sgStatsMemoWindow is how long one pairing-store snapshot serves. It only has
-// to span ONE export or scrape — the four gauges are evaluated microseconds
-// apart inside a single loop — and it must stay far below the shortest
-// plausible interval, so two consecutive exports never share a reading.
-const sgStatsMemoWindow = 100 * time.Millisecond
-
-// sgStatsMemo serves one servicegraph.Stats snapshot to the four gauges that
-// make up a single self-metrics export or /metrics scrape.
-type sgStatsMemo struct {
-	stats func() servicegraph.Stats
-
-	mu   sync.Mutex
-	at   time.Time
-	last servicegraph.Stats
-}
-
-func (m *sgStatsMemo) get() servicegraph.Stats {
-	now := time.Now()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.at.IsZero() || now.Sub(m.at) >= sgStatsMemoWindow {
-		m.last, m.at = m.stats(), now
-	}
-	return m.last
-}
-
-// listenAddr is one address this process will bind, with the flag that named it.
-type listenAddr struct {
-	flag string
-	addr string
-	// note is appended to a collision message this listener is part of, where
-	// losing the bind race is not the only thing wrong with the pair.
-	note string
-}
-
-// tierListeners are the addresses this process will bind for the trace tier, in
-// the order the flags are documented. The application ports are listed only when
-// they are actually served (-service-graph-ingest): a dry run that refused a
-// collision with a listener the start never binds would be stricter than the
-// start, which CrashLoops just as hard as being laxer.
-func tierListeners() []listenAddr {
-	// The internal hop carries the note because a collision involving it is the
-	// one that means more than a lost race: an internal hop addressed to an
-	// application port would also re-enrich and re-shard on every pass.
-	const internalNote = " The internal hop and the application ports must be different ports — an internal hop addressed to an application port would also re-enrich and re-shard on every pass."
-	out := []listenAddr{
-		{flag: "-service-graph-listen", addr: *serviceGraphListen, note: internalNote},
-		{flag: "-service-graph-http-listen", addr: *serviceGraphHTTPListen, note: internalNote},
-	}
-	if *serviceGraphIngest {
-		out = append(out,
-			listenAddr{flag: "-service-graph-ingest-grpc", addr: *serviceGraphIngestGRPC},
-			listenAddr{flag: "-service-graph-ingest-http", addr: *serviceGraphIngestHTTP})
-	}
-	return out
-}
-
-// processListeners are ALL the addresses this process will bind, given the flags
-// as they stand — the health/debug port, the two observability ports, the ingest
-// pair when -ingest is on, and the tier's up to four when -service-graph is.
-//
-// Every listener, not just the tier's, because the collision this refuses is not
-// a tier property: -ingest and -service-graph-ingest default to the SAME
-// :4317/:4318 (one is the node agent's logs-and-metrics receiver, the other the
-// tier's trace receiver), and -pprof-listen typed onto -metrics-listen's :9090
-// is the same mistake with no feature flag involved at all. Nothing composes
-// them today in a shipped manifest, which is exactly why an operator who does
-// deserves the dry run rather than a restart loop.
-func processListeners() []listenAddr {
-	out := []listenAddr{
-		{flag: "-listen", addr: *listen},
-		{flag: "-metrics-listen", addr: *metricsListen},
-		{flag: "-pprof-listen", addr: *pprofListen},
-	}
-	if *ingestOn {
-		out = append(out,
-			listenAddr{flag: "-ingest-grpc-endpoint", addr: *ingestGRPC},
-			listenAddr{flag: "-ingest-http-endpoint", addr: *ingestHTTP})
-	}
-	if *serviceGraphOn {
-		out = append(out, tierListeners()...)
-	}
-	return out
-}
-
-// listenersDistinct refuses two of this process's listeners configured on one
-// address.
-//
-// The tier alone binds up to four, from four independent flags — and the chart
-// renders three of them from values, so `serviceGraph.port: 4317` (warned
-// against in values.yaml prose, enforced nowhere) puts the INTERNAL receiver on
-// the application gRPC port. The servers start concurrently, so whichever binds
-// second dies with `address already in use` and takes the process with it; which
-// one that is varies between restarts. Loud, but only at the real start —
-// refused here, beside the ring cross-check, because this is the place that
-// knows more than one listener exists.
-func listenersDistinct() error {
-	ls := processListeners()
-	for i := range ls {
-		for _, other := range ls[i+1:] {
-			if sameListenAddr(ls[i].addr, other.addr) {
-				// One copy of a note the two sides share (both internal tier
-				// listeners collide with each other as readily as with an
-				// application port).
-				note := ls[i].note
-				if other.note != note {
-					note += other.note
-				}
-				return fmt.Errorf("%s and %s are both %q: this process binds them concurrently, so whichever loses the race fails with `address already in use` and takes the process down, and which one that is varies between restarts.%s",
-					ls[i].flag, other.flag, ls[i].addr, note)
-			}
-		}
-	}
-	return nil
-}
-
-// sameListenAddr reports whether two listen addresses would contend for one
-// socket. Empty disables a listener, so it collides with nothing; an address
-// that is not host:port is left to fail at bind, where the error names it.
-//
-// Hosts must match or one must be a WILDCARD: two different loopback or pod
-// addresses on one port are legitimate, while 0.0.0.0 (or "", or ::) covers
-// every address on that port and so contends with all of them.
-func sameListenAddr(a, b string) bool {
-	ha, pa, ok := splitListen(a)
-	if !ok {
-		return false
-	}
-	hb, pb, ok := splitListen(b)
-	if !ok || pa != pb {
-		return false
-	}
-	return ha == hb || wildcardHost(ha) || wildcardHost(hb)
-}
-
-// splitListen splits a listen address into host and normalised port.
-func splitListen(addr string) (host, port string, ok bool) {
-	addr = strings.TrimSpace(addr)
-	if addr == "" {
-		return "", "", false
-	}
-	h, p, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "", "", false
-	}
-	// ":04317" and ":4317" are one port; a NAMED port (":http") is compared as
-	// written, which is exact for the equality this is used for.
-	if n, err := strconv.Atoi(p); err == nil {
-		p = strconv.Itoa(n)
-	}
-	return h, p, true
-}
-
-// wildcardHost reports whether a listen host covers every local address.
-// net.SplitHostPort has already stripped the brackets from "[::]:4319", so the
-// bracketed spelling never reaches here.
-func wildcardHost(h string) bool {
-	switch h {
-	case "", "0.0.0.0", "::":
-		return true
-	}
-	return false
 }
 
 // parseShardEndpoint reads the shard tier's GOVERNING HEADLESS SERVICE address

@@ -59,9 +59,14 @@ func (w *gateWriter) String() string {
 // All three records the re-read can produce are covered, because closing one
 // and leaving its siblings is how this defect got re-introduced.
 //
-// Reverse-patch check: moving any of the three log calls back inside the
-// `if` block (i.e. before r.mu.Unlock()) makes the matching subtest hang to
-// its deadline and fail.
+// Reverse-patch check: moving any of the three log calls in Rotating.refresh
+// back before its r.mu.Unlock() makes the matching subtest fail: the second
+// caller blocks behind the parked write.
+//
+// The records are written by the refresh's own goroutine (await), which is
+// why the test polls for the record after releasing the writer instead of
+// reading the buffer the moment the triggering Tokens() returns — that call
+// now returns within refreshWait whether or not its read's report is stuck.
 func TestTokensDoesNotHoldTheLockAcrossALogWrite(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -161,8 +166,11 @@ func TestTokensDoesNotHoldTheLockAcrossALogWrite(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("the logging Tokens() never returned after the writer was released")
 			}
-			if out := gate.String(); !strings.Contains(out, tc.needle) {
-				t.Errorf("the %s record never reached the log; got:\n%s", tc.name, out)
+			for deadline := time.Now().Add(5 * time.Second); !strings.Contains(gate.String(), tc.needle); {
+				if time.Now().After(deadline) {
+					t.Fatalf("the %s record never reached the log; got:\n%s", tc.name, gate.String())
+				}
+				time.Sleep(time.Millisecond)
 			}
 		})
 	}

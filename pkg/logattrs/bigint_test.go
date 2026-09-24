@@ -4,8 +4,8 @@ import "testing"
 
 // A JSON integer beyond 2^53 must survive exactly. Decoding every number as
 // float64 rounded 64-bit ids (snowflake, order/user ids) silently — and the
-// result still looked like an exact integer downstream, because whole floats
-// are stored with PutInt.
+// result still looked like an exact integer downstream, because Put then
+// stored every whole float with PutInt (now only inside ±2^53, storedAsInt).
 func TestLargeJSONIntegerKeepsPrecision(t *testing.T) {
 	t.Parallel()
 	e, err := New(&Config{Rules: []Rule{

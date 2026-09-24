@@ -45,6 +45,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/internal/store"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 // goldenTargetsETag is the digest of the whole node-targets document the
@@ -175,7 +176,7 @@ func TestNodeTargetsResponseIsByteStable(t *testing.T) {
 		}
 		t.Fatalf("targets = %d, want %d", len(targets), goldenTargetsCount)
 	}
-	body, err := json.Marshal(map[string]any{"node": "node1", "targets": targets})
+	body, err := json.Marshal(kubemeta.NodeTargets{Node: "node1", Targets: targets})
 	if err != nil {
 		t.Fatal(err)
 	}

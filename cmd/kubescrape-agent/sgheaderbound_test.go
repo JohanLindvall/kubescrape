@@ -28,13 +28,13 @@ func TestServiceGraphInternalReceiverBoundsTheHeaderBlock(t *testing.T) {
 	rcv := &sgReceiver{
 		grpcAddr: freeAddr(t),
 		tokens:   func() []string { return []string{"s3cr3t"} },
+		cached:   func() []string { return []string{"s3cr3t"} },
 		consume:  func(_ context.Context, td ptrace.Traces) error { consumed += td.SpanCount(); return nil },
 		log:      slog.New(slog.DiscardHandler),
 	}
 	ready := make(chan struct{})
 	rcv.ready = sync.OnceFunc(func() { close(ready) })
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	errc := make(chan error, 1)
 	go func() { errc <- rcv.Run(ctx) }()
 	select {

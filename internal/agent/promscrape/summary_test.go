@@ -13,6 +13,7 @@ package promscrape
 // exercised rather than assumed.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -411,14 +412,48 @@ func TestSummaryUnresolvedPodFallsBackLikeCadvisor(t *testing.T) {
 	}
 
 	// And it is built by the SAME function an unresolved cadvisor row goes
-	// through, so the two agree in the unresolved state as well as the resolved
-	// one. The cadvisor row additionally carries a container id and image from
-	// its cgroup path and labels, which the summary has no source for.
-	cadvisor := pcommon.NewResource()
-	s.fillIdentityResource(context.Background(), cadvisor,
+	// through. For the POD the two agree exactly: the unresolved cadvisor
+	// pod-cgroup row carries the same namespace, pod and uid and nothing more.
+	cadvisorPod := pcommon.NewResource()
+	s.fillIdentityResource(context.Background(), cadvisorPod,
+		cadvisorIdentity{namespace: "ns2", pod: "ghost", podUID: ghostUID, hasCgroup: true})
+	if want := cadvisorPod.Attributes().AsRaw(); !reflect.DeepEqual(want, podRes) {
+		t.Errorf("the unresolved summary POD resource diverges from the unresolved cadvisor pod row:\ncadvisor: %v\nsummary:  %v", want, podRes)
+	}
+	// For the CONTAINER they differ, and exactly by what the cadvisor row takes
+	// from its cgroup path and labels — container.id and container.image.name —
+	// plus the service.instance.id derived from the id: that is the join loss,
+	// and nothing else may differ.
+	const ghostCID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	cadvisorCtr := pcommon.NewResource()
+	s.fillIdentityResource(context.Background(), cadvisorCtr, cadvisorIdentity{
+		namespace: "ns2", pod: "ghost", podUID: ghostUID, container: "worker",
+		containerID: ghostCID, image: "registry.example/worker:1", hasCgroup: true,
+	})
+	cRaw := cadvisorCtr.Attributes().AsRaw()
+	var differ []string
+	for k := range cRaw {
+		if !reflect.DeepEqual(cRaw[k], ctrRes[k]) {
+			differ = append(differ, k)
+		}
+	}
+	for k := range ctrRes {
+		if _, ok := cRaw[k]; !ok {
+			differ = append(differ, k)
+		}
+	}
+	sort.Strings(differ)
+	if want := []string{"container.id", "container.image.name", "service.instance.id"}; !slices.Equal(differ, want) {
+		t.Errorf("the unresolved summary and cadvisor container resources differ on %v, want exactly %v:\ncadvisor: %v\nsummary:  %v", differ, want, cRaw, ctrRes)
+	}
+
+	// What the summary adds of its own is nothing: its container resource is
+	// what fillIdentityResource makes of the summary's own identity.
+	own := pcommon.NewResource()
+	s.fillIdentityResource(context.Background(), own,
 		cadvisorIdentity{namespace: "ns2", pod: "ghost", podUID: ghostUID, container: "worker"})
-	if want, got := cadvisor.Attributes().AsRaw(), ctrRes; !reflect.DeepEqual(want, got) {
-		t.Errorf("the unresolved summary resource diverges from the unresolved cadvisor resource for the same object:\ncadvisor: %v\nsummary:  %v", want, got)
+	if want := own.Attributes().AsRaw(); !reflect.DeepEqual(want, ctrRes) {
+		t.Errorf("the summary added to the resource fillIdentityResource builds from its own identity:\nidentity: %v\nsummary:  %v", want, ctrRes)
 	}
 }
 
@@ -435,9 +470,7 @@ func TestSummaryNodeInstanceDoesNotCollideWithNodeMetrics(t *testing.T) {
 	newSummaryBatcher(context.Background(), s, "https://node1:10250"+summaryPath, summaryScrape).fillNodeResource(summaryRes)
 
 	nodeRes := pcommon.NewResource()
-	nodeRes.Attributes().PutStr("service.name", "kubelet")
-	nodeRes.Attributes().PutStr("url.full", "https://node1:10250/metrics")
-	s.attrsFor(pipelineNode).Build(nodeRes, attrs.Context{Node: s.nodeInfo()})
+	s.fillKubeletResource(nodeRes, pipelineNode, "https://node1:10250/metrics")
 
 	cadvisorRes := pcommon.NewResource()
 	s.attrsFor(pipelineCadvisor).Build(cadvisorRes, attrs.Context{Node: s.nodeInfo()})
@@ -483,6 +516,78 @@ func TestSummaryHealthMetricsHaveTheirOwnInstance(t *testing.T) {
 	}
 	if len(seen) != 3 {
 		t.Fatalf("got %d distinct up{} identities, want one per kubelet pipeline: %v", len(seen), seen)
+	}
+}
+
+// A kubelet pipeline's health gauges (up, scrape_duration_seconds,
+// scrape_samples_scraped) describe that pipeline's data only while both land on
+// ONE resource: exportHealth's kubelet arm and the scrape's own batcher each
+// build it through fillKubeletResource. A real cycle holds them to it, for the
+// /metrics scrape and for the summary's node resource.
+func TestKubeletHealthLandsOnTheResourceItsScrapeExports(t *testing.T) {
+	summary := loadSummary(t, "summary-1.33.json")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case nodeMetricsPath:
+			_, _ = w.Write([]byte("# TYPE kubelet_running_pods gauge\nkubelet_running_pods 7\n"))
+		case summaryPath:
+			_, _ = w.Write(summary)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	exp := &captureExporter{}
+	s := newSummaryScraper(t, srv.URL, &fakeMetaSource{}, exp)
+	s.cfg.Kubelet.Cadvisor = false
+	s.cfg.HealthMetrics = true
+	// Read the token up front: the cycle's two kubelet scrapes run
+	// concurrently, and a first read still in flight answers the other one
+	// with no token at all.
+	if _, err := s.kubeletToken.Read(); err != nil {
+		t.Fatal(err)
+	}
+	s.cycle(context.Background())
+
+	// The resource each metric name first appears on, and the `up` resource
+	// per scraped URL.
+	byMetric := map[string]map[string]any{}
+	upByURL := map[string]map[string]any{}
+	exp.mu.Lock()
+	for _, md := range exp.batches {
+		for i := 0; i < md.ResourceMetrics().Len(); i++ {
+			rm := md.ResourceMetrics().At(i)
+			res := rm.Resource().Attributes().AsRaw()
+			for j := 0; j < rm.ScopeMetrics().Len(); j++ {
+				ms := rm.ScopeMetrics().At(j).Metrics()
+				for k := 0; k < ms.Len(); k++ {
+					name := ms.At(k).Name()
+					if name == "up" {
+						upByURL[fmt.Sprint(res["url.full"])] = res
+					} else if _, ok := byMetric[name]; !ok {
+						byMetric[name] = res
+					}
+				}
+			}
+		}
+	}
+	exp.mu.Unlock()
+
+	for _, tc := range []struct{ pipeline, url, metric string }{
+		{pipelineNode, s.kubeletURLs.node, "kubelet_running_pods"},
+		{pipelineSummary, s.kubeletURLs.summary, nodeFsMetrics.capacity.name},
+	} {
+		scraped, ok := byMetric[tc.metric]
+		if !ok {
+			t.Fatalf("%s: the scrape exported no %s (metrics: %v)", tc.pipeline, tc.metric, keys(byMetric))
+		}
+		up, ok := upByURL[tc.url]
+		if !ok {
+			t.Fatalf("%s: no up{} for %s (up urls: %v)", tc.pipeline, tc.url, keys(upByURL))
+		}
+		if !reflect.DeepEqual(up, scraped) {
+			t.Errorf("%s: up{} and the scraped data are on different resources:\nup:      %v\nscraped: %v", tc.pipeline, up, scraped)
+		}
 	}
 }
 
@@ -934,10 +1039,53 @@ func TestSummaryForbiddenNamesTheRBACRule(t *testing.T) {
 	}
 }
 
+// A kubelet refusal is described in two places — the once-per-process line that
+// names the status, and the note on the throttled "scrape failed" line — and
+// both must name THIS pipeline's remedy. They used to disagree: a summary 401
+// got no line of its own at all (only the 403 was reported), and every kubelet
+// pipeline's `unauthorized` note named nodes/metrics, which on /stats/summary is
+// the rule the operator already has.
+func TestKubeletRefusalNamesThePipelinesOwnRemedy(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	var logged strings.Builder
+	s := newSummaryScraper(t, srv.URL, &fakeMetaSource{}, &captureExporter{})
+	s.log = slog.New(slog.NewTextHandler(&logged, nil))
+	if _, err := s.scrapeSummary(context.Background()); err == nil {
+		t.Fatal("a 401 reported success")
+	}
+	for _, want := range []string{"kubelet refused the scrape", "pipeline=summary", "status=401", "--authentication-token-webhook"} {
+		if !strings.Contains(logged.String(), want) {
+			t.Errorf("the summary 401 line is missing %q; log: %s", want, logged.String())
+		}
+	}
+
+	for _, c := range []struct {
+		pipeline, want, not string
+	}{
+		{pipelineSummary, "nodes/stats", "nodes/metrics"},
+		{pipelineCadvisor, "nodes/metrics", "nodes/stats"},
+		{pipelineNode, "nodes/metrics", "nodes/stats"},
+	} {
+		note := failureNote(c.pipeline, reasonUnauthorized)
+		if !strings.Contains(note, c.want) || strings.Contains(note, c.not) {
+			t.Errorf("%s: the unauthorized note must name %s and not %s: %q", c.pipeline, c.want, c.not, note)
+		}
+	}
+	// A discovered target has no subresource at all: its note is the monitor's
+	// credential, never an RBAC rule it cannot have.
+	if note := failureNote(pipelineTargets, reasonUnauthorized); strings.Contains(note, "nodes/") {
+		t.Errorf("a target's unauthorized note names a kubelet subresource: %q", note)
+	}
+}
+
 // The byte estimate is what keeps a chunk under the collector's 4 MiB receive
 // limit, and the one-resource-per-object shape is exactly where a missing
 // resourceBytes/chargeDescriptor call goes unnoticed: the split batcher's
-// dpaBytes bug left ~1 MB uncounted the same way.
+// uncharged datapoint-attributes bug left ~1 MB uncounted the same way.
 func TestSummaryByteEstimateTracksTheEncodedSize(t *testing.T) {
 	exp := &captureExporter{}
 	s := newSummaryScraper(t, "http://unused", &denseMetaSource{}, exp)
@@ -1272,6 +1420,120 @@ func TestSummaryRecreatedPodDoesNotLendItsIdentity(t *testing.T) {
 	}
 }
 
+// A /stats/summary container resolves by NAME inside its pod's document, and a
+// name is not an incarnation: after a restart the document podCache serves for
+// up to a minute still names the PREVIOUS container — its id, its restart count
+// — so the new incarnation's statistics went out as container.id=<old id> and
+// service.instance.id=cadvisor-<old id> while cadvisor, resolving the same
+// container by its new cgroup id, stamped the new one. The two stopped joining
+// after every restart, and nothing counted it because container.id was present.
+func TestSummaryContainerRestartIsNotStampedWithTheOldIncarnation(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	started := func(d time.Duration) *time.Time { ts := now.Add(d); return &ts }
+	// A body whose one container was created at `created` (the fixture's other
+	// timestamps are an hour old, which no assertion below reads).
+	body := func(created time.Time) []byte {
+		b := loadSummary(t, "summary-static-pod.json")
+		old := []byte(`"startTime": "2026-08-13T09:00:14Z"`)
+		if !bytes.Contains(b, old) {
+			t.Fatal("the fixture no longer carries the container startTime this test rewrites")
+		}
+		return bytes.Replace(b, old, []byte(`"startTime": "`+created.Format(time.RFC3339)+`"`), 1)
+	}
+	incarnation := func(id string, start *time.Time, restarts int32) kubemeta.Pod {
+		p := apiserverMirrorPod
+		p.Containers = []kubemeta.Container{{
+			Name: "kube-apiserver", ID: id, Image: apiserverImage,
+			State: "running", StartedAt: start, RestartCount: restarts,
+		}}
+		return p
+	}
+	containerRes := func(t *testing.T, s *Scraper, exp *captureExporter, created time.Time) map[string]any {
+		t.Helper()
+		exp.batches = nil
+		if _, err := s.convertSummary(context.Background(), "https://node1:10250"+summaryPath, body(created), time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range flattenSummary(exp.batches) {
+			if p.metric == metContainerEphemeralUsage.name && p.attrs[attrFsType] == "rootfs" {
+				return p.res
+			}
+		}
+		t.Fatal("no container point was exported")
+		return nil
+	}
+	firstCreated := now.Add(-10 * time.Minute)
+	// After the cached document below was fetched, with room for a slow machine
+	// between the two conversions; a creation time in the future is inside the
+	// window like any other.
+	restarted := now.Add(30 * time.Second)
+
+	t.Run("the cached document is re-asked", func(t *testing.T) {
+		src := &mirrorMetaSource{pod: incarnation(apiserverCID, started(-10*time.Minute), 0)}
+		exp := &captureExporter{}
+		s := newSummaryScraper(t, "http://unused", src, exp)
+		if res := containerRes(t, s, exp, firstCreated); res["container.id"] != apiserverCID {
+			t.Fatalf("the first incarnation did not resolve, so the restart proves nothing: %v", res)
+		}
+
+		// The container restarts and the service learns the new incarnation;
+		// this scraper's cache still holds the document from before.
+		src.pod = incarnation(successorCID, &restarted, 1)
+		res := containerRes(t, s, exp, restarted)
+		if res["container.id"] == apiserverCID {
+			t.Fatalf("the restarted container was stamped with the PREVIOUS incarnation's id: %v", res)
+		}
+		for k, want := range map[string]any{
+			"container.id":                successorCID,
+			"service.instance.id":         "cadvisor-" + successorCID,
+			"k8s.container.restart_count": int64(1),
+		} {
+			if res[k] != want {
+				t.Errorf("%s = %v, want %v", k, res[k], want)
+			}
+		}
+	})
+
+	t.Run("a document still behind is withheld, not stamped", func(t *testing.T) {
+		src := &mirrorMetaSource{pod: incarnation(apiserverCID, started(-10*time.Minute), 0)}
+		exp := &captureExporter{}
+		s := newSummaryScraper(t, "http://unused", src, exp)
+		containerRes(t, s, exp, firstCreated)
+
+		// The kubelet has not posted the new status yet: asking again returns
+		// the same old document.
+		before := obs.SummaryUnresolved.WithLabelValues(levelContainer).Value()
+		res := containerRes(t, s, exp, restarted)
+		if _, ok := res["container.id"]; ok {
+			t.Fatalf("a document naming only the previous incarnation lent it to the new one: %v", res)
+		}
+		if res["k8s.container.name"] != "kube-apiserver" || res["k8s.pod.uid"] != mirrorPodUID {
+			t.Errorf("the withheld container lost its name or its pod: %v", res)
+		}
+		if d := obs.SummaryUnresolved.WithLabelValues(levelContainer).Value() - before; d != 1 {
+			t.Errorf("unresolved containers moved by %v, want 1: the withheld incarnation must be counted", d)
+		}
+
+		// The status lands: the very next scrape resolves it, because the
+		// behind document was not kept for a minute.
+		src.pod = incarnation(successorCID, &restarted, 1)
+		if res := containerRes(t, s, exp, restarted); res["container.id"] != successorCID {
+			t.Fatalf("container.id = %v once the service caught up, want %s", res["container.id"], successorCID)
+		}
+	})
+
+	t.Run("an old container is taken as the document says", func(t *testing.T) {
+		// Outside the window a cached document cannot be stale for this reason,
+		// so a start time the creation time disagrees with is not second-guessed.
+		src := &mirrorMetaSource{pod: incarnation(apiserverCID, started(-20*time.Minute), 0)}
+		exp := &captureExporter{}
+		s := newSummaryScraper(t, "http://unused", src, exp)
+		if res := containerRes(t, s, exp, firstCreated); res["container.id"] != apiserverCID {
+			t.Fatalf("container.id = %v, want %s", res["container.id"], apiserverCID)
+		}
+	})
+}
+
 // The pipeline's headline risk is that its series join nothing, and an operator
 // has to be able to ALERT on it: the log line is said once per process, so
 // without a counter a fleet-wide metadata outage is invisible from the
@@ -1456,4 +1718,161 @@ func TestSummaryUnresolvedCountsAContainerWhosePodResolved(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A collector rejecting a /stats/summary chunk is reason=export, as it is for
+// every exposition pipeline (scrapeSession.export): the kubelet answered, and
+// left unclassified the failure was inferred against the KUBELET's URL —
+// `other` on gRPC, `connect`/`timeout` on OTLP/HTTP. Both flush sites: the
+// final one, and a mid-walk one whose error travels out through ArrayEach.
+func TestSummaryExportFailureIsReasonExport(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		batch int
+	}{{"final flush", 0}, {"mid-walk flush", 1}} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSummaryScraper(t, "http://unused", &fakeMetaSource{}, rejectingExporter{})
+			if tc.batch > 0 {
+				s.cfg.BatchPoints = tc.batch
+			}
+			_, err := s.convertSummary(context.Background(), "https://node1:10250"+summaryPath, loadSummary(t, "summary-1.30.json"), summaryScrape)
+			if err == nil {
+				t.Fatal("a rejected chunk reported success")
+			}
+			if got := failureReason(err); got != reasonExport {
+				t.Errorf("reason = %q (%v), want %q", got, err, reasonExport)
+			}
+		})
+	}
+}
+
+// reason=body is defined as "a response body over this pipeline's cap". A read
+// that FAILED mid-body — the scrape budget expiring, a reset — was wrapped as
+// body too, and the explicit wrapper beats inference, so a kubelet that stalled
+// read as one that sent too much.
+func TestSummaryReadFailureKeepsItsOwnReason(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"node":{"nodeName":"node1"`))
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	s := newSummaryScraper(t, srv.URL, &fakeMetaSource{}, &captureExporter{})
+	s.cfg.Timeout = 300 * time.Millisecond
+	_, err := s.scrapeSummary(context.Background())
+	if err == nil {
+		t.Fatal("a body stalling past the budget reported success")
+	}
+	if got := failureReason(err); got != reasonTimeout {
+		t.Errorf("a stalled body: reason = %q (%v), want %q", got, err, reasonTimeout)
+	}
+
+	// The cap refusal itself is still body.
+	if _, err := readCapped(strings.NewReader("12345"), 4); failureReason(err) != reasonBody {
+		t.Errorf("an over-cap body: reason = %q (%v), want %q", failureReason(err), err, reasonBody)
+	}
+}
+
+// FuzzConvertSummary drives the /stats/summary decoder — a lightning JSON walk
+// over a document the kubelet, not this agent, shapes — the way FuzzConverter
+// drives the exposition converter. It matters more here than a recovered panic
+// would elsewhere: there is no recover() in this binary, so a shape the walk
+// cannot survive takes the node's whole agent down.
+//
+// The properties are the ones the pipeline promises for ANY input: every
+// exported metric is one of the documented summary gauges, every point is an
+// Int >= 0 (parseCount refuses anything else, so a negative or fractional value
+// becomes an absent point, never a wrong one), every chunk marshals, and on
+// success the count returned is exactly the points exported (no filter is
+// configured, so nothing is dropped between the two). mode sets the chunk
+// size, so a small one exercises the mid-walk flush.
+func FuzzConvertSummary(f *testing.F) {
+	for _, name := range []string{"summary-1.28.json", "summary-1.30.json", "summary-1.33.json", "summary-sparse.json", "summary-static-pod.json"} {
+		b, err := os.ReadFile(filepath.Join("testdata", name))
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(b, byte(0))
+		f.Add(b, byte(2))
+	}
+	for _, shape := range []string{
+		`{"node":[],"pods":[1,"x",null,{}]}`,
+		`{"node":{"nodeName":"n","fs":{"usedBytes":-1,"capacityBytes":1.5,"inodes":9007199254740993}},"pods":{}}`,
+		`{"node":{"nodeName":"n"},"pods":[{"podRef":{"name":"a","namespace":"b","uid":"c"},"volume":[{"name":"v","usedBytes":1},{"name":"v","usedBytes":2}],"containers":[{"name":"x","rootfs":{"usedBytes":3}},{"name":"x","rootfs":{"usedBytes":4}}]}]}`,
+		`{"pods":[{"podRef":{"name":"ghost","namespace":"ns2","uid":"u"},"ephemeral-storage":{"usedBytes":null,"time":"not a time"}}]}`,
+		`null`, `{}`, `[]`, `{"node":{"fs":{"time":"2026-08-13T10:00:00Z","usedBytes":0}}}`,
+	} {
+		f.Add([]byte(shape), byte(0))
+	}
+
+	b, err := attrs.NewBuilders(nil, nil)
+	if err != nil {
+		f.Fatal(err)
+	}
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{}, Exporter: exp, StartTime: time.Now(),
+		Logger: slog.New(slog.DiscardHandler),
+		Attrs:  b,
+		Kubelet: KubeletConfig{
+			Endpoint: "http://unused", Summary: true, Meta: &fakeMetaSource{},
+		},
+	})
+	names := make(map[string]bool, len(summaryMetrics))
+	for _, sm := range summaryMetrics {
+		names[sm.m.name] = true
+	}
+	marshaler := &pmetric.ProtoMarshaler{}
+
+	f.Fuzz(func(t *testing.T, body []byte, mode byte) {
+		exp.mu.Lock()
+		exp.batches = nil
+		exp.mu.Unlock()
+		s.cfg.BatchPoints = 1 + int(mode)
+
+		n, err := s.convertSummary(context.Background(), "https://node1:10250"+summaryPath, body, summaryScrape)
+		if n < 0 {
+			t.Fatalf("returned count %d", n)
+		}
+		exported := 0
+		for _, md := range exp.batches {
+			if _, merr := marshaler.MarshalMetrics(md); merr != nil {
+				t.Fatalf("an exported chunk does not marshal: %v", merr)
+			}
+			rms := md.ResourceMetrics()
+			for i := 0; i < rms.Len(); i++ {
+				sms := rms.At(i).ScopeMetrics()
+				for j := 0; j < sms.Len(); j++ {
+					ms := sms.At(j).Metrics()
+					for k := 0; k < ms.Len(); k++ {
+						m := ms.At(k)
+						if !names[m.Name()] {
+							t.Fatalf("exported %q, which is not a summary metric", m.Name())
+						}
+						if m.Type() != pmetric.MetricTypeGauge {
+							t.Fatalf("%s is a %v, want a Gauge", m.Name(), m.Type())
+						}
+						dps := m.Gauge().DataPoints()
+						for d := 0; d < dps.Len(); d++ {
+							dp := dps.At(d)
+							if dp.ValueType() != pmetric.NumberDataPointValueTypeInt || dp.IntValue() < 0 {
+								t.Fatalf("%s point is %v %v, want an Int >= 0", m.Name(), dp.ValueType(), dp.IntValue())
+							}
+						}
+						exported += dps.Len()
+					}
+				}
+			}
+		}
+		if err == nil && exported != n {
+			t.Fatalf("returned %d points but exported %d with no filter configured", n, exported)
+		}
+	})
 }

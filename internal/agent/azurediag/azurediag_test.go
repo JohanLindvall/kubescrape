@@ -3,6 +3,7 @@ package azurediag
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
@@ -251,7 +253,7 @@ func TestParseResourceID(t *testing.T) {
 func TestLogConversion(t *testing.T) {
 	exp := &captureExporter{}
 	src := newFakeSource([][]byte{[]byte(logEnvelope)})
-	r := newTestReader(Config{Exporter: exp, Enrich: true}, src)
+	r := newTestReader(Config{Exporter: exp, Chain: logchain.Config{Enrich: true}}, src)
 	runUntilCommit(t, r, src)
 
 	recs := exp.records()
@@ -339,6 +341,74 @@ func TestMetricConversion(t *testing.T) {
 	}
 }
 
+// The converters memoize the resource key per CONSECUTIVE ARM id and the
+// lowered metric name per spelling, so neither may change what groups with
+// what: records of one resource interleaved with another's, and the same id or
+// metric name spelled in another case, still land in ONE resource and ONE
+// gauge per aggregation, in first-seen order.
+func TestConvertGroupsInterleavedResourcesAndCaseVariantNames(t *testing.T) {
+	const idA = "/SUBSCRIPTIONS/S1/RESOURCEGROUPS/RG/PROVIDERS/MICROSOFT.SQL/SERVERS/SRV/DATABASES/A"
+	const idB = "/SUBSCRIPTIONS/S1/RESOURCEGROUPS/RG/PROVIDERS/MICROSOFT.SQL/SERVERS/SRV/DATABASES/B"
+	metric := func(id, name string, vals map[int]float64) record {
+		rec := record{metric: true, resourceID: id, metricName: name, raw: []byte(`{}`)}
+		for agg, v := range vals {
+			rec.has[agg], rec.aggs[agg] = true, v
+		}
+		return rec
+	}
+	r := New(Config{})
+	md := r.convertMetrics([]record{
+		metric(idA, "Percentage CPU", map[int]float64{aggAverage: 1, aggMaximum: 2}),
+		metric(idB, "Percentage CPU", map[int]float64{aggAverage: 3}),
+		metric(strings.ToLower(idA), "percentage cpu", map[int]float64{aggAverage: 4}),
+		metric(idA, "PERCENTAGE CPU", map[int]float64{aggAverage: 5, aggCount: 6}),
+	})
+	if n := md.ResourceMetrics().Len(); n != 2 {
+		t.Fatalf("metric resources = %d, want 2 (A and B, whatever the order or case)", n)
+	}
+	type gauge struct {
+		name string
+		vals []float64
+	}
+	gauges := func(i int) []gauge {
+		ms := md.ResourceMetrics().At(i).ScopeMetrics().At(0).Metrics()
+		var out []gauge
+		for j := 0; j < ms.Len(); j++ {
+			g := gauge{name: ms.At(j).Name()}
+			dps := ms.At(j).Gauge().DataPoints()
+			for k := 0; k < dps.Len(); k++ {
+				g.vals = append(g.vals, dps.At(k).DoubleValue())
+			}
+			out = append(out, g)
+		}
+		return out
+	}
+	// First-seen order: a record's aggregations in agg order (count, total,
+	// minimum, maximum, average), so rec 1 creates maximum before average.
+	wantA := []gauge{
+		{"azure.percentage cpu.maximum", []float64{2}},
+		{"azure.percentage cpu.average", []float64{1, 4, 5}},
+		{"azure.percentage cpu.count", []float64{6}},
+	}
+	if got := gauges(0); fmt.Sprint(got) != fmt.Sprint(wantA) {
+		t.Errorf("resource A gauges = %v, want %v", got, wantA)
+	}
+	if got, want := gauges(1), []gauge{{"azure.percentage cpu.average", []float64{3}}}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("resource B gauges = %v, want %v", got, want)
+	}
+
+	logRec := func(id string) record { return record{resourceID: id, raw: []byte(`{"m":"x"}`)} }
+	ld := r.convertLogs([]record{logRec(idA), logRec(idB), logRec(strings.ToLower(idA)), logRec(idA)})
+	if n := ld.ResourceLogs().Len(); n != 2 {
+		t.Fatalf("log resources = %d, want 2", n)
+	}
+	for i, want := range []int{3, 1} {
+		if got := ld.ResourceLogs().At(i).ScopeLogs().At(0).LogRecords().Len(); got != want {
+			t.Errorf("log resource %d holds %d records, want %d", i, got, want)
+		}
+	}
+}
+
 // A transient export failure must NOT commit: the poll is retried in place
 // and the offsets stay where the collector last acknowledged.
 func TestCommitOnlyAfterAck(t *testing.T) {
@@ -396,7 +466,7 @@ func TestRulesDropAzureLogs(t *testing.T) {
 	}
 	exp := &captureExporter{}
 	src := newFakeSource([][]byte{[]byte(logEnvelope)})
-	r := newTestReader(Config{Exporter: exp, Rules: rules}, src)
+	r := newTestReader(Config{Exporter: exp, Chain: logchain.Config{Rules: rules}}, src)
 	runUntilCommit(t, r, src)
 
 	recs := exp.records()
@@ -416,8 +486,7 @@ func TestReadyAfterFirstPoll(t *testing.T) {
 	ready := make(chan struct{})
 	src := newFakeSource([][]byte{}) // one empty poll, then blocks
 	r := newTestReader(Config{Exporter: &captureExporter{}, Ready: func() { close(ready) }}, src)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go r.Run(ctx)
 	select {
 	case <-ready:
@@ -555,11 +624,10 @@ func TestConcurrentReadersShareTheChain(t *testing.T) {
 		src := newFakeSource(polls...)
 		srcs[i] = src
 		r := newTestReader(Config{
-			Exporter: exp, Enrich: true, Scrub: scrub, LogAttrs: extractor,
-			Rules: rules, LogMetrics: set,
+			Exporter: exp, Chain: logchain.Config{Enrich: true, Scrub: scrub, LogAttrs: extractor,
+				Rules: rules, LogMetrics: set},
 		}, src)
-		wg.Add(1)
-		go func() { defer wg.Done(); r.Run(ctx) }()
+		wg.Go(func() { ; r.Run(ctx) })
 	}
 
 	// Wait for every reader to have committed all of its polls, then stop.
@@ -620,5 +688,38 @@ func TestTransientExportFailuresCountPerSignal(t *testing.T) {
 	if got := obs.LogExportFailures.Value() - beforeRewinds; got != 0 {
 		t.Errorf("kubescrape_log_export_failures_total delta = %v, want 0: azurediag must not bump "+
 			"the tailer's files-rewound counter", got)
+	}
+}
+
+// An export outage ends with one line per signal that says so, sized like
+// journald's, events' and the tailer's: without it the per-attempt warnings
+// simply stop, which reads exactly like a reader that stopped trying. A signal
+// that never failed says nothing.
+func TestExportRecoveryIsLoggedOncePerFailingSignal(t *testing.T) {
+	log, dump := capturedLog()
+	exp := &captureExporter{failLogs: 2, err: errors.New("collector down")}
+	r := New(Config{Exporter: exp, Logger: log, RetryBackoff: time.Millisecond})
+	recs := r.decode([][]byte{[]byte(logEnvelope), []byte(metricEnvelope)})
+	if !r.deliver(context.Background(), recs) {
+		t.Fatal("deliver gave up with a live context")
+	}
+	out := dump()
+	const recovered = "azure diagnostics export recovered"
+	if n := strings.Count(out, recovered); n != 1 {
+		t.Fatalf("%d recovery lines, want exactly 1 (logs failed twice, metrics never):\n%s", n, out)
+	}
+	if !strings.Contains(out, recovered+`" signal=logs failures=2 outage=`) {
+		t.Fatalf("the recovery line does not name the signal and the failed attempts:\n%s", out)
+	}
+
+	// A second outage is a new one: it is counted from one again.
+	exp.mu.Lock()
+	exp.failLogs = 1
+	exp.mu.Unlock()
+	if !r.deliver(context.Background(), recs) {
+		t.Fatal("deliver gave up with a live context")
+	}
+	if out := dump(); strings.Count(out, recovered) != 2 || !strings.Contains(out, recovered+`" signal=logs failures=1 outage=`) {
+		t.Fatalf("the second outage was not reported as its own:\n%s", out)
 	}
 }

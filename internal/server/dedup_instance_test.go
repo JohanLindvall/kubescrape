@@ -163,8 +163,8 @@ func TestCollidingTargetsAreWarnedAbout(t *testing.T) {
 	}
 }
 
-// The collision is a STEADY state re-derived on every targets request of every
-// agent whose node holds one of the pods, so the line is throttled — otherwise
+// The collision is a STEADY state re-derived on every target derivation of
+// every node holding one of the pods, so the line is throttled — otherwise
 // the notice is a flood proportional to fleet size and gets filtered out, which
 // is the same as not warning at all.
 func TestCollisionWarningIsThrottledAcrossRequests(t *testing.T) {

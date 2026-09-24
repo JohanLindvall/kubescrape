@@ -41,7 +41,7 @@ func TestTransformRunsOncePerBatchAcrossRetries(t *testing.T) {
 	tl := driveTailer(dir, exp)
 	w := mustTransform(t, "logs: |\n  def transform(batch):\n      for r in batch:\n          r.body = \"[t] \" + r.body\n")
 	calls := 0
-	tl.cfg.Transform = func(ld plog.Logs) error {
+	tl.cfg.Transform = func(ld plog.Logs) (int, error) {
 		calls++
 		return w.TransformLogs(ld)
 	}
@@ -146,4 +146,66 @@ func TestTransformErrorRewindsAndRerunsReloadedScript(t *testing.T) {
 	if strings.Count(got[0], "[fixed] ") != 1 {
 		t.Fatalf("prefix applied %d times", strings.Count(got[0], "[fixed] "))
 	}
+}
+
+// The script's drops are counted once the batch's records SETTLE, not when the
+// batch is transformed: a failed flush rewinds the files, the next sweep
+// rebuilds the batch from the same bytes, and the script drops the same
+// records again — so counting at transform time made one intended drop read as
+// one per failed flush of the outage (measured: 3 for 1 across two failed
+// flushes). The permanent-rejection arm settles its records too: they are
+// never re-read, so their drops are counted there or nowhere.
+func TestTransformDropsAreCountedOncePerSettledBatch(t *testing.T) {
+	const script = "logs: |\n  def transform(batch):\n      for r in batch:\n          if r.body == \"drop\":\n              r.drop()\n"
+	dropped := obs.TransformDropped.WithLabelValues("logs")
+	run := func(t *testing.T, exp *fakeExporter) {
+		t.Helper()
+		dir := t.TempDir()
+		ctx := context.Background()
+		tl := driveTailer(dir, exp)
+		tl.cfg.Transform = mustTransform(t, script).TransformLogs
+		tl.scanDir(tl.loadCheckpoints(), true)
+		writeLog(t, dir,
+			"2026-07-05T10:00:00Z stdout F drop",
+			"2026-07-05T10:00:01Z stdout F keep")
+		tl.scanDir(nil, false)
+		path := filepath.Join(dir, logName)
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			tl.sweep(ctx, true)
+			tl.flush(ctx)
+			if f := tl.files[path]; f != nil && f.committed == st.Size() {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("the batch never settled")
+	}
+
+	t.Run("delivered after two failed flushes", func(t *testing.T) {
+		before := dropped.Value()
+		exp := &fakeExporter{fail: 6} // exportWithRetry's 3 attempts per flush: two failed flushes, then delivery
+		run(t, exp)
+		if got := exp.get(); len(got) != 1 || got[0] != "keep" {
+			t.Fatalf("delivered %q, want [keep]", got)
+		}
+		if exp.attempts != 7 {
+			t.Fatalf("export attempts = %d, want 7 — the premise is two rewound flushes", exp.attempts)
+		}
+		if got := dropped.Value() - before; got != 1 {
+			t.Fatalf("transform_dropped moved by %v for one dropped record, want 1", got)
+		}
+	})
+
+	t.Run("permanently rejected", func(t *testing.T) {
+		before := dropped.Value()
+		run(t, &fakeExporter{permanentN: 1})
+		if got := dropped.Value() - before; got != 1 {
+			t.Fatalf("transform_dropped moved by %v for one dropped record of an advanced batch, want 1", got)
+		}
+	})
 }

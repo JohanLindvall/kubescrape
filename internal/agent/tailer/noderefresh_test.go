@@ -6,6 +6,7 @@ package tailer
 import (
 	"context"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -89,12 +90,7 @@ func TestPlaceholderNodeMetadataDoesNotLatchAResolvedFile(t *testing.T) {
 
 	writeLog(t, dir, timeNowCRI()+" stdout F late")
 	driveUntil(t, ctx, tl, func() bool {
-		for _, r := range exp.get() {
-			if r == "late" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(exp.get(), "late")
 	}, "the second line of the SAME file to export")
 
 	if got := lastZone(exp); got != "eu-1a" {
@@ -136,12 +132,7 @@ func TestNodeRelabelReachesAnAlreadyResolvedPlainFile(t *testing.T) {
 	writeLines(t, path, "before relabel")
 	tl.scanDir(nil, false)
 	driveUntil(t, ctx, tl, func() bool {
-		for _, r := range exp.get() {
-			if r == "before relabel" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(exp.get(), "before relabel")
 	}, "the first line to export")
 	if got := lastZone(exp); got != "eu-1a" {
 		t.Fatalf("setup: want zone eu-1a on the first export, got %v", got)
@@ -152,12 +143,7 @@ func TestNodeRelabelReachesAnAlreadyResolvedPlainFile(t *testing.T) {
 
 	writeLines(t, path, "after relabel")
 	driveUntil(t, ctx, tl, func() bool {
-		for _, r := range exp.get() {
-			if r == "after relabel" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(exp.get(), "after relabel")
 	}, "the post-relabel line to export")
 
 	if got := lastZone(exp); got != "eu-1b" {
@@ -193,23 +179,13 @@ func TestPodAnnotationAttributesSurviveANodeMetadataRefresh(t *testing.T) {
 	writeLog(t, dir, timeNowCRI()+" stdout F first")
 	tl.scanDir(nil, false)
 	driveUntil(t, ctx, tl, func() bool {
-		for _, r := range exp.get() {
-			if r == "first" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(exp.get(), "first")
 	}, "the first line to export")
 
 	prov.set(map[string]string{"topology.kubernetes.io/zone": "eu-1b"})
 	writeLog(t, dir, timeNowCRI()+" stdout F second")
 	driveUntil(t, ctx, tl, func() bool {
-		for _, r := range exp.get() {
-			if r == "second" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(exp.get(), "second")
 	}, "the post-relabel line to export")
 
 	exp.mu.Lock()

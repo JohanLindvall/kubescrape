@@ -53,14 +53,14 @@ func secretsServer(t *testing.T, sec SecretReader) *httptest.Server {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(New(Config{
-		Store:           store.New(time.Minute),
-		Services:        services.NewIndex(),
-		Monitors:        monitors,
-		Resolver:        stubResolver{},
-		MaxWait:         500 * time.Millisecond,
-		Ready:           closedChan(),
-		Secrets:         sec,
-		ScrapeAuthToken: testScrapeToken,
+		Store:            store.New(time.Minute),
+		Services:         services.NewIndex(),
+		Monitors:         monitors,
+		Resolver:         stubResolver{},
+		MaxWait:          500 * time.Millisecond,
+		Ready:            closedChan(),
+		Secrets:          sec,
+		ScrapeAuthTokens: staticTokens(testScrapeToken),
 	}).Handler())
 	t.Cleanup(srv.Close)
 	return srv
@@ -218,9 +218,9 @@ func TestScrapeAuthWarnDoesNotStormAtTheCap(t *testing.T) {
 	for cycle := range 4 {
 		_ = cycle
 		for i := range maxScrapeAuthWarnRefs + 1 {
-			s.warnScrapeAuth(fmt.Sprintf("ns/name/key%d", i), func() {
+			if s.allowKeyed(s.warnRefs, fmt.Sprintf("ns/name/key%d", i), "scrape-auth", "refs", maxScrapeAuthWarnRefs) {
 				s.log().Warn("resolving scrape-auth secret")
-			})
+			}
 		}
 	}
 	// At most one line per distinct ref plus the single saturation notice. A
@@ -240,14 +240,43 @@ func TestScrapeAuthWarnThrottlesPerRef(t *testing.T) {
 	h := &countingHandler{}
 	s := New(Config{Log: slog.New(h)})
 	for range 50 {
-		s.warnScrapeAuth("ns/tok/token", func() { s.log().Warn("x") })
+		if s.allowKeyed(s.warnRefs, "ns/tok/token", "scrape-auth", "refs", maxScrapeAuthWarnRefs) {
+			s.log().Warn("x")
+		}
 	}
 	if h.count() != 1 {
 		t.Errorf("logged %d times for one ref, want 1", h.count())
 	}
 	// A DIFFERENT ref is not masked by the first.
-	s.warnScrapeAuth("ns/other/key", func() { s.log().Warn("x") })
+	if s.allowKeyed(s.warnRefs, "ns/other/key", "scrape-auth", "refs", maxScrapeAuthWarnRefs) {
+		s.log().Warn("x")
+	}
 	if h.count() != 2 {
 		t.Errorf("a second ref did not log: count=%d, want 2", h.count())
+	}
+}
+
+// Every keyed warning table announces its saturation through allowKeyed, so the
+// notice reads the same way wherever it fires — which table, what a suppressed
+// key IS, and the cap under one attribute name — and exactly once. The eight
+// hand-written copies it replaced disagreed on the wording and spelled the
+// count "refs", "pairs" or "keys" for the same quantity.
+func TestKeyedWarningSaturationNoticeIsUniform(t *testing.T) {
+	h := &recordingHandler{}
+	s := New(Config{Log: slog.New(h)})
+	allowed := 0
+	for i := range maxRelabelCappedWarnKeys + 5 {
+		if s.allowKeyed(s.warnRelabelCapped, fmt.Sprint(i), "relabel-ceiling", "monitors", maxRelabelCappedWarnKeys) {
+			allowed++
+		}
+	}
+	if allowed != maxRelabelCappedWarnKeys {
+		t.Errorf("allowed %d distinct keys, want the table's cap %d", allowed, maxRelabelCappedWarnKeys)
+	}
+	lines := h.matching("dedupe table is full")
+	want := fmt.Sprintf("relabel-ceiling warning dedupe table is full; further distinct monitors are suppressed keys=%d",
+		maxRelabelCappedWarnKeys)
+	if len(lines) != 1 || lines[0] != want {
+		t.Fatalf("saturation notice = %q, want exactly [%q]", lines, want)
 	}
 }

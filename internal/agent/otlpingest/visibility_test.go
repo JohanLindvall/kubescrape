@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -27,7 +28,10 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -106,10 +110,51 @@ func TestSheddingAtTheInFlightBoundIsReportedOnBothTransports(t *testing.T) {
 			}
 			// The HTTP arm knows who was pushing; the gRPC pre-decode tap does
 			// not (see noteShed), but the interceptor does when a peer is set.
-			if transport == "http" && !strings.Contains(out, "peer=10.4.5.6:34567") {
-				t.Errorf("the HTTP shed line must name the sender:\n%s", out)
+			// As the bare IP (peerip.ForLog, the vocabulary's `peer`), so one grep
+			// for a sender matches every line about it.
+			if transport == "http" && (!strings.Contains(out, "peer=10.4.5.6") || strings.Contains(out, "peer=10.4.5.6:")) {
+				t.Errorf("the HTTP shed line must name the sender as peer=10.4.5.6:\n%s", out)
 			}
 		})
+	}
+}
+
+// One condition, one description, whichever transport a sender used: the
+// in-flight refusal was spelled twice and the two had drifted ("...; retry" over
+// gRPC, without it over HTTP). Both answers are retryable, and both carry the
+// same sentence (errInFlight).
+func TestInFlightRefusalReadsTheSameOnBothTransports(t *testing.T) {
+	s := NewServer(ServerConfig{
+		Enricher:    newEnricher(newMeta(), MetricsAuto),
+		Exporter:    exporterFunc(func(plog.Logs) error { return nil }),
+		MaxInFlight: 1,
+	})
+	if !s.acquire() {
+		t.Fatal("could not take the only in-flight slot")
+	}
+	defer s.release()
+
+	_, err := s.limitUnary(context.Background(), nil, &grpc.UnaryServerInfo{},
+		func(context.Context, any) (any, error) { return nil, nil })
+	st, _ := status.FromError(err)
+	if st.Code() != codes.ResourceExhausted || !otlpexport.RetryableStatus(st) {
+		t.Fatalf("gRPC answer = %v, want a retryable ResourceExhausted", err)
+	}
+
+	body, err := plogotlp.NewExportRequestFromLogs(oneLogsPush()).MarshalProto()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/logs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	s.handleHTTPLogs(rec, req)
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("HTTP answer = %d (Retry-After %q), want a retryable 429", rec.Code, rec.Header().Get("Retry-After"))
+	}
+
+	if httpText := strings.TrimSpace(rec.Body.String()); httpText != st.Message() {
+		t.Errorf("the transports describe one refusal differently:\n  gRPC: %q\n  HTTP: %q", st.Message(), httpText)
 	}
 }
 
@@ -123,7 +168,7 @@ func TestTheShedLineIsThrottledPerBound(t *testing.T) {
 		Exporter: exporterFunc(func(plog.Logs) error { return nil }),
 		Logger:   log,
 	})
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		s.noteShed(shedInFlight, "10.0.0.1:1")
 	}
 	if n := strings.Count(dump(), "shedding pushes"); n != 1 {
@@ -201,7 +246,7 @@ func TestChainSkipsAreExplainedNotJustCounted(t *testing.T) {
 	rl := ld.ResourceLogs().AppendEmpty()
 	// One resource wider than the observation cap, carrying one body over the
 	// render cap: two different bounds in one push.
-	for i := 0; i < maxObservedResourceAttrs+1; i++ {
+	for i := range maxObservedResourceAttrs + 1 {
 		rl.Resource().Attributes().PutStr("k"+string(rune('a'+i%26))+string(rune('a'+i/26)), "v")
 	}
 	lrs := rl.ScopeLogs().AppendEmpty().LogRecords()
@@ -226,6 +271,31 @@ func TestChainSkipsAreExplainedNotJustCounted(t *testing.T) {
 	}
 }
 
+// Every chain-skip bound gets its own line even when all of them bind at once:
+// the warning table admits a new reason only once a resident one lapses, so a
+// table one key short of the reason set silenced the last reason for as long as
+// the others kept binding — with its counter still moving.
+func TestEveryChainSkipReasonWarnsWhenAllCoOccur(t *testing.T) {
+	// One chainSkips field per reason: a reason added to the struct and not to
+	// chainSkipReasons would undersize the table again.
+	if got, want := len(chainSkipReasons), reflect.TypeFor[chainSkips]().NumField(); got != want {
+		t.Fatalf("chainSkipReasons lists %d reasons, chainSkips tallies %d", got, want)
+	}
+	log, dump := capturedLogger()
+	s := NewServer(ServerConfig{
+		Enricher: newEnricher(newMeta(), MetricsAuto),
+		Exporter: exporterFunc(func(plog.Logs) error { return nil }),
+		Logger:   log,
+	})
+	s.noteChainSkipped(chainSkips{resources: 1, tooWide: 1, bodies: 1, valueTooLarge: 1})
+	out := dump()
+	for _, reason := range chainSkipReasons {
+		if !strings.Contains(out, "reason="+reason+" ") {
+			t.Errorf("no skip line for reason %q while every bound bound at once:\n%s", reason, out)
+		}
+	}
+}
+
 // A metadata service that cannot be reached costs ATTRIBUTION on every pushed
 // resource, and the counter that moves (unresolved) says exactly the same thing
 // it says for a stale container id — the ordinary case. Only the line separates
@@ -243,6 +313,34 @@ func TestAnUnreachableMetadataServiceIsWarnedButAMissIsNot(t *testing.T) {
 		out := dump()
 		if !strings.Contains(out, "the metadata service is not answering lookups") {
 			t.Errorf("a broken metadata service must be reported:\n%s", out)
+		}
+	})
+	// The peer-IP fallback is the path every id-less sender takes while it is
+	// on, and its lookup error was discarded outright: an outage read only as
+	// outcome=unresolved, not even a Debug line.
+	t.Run("unreachable over the peer-IP fallback", func(t *testing.T) {
+		log, dump := capturedLogger()
+		e := NewEnricher(Config{Meta: brokenMeta{}, Logger: log, PeerIPFallback: true})
+		ld := plog.NewLogs()
+		rl := ld.ResourceLogs().AppendEmpty()
+		rl.Resource().Attributes().PutStr("service.name", "no-id") // nothing to look up by id
+		rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("x")
+		e.EnrichLogs(withPeerIP(context.Background(), "10.1.2.3:41234"), ld)
+
+		if out := dump(); !strings.Contains(out, "the metadata service is not answering lookups") {
+			t.Errorf("a broken metadata service must be reported on the peer-IP path too:\n%s", out)
+		}
+	})
+	t.Run("unknown peer", func(t *testing.T) {
+		log, dump := capturedLogger()
+		e := NewEnricher(Config{Meta: notFoundMeta{}, Logger: log, PeerIPFallback: true})
+		ld := plog.NewLogs()
+		rl := ld.ResourceLogs().AppendEmpty()
+		rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("x")
+		e.EnrichLogs(withPeerIP(context.Background(), "10.9.9.9:41234"), ld)
+
+		if strings.Contains(dump(), "the metadata service is not answering") {
+			t.Errorf("a peer no pod owns (a hostNetwork sender) is ordinary and must not read as an outage:\n%s", dump())
 		}
 	})
 	t.Run("unknown id", func(t *testing.T) {
@@ -299,17 +397,17 @@ func newCountingSet(t *testing.T) *metrics.DynamicMetricSet {
 	return set
 }
 
-// Past the splitter's caps the remaining objects' points fold onto the
-// SENDER's resource, unenriched: the series keep flowing and describe one
-// object while labelled with another. The counter alone reads as a small
-// number beside a large one; the line says which bound bound and how far past
-// it the sender is.
+// Past the splitter's caps the remaining objects' points fold into one
+// overflow resource per input resource (overflowID), stripped of the sender's
+// identity and unenriched: the series keep flowing, attributed to no object.
+// The counter alone reads as a small number beside a large one; the line says
+// which bound bound and how far past it the sender is.
 func TestTheSplitCapExplainsItself(t *testing.T) {
 	log, dump := capturedLogger()
 	md := pmetric.NewMetrics()
 	sm := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
 	const n = maxSplitGroups + 5
-	for i := 0; i < n; i++ {
+	for i := range n {
 		m := sm.Metrics().AppendEmpty()
 		m.SetName("m")
 		dp := m.SetEmptyGauge().DataPoints().AppendEmpty()

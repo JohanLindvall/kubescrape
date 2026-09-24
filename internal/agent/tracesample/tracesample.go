@@ -1,15 +1,20 @@
 // Package tracesample drops ingested spans before they are forwarded: a
 // consistent probabilistic sampler plus guard rails (always keep errors,
-// always keep slow spans, cap total spans/second). It wraps the RAW trace
-// exporter BELOW the spanmetrics tap, so RED metrics are still derived from
-// 100% of the spans while only the sampled subset is shipped — the classic
+// always keep slow spans, cap total spans/second). It runs in the trace tier's
+// owner chain (cmd/kubescrape-agent's buildOwnerChain), wrapping the next
+// exporter down — the tail-sampling buffer when tailSampling is enabled, else
+// the tier's exporter — BELOW the spanmetrics tap and the service-graph pairing
+// tap, so RED metrics and the graph are still derived from 100% of the spans
+// while only the sampled subset is shipped — the classic
 // spanmetrics-plus-sampling arrangement.
 //
 // Decisions are deterministic per trace ID (tracehash: a rapidhash of the ID
 // against the probability threshold), so all spans of a trace sample
-// identically on this node AND on every other node running the same config —
-// a node-local sampler still yields whole traces. A sender's retry of a failed
-// payload re-samples identically, keeping the at-least-once path consistent.
+// identically on every shard of the trace tier running the same config — a
+// trace samples the same way wherever it is judged, and its spans are never
+// split between kept and dropped by the probability half. A sender's retry of
+// a failed payload re-samples identically, keeping the at-least-once path
+// consistent.
 package tracesample
 
 import (
@@ -46,7 +51,7 @@ type Config struct {
 	// MaxSpansPerSecond caps forwarded spans after sampling; excess spans are
 	// dropped and counted (0 = uncapped). A hard safety valve, applied to
 	// guard-rail keeps too — a cap that can be exceeded is not a cap. NOTE:
-	// when the ingest batcher retries a payload, the rate bucket is consumed
+	// when a sender retransmits a failed push, the rate bucket is consumed
 	// again for the re-sent spans, so the effective cap can be slightly
 	// stricter than configured under sustained retries — acceptable for a
 	// safety valve (the probability decision stays exact, being per-trace-ID).
@@ -72,6 +77,13 @@ func (c Config) Enabled() bool {
 func (c Config) SlowerThan() (time.Duration, error) {
 	return config.Duration("traceSampling.keepSlowerThan", c.KeepSlowerThan, 0, config.ZeroDisables())
 }
+
+// KeepsErrors reports whether the keepErrors guard rail is armed: unset means
+// ON. Exported for SlowerThan's reason — configWarnings asks the same question
+// and must answer it with the sampler's own default, not a re-derived copy of
+// it (whether the default was SPELLED OUT is a separate question, which it
+// still reads off KeepErrors == nil).
+func (c Config) KeepsErrors() bool { return c.KeepErrors == nil || *c.KeepErrors }
 
 // Validate reports a malformed config, so a bad value fails startup with a
 // clear message instead of silently disabling the guard rail.
@@ -104,8 +116,9 @@ type Sampler struct {
 	slow      time.Duration
 
 	// Token bucket for MaxSpansPerSecond (tracehash.Bucket carries the mutex:
-	// without the ingest batcher, ExportTraces runs on concurrent ingest
-	// handlers). rate is kept beside it for the is-a-cap-configured checks.
+	// ExportTraces runs on the trace tier's concurrent receive goroutines, the
+	// application ports and the internal re-shard hop alike). rate is kept
+	// beside it for the is-a-cap-configured checks.
 	rate   float64
 	bucket *tracehash.Bucket
 	now    func() time.Time // injectable for tests
@@ -143,10 +156,9 @@ func New(cfg Config, next Exporter) *Sampler {
 		}
 		p = 1
 	}
-	keepErr := cfg.KeepErrors == nil || *cfg.KeepErrors
 	s := &Sampler{
 		next:    next,
-		keepErr: keepErr,
+		keepErr: cfg.KeepsErrors(),
 		slow:    slow,
 		rate:    cfg.MaxSpansPerSecond,
 		// Starts full, burst floored at one whole span — tracehash.NewBucket
@@ -319,7 +331,13 @@ func (s *Sampler) keep(sp ptrace.Span) bool {
 	if s.keepErr && sp.Status().Code() == ptrace.StatusCodeError {
 		return true
 	}
-	if s.slow > 0 && sp.EndTimestamp() > sp.StartTimestamp() &&
+	// A span with NO start (0 is OTLP's "unknown") cannot bound an interval:
+	// measured anyway it spans from the Unix epoch to its end, ~56 years, and
+	// was kept at any probability. tailsample's traceDuration skips such spans
+	// for the same reason — a malformed span must never look SLOWER than it
+	// was. An end-start past what a Duration holds converts NEGATIVE and falls
+	// through to the hash, the non-costly direction, so it needs no guard.
+	if s.slow > 0 && sp.StartTimestamp() != 0 && sp.EndTimestamp() > sp.StartTimestamp() &&
 		time.Duration(sp.EndTimestamp()-sp.StartTimestamp()) >= s.slow {
 		return true
 	}

@@ -7,22 +7,16 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/JohanLindvall/haste/xxh3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-
-	"github.com/JohanLindvall/kubescrape/internal/scrape"
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/internal/store"
@@ -74,17 +68,16 @@ type Config struct {
 	// -scrape-auth-secrets — it requires secrets RBAC and ships secret
 	// material over the cluster-internal HTTP channel.
 	Secrets SecretReader
-	// ScrapeAuthToken is the shared bearer token clients must present on
-	// GET /v1/scrape-auth (`Authorization: Bearer <token>`), read from
-	// -scrape-auth-token-file. One of it or ScrapeAuthTokens is REQUIRED
-	// whenever Secrets is set (see Validate); both guard that route only — the
-	// rest of the API carries no secret material and stays open.
-	ScrapeAuthToken string
-	// ScrapeAuthTokens, when set, supersedes ScrapeAuthToken: it is evaluated
-	// per request and every returned token is accepted. This is what makes
-	// ROTATION a non-event — the caller returns the current token plus the
-	// previous one for a grace window, so re-reading agents and the re-read
-	// service file never have to flip in lockstep.
+	// ScrapeAuthTokens yields the bearer tokens clients may present on
+	// GET /v1/scrape-auth (`Authorization: Bearer <token>`); cmd/kubescrape
+	// wires it from -scrape-auth-token-file through bearer.Rotating. It is
+	// REQUIRED whenever Secrets is set (see Validate) and guards that route
+	// only — the rest of the API carries no secret material and stays open.
+	// It is evaluated per request and every returned token is accepted, which
+	// is what makes ROTATION a non-event: the source returns the current token
+	// plus the previous one for a grace window, so re-reading agents and the
+	// re-read service file never have to flip in lockstep. An empty token never
+	// authorizes (bearer.Authorized).
 	ScrapeAuthTokens func() []string
 	// Log receives the handful of server-side events an agent cannot diagnose
 	// from a status code alone (a Secret read that failed for a reason other
@@ -100,7 +93,7 @@ type Config struct {
 // cluster-wide secret leak, which is exactly the failure mode a "the flag was
 // not set" default must never produce.
 func (c Config) Validate() error {
-	if c.Secrets != nil && c.ScrapeAuthToken == "" && c.ScrapeAuthTokens == nil {
+	if c.Secrets != nil && c.ScrapeAuthTokens == nil {
 		return errors.New("-scrape-auth-secrets requires -scrape-auth-token-file: " +
 			"/v1/scrape-auth serves monitor Secret keys and must not be reachable unauthenticated")
 	}
@@ -188,9 +181,19 @@ type Server struct {
 	svcSelectorEvals atomic.Int64
 
 	// warnRefs throttles the per-ref scrape-auth failure log, warnShadowed the
-	// per-pair shadowed-monitor one and warnCollide the per-(pod, host:port)
-	// colliding-identity one. All three are concurrency-safe on their own, so
-	// they need no mutex here.
+	// per-pair shadowed-monitor one and warnCollide the per-CONFIGURATION
+	// colliding-identity one (the job, the port and the set of colliding
+	// declarations — see collisionWarnKey; the pod and its IP are deliberately
+	// not part of the key). All three are concurrency-safe on their own, so
+	// they need no mutex here, and like every keyed table here they are asked
+	// through allowKeyed.
+	//
+	// Every warnRefs key is ALLOWLIST-derived — the ref has already been
+	// matched against AuthSecretRefs, so it names a secret some indexed monitor
+	// asked for, bounded in count by the operators' monitors and in length by
+	// servicemonitors' own field ceiling. A ref the allowlist REFUSED must not
+	// reach this table: those segments are the caller's, so they bound
+	// nothing. See warnAuthDenied.
 	warnRefs     *logdedupe.Table
 	warnShadowed *logdedupe.Table
 	warnCollide  *logdedupe.Table
@@ -223,6 +226,11 @@ type Server struct {
 	warnEncode         logdedupe.Throttle
 	warnPodCapped      *logdedupe.Table
 	warnUnresolved     *logdedupe.Table
+	// warnViewTrimmed is the swap arms' Service-view refusal, keyed by the
+	// Service (reportViewsTrimmed). Its own table for warnRelabelCapped's
+	// reason: it co-occurs with the per-pod ceiling, whose table is keyed by
+	// workload, and one gate for both would hide whichever came second.
+	warnViewTrimmed *logdedupe.Table
 	// warnAuthDenied is the allowlist MISS, and it gets its own table rather
 	// than sharing warnRefs: a ref the allowlist refused is by definition one
 	// no monitor named, i.e. three path segments the CALLER chose, unbounded
@@ -262,14 +270,9 @@ type Server struct {
 
 // New creates a Server.
 func New(cfg Config) *Server {
-	tokens := cfg.ScrapeAuthTokens
-	if tokens == nil && cfg.ScrapeAuthToken != "" {
-		token := cfg.ScrapeAuthToken
-		tokens = func() []string { return []string{token} }
-	}
 	return &Server{
 		secrets:           cfg.Secrets,
-		scrapeAuthTokens:  tokens,
+		scrapeAuthTokens:  cfg.ScrapeAuthTokens,
 		store:             cfg.Store,
 		services:          cfg.Services,
 		monitors:          cfg.Monitors,
@@ -287,6 +290,7 @@ func New(cfg Config) *Server {
 		warnContribCapped: logdedupe.New(maxContribCappedWarnKeys, contribCappedWarnEvery),
 		warnPodCapped:     logdedupe.New(maxCappedWarnKeys, cappedWarnEvery),
 		warnUnresolved:    logdedupe.New(maxUnresolvedWarnKeys, unresolvedWarnEvery),
+		warnViewTrimmed:   logdedupe.New(maxViewTrimmedWarnKeys, viewTrimmedWarnEvery),
 		warnAuthDenied:    logdedupe.New(maxScrapeAuthDeniedRefs, scrapeAuthWarnEvery),
 		draining:          make(chan struct{}),
 	}
@@ -341,184 +345,28 @@ func (s *Server) log() *slog.Logger {
 	return slog.Default()
 }
 
-// scrapeAuthWarnEvery bounds how often one secret ref may log a resolution
-// failure. An RBAC grant that was never added is a STEADY state, not an event:
-// every agent on every node re-asks each scrape cycle, so an unthrottled line
-// is a permanent flood proportional to fleet size. The counter carries the rate;
-// the log only has to name the ref often enough to be found.
-const scrapeAuthWarnEvery = 5 * time.Minute
-
-// maxScrapeAuthWarnRefs bounds the throttle table. Keys come from the
-// AuthSecretRefs allowlist, so they are already bounded by the indexed monitors
-// — this is belt and braces against a monitor set that churns.
-const maxScrapeAuthWarnRefs = 1024
-
-// maxScrapeAuthDeniedRefs bounds the SEPARATE table the allowlist miss uses
-// (see Server.warnAuthDenied). Same size, different blast radius: those keys
-// are caller-chosen, so that is the table a mint may saturate and it must not
-// be the one carrying the operator-facing failures.
-const maxScrapeAuthDeniedRefs = 1024
-
-// warnScrapeAuth throttles the per-ref scrape-auth failure log, emitting the
-// one-time saturation notice when the table fills.
-//
-// Every key here is ALLOWLIST-derived — the ref has already been matched
-// against AuthSecretRefs, so it names a secret some indexed monitor asked for,
-// bounded in count by the operators' monitors and in length by
-// servicemonitors' own field ceiling. A ref the allowlist REFUSED must not
-// reach this table: those segments are the caller's, so they bound nothing.
-// See warnAuthDenied.
+// allowKeyed asks one of this package's per-key warning tables whether key may
+// log now, logging the table's one-time saturation notice on the call that
+// filled it. table names the warning ("scrape-auth", "conflicting-monitor"),
+// noun what a suppressed key IS ("refs", "pairs", "monitors") — the one word
+// that tells the reader what the notice truncated — and limit is the table's
+// cap; attrs ride on the notice after it. Every keyed site goes through here,
+// so the notice reads the same way wherever it fires: the eight copies it
+// replaced had drifted in wording and in the name of the count attribute.
 //
 // The saturation POLICY — suppress further keys, never clear the table — lives
-// in internal/logdedupe, along with the reason. This file had its own copy that
-// cleared when full, which at cap+1 distinct refs re-fills, overflows and
-// clears on every cycle: the flood the throttle exists to prevent, re-armed,
-// and silently. The agent had already reached the opposite conclusion and
-// written it down; now there is one table type and one answer.
-func (s *Server) warnScrapeAuth(ref string, emit func()) {
-	allow, saturated := s.warnRefs.Allow(ref)
+// in internal/logdedupe, along with the reason. This package once had its own
+// copy that cleared when full, which at cap+1 distinct keys re-fills, overflows
+// and clears on every cycle: the flood the throttle exists to prevent,
+// re-armed, and silently. The caller logs the warning itself; this only
+// decides (logdedupe's contract).
+func (s *Server) allowKeyed(t *logdedupe.Table, key, table, noun string, limit int, attrs ...any) bool {
+	allow, saturated := t.Allow(key)
 	if saturated {
-		s.log().Warn("scrape-auth warning dedupe table is full; further distinct refs are suppressed",
-			"refs", maxScrapeAuthWarnRefs)
+		s.log().Warn(table+" warning dedupe table is full; further distinct "+noun+" are suppressed",
+			append([]any{"keys", limit}, attrs...)...)
 	}
-	if allow {
-		emit()
-	}
-}
-
-// shadowWarnEvery bounds how often one conflicting (winner, loser) pair may
-// log. Like the scrape-auth throttle, this is a STEADY state rather than an
-// event: the pair is re-decided on every targets request of every agent that
-// has the pod on its node, so an unthrottled line is a permanent flood
-// proportional to fleet size. The counter carries the rate.
-const shadowWarnEvery = 30 * time.Minute
-
-// maxShadowedWarnPairs bounds the throttle table. Keys are monitor PAIRS, so
-// they are bounded by the indexed monitors; this is belt and braces against a
-// monitor set that churns.
-const maxShadowedWarnPairs = 1024
-
-// reportAuthConflict records a monitor endpoint whose auth/TLS material could
-// not be merged into the target already holding the same URL on that pod:
-// both declare it and it differs, so the holder's is served (see
-// scrape.MergeMonitorEndpoint — every other endpoint group merges, silently).
-// The scrape is now running with a credential/TLS config one of its CRs did
-// not choose, which must not be discoverable only by a packet capture. The
-// winner may equal the loser: one monitor's two endpoints resolving to one URL
-// with different material is the same unhonoured declaration.
-func (s *Server) reportAuthConflict(kind, winner, loser, url string) {
-	obs.MonitorTargetShadowed.WithLabelValues(kind).Inc()
-	if allow, saturated := s.warnShadowed.Allow(kind + "\x00" + winner + "\x00" + loser); allow || saturated {
-		if saturated {
-			s.log().Warn("conflicting-monitor warning dedupe table is full; further distinct pairs are suppressed",
-				"pairs", maxShadowedWarnPairs)
-		}
-		if allow {
-			s.log().Warn("two monitor endpoints declare different auth/TLS for one scrape URL; the first monitor's is served",
-				"kind", kind, "serving", winner, "conflicting", loser, "url", url,
-				"note", "the conflicting endpoint's auth/TLS is NOT applied (its other configuration merges); "+
-					"further warnings for this pair are suppressed for "+shadowWarnEvery.String())
-		}
-	}
-}
-
-// relabelCappedWarnEvery and maxRelabelCappedWarnKeys bound the merged-chain
-// ceiling warning. Like the two throttles above it this is a STEADY state, not
-// an event: the merge is re-decided on every targets request of every agent
-// whose node holds one of the pods, so an unthrottled line is a permanent
-// flood proportional to fleet size. Keys are monitor names, so the live set is
-// bounded by the indexed monitors; the cap is belt and braces against churn.
-const (
-	relabelCappedWarnEvery   = 30 * time.Minute
-	maxRelabelCappedWarnKeys = 1024
-)
-
-// reportRelabelCapped records a monitor endpoint whose metricRelabelings were
-// only partly folded into the target already holding its URL: the merged chain
-// hit scrape.MaxRelabelChainRules/MaxRelabelChainBytes and the rest of the
-// chain filters nothing.
-//
-// It needs a line as well as the counter for the same reason the per-pod
-// ceiling does: the refusal is invisible in the data. A drop rule that was not
-// applied does not fail a scrape and does not log on the agent — the series the
-// operator asked to drop simply arrive, at whatever cardinality they have, and
-// nothing anywhere says which CR stopped being honoured.
-func (s *Server) reportRelabelCapped(kind, monitor, url string) {
-	obs.MonitorRelabelChainCapped.WithLabelValues(kind).Inc()
-	allow, saturated := s.warnRelabelCapped.Allow(kind + "\x00" + monitor)
-	if saturated {
-		s.log().Warn("relabel-ceiling warning dedupe table is full; further distinct monitors are suppressed",
-			"keys", maxRelabelCappedWarnKeys)
-	}
-	if !allow {
-		return
-	}
-	s.log().Warn("monitor metricRelabelings only partly applied: the merged chain for this scrape URL is at the per-target ceiling",
-		"kind", kind, "monitor", monitor, "url", url,
-		"rules", scrape.MaxRelabelChainRules, "bytes", scrape.MaxRelabelChainBytes,
-		"note", "every monitor resolving to one URL on one pod is served as ONE scrape, so their chains "+
-			"concatenate; the rules that fit are applied and the rest filter nothing. Either the chain is "+
-			"enormous or several monitors target this URL — GET /v1/explain/<ns>/<pod> says which. Further "+
-			"warnings for this monitor are suppressed for "+relabelCappedWarnEvery.String())
-}
-
-// contribCappedWarnEvery and maxContribCappedWarnKeys bound the contributor-list
-// ceiling warning. It gets its OWN throttle table rather than sharing the
-// relabel one beside it: the two conditions are independent (the attack that
-// fills the contributor list carries no relabel rules at all), and a shared
-// gate would let whichever fired first suppress the other for half an hour on
-// exactly the monitor an operator is looking at. Same steady-state reasoning as
-// its siblings — the merge is re-decided on every targets request of every
-// agent whose node holds one of the pods.
-//
-// Keys are the URL, NOT the monitor the two siblings key by, because the
-// condition is a property of the URL: "too many monitors resolve here". The
-// refused monitor is a symptom, and there are as many of them as the tenant
-// cares to create — keying by monitor turned one pile-up into one line per
-// refused CR (1,968 of them in the regression test) saying the same thing.
-// /v1/explain is where the per-monitor answer lives, and the line points at it.
-const (
-	contribCappedWarnEvery   = 30 * time.Minute
-	maxContribCappedWarnKeys = 1024
-)
-
-// reportContributorsCapped records a monitor whose endpoint MERGED into the
-// target holding its URL but which is not listed among that target's
-// contributors, the list being at scrape.MaxContributorsPerTarget.
-//
-// Nothing about the scrape changed, which is the entire reason this needs a
-// line and a counter: an operator reading the served target, or the series it
-// produces, has no way to tell that a monitor they can see being honoured is
-// missing from the attribution — and the shape that fills the list (many
-// monitors resolving to one URL on one pod) is worth reconciling on its own.
-// The monitor is named as the EXAMPLE it is: it is whichever one happened to
-// arrive first past the ceiling, not the cause.
-// firstForPod is the caller's per-derivation gate (targetDedup.firstContribCap):
-// the condition is a property of the URL and fires once per monitor past the
-// ceiling, so on a pile-up this used to build one throttle key — an allocation
-// — and take one dedupe-table mutex per REFUSED MONITOR, i.e. the guard that
-// bounds the abuse allocated in proportion to it. The COUNTER still moves on
-// every refusal, because it is the rate an operator alerts on; only the line,
-// which says the same thing every time, is folded to once per URL per pod.
-func (s *Server) reportContributorsCapped(kind, monitor, url string, firstForPod bool) {
-	obs.MonitorContributorsCapped.WithLabelValues(kind).Inc()
-	if !firstForPod {
-		return
-	}
-	allow, saturated := s.warnContribCapped.Allow(kind + "\x00" + url)
-	if saturated {
-		s.log().Warn("contributor-ceiling warning dedupe table is full; further distinct scrape URLs are suppressed",
-			"keys", maxContribCappedWarnKeys)
-	}
-	if !allow {
-		return
-	}
-	s.log().Warn("more monitors resolve to one scrape URL than its contributor list can carry; the rest merge unattributed",
-		"kind", kind, "url", url, "monitors", scrape.MaxContributorsPerTarget, "example", monitor,
-		"note", "the endpoints' metricRelabelings, interval and auth DO merge — only the attribution is "+
-			"refused, so the scrape is unaffected. Every monitor resolving to one URL on one pod is served "+
-			"as ONE scrape; GET /v1/explain/<ns>/<pod> lists every monitor and says which ones are not "+
-			"contributors. Further warnings for this URL are suppressed for "+contribCappedWarnEvery.String())
+	return allow
 }
 
 // Handler returns the HTTP routes.
@@ -795,184 +643,19 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
-// maxContainerIDLen bounds the container-ID path segment
-// (kubemeta.MaxContainerIDLen carries the 64-hex-runtime rationale): over it
-// the request 400s up front (handlers.go writes StatusBadRequest), so hostile
-// IDs never reach the store's waiter map.
-const maxContainerIDLen = kubemeta.MaxContainerIDLen
-
-// monitorEndpoint pairs a ServiceMonitor endpoint with its monitor name.
-//
-// The endpoint is a POINTER into the indexed monitor, which is treat-as-
-// immutable and outlives this map; stampEndpoint only reads it. By value the
-// pair was 304 bytes and the memo holds one per (monitor, service, endpoint) —
-// a cluster-wide 50 monitors over 2,000 Services is 100,000 pairs, measured at
-// 40.2 MB resident for as long as the memo lives, with both the old and the new
-// map alive across a rebuild (an 80 MB transient peak) against a 128Mi request.
-type monitorEndpoint struct {
-	monitor  string
-	endpoint *servicemonitors.Endpoint
+// Enrich fills in owner-chain and namespace metadata on a pod document: the
+// ONE enrichment every served pod gets, used by the HTTP handlers and by the
+// service's own self-attribute lookup (cmd/kubescrape selfResolver), so an
+// enrichment step added here reaches both. Package-level rather than a method
+// because that caller holds a MetadataResolver, not a Server.
+func Enrich(r MetadataResolver, pod *kubemeta.Pod, refs []metav1.OwnerReference) {
+	pod.Owners, pod.OwnersOmitted = r.Resolve(pod.Namespace, refs)
+	pod.NamespaceMetadata = r.Namespace(pod.Namespace)
 }
 
-// monitoredServices maps Service UIDs to the ServiceMonitor endpoints
-// selecting them. It is rebuilt only when the monitor or Service index has
-// changed since the last build; callers must treat it as read-only.
-func (s *Server) monitoredServices() map[string][]monitorEndpoint {
-	if s.monitors == nil {
-		return nil
-	}
-	// Read the change tokens BEFORE the build: a change landing during it is
-	// then recorded as unbuilt and rebuilds on the next call, rather than being
-	// stamped as already-included and lost until the next unrelated change.
-	monGen, svcGen := s.monitors.Generation(), s.services.Generation()
-	s.monMu.Lock()
-	defer s.monMu.Unlock()
-	if !s.monValid || s.monGen != monGen || s.svcGen != svcGen {
-		s.monCache = s.buildMonitoredServices()
-		s.monGen, s.svcGen, s.monValid = monGen, svcGen, true
-	}
-	return s.monCache
-}
-
-// buildMonitoredServices resolves the monitor→services match from scratch.
-//
-// The Service snapshot is taken once per RUN of monitors sharing a namespace
-// set, not once per monitor. services.All allocates and fills a slice of every
-// Service in the named namespaces, and the shape this cross product exists for
-// is a fleet of cluster-wide monitors (`namespaceSelector.any: true`, what
-// kube-prometheus-stack ships): 200 of them over 2,000 Services took 200 copies
-// of the same 2,000-element list — measured 41.5 MB and ~89 ms per rebuild, of
-// which the snapshots are the overwhelming majority, and a rebuild is triggered
-// by ANY Service change while monMu is held against every concurrent poll.
-//
-// ONE entry rather than a map of them, deliberately: Index.All returns monitors
-// in (namespace, name) order, which puts monitors sharing a namespace set in a
-// run for both shapes that matter — every monitor cluster-wide (one run), and
-// monitors selecting their own namespace (one run per namespace) — so a
-// one-entry cache collapses the repeats without ever holding more than a single
-// snapshot alive. A map keyed by the namespace set would retain one snapshot
-// per distinct set for the whole build, which on a heavily overlapping set of
-// matchNames is the same 41.5 MB, live at once instead of collectable.
-//
-// The monitor ORDER is untouched, and must be: the order endpoints land in
-// out[uid] is the encounter order MergeMonitorEndpoint folds in, so grouping
-// monitors by namespace set — the obvious alternative — would silently change
-// which monitor names a merged target and how its relabel chains concatenate.
-//
-// The monitors of one run now see ONE point-in-time view of their namespaces
-// instead of a fresh read apiece, which is if anything more coherent; a Service
-// change arriving mid-build is handled where it always was, by monitoredServices
-// reading the change tokens BEFORE the build and rebuilding on the next call.
-func (s *Server) buildMonitoredServices() map[string][]monitorEndpoint {
-	s.monBuilds.Add(1)
-	out := map[string][]monitorEndpoint{}
-	var (
-		runKey   []byte
-		runSvcs  []*services.Service
-		runValid bool
-		key      []byte
-	)
-	for _, m := range s.monitors.All() {
-		name := m.Namespace + "/" + m.Name
-		namespaces := m.ServiceNamespaces()
-		key = appendNamespaceSetKey(key[:0], namespaces)
-		if !runValid || string(key) != string(runKey) {
-			runSvcs = s.services.All(namespaces)
-			runKey = append(runKey[:0], key...)
-			runValid = true
-		}
-		for _, svc := range runSvcs {
-			if !m.Selector.Matches(labels.Set(svc.Labels)) {
-				continue
-			}
-			for i := range m.Endpoints {
-				out[svc.UID] = append(out[svc.UID], monitorEndpoint{monitor: name, endpoint: &m.Endpoints[i]})
-			}
-		}
-	}
-	return out
-}
-
-// appendNamespaceSetKey renders a monitor's resolved namespace set into dst.
-//
-// nil means EVERY namespace and is not the same question as any explicit list,
-// so it gets its own marker byte rather than an empty join — otherwise a
-// cluster-wide monitor and one naming no namespace at all would share a
-// snapshot, and the cluster-wide one would be answered with nothing.
-func appendNamespaceSetKey(dst []byte, namespaces []string) []byte {
-	if namespaces == nil {
-		return append(dst, 0x01)
-	}
-	dst = append(dst, 0x02)
-	for _, ns := range namespaces {
-		dst = append(dst, ns...)
-		dst = append(dst, 0x00)
-	}
-	return dst
-}
-
-// podMonitorRef is one indexed PodMonitor with its "namespace/name" already
-// rendered: the name is stamped on every target the monitor produces, and
-// building it per (pod, monitor) is one allocation per pair on the targets path.
-type podMonitorRef struct {
-	monitor *servicemonitors.PodMonitor
-	name    string
-	// namespaces is monitor.PodNamespaces() resolved ONCE per request: the
-	// common no-namespaceSelector shape allocates a one-element slice per
-	// call, and podMonitorsFor runs per (pod, monitor) pair on the targets
-	// hot path — the same per-pair cost `name` was hoisted for.
-	namespaces []string
-}
-
-// allPodMonitors returns the indexed PodMonitors, rendered once per change of
-// the monitor index rather than once per request (see pmMu).
-//
-// THE RESULT IS SHARED AND MUST BE TREATED AS READ-ONLY — the same contract
-// monitoredServices and servicemonitors.PodMonitors already carry.
-// podMonitorsFor only reads it, copying the refs it keeps into a caller-owned
-// slice.
-func (s *Server) allPodMonitors() []podMonitorRef {
-	if s.monitors == nil {
-		return nil
-	}
-	// The token BEFORE the lock, exactly as monitoredServices does: a change
-	// landing during the render is then recorded as unbuilt and re-rendered on
-	// the next call, rather than stamped as already-included.
-	gen := s.monitors.Generation()
-	s.pmMu.Lock()
-	defer s.pmMu.Unlock()
-	if s.pmValid && s.pmGen == gen {
-		return s.pmCache
-	}
-	s.pmBuilds.Add(1)
-	all := s.monitors.PodMonitors()
-	out := make([]podMonitorRef, 0, len(all))
-	for _, m := range all {
-		out = append(out, podMonitorRef{monitor: m, name: m.Namespace + "/" + m.Name, namespaces: m.PodNamespaces()})
-	}
-	s.pmCache, s.pmGen, s.pmValid = out, gen, true
-	return out
-}
-
-// podMonitorsFor filters the request's PodMonitors down to the ones selecting a
-// pod (namespace + label selector), appending into a caller-owned scratch slice.
-func podMonitorsFor(pod kubemeta.Pod, all []podMonitorRef, out []podMonitorRef) []podMonitorRef {
-	for _, ref := range all {
-		if ref.namespaces != nil && !slices.Contains(ref.namespaces, pod.Namespace) {
-			continue
-		}
-		if !ref.monitor.Selector.Matches(labels.Set(pod.Labels)) {
-			continue
-		}
-		out = append(out, ref)
-	}
-	return out
-}
-
-// enrich fills in owner-chain and namespace metadata on a pod.
+// enrich is Enrich with this server's resolver.
 func (s *Server) enrich(pod *kubemeta.Pod, refs []metav1.OwnerReference) {
-	pod.Owners, pod.OwnersOmitted = s.resolver.Resolve(pod.Namespace, refs)
-	pod.NamespaceMetadata = s.resolver.Namespace(pod.Namespace)
+	Enrich(s.resolver, pod, refs)
 }
 
 // enrichCache memoises ONE request's related-object resolutions.
@@ -990,8 +673,8 @@ func (s *Server) enrich(pod *kubemeta.Pod, refs []metav1.OwnerReference) {
 // namespace from ever reaching the documents this route serves.
 //
 // The resolved values are SHARED by every pod that keys to them. Nothing
-// mutates them — enrich is the only writer of Pod.Owners and
-// Pod.NamespaceMetadata in the process, and both are read-only from there on
+// mutates them — Enrich and enrichCached are the only writers of Pod.Owners
+// and Pod.NamespaceMetadata in the process, and both are read-only from there on
 // (marshalled and discarded) — which is the same treat-as-immutable contract
 // the store's records and the Service snapshots are served under.
 type enrichCache struct {
@@ -1022,7 +705,9 @@ type resolvedOwners struct {
 	omitted int
 }
 
-// enrichCached is enrich through a request-scoped memo (see enrichCache).
+// enrichCached is Enrich through a request-scoped memo (see enrichCache): the
+// same two resolutions, each answered from the memo when this request already
+// asked it. A step added to Enrich must be added here too.
 func (s *Server) enrichCached(c *enrichCache, pod *kubemeta.Pod, refs []metav1.OwnerReference) {
 	c.key = appendOwnerKey(c.key[:0], pod.Namespace, refs)
 	if r, ok := c.owners[string(c.key)]; ok {
@@ -1193,7 +878,7 @@ func (s *Server) waitReady(ctx context.Context) error {
 			// window this fires in, and the outcome is the half that answers
 			// "why did the agent's first poll return nothing?".
 			s.log().Debug("container lookup left the readiness park",
-				"waited", time.Since(parkedAt).Round(time.Millisecond),
+				"elapsed", time.Since(parkedAt).Round(time.Millisecond),
 				"outcome", s.readyParkOutcome(), "blockedLookups", s.blockedLookups())
 		}()
 	}
@@ -1252,47 +937,3 @@ var (
 	errNotSynced = errors.New("informer caches not synced")
 	errDraining  = errors.New("server is shutting down")
 )
-
-// etagMatches evaluates an If-None-Match header against the current entity
-// tag per RFC 9110: a comma-separated list of entity tags compared weakly (a
-// W/ prefix is ignored), with "*" matching any current representation. Our
-// ETags are quoted hex with no embedded commas, so splitting on commas is
-// exact.
-func etagMatches(header, etag string) bool {
-	for _, candidate := range strings.Split(header, ",") {
-		candidate = strings.TrimSpace(candidate)
-		if candidate == "*" {
-			return true
-		}
-		if strings.TrimPrefix(candidate, "W/") == etag {
-			return true
-		}
-	}
-	return false
-}
-
-// bodyHash is the ETag digest: xxh3, 128 bits wide.
-//
-// Not hash/fnv, because FNV-1a is a byte-at-a-time loop (~1.2 GB/s) and this
-// runs over the FULL body of every cached response, including every 304
-// revalidation — most visibly on /v1/nodes/{node}/targets, which re-serializes
-// every pod document on the node each scrape cycle.
-//
-// 128 bits rather than 64 because of what a collision COSTS here, not because
-// one is likely: two bodies sharing a digest make writeCached answer a
-// revalidation with 304, and the agent then keeps serving the PREVIOUS node's
-// target list — a wrong answer that persists until the body changes again and
-// looks exactly like a correctly-cached response while it lasts. A digest is
-// also the one place where the input is attacker-influenced in principle (a pod
-// annotation lands in the body), and 64-bit xxhash is not collision-resistant
-// against a chosen input. The width is close to free: xxh3 computes the 128-bit
-// result in the same pass as the 64-bit one.
-//
-// ETags stay opaque to clients (etagMatches only string-compares, W/ prefix
-// stripped), so widening the digest costs one full 200 per cached client at the
-// upgrade boundary, exactly as any other ETag change would.
-func bodyHash(b []byte) xxh3.Uint128 { return xxh3.Sum128(b) }
-
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
-}

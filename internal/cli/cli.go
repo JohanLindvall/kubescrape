@@ -1,10 +1,13 @@
 // Package cli holds the small startup helpers both binaries' mains share: the
 // process logger built from -log-level, the comma-separated list splitter
-// behind several flags, and the GOMEMLIMIT derivation. Each existed once per
-// main, byte-identical in behavior, with only the function names drifting
-// (buildConfig vs kubeConfig) — the shape that eventually drifts for real.
+// behind several flags, the GOMEMLIMIT derivation, the signal-driven process
+// lifetime (ShutdownContext), the listen-address check (CheckListeners) and
+// the readiness-gate watch (WatchGates). Each existed once per
+// main, byte-identical in behavior, with only the function names drifting —
+// the shape that eventually drifts for real.
 //
-// The kubeconfig precedence builder is the one that moved OUT, into the
+// The kubeconfig precedence builder — whose two copies had already drifted in
+// name (buildConfig vs kubeConfig) — is the one that moved OUT, into the
 // kubecfg subpackage: it is the only one of these that costs an import of
 // k8s.io/client-go, and this package is imported by an agent built without the
 // `events` tag, whose entire purpose is not to link that.
@@ -31,16 +34,22 @@
 // Identity and objects:
 //
 //	error        the error. NEVER err, cause, reason or msg
-//	path         a filesystem path (a log file, a token file, a socket). NEVER file
+//	path         a filesystem path (a log file, a socket). NEVER file; a
+//	             credential file's path is tokenFile
 //	dir          a directory
 //	url          a full URL that was (or would be) requested
 //	endpoint     a configured destination: host:port for gRPC, base URL for HTTP
 //	addr         a LISTEN address of this process
+//	peer         the remote address of the connection a line is about, as
+//	             peerip.ForLog renders it: the bare canonical IP (no port), or
+//	             the raw address, clipped, only where it does not parse. NEVER
+//	             remoteAddr
 //	namespace    a Kubernetes namespace. NEVER ns or podNamespace
 //	pod          a pod name (namespace travels in `namespace`)
+//	service      a Kubernetes Service name (namespace travels in `namespace`)
 //	node         a node name
 //	container    a container name
-//	uid          a Kubernetes UID
+//	uid          a Kubernetes UID. NEVER podUID
 //	id           an opaque id that is not a UID (container id, cgroup id)
 //	target       a scrape target's identity
 //	monitor      a ServiceMonitor/PodMonitor as "namespace/name"
@@ -58,9 +67,14 @@
 //	timeout      a configured per-attempt deadline
 //	budget       how much of a deadline this step was given
 //	backoff      the delay before the next attempt
-//	wait         how long something blocked, or may block
+//	wait         how long something MAY block: a wait budget or deadline
+//	elapsed      how long a finished step took — a blocked lookup, a readiness
+//	             wait, a walk, a shutdown. NEVER took or waited
 //	grace        a rotation/termination grace window
 //	attempts     how many tries were made
+//	outage       how long the current run of failures has lasted, beside
+//	             failures, how many that run has had (logdedupe.Outage keeps
+//	             both: Lasted, Failures)
 //	bytes        a size in bytes (maxBytes / limitBytes for a bound)
 //	count nouns  plural and bare: records, entries, targets, pods, containers,
 //	             routes, shards, waiters, lookups, segments, dropped
@@ -74,6 +88,13 @@
 //	version      the build version; built the build timestamp
 //	hash         a content hash (transform program, ETag material)
 //	tokenFile    the PATH of a credential file — never the credential
+//
+// Reserved — slog writes these itself and does not dedupe an attribute
+// against them, so a second pair would shadow the record's own field for
+// whichever consumer keeps that one (TestNoLogCallUsesASlogReservedKey fails
+// the build on a call that uses one):
+//
+//	time level msg
 //
 // # Never log a secret
 //
@@ -90,7 +111,7 @@ import (
 // each entry and dropping empty ones; an empty or all-blank value yields nil.
 func SplitList(s string) []string {
 	var out []string
-	for _, part := range strings.Split(s, ",") {
+	for part := range strings.SplitSeq(s, ",") {
 		if part = strings.TrimSpace(part); part != "" {
 			out = append(out, part)
 		}

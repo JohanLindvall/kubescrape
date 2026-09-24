@@ -8,8 +8,10 @@ import (
 )
 
 // retainedMemoBytes is what the session's memos actually hold alive, counted
-// off the maps themselves rather than off the session's own accounting — a
-// broken charge would agree with itself.
+// off the maps and the mask backing slice themselves rather than off the
+// session's own accounting — a broken charge would agree with itself. The mask
+// words count: at a few thousand rules they, not the key text, are what a
+// memoized name costs.
 func retainedMemoBytes(s *filterSession) int {
 	n := 0
 	for k := range s.offsets {
@@ -18,6 +20,7 @@ func retainedMemoBytes(s *filterSession) int {
 	for k := range s.lblMatch {
 		n += len(k.value)
 	}
+	n += len(s.maskWords) * 8
 	return n
 }
 
@@ -46,7 +49,7 @@ func TestFilterSessionMemoIsBoundedByBytes(t *testing.T) {
 		names   = 4000
 		nameLen = 1000
 	)
-	for i := 0; i < names; i++ {
+	for i := range names {
 		name := strings.Repeat("n", nameLen-8) + pad8Scrape(i)
 		value := strings.Repeat("v", nameLen-8) + pad8Scrape(i)
 		if !s.Keep(name, []Label{{Name: "zone", Value: value}}) {
@@ -76,9 +79,47 @@ func TestFilterSessionMemoIsBoundedByBytes(t *testing.T) {
 		if got := s.Keep(tc.name, tc.labels); got != tc.want {
 			t.Fatalf("with the memo full, Keep(%.10s..., %v) = %v, want %v", tc.name, tc.labels, got, tc.want)
 		}
-		if got := filter.Keep(tc.name, tc.labels); got != tc.want {
+		if got := keepReference(filter, tc.name, tc.labels); got != tc.want {
 			t.Fatalf("unmemoized Keep(%.10s..., %v) = %v, want %v", tc.name, tc.labels, got, tc.want)
 		}
+	}
+}
+
+// A memoized name costs its KEY TEXT plus its mask words — one uint64 per 64
+// rules — and at a large rule count the words dominate: 5000 rules is 79 words,
+// 632 bytes a name, against a 16-byte name. Charging the text alone let the
+// memo grow to its 100k-entry cap, ~63 MB of mask words for one scrape, since
+// the rule count is the operator's config and the name count is the target's
+// choice. Short names, so the key text alone would never reach the budget.
+func TestFilterSessionMemoChargesItsMaskWords(t *testing.T) {
+	const rules = 5000
+	// Label-only rules: no NAME regex, so every rule is in every mask and
+	// mask() runs no regex at all — the cost under test is the bookkeeping.
+	many := make([]FilterRule, rules)
+	for i := range many {
+		many[i] = FilterRule{Action: "drop", Labels: map[string]string{"zone": "never"}}
+	}
+	filter, err := newMetricFilter(many)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := filter.session()
+	if want := (rules + 63) / 64; s.words != want {
+		t.Fatalf("bitset is %d words, want %d", s.words, want)
+	}
+	const names = 3000 // 3000 x (16 + 632) bytes is ~1.9 MiB, past the budget
+	for i := range names {
+		mask := s.mask("series__" + pad8Scrape(i))
+		if mask[len(mask)-1] == 0 {
+			t.Fatalf("name %d: the last word of its mask is empty; every rule applies to every name", i)
+		}
+	}
+	if retained := retainedMemoBytes(s); retained > maxMemoBytes {
+		t.Fatalf("filter session memo retains %d bytes (%d names memoized, %d mask words), want <= %d: the mask words must be charged with the name",
+			retained, len(s.offsets), len(s.maskWords), maxMemoBytes)
+	}
+	if len(s.offsets) < 10 {
+		t.Fatalf("only %d names memoized: the byte bound must stop the memo GROWING, not disable it", len(s.offsets))
 	}
 }
 
@@ -115,7 +156,7 @@ func TestFilterSessionMemoSurvivesPastOneBitsetWord(t *testing.T) {
 	// call is served from the memo.
 	for _, name := range []string{"rule" + pad8Scrape(0) + "_x", "rule" + pad8Scrape(63) + "_x",
 		"rule" + pad8Scrape(64) + "_x", "rule" + pad8Scrape(rules-1) + "_x", "kept_x", "unmatched_x"} {
-		want := filter.Keep(name, nil)
+		want := keepReference(filter, name, nil)
 		for pass := range 2 {
 			if got := s.Keep(name, nil); got != want {
 				t.Fatalf("pass %d: memoized Keep(%q) = %v, unmemoized = %v", pass, name, got, want)
@@ -203,7 +244,7 @@ func TestSplitBatcherMemosAreBoundedByBytes(t *testing.T) {
 		names   = 4000
 		nameLen = 1000
 	)
-	for i := 0; i < names; i++ {
+	for i := range names {
 		b.route(strings.Repeat("m", nameLen-8)+pad8Scrape(i), labels)
 		b.dropped(rule, strings.Repeat("l", nameLen-8)+pad8Scrape(i))
 	}

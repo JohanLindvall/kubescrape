@@ -89,8 +89,8 @@ func TestOwnedTracesAreSpooled(t *testing.T) {
 		t.Fatal("nothing was written to the traces spool")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel() // stop Run BEFORE the spool Close deferred above; t.Context() alone ends after them
 	go b.Run(ctx)
 	send.setDown(false)
 	waitFor(t, func() bool { return len(send.got()) == 1 }, "the spooled trace to be delivered")
@@ -138,8 +138,8 @@ func TestOwnedTracesSurviveARestart(t *testing.T) {
 	send2 := &traceSender{}
 	b2, tb2 := openTraceBuffered(t, dir, send2)
 	defer func() { _ = tb2.Close() }()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel() // stop Run BEFORE the spool Close deferred above; t.Context() alone ends after them
 	go b2.Run(ctx)
 	waitFor(t, func() bool { return len(send2.got()) == 1 }, "the trace spooled by the previous process to be delivered")
 	if got := send2.got(); got[0] != "checkout" {

@@ -19,7 +19,7 @@ endpoint you can `kubectl port-forward` to.
 
 ## Pre-flight
 
-Six things must be true before the first `helm install`. Each of them fails in
+Seven things must be true before the first `helm install`. Each of them fails in
 a way that is diagnosable, but knowing them up front saves the diagnosis.
 
 **1. A collector endpoint that exists.** kubescrape exports OTLP and stores
@@ -74,6 +74,17 @@ logfmt and only logfmt. Go's `flag` package exits 2 on an undefined flag, so a
 hand-edited manifest is a CrashLoop, not an ignored setting. Grep your values
 files. See [Logging](CONFIGURATION.md#logging).
 
+**7. A quota for the priority classes, where the cluster demands one.** The
+agent schedules at `system-node-critical` and the metadata service at
+`system-cluster-critical`. Some clusters — GKE among them — configure the
+ResourceQuota admission plugin to refuse those classes outside `kube-system`
+unless a quota in the pod's namespace covers them, and then the DaemonSet and
+the Deployment create no pods at all; the only symptom is a `FailedCreate`
+event on the controllers ("insufficient quota to match these scopes"). The
+chart renders that quota by default (`priorityClassQuota`, derived from the
+`priorityClassName` values it actually uses, bounding only `pods` far above any
+fleet); `deploy/kubernetes.yaml` and `deploy/agent.yaml` carry it commented out.
+
 Then, before you install anything, dry-run BOTH binaries' configuration.
 Each compiles what it has, prints the same startup summary a real start
 prints, and acquires nothing — no listeners, no informers, no API-server
@@ -89,9 +100,11 @@ Pass the service the flags you intend to deploy it with (`-servicemonitors`,
 check is over its flags, and it refuses the ones that are silent at runtime
 — a `-monitor-namespaces` entry that is a glob or not a namespace name (the
 flag is an exact list, unlike the agent's namespace globs, so such an entry
-indexes no monitor and says nothing), an empty or duplicated listener
-address, a negative duration, and `-scrape-auth-secrets` without
-`-scrape-auth-token-file`.
+indexes no monitor and says nothing), an empty `-listen`, a listener
+address that is not host:port, two listeners naming one socket, a negative
+`-wait-timeout`, `-cache-ttl`, `-metadata-cache-ttl`, `-resync` or
+`-apiserver-probe-interval`, a `-max-blocked-lookups` below 1, and
+`-scrape-auth-secrets` without `-scrape-auth-token-file`.
 
 What it deliberately does NOT judge is the ENVIRONMENT: whether the
 scrape-auth token file is readable, and whether an API server is reachable
@@ -143,9 +156,11 @@ because each depends on the one before it being demonstrably healthy:
 separate cost profiles, and each has its own failure mode:
 `agent.kubeletSummary` (per-pod ephemeral storage and volumes; needs
 `nodes/stats`), `agent.journald.enabled` (node unit logs; cgo, and the
-`journald` build tag), `agent.cgroupStats` (1s CPU/memory distributions; ~0.5%
-of a core and ~5.5 MiB RSS at 200 containers), the `-events` singleton
-(cluster-wide Kubernetes events; its own Deployment with leader election), and
+`journald` build tag), `agent.cgroupStats` (1s CPU/memory distributions;
+measured at 0.43-0.51% of a core and +4.7 to +6.3 MiB RSS at 200 containers —
+size the DaemonSet with headroom above the top of that range), the `-events`
+singleton (cluster-wide Kubernetes events; its own Deployment with leader
+election), and
 `-service-graph` (the trace tier — its own StatefulSet, and a hard cluster-wide
 dependency for traces once applications point at it).
 
@@ -166,7 +181,7 @@ told rather than what was meant:
 
 ```
 level=INFO msg="kubescrape-agent starting" version=v1.2.3 built=… optionalPipelines=journald,azure,events
-level=INFO msg="Go soft memory limit set from the cgroup memory limit" limitBytes=482344960 cgroupLimitBytes=536870912 share=0.9 …
+level=INFO msg="Go soft memory limit set from the cgroup memory limit" limitBytes=483183820 cgroupLimitBytes=536870912 share=0.9 …
 level=INFO msg="effective configuration" role=node-agent sections=logs pipelines="logs=on metrics=on cadvisor=on …"
 level=INFO msg="effective destinations" metadataEndpoint=http://kubescrape.monitoring otlpEndpoint=… kubeletEndpoint=…
 level=INFO msg="effective listeners" listen=:8081 debugAccess=local-only metricsListen=:9090 pprofListen=""
@@ -192,16 +207,16 @@ intend.
 ### Minute 1-2: did it become ready?
 
 ```
-level=INFO msg="informer caches synced" pods=412 containers=1180 waited=1.9s      # service
-level=INFO msg=ready waited=3s gates=metadata-service                              # agent
+level=INFO msg="informer caches synced" pods=412 containers=1180 elapsed=1.9s      # service
+level=INFO msg=ready elapsed=3s gates=metadata-service                              # agent
 ```
 
 If those lines do not appear, after 30 seconds you get the negative instead,
 naming what is pending and re-stating it every two minutes:
 
 ```
-level=WARN msg="not ready: /readyz is 503, so a rolling update will not advance past this pod" gates=metadata-service waited=30s
-level=WARN msg="not ready: informer caches have not synced, so /readyz is 503 and this replica has no Service endpoints" caches=pods,services waited=30s note="a cache that never syncs is usually a missing RBAC rule for that resource; the reflector retries it forever"
+level=WARN msg="not ready: /readyz is 503, so a rolling update will not advance past this pod" gates=metadata-service elapsed=30s
+level=WARN msg="not ready: informer caches have not synced, so /readyz is 503 and this replica has no Service endpoints" gates=pods,services elapsed=30s note="a cache that never syncs is usually a missing RBAC rule for that resource; the reflector retries it forever"
 ```
 
 The metric is the same statement fleet-wide, and it is the one that works when
@@ -265,7 +280,7 @@ kubectl -n monitoring port-forward ds/kubescrape-agent 8081:8081
 | Endpoint | On | Reach for it when |
 |---|---|---|
 | `/debug` | both | you do not know what else this process exposes. Root redirects here. |
-| `/v1/explain/{namespace}/{pod}` | service | "why is this pod (not) scraped?" It walks the same decision chain that derives the targets — scrapeable verdicts, per-port resolution, Service and monitor endpoint verdicts, the final dedup — so the explanation cannot drift from the derivation. Always 200 with a JSON body, `found:false` for a miss. |
+| `/v1/explain/{namespace}/{pod}` | service | "why is this pod (not) scraped?" It walks the same decision chain that derives the targets — scrapeable verdicts, per-port resolution, Service and monitor endpoint verdicts, the final dedup — so the explanation cannot drift from the derivation. 200 with a JSON body once the caches have synced (503 before), `found:false` for a miss. |
 | `/debug/targets` | agent | "which targets does THIS node have and what happened to each?" Last outcome per target, failures first, undue targets shown as pending. |
 | `/debug/tailer` | agent | "which files is this node tailing, and how far behind?" Per-file positions and lag, largest first, plus any pod's malformed `kubescrape.io/logs` annotation. |
 | `/debug/otlp` (+ `/ui`) | agent | "what is this agent actually EXPORTING?" A live stream of post-transform OTLP as JSON lines, filterable by resource attribute (`attr=k8s.namespace.name=team-*`), signal and sample percentage. This is what settles "the agent is not sending it" versus "the backend is not showing it". |
@@ -289,8 +304,10 @@ both are satisfied by an ordinary port-forward:
 * the request's `Host` must be `localhost`, `127.0.0.1` or `::1`. So reach the
   forwarded port as `http://localhost:8081/…`, not through a hostname you
   pointed at it — a mismatch is refused `host`, which is the DNS-rebinding
-  guard doing its job. A forwarding header (`X-Forwarded-For` and friends) on a
-  local connection is refused `forwarded` for the same family of reason.
+  guard doing its job. A forwarding header (`Forwarded`, `Via`,
+  `X-Forwarded-For` or `X-Real-Ip` — its presence alone, an empty value
+  included) on a local connection is refused `forwarded` for the same family of
+  reason: the address is the relay's.
 
 To read an agent from anywhere else, give the fleet a token —
 `agent.debug.tokenSecret.name` in the chart, `-debug-token-file` on the flag —
@@ -328,8 +345,9 @@ that distinguishes it from its neighbours.
 | `kubescrape_scrape_targets` **absent** | Annotation and monitor scraping is off (`-metrics=false`). | Turn it on, or stop expecting targets. |
 | `kubescrape_scrape_targets` **== 0** | The metadata service answered and this node genuinely has no targets: no pod here carries `prometheus.io/scrape`, no annotated Service selects one, and no monitor resolves here. | The agent warns naming the node, re-stating every 30 minutes, and logs Info when targets appear. Ask the service `/v1/explain/{ns}/{pod}` about a pod you expected to be scraped — it names the verdict at every step. |
 | `kubescrape_store_pods` == 0 on the service | The pod informer has nothing. Almost always RBAC, or an API server the pod cannot reach. | `kubescrape_readiness_gate{gate="pods"}` and `kubescrape_apiserver_reachable`. |
-| Targets exist but one pod's are truncated; `kubescrape_scrape_targets_capped_total` moves | One pod exceeded the per-pod target ceiling. Every target embeds the whole pod by value, so an unbounded count is an O(N²) response. | A throttled Warn names the pod and its workload; `/v1/explain` names the ports it refused. |
-| ServiceMonitors are installed but nothing resolves; `kubescrape_monitors_rejected{kind}` > 0 | A monitor failed to parse, or `-monitor-namespaces` refused it. | The gauge is the state (still true now), `kubescrape_monitor_parse_errors_total` the event. `kubescrape_monitor_namespace_refused_total` is the gate. |
+| Targets exist but one pod's are truncated; `kubescrape_scrape_targets_capped_total` moves | One pod exceeded a per-pod ceiling: its target COUNT (16) or its target BYTES (256 KiB of target documents, which large labels or annotations reach with only a few ports). Every target embeds the whole pod by value, so either unbounded is an O(N²) response. The pod's first target is always served. | A throttled Warn names the pod and its workload, with `dropped` and `droppedBySize` saying which ceiling bound. `/v1/explain` names the refused ports and endpoints; compare its `cappedTargets` with `cappedTargetsBySize` and `podDocumentBytes`. A count refusal is answered by fewer ports; a size refusal by shrinking the pod's labels and annotations or splitting its ports across workloads. |
+| ServiceMonitors are installed but nothing resolves; `kubescrape_monitors_rejected{kind}` > 0 | A monitor failed to parse. | The gauge is the state (still true now), `kubescrape_monitor_parse_errors_total` the event; the service's Warn names the monitor and the error. |
+| ServiceMonitors are installed but nothing resolves; `kubescrape_monitor_namespace_refused_total{kind}` moved, `kubescrape_monitors_rejected` at 0 | `-monitor-namespaces` refused the monitor: its namespace is not in the list, so it never reached the index (which is why the rejected gauge does not count it). | Counted once per created or edited monitor, with an Info line naming it. Add the namespace to `-monitor-namespaces` if the monitor should be honoured. |
 
 ### Every target is `up=0`
 
@@ -343,11 +361,11 @@ topk(10, sum by (pipeline, reason) (rate(kubescrape_scrape_failures_total[5m])))
 
 | `reason` | Means | Note on the log line |
 |---|---|---|
-| `dns`, `connect`, `tls`, `timeout` | The target could not be reached. | `tls` carries a note about scheme, `tlsConfig.ca`, `serverName` and `insecureSkipVerify`. |
-| `unauthorized` | The target answered and refused the credential. For the kubelet pipelines this is the `nodes/metrics` ClusterRole rule; `/stats/summary` needs `nodes/stats` instead, and says so by name. | note names both cases. |
+| `dns`, `connect`, `tls`, `timeout` | The target could not be reached. `tls` includes a target that REFUSED this agent's client certificate (a `remote error` from the handshake — `tlsConfig.cert`/`keySecret` missing, untrusted or expired); a `tlsConfig` secret ref that would not resolve is `auth`, not `tls`. | `tls` carries a note about scheme, `tlsConfig.ca`, `serverName`, `insecureSkipVerify` and the client certificate. |
+| `unauthorized` | The target answered and refused the credential. On the kubelet pipelines a 403 is a missing ClusterRole rule — `nodes/metrics` for `cadvisor`/`node`, `nodes/stats` for `summary` — and a 401 is the token itself. | note, per pipeline: for a target, the monitor's credential; for a kubelet pipeline, that pipeline's subresource and the token. A once-per-process `the kubelet refused the scrape` line names the status and the rule. |
 | `status` | Any other non-200. | |
-| `auth` | The scrape never left this agent: a secret ref could not be resolved. | note: the service must run `-scrape-auth-secrets` and both sides must share `-scrape-auth-token-file`. Cross-check `kubescrape_scrape_auth_failures_total{reason}` on the service. |
-| `relabel` | A monitor's `metricRelabelings` regex would not compile. The scrape fails deliberately rather than export what the rule asked to drop. | |
+| `auth` | The scrape never left this agent: a secret ref could not be resolved — or, on the kubelet pipelines (`cadvisor`/`node`/`summary`), the agent's own `-kubelet-token-file` has never been readable. | note, per pipeline: for a target, the service must run `-scrape-auth-secrets` and both sides must share `-scrape-auth-token-file` (cross-check `kubescrape_scrape_auth_failures_total{reason}` on the service); for a kubelet pipeline, check the ServiceAccount token mount (`automountServiceAccountToken`) or the flag's path. |
+| `relabel` | A monitor's `metricRelabelings` regex would not compile, or is over the compile-cost bound (only a metadata service older than the agent serves one). The scrape fails deliberately rather than export what the rule asked to drop. | |
 | `proto_refused` | The target served protobuf without `-scrape-native-histograms` having asked for it. | note: pass the flag, or fix the target to honour Accept. |
 | `sample_limit`, `body` | The target answered wrong or too big. What was converted before the abort is still exported. | |
 | `export` | **The target is fine.** The scrape succeeded and the COLLECTOR (or the spool) refused the payload. | note points at `kubescrape_export_requests_total`. |
@@ -374,12 +392,13 @@ the first for the up/down ratio and the second for the cause.
 
 | Signal | Cause | Fix |
 |---|---|---|
+| No pods at all; `FailedCreate` "insufficient quota to match these scopes" on the DaemonSet or ReplicaSet | The cluster restricts the `system-*` priority classes to namespaces with a covering quota (pre-flight 7). | Keep `priorityClassQuota.enabled` (the default), or apply the commented quota in `deploy/`. |
 | `flag provided but not defined: -log-format`, exit 2, CrashLoop | The flag was removed. Go's `flag` package exits rather than ignoring. | Remove it from `extraArgs` and any hand-edited manifest. |
 | Exit 2 naming some other flag | A chart value rendered a flag the binary does not define. `internal/manifestcheck` prevents this for the shipped templates, so it means a hand-edited manifest or `extraArgs`. | |
-| A startup error naming a build tag | `-journald` or `-azure-diagnostics` on a binary compiled without that pipeline. | Rebuild with the tag, or drop the flag. `-check-config` catches this before a rollout does. |
+| A startup error naming a build tag | `-journald`, `-azure-diagnostics` or `-events` on a binary compiled without that pipeline (the startup line's `optionalPipelines=` says which ones it has). | Rebuild with the tag, or drop the flag. `-check-config` catches this before a rollout does. |
 | Config error, exit non-zero, same message every time | A `-config` section did not compile. The refusal names the field and the value. | Reproduce locally with `-check-config`; it runs the same `validateConfig`. |
 | A flag parsed as `0` where a size was meant | Helm's `int64` parses `"3MiB"` to 0, and 0 on `-logs-metrics-max-bytes` reads as ONE payload. The chart's helper fails the render on a non-digit value for exactly this. | Render integer byte values as integers. |
-| OOMKilled: the **agent** | Usually the ingest or trace-tier paths, which buffer sender-controlled bytes. | `-ingest-max-in-flight` bounds processing; the raw and decoded byte budgets bound memory and scale from `-ingest-grpc-max-recv-bytes`. On the trace tier, `kubescrape_tail_sampling_buffered_spans` is exactly what a hard kill would lose, and `maxSpans` is sized against the cgroup limit at startup. Check the startup line for `Go soft memory limit set…`: if it is absent, the container has no `limits.memory`, and the GC has no ceiling to collect against. |
+| OOMKilled: the **agent** | Usually the ingest or trace-tier paths, which buffer sender-controlled bytes. | `-ingest-max-in-flight` bounds processing; the raw and decoded byte budgets bound memory, and sit at a 64 MiB / 128 MiB floor that `-ingest-grpc-max-recv-bytes` raises only once it is set above 16 MiB (to 4x / 8x the flag) — lowering the flag cannot shrink them. On the trace tier, `kubescrape_tail_sampling_buffered_spans` is exactly what a hard kill would lose, and `maxSpans` is sized against the cgroup limit at startup. Check the startup line for `Go soft memory limit set…`: if it is absent, the container has no `limits.memory`, and the GC has no ceiling to collect against. |
 | OOMKilled: the **metadata service** | Its footprint scales with the SIZE OF THE CLUSTER — one record per pod plus the owner and service caches — which is why the chart sets no memory limit for it. | `kubescrape_store_pods × ~2 KiB` is the shape. Measure, then set a limit; do not copy the agent's. Setting one also turns on the soft memory limit, which this workload otherwise gets nothing from. |
 
 ### Attribution is wrong or missing
@@ -426,8 +445,8 @@ Two classes, and the distinction is the whole point: **data loss** pages,
 | `rate(kubescrape_owner_resolve_failures_total{reason=~"lister_error\|no_informer\|wrong_type"}[5m]) > 0` | 5m | The service cannot read owner metadata, and NOTHING ELSE SAYS SO: a failed read still answers with the bare owner reference, so the response is well-formed while `service.name` falls back to the pod name and half the Prometheus job of every series that workload exports changes. These three reasons are a broken cache or a wiring bug (usually a missing ClusterRole rule) and each carries a throttled Warn naming the object. Exclude `not_found`, which is normal at a low rate — alert on THAT one only if it is sustained and fleet-wide. |
 | `rate(kubescrape_container_lookup_timeouts_total[5m])` sustained | 15m | This replica's pod informer is not seeing the pods whose logs the agents ship. A low rate is normal (the ~1s kubelet gap). |
 | `rate(kubescrape_index_name_reuse_total[5m])` sustained | 15m | Watches keep breaking. The guard keeps served data correct, but it is also the condition under which OTHER missed deletes — the ones no name index can catch — leave a deleted pod served as a live target. Read beside `kubescrape_informer_watch_errors_total`. |
-| `kubescrape_transform_reloads_total{outcome="failed"}` increasing | any | A broken transforms edit. The last good program keeps running, so nothing breaks — but the file on disk and the program in memory have diverged, and `/debug/transforms` shows which nodes are on which. |
-| `rate(kubescrape_ingest_rejected_total[5m])` sustained | 15m | The node cannot keep up with what is pushed at it. There is no single knob: the `reason` label is one of `in_flight`, `buffer_bytes` or `decoded_bytes`, each a different bound with a different flag, and the throttled line beside it names the flag. |
+| `kubescrape_transform_reload_failing == 1` | one edit-fix cycle | The transforms file on disk does not compile. The last good program keeps running, so nothing breaks YET — but the startup compile is fatal, so the next restart, reboot or eviction of any node in this state CrashLoops it; `/debug/transforms` shows which nodes are on which program. Alert on this gauge, not on `kubescrape_transform_reloads_total{outcome="failed"}`: that counter is deduped per distinct broken edit, so an increase() alert on it resolves one window after the edit while the file is still broken. |
+| `rate(kubescrape_ingest_rejected_total[5m])` sustained | 15m | The node cannot keep up with what is pushed at it. There is no single knob: the `reason` label is one of `in_flight`, `buffer_bytes` or `decoded_bytes`, and the throttled line beside it says where that bound's limit comes from. `in_flight` names `-ingest-max-in-flight`. `buffer_bytes` and `decoded_bytes` are two budgets with ONE source: their line names `-ingest-grpc-max-recv-bytes` only once that flag is set above 16 MiB (it is what raised the budget); at the default floor it carries `floorBytes` and a `note` saying the senders must batch smaller, because raising the flag there cannot move the limit. |
 | `rate(kubescrape_log_sweeps_total[5m]) == 0` with `-logs` on | 10m | The tailer's heartbeat has stopped. The lag gauges are published from the same goroutine, so they FREEZE rather than climb when it wedges — this is the only signal for a sweep stuck in an export retry loop or a blocking open. |
 | the p90 of `kubescrape_export_duration_seconds` (a histogram: `histogram_quantile` over its `rate`) approaching `-otlp-timeout` | 10m | The collector is SLOW rather than down: attempts still succeed but spend most of their budget. The transient counter starts moving only once they fail; this fires first. |
 | `kubescrape_azure_partitions_assigned == 0` | 10m | The consumer joined its group and owns nothing: a topic pattern matching no hub, an entity-scoped credential in a shared group, or a rebalance that assigned this member nothing. The records counter cannot tell this from a quiet hub. |

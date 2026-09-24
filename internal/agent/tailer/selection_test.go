@@ -28,8 +28,8 @@ func TestSourceNamespaceSelection(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := compileSources([]Source{tc.src}, "/var/log/containers", true)[0]
-			if got := cs.wantNamespace(tc.ns); got != tc.want {
-				t.Fatalf("wantNamespace(%q) = %v, want %v", tc.ns, got, tc.want)
+			if got := !cs.deniesNamespace(tc.ns) && cs.allowsNamespace(tc.ns); got != tc.want {
+				t.Fatalf("accepts(%q) = %v, want %v", tc.ns, got, tc.want)
 			}
 		})
 	}
@@ -106,8 +106,8 @@ func TestSourceSelectorEmptyValueRequiresThePresentLabel(t *testing.T) {
 }
 
 // A malformed namespace pattern must fail startup. path.Match returns
-// ErrBadPattern for EVERY input when the pattern is bad, and wantNamespace
-// reads that as "no match" — so an unvalidated typo silently collects NOTHING
+// ErrBadPattern for EVERY input when the pattern is bad, and deniesNamespace/
+// allowsNamespace read that as "no match" — so an unvalidated typo silently collects NOTHING
 // for the source, with no warning, no metric and -check-config green.
 func TestInvalidNamespacePatternRejected(t *testing.T) {
 	for _, s := range []Source{

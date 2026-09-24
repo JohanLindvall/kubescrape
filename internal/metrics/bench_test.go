@@ -199,7 +199,7 @@ func BenchmarkExport(b *testing.B) {
 	defer testEpoch.Store(0)
 	set := benchRules(b)
 	res := benchResource()
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		attrs := map[string]string{
 			"level": "info", "http_status": strconv.Itoa(200 + i%5), "method": "GET",
 		}
@@ -502,6 +502,55 @@ func TestDynamicAddResourceLabelsAllocationBudget(t *testing.T) {
 	add() // admit the series and warm every pool
 	if allocs := testing.AllocsPerRun(200, add); allocs > 1.5 {
 		t.Fatalf("Add allocates %v times per line with resourceLabels, want <= 1.5", allocs)
+	}
+}
+
+// emitDirectFixture is a transform script's emit_metric into an EXISTING
+// series: three labels and a three-attribute resource, the shape the Starlark
+// bridge hands EmitDirect once per call.
+func emitDirectFixture(tb testing.TB) (*DynamicMetricSet, map[string]string, pcommon.Map) {
+	tb.Helper()
+	set, err := newTestSet([]Dynamic{{Name: "script_events_total", Type: CounterType, Value: "1"}})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	lbls := map[string]string{"route": "/api/v1/orders", "method": "GET", "status": "2xx"}
+	res := pcommon.NewMap()
+	res.PutStr("service.name", "payments")
+	res.PutStr("k8s.namespace.name", "prod-payments")
+	res.PutStr("k8s.pod.name", "payments-6f7b9c001")
+	if err := set.EmitDirect("script_events_total", 1, lbls, res); err != nil { // admit the series
+		tb.Fatal(err)
+	}
+	return set, lbls, res
+}
+
+// BenchmarkEmitDirect reports what one emit_metric costs the store once the
+// series exists. TestEmitDirectAllocationBudget is what holds it.
+func BenchmarkEmitDirect(b *testing.B) {
+	setTimeForTest(time.Unix(1_700_600_300, 0))
+	defer testEpoch.Store(0)
+	set, lbls, res := emitDirectFixture(b)
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = set.EmitDirect("script_events_total", 1, lbls, res)
+	}
+}
+
+// EmitDirect's identity is order-independent (the label fold is an XOR and the
+// stored rendering sorts), so the label map is copied in map order into one
+// presized slice: that slice is the only allocation. It used to sort the keys
+// first, for a determinism nothing read, at 8 of the call's 9 allocations.
+func TestEmitDirectAllocationBudget(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	setTimeForTest(time.Unix(1_700_600_300, 0))
+	defer testEpoch.Store(0)
+	set, lbls, res := emitDirectFixture(t)
+	emit := func() { _ = set.EmitDirect("script_events_total", 1, lbls, res) }
+	if allocs := testing.AllocsPerRun(200, emit); allocs > 1 {
+		t.Fatalf("EmitDirect into an existing series allocates %v times, want <= 1 (the label slice)", allocs)
 	}
 }
 

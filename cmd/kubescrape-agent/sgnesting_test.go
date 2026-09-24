@@ -49,7 +49,7 @@ func protoField(dst []byte, field int, payload []byte) []byte {
 // in principle emit, so the payload is one the decoder would happily accept.
 func nestedAnyValue(levels int) []byte {
 	v := []byte{1<<3 | 2, 0} // AnyValue{string_value: ""}
-	for i := 0; i < levels; i++ {
+	for range levels {
 		v = protoField(nil, 5, protoField(nil, 1, v)) // AnyValue{array_value{values}}
 	}
 	return v
@@ -70,13 +70,13 @@ func TestServiceGraphInternalReceiverRefusesADeeplyNestedPush(t *testing.T) {
 	rcv := &sgReceiver{
 		grpcAddr: freeAddr(t),
 		tokens:   func() []string { return []string{"s3cr3t"} },
+		cached:   func() []string { return []string{"s3cr3t"} },
 		consume:  func(_ context.Context, td ptrace.Traces) error { consumed += td.SpanCount(); return nil },
 		log:      slog.New(slog.DiscardHandler),
 	}
 	ready := make(chan struct{})
 	rcv.ready = sync.OnceFunc(func() { close(ready) })
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	errc := make(chan error, 1)
 	go func() { errc <- rcv.Run(ctx) }()
 	select {

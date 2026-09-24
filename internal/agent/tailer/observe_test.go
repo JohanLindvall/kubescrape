@@ -4,10 +4,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/JohanLindvall/enrich"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -67,8 +69,8 @@ func countingTailer(t *testing.T, dir string, exp *fakeExporter) (*Tailer, *metr
 		t.Fatal(err)
 	}
 	tl := driveTailer(dir, exp)
-	tl.cfg.LogMetrics = set
-	tl.cfg.Rules = rules
+	tl.cfg.Chain.LogMetrics = set
+	tl.cfg.Chain.Rules = rules
 	return tl, set
 }
 
@@ -369,7 +371,7 @@ func TestEnrichmentCountsOncePerRecordAcrossARewind(t *testing.T) {
 	ctx := context.Background()
 	exp := &fakeExporter{fail: 3} // exportWithRetry's whole budget: the batch rewinds
 	tl := driveTailer(dir, exp)
-	tl.cfg.Enrich = true
+	tl.cfg.Chain.Enrich = true
 
 	tl.scanDir(tl.loadCheckpoints(), true)
 	// A ZONE-LESS timestamp in each body, beneath the CRI header's zoned one:
@@ -408,5 +410,50 @@ func TestEnrichmentCountsOncePerRecordAcrossARewind(t *testing.T) {
 		t.Errorf("kubescrape_log_enrich_time_rejected_total delta = %v for 5 delivered records, want 5: "+
 			"a refusal is a property of the record, so an operator cannot tell five displaced "+
 			"timestamps from ten", got)
+	}
+}
+
+// Scrubbing across the same rewind. Redaction has to precede GROUPING, so it
+// runs in logchain.Chain.Line, before the record — and so before the Input
+// that carries Observed — exists, and kubescrape_log_scrubbed_total was the one
+// record-unit counter left ungated: 6 for 3 delivered records across one
+// rewind. The tailer knows the entry was observed before it calls Line, so the
+// flag goes there too; the redaction itself is identical on both passes.
+func TestScrubCountsOncePerRecordAcrossARewind(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{fail: 3} // exportWithRetry's whole budget: the batch rewinds
+	tl := driveTailer(dir, exp)
+	sc, err := logscrub.New(logscrub.Config{Rules: []logscrub.Rule{{Name: "rewind-probe", Regexp: `pin=\d+`}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl.cfg.Chain.Scrub = sc
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir,
+		timeNowCRI()+" stdout F login pin=1111",
+		timeNowCRI()+" stdout F login pin=2222",
+		timeNowCRI()+" stdout F login pin=3333",
+	)
+	tl.scanDir(nil, false)
+	scrubbed := obs.LogScrubbed.WithLabelValues("rewind-probe").Value()
+	rewinds := obs.LogExportFailures.Value()
+	driveUntil(t, ctx, tl, func() bool { return len(exp.get()) == 3 }, "the three records delivered")
+
+	if got := obs.LogExportFailures.Value() - rewinds; got != 1 {
+		t.Fatalf("precondition: want exactly one rewind, got %v", got)
+	}
+	if exp.attempts < 4 {
+		t.Fatalf("precondition: want the batch re-sent after the rewind, attempts = %d", exp.attempts)
+	}
+	for _, body := range exp.get() {
+		if strings.Contains(body, "pin=") {
+			t.Fatalf("a re-read record shipped unredacted: %q", body)
+		}
+	}
+	if got := obs.LogScrubbed.WithLabelValues("rewind-probe").Value() - scrubbed; got != 3 {
+		t.Errorf("kubescrape_log_scrubbed_total delta = %v for 3 delivered records, want 3: "+
+			"the rewind re-scrubbed the same records and counted them again", got)
 	}
 }

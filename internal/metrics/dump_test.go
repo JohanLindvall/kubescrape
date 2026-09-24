@@ -168,10 +168,8 @@ func TestDumpConcurrentWithObserveAndExport(t *testing.T) {
 
 	var producers sync.WaitGroup
 	stop := make(chan struct{})
-	for i := 0; i < 4; i++ {
-		producers.Add(1)
-		go func() {
-			defer producers.Done()
+	for range 4 {
+		producers.Go(func() {
 			for {
 				select {
 				case <-stop:
@@ -181,25 +179,21 @@ func TestDumpConcurrentWithObserveAndExport(t *testing.T) {
 					h.WithLabelValues("a").Observe(0.3)
 				}
 			}
-		}()
+		})
 	}
 	var readers sync.WaitGroup
-	for i := 0; i < 2; i++ {
-		readers.Add(1)
-		go func() {
-			defer readers.Done()
-			for j := 0; j < 200; j++ {
+	for range 2 {
+		readers.Go(func() {
+			for range 200 {
 				_ = r.Dump()
 			}
-		}()
+		})
 	}
-	readers.Add(1)
-	go func() {
-		defer readers.Done()
-		for j := 0; j < 200; j++ {
+	readers.Go(func() {
+		for range 200 {
 			_ = r.Export(context.Background(), nopDumpExporter{}, pcommon.NewResource())
 		}
-	}()
+	})
 	readers.Wait()
 	close(stop)
 	producers.Wait()

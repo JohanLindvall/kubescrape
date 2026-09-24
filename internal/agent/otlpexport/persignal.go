@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -24,7 +25,7 @@ import (
 
 // ExportOverride is one signal's destination overrides. An empty/nil field
 // inherits, but WHAT it inherits depends on whether the override names its own
-// endpoint — see signalConfig, which owns that rule. Headers MERGE over what
+// endpoint — see destinationConfig, which owns that rule. Headers MERGE over what
 // is inherited (the override winning per key) — replacing wholesale would
 // silently drop a base tenancy header the moment a signal override added an
 // unrelated one.
@@ -63,6 +64,16 @@ type ExportConfig struct {
 // Validate checks the section's SHAPE without touching the filesystem or the
 // network, so -check-config stays a pure dry run (file errors surface at the
 // real start, where the clients are built).
+//
+// It checks only what no MERGED destination can: the section's own client
+// pair. ApplyBase takes that pair only when its certificate is set, so a lone
+// key never reaches any Config.Validate — and with all three signals
+// overridden no merged config carries the pair at all. Everything an OVERRIDE
+// sets (protocol, compression, the http scheme, its own client pair) lands in
+// the merged per-signal Config, and both callers validate every one of those:
+// ValidateAgainst directly, BuildExporter through New. This used to repeat
+// those rules per override, and the copied scheme test had already drifted
+// looser than Config.Validate's (any "://" against http:// or https://).
 func (c *ExportConfig) Validate() error {
 	if c == nil {
 		return nil
@@ -70,89 +81,102 @@ func (c *ExportConfig) Validate() error {
 	if (c.ClientCertFile == "") != (c.ClientKeyFile == "") {
 		return errors.New("clientCertFile and clientKeyFile must be set together")
 	}
-	// In signal order, never off a map: a section with two mistakes must name
-	// the same one on every run, or a fixed error is followed by a different one
-	// the previous run hid — and a test of the wording can only pin one.
-	for _, sig := range c.overrides() {
-		name, o := sig.name, sig.override
-		if o == nil {
-			continue
-		}
-		switch o.Protocol {
-		case "", "grpc", "http":
-		default:
-			return fmt.Errorf("export.%s.protocol %q (want grpc or http)", name, o.Protocol)
-		}
-		switch o.Compression {
-		case "", "gzip", "none":
-		default:
-			return fmt.Errorf("export.%s.compression %q (want gzip or none)", name, o.Compression)
-		}
-		if (o.ClientCertFile == "") != (o.ClientKeyFile == "") {
-			return fmt.Errorf("export.%s: clientCertFile and clientKeyFile must be set together", name)
-		}
-		// The same scheme rule New enforces at the real start, checked here so
-		// -check-config catches it too (only when the override itself declares
-		// the http protocol — an inherited base protocol is a flag Validate
-		// cannot see, and New still refuses at startup).
-		if o.Protocol == "http" && o.Endpoint != "" && !strings.Contains(o.Endpoint, "://") {
-			return fmt.Errorf("export.%s.endpoint %q needs a scheme (http:// or https://)", name, o.Endpoint)
-		}
-	}
 	return nil
 }
 
 // signalConfig derives ONE signal's client config from the FLAG base plus this
 // section: the section's own base additions (headers, client certificate)
-// apply first, then the override's fields.
+// apply first, then the override's fields. It is destinationConfig with the
+// section's mTLS identity carried to an own endpoint — see there.
+func (c *ExportConfig) signalConfig(o *ExportOverride, flagBase Config) Config {
+	return c.destinationConfig(o, flagBase, true)
+}
+
+// RouteConfig derives a routing route's client config: the same derivation as
+// an export.<signal> override (destinationConfig), with the ONE deliberate
+// difference that the section's clientCertFile/clientKeyFile never reach a
+// route naming its own endpoint. o is the route's destination fields
+// (route.Route.ExportOverride); a route has no protocol or compression of its
+// own, so those are always the base's.
+func (c *ExportConfig) RouteConfig(o *ExportOverride, flagBase Config) Config {
+	return c.destinationConfig(o, flagBase, false)
+}
+
+// OwnEndpoint reports whether endpoint names a destination OTHER than the flag
+// base's: non-empty and not -otlp-endpoint repeated. It is the one test for "a
+// different host" — destinationConfig, DroppedBaseCredentials and
+// BaseEndpointUnused all ask it — so an export.<signal> override and a routing
+// route repeating -otlp-endpoint are the base destination alike, and never
+// lose the credentials issued for it.
+func OwnEndpoint(endpoint string, flagBase Config) bool {
+	return endpoint != "" && endpoint != flagBase.Endpoint
+}
+
+// destinationConfig is the ONE derivation of a destination an override
+// declares — an export.<signal> (signalConfig) or a routing route
+// (RouteConfig). Two used to exist, and they drifted on every point that
+// matters here: which endpoint counts as another host, whether skip-verify
+// crosses to it, what an endpoint-less route does with its own credentials.
 //
-// A signal naming its OWN endpoint does NOT inherit the FLAG base's
-// destination credentials. transport.go states the rule this implements: the
-// bearer token, the CA bundle and the skip-verify decision that reach this
-// process through -otlp-bearer-token-file / -otlp-tls-ca-file /
-// -otlp-tls-insecure-skip-verify describe the deployment's OWN collector, and
-// the whole point of the `export` section is naming a DIFFERENT host —
-// typically a third-party SaaS backend. Copying the base wholesale and
-// overwriting only what the override sets presented the collector's bearer
-// token and mTLS client certificate to that backend on every export, and
-// carried insecureSkipVerify=true over so the third party's certificate was
-// not verified either, with no per-signal field that could have opted out.
-// So the destination is rebuilt on Config.TransportOnly — the one spelling of
-// the transport-vs-destination partition, shared with routeExportConfig and
-// the reshard hop — and every credential is taken from the override or left
-// unset. cmd/kubescrape-agent's routeExportConfig takes the same decision for
-// the identical shape.
+// A destination naming its OWN endpoint (OwnEndpoint) does NOT inherit the
+// FLAG base's destination credentials. transport.go states the rule this
+// implements: the bearer token, the CA bundle and the skip-verify decision
+// that reach this process through -otlp-bearer-token-file / -otlp-tls-ca-file
+// / -otlp-tls-insecure-skip-verify describe the deployment's OWN collector,
+// and the whole point of the `export` section — and of a route with an
+// endpoint — is naming a DIFFERENT host, typically a third-party SaaS backend
+// or another tenant's collector. Copying the base wholesale and overwriting
+// only what the override sets presented the collector's bearer token and mTLS
+// client certificate to that host on every export, and carried
+// insecureSkipVerify=true over so its certificate was not verified either,
+// with no field that could have opted out. So the destination is rebuilt on
+// Config.TransportOnly — the one spelling of the transport-vs-destination
+// partition, shared with the reshard hop — and every credential is taken from
+// the override or left unset.
 //
 // Two deliberate carryovers, both argued rather than convenient:
 //
-//   - The SECTION's own base additions — `export.headers` and
-//     `export.clientCertFile`/`clientKeyFile` — still apply. They are not
-//     inherited from a field left empty: they are declared in the same
-//     `export:` block, at every-signal scope, by the author who named this
-//     endpoint, and the documented collectorless example relies on exactly
-//     that (one tenancy header and one mTLS identity towards three backends).
-//     Neither has a flag, so nothing collector-scoped can arrive this way; an
-//     override's own headers still merge over them and its own client
-//     certificate still replaces them.
+//   - The SECTION's own base additions. `export.headers` always applies. The
+//     section's `clientCertFile`/`clientKeyFile` applies only when
+//     sectionIdentity is set — for an export.<signal>, never for a route. They
+//     are not inherited from a field left empty: they are declared in the same
+//     `export:` block, at every-signal scope, by the author who named that
+//     signal's endpoint, and the documented collectorless example relies on
+//     exactly that (one tenancy header and one mTLS identity towards three
+//     backends). A route is declared under `routing:`, usually for another
+//     tenant, so the section's mTLS identity is not its author's to present
+//     there — a route presents only its own pair. Neither addition has a flag,
+//     so nothing collector-scoped arrives this way; the override's own headers
+//     still merge over them and its own client pair still replaces them.
 //   - Insecure (plaintext gRPC) is carried from the flag base unless the
 //     override sets it. Plaintext-ness is transport to the named host, not a
 //     credential, and a bool zero value here would flip every own-endpoint
-//     signal written against a plaintext in-cluster collector to TLS on
-//     upgrade — routeExportConfig's argument, verbatim.
+//     destination written against a plaintext in-cluster collector to TLS on
+//     upgrade — an endless transient export failure -check-config cannot see.
 //
-// An override REPEATING the base endpoint names the same destination, so
-// nothing crosses a boundary there and the base applies unchanged.
-func (c *ExportConfig) signalConfig(o *ExportOverride, flagBase Config) Config {
+// An override with NO endpoint, or REPEATING the base's, names the base
+// destination, so nothing crosses a boundary: the merged base applies
+// (credentials included) and every field the override sets wins over it. For
+// a route that means an endpoint-less route's own bearerTokenFile, caFile,
+// client pair, insecure and insecureSkipVerify are applied to the default
+// destination it is reached through, exactly as an export.<signal> without an
+// endpoint applies them.
+//
+// The override's client pair is taken whole when EITHER half is set, so a half
+// pair reaches Config.Validate and is refused by name there — taking it only
+// when the certificate was set silently dropped a lone key and kept the base's
+// pair in its place.
+func (c *ExportConfig) destinationConfig(o *ExportOverride, flagBase Config, sectionIdentity bool) Config {
 	out := c.ApplyBase(flagBase)
 	if o == nil {
 		return out
 	}
-	if o.Endpoint != "" && o.Endpoint != flagBase.Endpoint {
+	if OwnEndpoint(o.Endpoint, flagBase) {
 		// Rebuild: transport tuning, plus the section's own additions applied
 		// onto nothing, plus the plaintext decision. Everything else — the
 		// endpoint, the token, the CA, the trust decision — comes from the
 		// override below or stays unset.
-		out = c.ApplyBase(flagBase.TransportOnly())
+		out = c.applyBase(flagBase.TransportOnly(), sectionIdentity)
 		out.Insecure = flagBase.Insecure
 		out.Endpoint = o.Endpoint
 	} else if o.Endpoint != "" {
@@ -177,20 +201,22 @@ func (c *ExportConfig) signalConfig(o *ExportOverride, flagBase Config) Config {
 	if o.Compression != "" {
 		out.Compression = o.Compression
 	}
-	if o.ClientCertFile != "" {
+	if o.ClientCertFile != "" || o.ClientKeyFile != "" {
 		out.ClientCertFile = o.ClientCertFile
 		out.ClientKeyFile = o.ClientKeyFile
 	}
 	return out
 }
 
-// droppedBaseCredentials names the FLAGS whose values signalConfig refuses to
-// carry to o's own endpoint, in a fixed order. Empty when the override
+// DroppedBaseCredentials names the FLAGS whose values destinationConfig
+// refuses to carry to o's own endpoint, in a fixed order — for an
+// export.<signal> override and a routing route alike, so the two seams that
+// drop the same flags report them the same way. Empty when the destination
 // inherits (no endpoint of its own, or the base's), when the flag carries
 // nothing, or when the override supplies its own — so the caller's warning
 // fires only where behaviour actually differs from a naive merge.
-func droppedBaseCredentials(o *ExportOverride, flagBase Config) []string {
-	if o == nil || o.Endpoint == "" || o.Endpoint == flagBase.Endpoint {
+func DroppedBaseCredentials(o *ExportOverride, flagBase Config) []string {
+	if o == nil || !OwnEndpoint(o.Endpoint, flagBase) {
 		return nil
 	}
 	var dropped []string
@@ -218,14 +244,17 @@ type PerSignal struct {
 // ValidateAgainst checks the section's shape AND every merged per-signal
 // destination — exactly the Configs BuildExporter hands to New.
 //
-// Validate alone is not enough for a dry run. Every rule that only becomes
-// checkable AFTER the merge was invisible to -check-config: TLS material on a
-// destination that inherits plaintext gRPC from the flags, and the http://
-// scheme requirement when the protocol is inherited from -otlp-protocol rather
-// than declared on the override (Validate deliberately skips that case because
-// it cannot see the flags). So -check-config exited 0 and the same ConfigMap
+// Validate alone is not enough for a dry run: it checks only the section's own
+// client pair, and every rule about an override is judged here, on the merged
+// destination. That is the only place some of them CAN be judged — TLS
+// material on a destination that inherits plaintext gRPC from the flags, the
+// http:// scheme requirement when the protocol is inherited from
+// -otlp-protocol rather than declared on the override — and before this
+// existed -check-config exited 0 for them while the same ConfigMap
 // CrashLooped the fleet at `creating OTLP exporter`, from the check whose whole
-// purpose is preventing that.
+// purpose is preventing that. A refusal names the signal (`export.logs: ...`)
+// and walks the signals in a fixed order, so a section with two mistakes names
+// the same one on every run.
 //
 // Still shape-only in the sense that matters: Config.Validate touches neither
 // the filesystem nor the network.
@@ -235,12 +264,12 @@ func (c *ExportConfig) ValidateAgainst(base Config) error {
 	}
 	merged := c.ApplyBase(base)
 	if c != nil {
-		for _, sig := range c.overrides() {
-			if sig.override == nil {
+		for _, sig := range c.Overrides() {
+			if sig.Override == nil {
 				continue
 			}
-			if err := c.signalConfig(sig.override, base).Validate(); err != nil {
-				return fmt.Errorf("export.%s: %w", sig.name, err)
+			if err := c.signalConfig(sig.Override, base).Validate(); err != nil {
+				return fmt.Errorf("export.%s: %w", sig.Name, err)
 			}
 			// Said out loud on the one seam BOTH -check-config and every real
 			// start cross (validateConfig calls this): an own-endpoint signal
@@ -249,10 +278,10 @@ func (c *ExportConfig) ValidateAgainst(base Config) error {
 			// backend the operator believes is authenticated. Warn, not refuse
 			// — dropping the credential IS the correct destination, and the
 			// override has a field for every one of them.
-			if dropped := droppedBaseCredentials(sig.override, base); len(dropped) > 0 {
+			if dropped := DroppedBaseCredentials(sig.Override, base); len(dropped) > 0 {
 				slog.Default().Warn("this export destination names its own endpoint, so the flag base's collector credentials are NOT presented to it",
-					"signal", sig.name, "endpoint", sig.override.Endpoint, "flag", strings.Join(dropped, ","),
-					"note", "they authenticate this deployment to ITS collector and this is a different host; set bearerTokenFile / caFile / insecureSkipVerify on the export."+sig.name+" override itself if this destination needs them")
+					"signal", sig.Name, "endpoint", sig.Override.Endpoint, "flag", strings.Join(dropped, ","),
+					"note", "they authenticate this deployment to ITS collector and this is a different host; set bearerTokenFile / caFile / insecureSkipVerify on the export."+sig.Name+" override itself if this destination needs them")
 			}
 		}
 	}
@@ -273,11 +302,18 @@ func (c *ExportConfig) ValidateAgainst(base Config) error {
 // a tenancy header set once in `export.headers` reaches route destinations
 // too instead of silently applying to only the default chain.
 func (c *ExportConfig) ApplyBase(base Config) Config {
+	return c.applyBase(base, true)
+}
+
+// applyBase is ApplyBase with the section's client pair optional: identity
+// false applies the headers alone (a route's own-endpoint rebuild, see
+// destinationConfig).
+func (c *ExportConfig) applyBase(base Config, identity bool) Config {
 	if c == nil {
 		return base
 	}
 	base.Headers = MergeHeaders(base.Headers, c.Headers)
-	if c.ClientCertFile != "" {
+	if identity && c.ClientCertFile != "" {
 		base.ClientCertFile = c.ClientCertFile
 		base.ClientKeyFile = c.ClientKeyFile
 	}
@@ -288,35 +324,88 @@ func (c *ExportConfig) ApplyBase(base Config) Config {
 // shared by every destination derived from it and must not be written through.
 // With nothing to overlay the base is returned as is (nil stays nil). One
 // function for the three places a header layer is applied: the section's base
-// additions (ApplyBase), a per-signal override (signalConfig) and a routing route's
-// own headers (cmd/kubescrape-agent's routeExportConfig), which each spelled
+// additions (ApplyBase) and the override a destination declares — a
+// per-signal one or a routing route's (destinationConfig) — which each spelled
 // the same seven lines.
+//
+// Keys match CASE-INSENSITIVELY, because both transports fold them (gRPC
+// lowercases metadata keys, HTTP canonicalises header names): an override
+// spelled `x-scope-orgid` REPLACES a base `X-Scope-OrgID`, under the
+// override's spelling. Matching the exact string kept both, and the pair was
+// one header with two values on the wire — gRPC sent both, HTTP sent
+// whichever its map iteration visited last, so a per-signal or per-route
+// tenant changed at random between exports.
+//
+// The fold removes only BASE keys an override replaces. Two keys differing
+// only in case WITHIN one layer are kept as they are, so Config.Validate can
+// refuse the ambiguity by name instead of this function silently picking one.
 func MergeHeaders(base, over map[string]string) map[string]string {
 	if len(over) == 0 {
 		return base
 	}
 	merged := make(map[string]string, len(base)+len(over))
 	for k, v := range base {
-		merged[k] = v
+		if !overridden(k, over) {
+			merged[k] = v
+		}
 	}
-	for k, v := range over {
-		merged[k] = v
-	}
+	maps.Copy(merged, over)
 	return merged
 }
 
-// signalOverride pairs a per-signal override with the name the section spells
-// it by, so a walk over the three is in a FIXED order.
-type signalOverride struct {
-	name     string
-	override *ExportOverride
+// overridden reports whether over holds a key naming the same header as k,
+// whatever its case. Header maps are a handful of entries, so a scan is
+// cheaper than building a folded index, and this runs once per derived config.
+func overridden(k string, over map[string]string) bool {
+	for o := range over {
+		if strings.EqualFold(k, o) {
+			return true
+		}
+	}
+	return false
 }
 
-// overrides lists the section's per-signal overrides in signal order (logs,
-// metrics, traces), nil entries included: every walk over "the three signals"
-// goes through this so none of them can iterate a map.
-func (c *ExportConfig) overrides() []signalOverride {
-	return []signalOverride{{"logs", c.Logs}, {"metrics", c.Metrics}, {"traces", c.Traces}}
+// SignalOverride pairs a per-signal override with the name the section spells
+// it by ("logs", "metrics", "traces"), so a walk over the three is in a FIXED
+// order.
+type SignalOverride struct {
+	Name string
+	// Override is nil when the section leaves the signal to the flag base.
+	Override *ExportOverride
+}
+
+// Overrides lists the section's per-signal overrides in signal order (logs,
+// metrics, traces), nil entries included; nil for no section. Every walk over
+// "the three signals", in this package and outside it (the agent's startup
+// summary), goes through this so none of them can iterate a map or enumerate
+// the signals a second time.
+func (c *ExportConfig) Overrides() []SignalOverride {
+	if c == nil {
+		return nil
+	}
+	return []SignalOverride{{"logs", c.Logs}, {"metrics", c.Metrics}, {"traces", c.Traces}}
+}
+
+// BaseEndpointUnused reports whether NOTHING dials the flag base endpoint:
+// every signal is overridden AND every override names its OWN endpoint
+// (OwnEndpoint). False for no section.
+//
+// Struct presence is not the test. An override that sets only headers (or a
+// bearer file, or TLS) inherits the base ENDPOINT through destinationConfig,
+// so the base is still the address that signal reaches; the same holds for an
+// override that REPEATS the base endpoint. A caller refusing to inherit an
+// unused base (an endpoint-less routing route) would otherwise fail a config
+// the exporter builds happily.
+func (c *ExportConfig) BaseEndpointUnused(flagBase Config) bool {
+	if c == nil {
+		return false
+	}
+	for _, s := range c.Overrides() {
+		if s.Override == nil || !OwnEndpoint(s.Override.Endpoint, flagBase) {
+			return false
+		}
+	}
+	return true
 }
 
 // BuildExporter builds the export stack's bottom layer from the flag-derived

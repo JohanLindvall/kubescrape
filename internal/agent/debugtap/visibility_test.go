@@ -95,7 +95,7 @@ func TestStreamAttachAndDetachAreLogged(t *testing.T) {
 func TestStreamRefusalIsLogged(t *testing.T) {
 	logged := captureLog(t)
 	tap := New(&fakeInner{})
-	for i := 0; i < maxSubscribers; i++ {
+	for i := range maxSubscribers {
 		sub, unsub := tap.subscribe(sigAll, nil, 100)
 		if sub == nil {
 			t.Fatalf("subscriber %d refused under the cap", i)
@@ -156,7 +156,7 @@ func TestRenderFailureIsReportedAndNoMatchIsNot(t *testing.T) {
 // no-match answer; this pins the two-valued contract the reporting depends on.
 func TestRenderersDistinguishNoMatchFromFailure(t *testing.T) {
 	tap := New(&fakeInner{})
-	sub := &subscriber{signals: sigAll, sample: 100, filters: []attrFilter{{Key: "nope", Value: "*"}}}
+	sub := &subscriber{signals: sigAll, sample: 100, filters: []attrFilter{newAttrFilter("nope", "*")}}
 	if b, fail := tap.renderLogs(logsWithNamespaces("team-a"), sub); b != nil || fail != nil {
 		t.Fatalf("no-match render = (%v, %v), want (nil, nil)", b, fail)
 	}
@@ -195,14 +195,14 @@ func TestDetachTallyIsNotResetByTheOnStreamReport(t *testing.T) {
 func TestRepeatedStreamRefusalsAreThrottled(t *testing.T) {
 	logged := captureLog(t)
 	tap := New(&fakeInner{})
-	for i := 0; i < maxSubscribers; i++ {
+	for i := range maxSubscribers {
 		sub, unsub := tap.subscribe(sigAll, nil, 100)
 		if sub == nil {
 			t.Fatalf("subscriber %d refused under the cap", i)
 		}
 		defer unsub()
 	}
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		rec := httptest.NewRecorder()
 		tap.ServeHTTP(rec, httptest.NewRequest("GET", "/debug/otlp", nil))
 		if rec.Code != http.StatusServiceUnavailable {

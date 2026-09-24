@@ -84,6 +84,14 @@ func TestPeekLeavesTheBucketUntouched(t *testing.T) {
 	if b.AdmitDebt(1, t0) {
 		t.Fatal("Peek mutated the bucket (banked the refill or moved last)")
 	}
+	// The assertion above cannot see a Peek that moved `last` forward WITHOUT
+	// banking: the out-of-order AdmitDebt bills a negative elapsed as zero and
+	// refuses either way. This one can — the refill accrued between t0 and
+	// t0+1s must still be there for the first-time decision that follows a
+	// re-decision, or the rate cap under-admits every trace after one.
+	if !b.AdmitDebt(10, t0.Add(time.Second)) {
+		t.Fatal("Peek advanced last without banking: the refill accrued before it is lost")
+	}
 }
 
 // An out-of-order `now` (concurrent handlers read the clock outside the bucket
@@ -108,5 +116,46 @@ func TestBucketOutOfOrderNowDoesNotDebit(t *testing.T) {
 	// not the stale straggler value.
 	if !b.TakeExact(10, t0.Add(2*time.Second)) {
 		t.Fatal("refill must resume from the max observed time, not the rewound one")
+	}
+}
+
+// Peek is the re-decision stand-in for AdmitDebt, so for every bucket state
+// and every n it must give AdmitDebt's answer — the no-mutation half is
+// TestPeekLeavesTheBucketUntouched's; this is the agreement half. The states
+// cover a first call (no refill billed yet), a full and a part-spent bucket,
+// a bucket in DEBT, n below, at and above the burst, and a `now` earlier than
+// `last` (billed as zero elapsed).
+func TestPeekAgreesWithAdmitDebt(t *testing.T) {
+	t0 := time.Unix(1_000_000, 0)
+	type state struct {
+		name   string
+		rate   float64
+		tokens float64
+		last   time.Time
+	}
+	states := []state{
+		{"first call", 10, 10, time.Time{}},
+		{"full", 10, 10, t0},
+		{"part spent", 10, 3.5, t0},
+		{"empty", 10, 0, t0},
+		{"in debt", 10, -15, t0},
+		{"fractional rate", 0.5, 0.25, t0},
+	}
+	nows := []time.Duration{-time.Second, 0, 100 * time.Millisecond, time.Second, 2 * time.Second, time.Minute}
+	ns := []float64{0, 0.5, 1, 3, 9.99, 10, 11, 25, 1000}
+	for _, st := range states {
+		for _, d := range nows {
+			for _, n := range ns {
+				now := t0.Add(d)
+				mk := func() *Bucket {
+					return &Bucket{rate: st.rate, burst: max(1, st.rate), tokens: st.tokens, last: st.last}
+				}
+				peeked := mk().Peek(n, now)
+				admitted := mk().AdmitDebt(n, now)
+				if peeked != admitted {
+					t.Errorf("%s, now=t0 + %v, n=%v: Peek=%v but AdmitDebt=%v", st.name, d, n, peeked, admitted)
+				}
+			}
+		}
 	}
 }

@@ -1,0 +1,39 @@
+# Exposition fuzz seeds, SHARED by pkg/promparse's FuzzParser and
+# internal/agent/promscrape's FuzzConverter, so a seed added for a parser bug
+# also reaches the converter.
+#
+# One Go string literal per line (strconv.Quote form, read back with
+# strconv.Unquote); lines starting with # and blank lines are ignored. Quoted
+# rather than raw because several seeds carry NUL, invalid UTF-8 and trailing
+# whitespace, which would make a raw file binary to git and fragile under any
+# editor that strips trailing blanks.
+
+# Representative classic exposition.
+"# HELP http_requests_total Total requests.\n# TYPE http_requests_total counter\nhttp_requests_total{code=\"200\",method=\"get\"} 1027 1395066363000\nhttp_requests_total{code=\"400\",method=\"post\"} 3\n# TYPE temp gauge\ntemp{host=\"a\"} -17.5\n"
+
+# Histogram + summary families.
+"# TYPE http_duration histogram\nhttp_duration_bucket{le=\"0.1\"} 100\nhttp_duration_bucket{le=\"0.5\"} 140\nhttp_duration_bucket{le=\"+Inf\"} 144\nhttp_duration_sum 53.4\nhttp_duration_count 144\n# TYPE rpc summary\nrpc{quantile=\"0.5\"} 0.05\nrpc{quantile=\"0.99\"} 0.9\nrpc_sum 8000\nrpc_count 100000\n"
+
+# OpenMetrics with exemplar and EOF.
+"# TYPE foo counter\nfoo_total 17.0 1520879607.789 # {trace_id=\"4bf92f3577b34da6a3ce929d0e0e4736\",span_id=\"00f067aa0ba902b7\"} 0.67 1520879607.789\n# EOF\n"
+
+# Escapes, empty label block, NaN/Inf values, missing values.
+"a{b=\"c\\n\\\"d\\\\\"} 1\nempty{} 2\nnan NaN\ninf +Inf\nneg -Inf\nnoval\n"
+
+# TYPE redeclaration mid-exposition (converter order-key edge).
+"# TYPE x histogram\nx_bucket{le=\"1\"} 1\n# TYPE x summary\nx{quantile=\"0.5\"} 2\nx_count 3\n"
+
+# Buckets without le, summaries without quantile, decreasing cumulative counts, duplicate le values.
+"# TYPE h histogram\nh_bucket 5\nh_bucket{le=\"2\"} 9\nh_bucket{le=\"2\"} 4\nh_bucket{le=\"1\"} 7\n# TYPE s summary\ns 3\n"
+
+# Malformed lines, control bytes, non-UTF8.
+"metric{a=\"unterminated\nm\x00etric 1\n\xff\xfe 2\nname{=\"v\"} 1\nname{a=} 1\nname{a=\"v\" 1\n"
+
+# Whitespace-heavy and comment-only.
+"   \n\t\n#\n# TYPE\n# TYPE t\n# TYPE t counter extra\n  m  1  \n"
+
+# Exemplar edge cases.
+"om_total 1 # {} 2\nom_total 1 #{a=\"b\"} 2 3 4\nom 2 1.5 # {a=\"b\"} 1\n"
+
+# Timestamp extremes.
+"m 1 9223372036854775807\nm 1 -9223372036854775808\nm 1 1e300\nm 1 0.0001\n"

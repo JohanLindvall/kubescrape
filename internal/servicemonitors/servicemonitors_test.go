@@ -10,15 +10,7 @@ import (
 )
 
 func monitorObj(namespace, name string, spec map[string]any) *unstructured.Unstructured {
-	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "monitoring.coreos.com/v1",
-		"kind":       "ServiceMonitor",
-		"metadata": map[string]any{
-			"namespace": namespace,
-			"name":      name,
-		},
-		"spec": spec,
-	}}
+	return crObject("ServiceMonitor", namespace, name, "", spec)
 }
 
 func TestParse(t *testing.T) {
@@ -207,7 +199,7 @@ func TestAllIsDeterministicallyOrdered(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for i := 0; i < 20; i++ { // map order varies per run; make one run enough
+	for range 20 { // map order varies per run; make one run enough
 		got := ix.All()
 		var keys []string
 		for _, m := range got {

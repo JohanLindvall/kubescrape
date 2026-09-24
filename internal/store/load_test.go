@@ -49,9 +49,7 @@ func TestConcurrentChurnInvariants(t *testing.T) {
 	// Writers: each owns a disjoint pod range, so its delete-then-check is
 	// not raced by another writer resurrecting the pod.
 	for w := range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			rv := 0
 			for gen := 0; ; gen++ {
 				for p := range podsPerWriter {
@@ -80,15 +78,13 @@ func TestConcurrentChurnInvariants(t *testing.T) {
 					}
 				}
 			}
-		}()
+		})
 	}
 
 	// Readers: random-ish mix over the whole keyspace.
 	readerErr := make(chan string, 1)
 	for r := range readers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			ctx := context.Background()
 			i := r
 			for {
@@ -130,7 +126,7 @@ func TestConcurrentChurnInvariants(t *testing.T) {
 				}
 				reads.Add(1)
 			}
-		}()
+		})
 	}
 
 	time.Sleep(duration)

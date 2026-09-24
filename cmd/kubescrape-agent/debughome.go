@@ -3,7 +3,7 @@ package main
 // The /debug homepage: one place that links every debug surface this agent
 // serves, so an operator port-forwarding to -listen discovers what exists
 // instead of memorizing paths from the docs. Entries are appended exactly
-// where the handlers are registered (startDebugServer), so the page cannot
+// where the handlers are registered (debugMux), so the page cannot
 // list an endpoint this process does not serve.
 
 import (

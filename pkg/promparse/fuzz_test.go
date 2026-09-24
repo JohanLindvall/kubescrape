@@ -3,50 +3,44 @@ package promparse
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
 )
 
-// fuzzSeedBodies are representative and adversarial exposition bodies shared
-// by the parser and converter fuzz targets.
-var fuzzSeedBodies = []string{
-	// Representative classic exposition.
-	"# HELP http_requests_total Total requests.\n" +
-		"# TYPE http_requests_total counter\n" +
-		"http_requests_total{code=\"200\",method=\"get\"} 1027 1395066363000\n" +
-		"http_requests_total{code=\"400\",method=\"post\"} 3\n" +
-		"# TYPE temp gauge\n" +
-		"temp{host=\"a\"} -17.5\n",
-	// Histogram + summary families.
-	"# TYPE http_duration histogram\n" +
-		"http_duration_bucket{le=\"0.1\"} 100\n" +
-		"http_duration_bucket{le=\"0.5\"} 140\n" +
-		"http_duration_bucket{le=\"+Inf\"} 144\n" +
-		"http_duration_sum 53.4\n" +
-		"http_duration_count 144\n" +
-		"# TYPE rpc summary\n" +
-		"rpc{quantile=\"0.5\"} 0.05\n" +
-		"rpc{quantile=\"0.99\"} 0.9\n" +
-		"rpc_sum 8000\n" +
-		"rpc_count 100000\n",
-	// OpenMetrics with exemplar and EOF.
-	"# TYPE foo counter\n" +
-		"foo_total 17.0 1520879607.789 # {trace_id=\"4bf92f3577b34da6a3ce929d0e0e4736\",span_id=\"00f067aa0ba902b7\"} 0.67 1520879607.789\n" +
-		"# EOF\n",
-	// Escapes, empty label block, NaN/Inf values, missing values.
-	"a{b=\"c\\n\\\"d\\\\\"} 1\nempty{} 2\nnan NaN\ninf +Inf\nneg -Inf\nnoval\n",
-	// TYPE redeclaration mid-exposition (converter order-key edge).
-	"# TYPE x histogram\nx_bucket{le=\"1\"} 1\n# TYPE x summary\nx{quantile=\"0.5\"} 2\nx_count 3\n",
-	// Buckets without le, summaries without quantile, decreasing cumulative
-	// counts, duplicate le values.
-	"# TYPE h histogram\nh_bucket 5\nh_bucket{le=\"2\"} 9\nh_bucket{le=\"2\"} 4\nh_bucket{le=\"1\"} 7\n# TYPE s summary\ns 3\n",
-	// Malformed lines, control bytes, non-UTF8.
-	"metric{a=\"unterminated\nm\x00etric 1\n\xff\xfe 2\nname{=\"v\"} 1\nname{a=} 1\nname{a=\"v\" 1\n",
-	// Whitespace-heavy and comment-only.
-	"   \n\t\n#\n# TYPE\n# TYPE t\n# TYPE t counter extra\n  m  1  \n",
-	// Exemplar edge cases.
-	"om_total 1 # {} 2\nom_total 1 #{a=\"b\"} 2 3 4\nom 2 1.5 # {a=\"b\"} 1\n",
-	// Timestamp extremes.
-	"m 1 9223372036854775807\nm 1 -9223372036854775808\nm 1 1e300\nm 1 0.0001\n",
+// fuzzSeedsFile holds the exposition seed bodies, one strconv.Quote'd string
+// per line. It is SHARED with internal/agent/promscrape's FuzzConverter, which
+// reads this same file, so a seed added for a parser bug reaches the converter
+// too — the two used to carry byte-identical copies that nothing kept in step.
+const fuzzSeedsFile = "testdata/fuzzseeds.txt"
+
+// loadFuzzSeeds reads a seed file in fuzzseeds.txt's format (see its header).
+// internal/agent/promscrape's fuzz_test.go carries the same few lines: test
+// helpers cannot cross a package boundary without an exported test package,
+// and this one would put fixtures on a public import surface.
+func loadFuzzSeeds(tb testing.TB, path string) []string {
+	tb.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	var seeds []string
+	for n, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		s, err := strconv.Unquote(line)
+		if err != nil {
+			tb.Fatalf("%s:%d: %v", path, n+1, err)
+		}
+		seeds = append(seeds, s)
+	}
+	if len(seeds) == 0 {
+		tb.Fatalf("%s holds no seeds", path)
+	}
+	return seeds
 }
 
 // knownGood is a body with an exactly-known parse, used to verify a pooled
@@ -107,12 +101,18 @@ func parseKnownGood(t *testing.T) {
 
 // FuzzParser feeds arbitrary bytes through the pooled parser path in every
 // mode combination. Invariants: no panics; parse of an in-memory reader never
-// errors; the malformed count stays within the physical line count; every
-// emitted sample has a non-empty name and non-empty label names; the pool is
+// errors; the malformed count stays within the physical line count; the
+// MalformedDetail breakdown never sums past the malformed total it attributes;
+// no exemplar is emitted OR counted malformed unless exemplar parsing is on
+// (OpenMetrics and Exemplars both); every emitted sample has a non-empty name
+// and non-empty label names; each byte-bounded table (TYPE, HELP/UNIT, the
+// interned names) is charged EXACTLY what it retains and stays within its
+// budget — a charge that drifts from the table either refuses families it has
+// room for or stops bounding memory, and nothing else would notice; the pool is
 // not corrupted (a known-good body still parses exactly afterwards).
 func FuzzParser(f *testing.F) {
-	for _, body := range fuzzSeedBodies {
-		for mode := byte(0); mode < 8; mode++ {
+	for _, body := range loadFuzzSeeds(f, fuzzSeedsFile) {
+		for mode := range byte(8) {
 			f.Add([]byte(body), mode)
 		}
 	}
@@ -140,7 +140,7 @@ func FuzzParser(f *testing.F) {
 				}
 			}
 			if s.Exemplar != nil {
-				if !exemplars {
+				if !openMetrics || !exemplars {
 					t.Errorf("sample %q: exemplar emitted with exemplars disabled", s.Name)
 				}
 				for _, l := range s.Exemplar.Labels {
@@ -161,9 +161,38 @@ func FuzzParser(f *testing.F) {
 		if samples+malformed > lines {
 			t.Fatalf("samples=%d + malformed=%d exceeds physical lines %d", samples, malformed, lines)
 		}
+		// Read before Put, as the accessors' docs require.
+		if d := pp.MalformedDetail(); d.OverLongLines+d.TruncatedLines+d.DuplicateLabels+d.TooManyLabels > malformed {
+			t.Fatalf("MalformedDetail %+v sums past malformed=%d: it attributes the total and must never exceed it", d, malformed)
+		}
+		if bad := pp.MalformedExemplars(); bad != 0 && (!openMetrics || !exemplars) {
+			t.Fatalf("MalformedExemplars=%d with exemplar parsing off (openMetrics=%v exemplars=%v)", bad, openMetrics, exemplars)
+		}
+		checkTableCharges(t, pp.p)
 		Put(pp)
 
 		// The recycled parser must be uncorrupted.
 		parseKnownGood(t)
 	})
+}
+
+// checkTableCharges asserts that every byte-bounded table is charged exactly
+// what it holds, counted off the table itself, and holds no more than its
+// budget. The name table is warm across pooled parses, so its identity holds
+// at every point, not just after a fresh parser's first parse.
+func checkTableCharges(t *testing.T, p *Parser) {
+	t.Helper()
+	if got := retainedTypeBytes(p); got != p.typeBytes || got > maxTypeBytes {
+		t.Fatalf("TYPE table retains %d bytes, charged %d, budget %d", got, p.typeBytes, maxTypeBytes)
+	}
+	meta := 0
+	for k, m := range p.metas {
+		meta += len(k) + len(m.help) + len(m.unit)
+	}
+	if meta != p.metaBytes || meta > maxMetaBytes {
+		t.Fatalf("HELP/UNIT table retains %d bytes, charged %d, budget %d", meta, p.metaBytes, maxMetaBytes)
+	}
+	if got := retainedNameBytes(p); got != p.nameBytes || got > maxInternedNameBytes {
+		t.Fatalf("name intern table retains %d bytes, charged %d, budget %d", got, p.nameBytes, maxInternedNameBytes)
+	}
 }

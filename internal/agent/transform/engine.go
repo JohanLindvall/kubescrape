@@ -27,6 +27,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/pkg/otlpsplit"
 )
 
 func contentHash(raw []byte) string {
@@ -80,16 +81,11 @@ func (p *starlarkProgram) thread() *starlark.Thread {
 // (this repo has no recover(), so the process is going down anyway).
 func (p *starlarkProgram) release(th *starlark.Thread) { p.threads.Put(th) }
 
-// compileStarlark compiles src and resolves its transform() function. The
-// compile includes a smoke evaluation of the module (top-level statements
-// run), so syntax and load-time errors are caught at config time.
-func compileStarlark(signal, src string) (*starlarkProgram, error) {
-	return compileStarlarkFn(signal, src, "transform")
-}
-
 // compileStarlarkFn compiles src and resolves fnName — the batch transforms
 // all define transform(batch); the hook sections each define their own
-// (admit/target/decide/parse).
+// (admit/target/decide/parse). The compile includes a smoke evaluation of the
+// module (top-level statements run), so syntax and load-time errors are
+// caught at config time.
 //
 // The parse/rewrite/compile steps are spelled out rather than left to
 // ExecFileOptions because the amplifier rewrite (rewrite.go) has to happen
@@ -116,7 +112,8 @@ func compileStarlarkFn(signal, src, fnName string) (*starlarkProgram, error) {
 	// that dies here dies before there is a last-good program to fall back to.
 	globals, err := prog.Init(arm(p.newThread("compile:"+signal)), pre)
 	if err != nil {
-		return nil, fmt.Errorf("transforms %s: %w", signal, err)
+		// scriptError: module-level code can fail() with a script-built message.
+		return nil, fmt.Errorf("transforms %s: %w", signal, scriptError{err})
 	}
 	fn, ok := globals[fnName].(starlark.Callable)
 	if !ok {
@@ -127,17 +124,36 @@ func compileStarlarkFn(signal, src, fnName string) (*starlarkProgram, error) {
 	return p, nil
 }
 
-// call invokes the program's function with args on a bounded thread, returning
-// its value (the hook accessors interpret it; run below discards it). Errors
-// count into obs.TransformErrors under the program's signal.
+// call invokes the program's function with args on a bounded thread and
+// returns its value, for run and the hook accessors (hooks.go) to interpret.
+// An error comes back clipped (scriptError — the text is the script's, e.g.
+// fail(r.body)) but UNCOUNTED and unreported: call touches no obs counter and
+// writes no log line. The CALLER counts, by routing a non-nil error through
+// reportScriptError — run directly, each hook accessor through hookErr — or a
+// failure is invisible: a failing hook's only symptom is that nothing
+// happened, and a failing transform's is an export error that reads as a
+// collector problem.
 func (p *starlarkProgram) call(args ...starlark.Value) (starlark.Value, error) {
 	th := p.thread()
 	v, err := starlark.Call(th, p.fn, starlark.Tuple(args), nil)
 	p.release(th)
 	if err != nil {
-		return nil, fmt.Errorf("transform %s: %w", p.signal, err)
+		return nil, scriptError{err}
 	}
 	return v, nil
+}
+
+// reportScriptError counts a script failure into
+// kubescrape_transform_errors_total{signal} and warns, at most once a minute
+// through gate, with msg, the signal and the script POSITION — the one thing
+// the bare Starlark message ("undefined: foo") does not carry. Both the
+// per-batch transforms (run) and the fail-open hooks (hookErr) report through
+// here, so the two lines share one vocabulary.
+func reportScriptError(gate *logdedupe.Throttle, signal, msg string, err error) {
+	obs.TransformErrors.WithLabelValues(signal).Inc()
+	if gate.Allow(time.Minute) {
+		slog.Warn(msg, "signal", signal, "script", scriptPos(err), "error", err)
+	}
 }
 
 // scriptPos renders the innermost SCRIPT position of a Starlark failure —
@@ -195,33 +211,32 @@ func runWarnGate(signal string) *logdedupe.Throttle {
 // the line. It is per BATCH, not per record, and throttled, so a script
 // erroring on every export costs one line a minute.
 func (p *starlarkProgram) run(batch starlark.Value) error {
-	th := p.thread()
-	_, err := starlark.Call(th, p.fn, starlark.Tuple{batch}, nil)
-	p.release(th)
-	if err != nil {
-		obs.TransformErrors.WithLabelValues(p.signal).Inc()
-		if runWarnGate(p.signal).Allow(time.Minute) {
-			slog.Warn("transform script failed at runtime; the batch is NOT exported and its producer will "+
-				"retry it, so this signal stops shipping until the script or the payload changes",
-				"signal", p.signal, "script", scriptPos(err), "error", err)
-		}
+	if _, err := p.call(batch); err != nil {
+		// Clipped by call: the text is the script's (fail(r.body)), and it goes
+		// into this Warn, the producer's own failure line and, on the ingest
+		// path, the sender's gRPC status.
+		reportScriptError(runWarnGate(p.signal), p.signal,
+			"transform script failed at runtime; the batch is NOT exported and its producer will "+
+				"retry it, so this signal stops shipping until the script or the payload changes", err)
 		return fmt.Errorf("transform %s: %w", p.signal, err)
 	}
 	return nil
 }
 
-// run* return the pruned-record count WITHOUT counting it: the caller counts
-// via countDropped only once the batch's journey ends in an ack (a delivered
-// forward, or an emptied payload acked without a send) — or, on a FAILED
-// forward, once it is clear the script will never run over those records
-// again (transform.countFailed). Counting at prune time inflated
-// kubescrape_transform_dropped_total by one full batch per transient retry for
-// the copy-path producers, which re-offer the same object and re-run the
-// script on a fresh copy every attempt — an operator alerting on the rate saw
-// drop volume proportional to outage length, not intent. Skipping the failed
-// forward for a HANDED-OFF payload was the mirror-image error: that producer
-// rebuilds from source, and for promscrape and cgroupstats the source is
-// destroyed by the attempt, so those drops were counted nowhere at all.
+// run* return the pruned-record count WITHOUT counting it: the wrapper counts
+// through settle (transform.go) only once the batch's records are settled — its journey
+// ends in an ack (a delivered forward, or an emptied payload acked without a
+// send), or a FAILED forward whose payload is marked Consumed (handoff.go),
+// i.e. no retry will run the script over those records again. The tailer,
+// which transforms through TransformLogs, counts at its own commit. Counting
+// at prune time inflated kubescrape_transform_dropped_total by one full batch
+// per transient retry for every producer whose retry brings the same records
+// back — a copy-path producer re-offering the object, an ingest sender
+// retransmitting it, a tailer re-reading a rewound file — so an operator
+// alerting on the rate saw drop volume proportional to outage length, not
+// intent. Skipping every failed forward was the mirror-image error: for the
+// Consumed producers (promscrape, cgroupstats, the cumulative renders) the
+// source is destroyed by the attempt, so those drops were counted nowhere.
 func (p *starlarkProgram) runLogs(ld plog.Logs, em MetricEmitter) (int, error) {
 	if err := p.run(&logBatch{ld: ld, em: em}); err != nil {
 		return 0, err
@@ -291,7 +306,7 @@ func pruneMetrics(md pmetric.Metrics) int {
 					// A whole metric costs every point it carried: the unit
 					// this counter reports is data points, so that a metrics
 					// drop is comparable with a logs one.
-					dropped += dataPointCount(m)
+					dropped += otlpsplit.DataPointCount(m)
 					return true
 				}
 				// Points dropped individually. A metric emptied by them goes
@@ -306,23 +321,6 @@ func pruneMetrics(md pmetric.Metrics) int {
 		return sms.Len() == 0
 	})
 	return dropped
-}
-
-// dataPointCount is one metric's point count across every kind.
-func dataPointCount(m pmetric.Metric) int {
-	switch m.Type() {
-	case pmetric.MetricTypeGauge:
-		return m.Gauge().DataPoints().Len()
-	case pmetric.MetricTypeSum:
-		return m.Sum().DataPoints().Len()
-	case pmetric.MetricTypeHistogram:
-		return m.Histogram().DataPoints().Len()
-	case pmetric.MetricTypeExponentialHistogram:
-		return m.ExponentialHistogram().DataPoints().Len()
-	case pmetric.MetricTypeSummary:
-		return m.Summary().DataPoints().Len()
-	}
-	return 0
 }
 
 // pruneDataPoints removes points a script called drop() on and reports how

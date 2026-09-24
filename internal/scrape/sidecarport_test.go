@@ -65,9 +65,9 @@ func TestNativeSidecarDoesNotWinAPortNameFromTheAppContainer(t *testing.T) {
 		{"pod annotation", targetPorts(PodTargets(pod))},
 		{"service annotation targetPort", targetPorts(ServiceTargets(pod, svc))},
 		{"servicemonitor endpoint port", targetPorts(MonitorTargets(pod, svc, "ns/sm", servicemonitors.Endpoint{Port: "http"}))},
-		{"servicemonitor endpoint targetPort", targetPorts(MonitorTargets(pod, svc, "ns/sm", servicemonitors.Endpoint{TargetPort: ptr(intstr.FromString("metrics"))}))},
+		{"servicemonitor endpoint targetPort", targetPorts(MonitorTargets(pod, svc, "ns/sm", servicemonitors.Endpoint{TargetPort: new(intstr.FromString("metrics"))}))},
 		{"podmonitor endpoint port", targetPorts(PodMonitorTargets(pod, "ns/pm", servicemonitors.Endpoint{Port: "metrics"}))},
-		{"podmonitor endpoint targetPort", targetPorts(PodMonitorTargets(pod, "ns/pm", servicemonitors.Endpoint{TargetPort: ptr(intstr.FromString("metrics"))}))},
+		{"podmonitor endpoint targetPort", targetPorts(PodMonitorTargets(pod, "ns/pm", servicemonitors.Endpoint{TargetPort: new(intstr.FromString("metrics"))}))},
 	} {
 		if !slices.Equal(tc.ports, []int32{want}) {
 			t.Errorf("%s resolved %v, want the app container's %d: podutil.FindPort walks spec.containers only, so the sidecar's declaration is not what the rest of the stack scrapes", tc.path, tc.ports, want)

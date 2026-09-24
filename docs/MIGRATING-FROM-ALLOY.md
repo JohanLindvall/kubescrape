@@ -1,21 +1,32 @@
 # Migrating from Grafana Alloy to kubescrape
 
-This guide maps each Alloy component onto its kubescrape equivalent.
+This guide maps Alloy components onto their kubescrape equivalents. It was
+written against one specific Alloy configuration, called **cmb-alloy** below:
+a clustered Deployment that scrapes Prometheus targets and receives OTLP,
+built from modules whose names are the `snake_case` headings here
+(`scrape_prometheus_k8s_pods`, `filter_metrics`, `otel_process_attrs`,
+`output_otlp`, …). Where cmb-alloy made a choice of its own — its
+`instance_prefix`, its 40 MiB gRPC receive cap — the text says so. Headings in
+dotted form (`loki.source.journal`, `otelcol.processor.transform`, …) are
+Alloy's own components and apply to any Alloy install, including the log
+pipeline cmb-alloy does not run
+([container and file logs](#container-and-file-logs-lokisourcekubernetes-lokisourcefile-lokiprocess)).
+
 kubescrape is deployed with the [Helm chart](../charts/kubescrape); unlike
-the Alloy configuration, nothing is hard-coded — every behavior below is a
+cmb-alloy, nothing is hard-coded — every behavior below is a
 flag or a config-file entry. If this is also your first kubescrape install,
 read [FIRST-RUN.md](FIRST-RUN.md) alongside it: the mapping tells you what to
 configure, the runbook tells you what to watch while it comes up.
 
 ## Architecture differences
 
-| | Alloy | kubescrape |
+| | Alloy (cmb-alloy) | kubescrape |
 |---|---|---|
 | Topology | 3–5 clustered Deployment replicas | metadata service (Deployment; every replica serves reads from its own informer caches, no coordination needed) + per-node agent (DaemonSet) |
 | Target distribution | Alloy clustering | node-local by construction (each agent scrapes its node's pods) |
 | Kubernetes access | every replica watches pods/nodes/services | only the metadata service watches; agents talk HTTP to it |
-| Logs | not collected | collected (CRI + multiline joining, at-least-once, drop/keep/sample rules, per-file rate limit) |
-| Delivery | batch processor + sending queue | logs: checkpointed at-least-once with rewind; metrics: bounded retries |
+| Logs | none in cmb-alloy (Alloy's own `loki.source.*` components are mapped below) | collected (CRI + multiline joining, at-least-once, drop/keep/sample rules, per-file rate limit) |
+| Delivery | batch processor + sending queue | logs: checkpointed at-least-once with rewind; metrics: bounded retries; opt-in disk buffer for logs, metrics and tail-sampled traces (`agent.bufferDir`, flag `-buffer-dir`) |
 
 ## Top-level blocks
 
@@ -90,7 +101,13 @@ cadvisor resources get `service.instance.id` prefixed with `cadvisor-`
 ### `filter_metrics` + the node-scrape filter
 
 `agent.config.metrics.pipelines`: ordered keep/drop rules, first match wins.
-The keep-exception-then-drop shape translates directly:
+The keep-exception-then-drop shape translates directly — but Alloy's one node
+scrape covered the kubelet and cadvisor together, and here they are two
+pipelines with a filter each: cadvisor series (`container_*`, `machine_*`,
+from `/metrics/cadvisor`) are filtered under `cadvisor`, the kubelet's own
+`/metrics` series under `node`, and `/stats/summary` under `summary`. A rule
+under the wrong one is still valid config, so it passes `-check-config` and
+simply never matches:
 
 ```yaml
 agent:
@@ -102,12 +119,15 @@ agent:
             metrics: 'envoy_(cluster_(upstream_(rq(_total|_xx|_completed)?|cx_total))|requests_total)'
           - action: drop
             metrics: '(envoy_|otelcol_|prometheus_|rest_client_|cortex_|csi_|grafana_|loki_|thanos_).+'
-        node:
+        cadvisor:
           - action: keep
             metrics: 'container_network_(receive|transmit)_bytes_total'
             labels: {interface: eth0}
           - action: drop
-            metrics: 'container_network_.+|container_tasks_state|kubelet_runtime_operations_duration_seconds_bucket'
+            metrics: 'container_network_.+|container_tasks_state'
+        node:
+          - action: drop
+            metrics: 'kubelet_runtime_operations_duration_seconds_bucket'
 ```
 
 ### `prometheus_to_otel` (kube-state-metrics, kubelet-stats regrouping)
@@ -255,9 +275,22 @@ An Alloy pipeline shipping different signals to different backends (a
 onto the config file's `export` section: per-signal OTLP endpoint/protocol/
 headers/auth overrides riding the same per-signal disk buffer, plus static
 tenancy headers and an mTLS client certificate on the default chain — see
-CONFIGURATION.md's "Per-signal destinations". Loki, Mimir and Tempo all
-ingest OTLP natively, so no push-protocol or remote-write translation is
-involved.
+[Per-signal destinations](CONFIGURATION.md#per-signal-destinations-export-section).
+Loki, Mimir and Tempo all ingest OTLP natively, so no push-protocol or
+remote-write translation is involved.
+
+**The ingest token above does not follow the signals to their new hosts.** An
+override naming its own endpoint does not inherit the flag base's bearer token
+(`agent.otlp.bearerTokenSecret`, i.e. `-otlp-bearer-token-file`), CA or
+skip-verify: those describe the base destination, and presenting them to a
+different host would hand that host a credential it was never issued. Set
+`bearerTokenFile`/`caFile` on each override that needs them, or a static
+credential header in that override's own `headers`. (`export.headers` also
+reaches every signal, but it reaches every `routing` route too, and an
+`Authorization` there is refused beside a bearer token file on any destination
+that still uses the base.) A start and `-check-config` warn, naming the signal
+and the dropped flags, so a missing token shows up before the backend's 401
+does.
 
 ### `output_debug_otlp` / the `debug_otlp_output` pod label
 
@@ -308,25 +341,64 @@ honored. **PodMonitors** (endpoints naming container ports) are discovered
 under the same flag whenever the cluster serves that CRD — covering
 `prometheus.operator.podmonitors` too.
 
-Per-endpoint `tlsConfig.insecureSkipVerify` and `bearerTokenSecret` **are**
-interpreted (run the metadata service with `-scrape-auth-secrets` so agents
-can fetch the tokens; it needs `secrets get` RBAC, commented in the
-manifests, plus `-scrape-auth-token-file` — the bearer token agents present
-on `/v1/scrape-auth`, which the chart generates and mounts on both sides when
-`service.scrapeAuthSecrets` is set), and the keep/drop subset of
+Per-endpoint `bearerTokenSecret`, `basicAuth`, `authorization` and
+secret-backed `tlsConfig` (`ca`/`cert`/`keySecret`, plus `serverName` and
+`insecureSkipVerify`) **are** interpreted (run the metadata service with
+`-scrape-auth-secrets` so agents can fetch the secret material; it needs
+`secrets get` RBAC, commented in the manifests, plus `-scrape-auth-token-file`
+— the bearer token agents present on `/v1/scrape-auth`, which the chart
+generates and mounts on both sides when `service.scrapeAuthSecrets` is set),
+and the keep/drop subset of
 `metricRelabelings` is applied per
 sample by the agent (the action is matched case-insensitively, so `Keep`/`Drop`
 work as well as `keep`/`drop`). Per-endpoint `interval`/`scrapeTimeout`
 overrides **are** interpreted — each target is scheduled on its own period —
-so those monitors need no conversion. Relabel actions other than keep/drop, and
-authentication schemes beyond `basicAuth`/`authorization`/`bearerTokenSecret`,
-are still not interpreted: convert those monitors to annotated Services or
+so those monitors need no conversion. Relabel actions other than keep/drop,
+`oauth2`, proxy settings, and ConfigMap- or file-backed TLS material
+(`tlsConfig.ca.configMap`, `caFile`/`certFile`/`keyFile`) are still not
+interpreted (see [CONFIGURATION.md#metadata-service](CONFIGURATION.md#metadata-service)
+for the full list): convert those monitors to annotated Services or
 metrics-config rules — or, for relabel power the declarative rules lack, the
 transforms file's `targets:` hook, which runs a script per fetched scrape
 target per cycle (drop it, rewrite its path). Nothing is dropped silently —
 an uninterpreted field is
 logged once per monitor and counted in
 `kubescrape_monitor_fields_ignored_total{kind}`.
+
+### Container and file logs (`loki.source.kubernetes`, `loki.source.file`, `loki.process`)
+
+cmb-alloy collects no logs, but most Alloy estates do, so this is the mapping
+for a stock Alloy log pipeline. Container logs are on by default
+(`agent.logs`, flag `-logs`): every agent tails its own node's
+`/var/log/containers` files and attributes each one through the metadata
+service, so there is no `discovery.kubernetes` + `discovery.relabel` stage to
+translate — selection moves into the config file's `logs.sources`
+([log sources](CONFIGURATION.md#agent-log-sources)). Arbitrary host files
+(`local.file_match` + `loki.source.file`) are a *plain* source there, with the
+same rotation and checkpoint machinery. The `loki.process` stages map as
+follows:
+
+| Alloy | kubescrape |
+|---|---|
+| `stage.cri` | built in: CRI parsing and partial-line rejoin, no configuration |
+| `stage.multiline` | built in for stack traces (`agent.multiline`, flag `-logs-multiline`); overridable per source (`multiline`) and per pod |
+| `stage.timestamp`, level extraction | built in (`agent.enrich`, flag `-enrich`): timestamp, severity, trace/span ids and exception fields are parsed from each line with no configuration; a parsed timestamp replaces the CRI one only when it carries its own zone |
+| `stage.json` / `stage.logfmt` + `stage.labels` / `stage.structured_metadata` | `logAttributes` rules: lift a JSON or logfmt key onto a resource, scope or log attribute |
+| `stage.static_labels` | the source's `attributes` (plain sources), or `resourceAttributes` — per pipeline under `pipelines.logs` — for container logs |
+| `stage.regex` over `filename` | per-source `pathAttributes` |
+| `stage.drop`, `stage.match` with `action: drop`, `stage.sampling` | `logs.rules` (ordered keep/drop/sample, with `__severity__` for the enriched level) |
+| `stage.limit` | `agent.logsRateLimit` (flag `-logs-rate-limit`): per file, pausing the file by default or dropping with `-logs-rate-drop` — there is no node-global budget |
+| `stage.metrics` | `logMetrics` (counter/gauge/histogram/summary, pushed as OTLP with the line's own resource) |
+| `stage.tenant` | `routing`, by namespace rather than by line content |
+| `stage.replace` for redaction, `loki.secretfilter` | `logScrubbing` (curated built-ins plus custom regexes, applied before anything copies from the body) |
+| `stage.output` / `stage.template` / `stage.replace` for rewriting | a `logs:` Starlark transform (`-transforms-file`) |
+| `discovery.relabel` keep/drop by namespace or label | a containerd source's `namespaces` / `excludeNamespaces` (read from the file name, so a skipped file is never opened) and `selector` (pod labels) |
+| `loki.source.podlogs` (PodLogs CRD) | the pod annotation `kubescrape.io/logs`: exclude, multiline, `serviceName`, attributes and rules per workload |
+| `loki.write` | OTLP to Loki 3.x, which ingests it natively: an `export.logs` override at Loki's `/otlp` base URL with `protocol: http` (see [OTLP export](CONFIGURATION.md#agent-otlp-export)); resource attributes become index labels or structured metadata on the Loki side |
+
+`docs/COMPARISON.md`'s [Migrating off Promtail](COMPARISON.md#migrating-off-promtail)
+lists what does *not* carry over (agent-side control of the Loki label set,
+content-based tenancy, syslog/cloud/kafka inputs).
 
 ### `loki.source.journal`
 
@@ -360,7 +432,10 @@ re-shards by trace id and derives service-graph edges and RED metrics from spans
 it can see whole. Pushed payloads are forwarded as received — the role of
 `otelcol.processor.batch` stays with your SDK's batch span/log processor or
 the downstream collector, and every forward keeps the sender's own retry
-semantics (nothing is acknowledged before it is handed on).
+semantics (nothing is acknowledged before it is handed on — except under the
+trace tier's `tailSampling`, which acks spans when it buffers them; see
+[the sampling section](#otelcolprocessorprobabilistic_sampler--spanmetrics-connector)
+below).
 
 Two association differences from `otelcol.processor.k8sattributes`:
 
@@ -457,12 +532,17 @@ lazy field access, no I/O.
 
 ### `otelcol.processor.probabilistic_sampler` / spanmetrics connector
 
-The `traceSampling` config section samples ingested spans with
-**consistent per-trace-ID decisions** (all agents keep the same traces given
-the same config), `keepErrors`/`keepSlowerThan` guard rails and a
-spans/second cap. `-ingest-span-metrics` is the spanmetrics-connector
-counterpart (same `traces.span.metrics.*` naming), derived ahead of the
-sampler so RED metrics keep full coverage. Cross-node **tail** sampling
+Both run on the trace tier (`serviceGraph.enabled: true`, flag
+`-service-graph`), the one workload that receives traces; on any other
+workload the section is inert and the flag is ignored with a startup warning.
+The `traceSampling` config section (in `agent.config`, which the tier mounts
+too) samples received spans with **consistent per-trace-ID decisions** (every
+shard keeps the same traces given the same config),
+`keepErrors`/`keepSlowerThan` guard rails and a spans/second cap. Span metrics
+are the spanmetrics-connector counterpart (same `traces.span.metrics.*`
+naming), enabled with the chart's `serviceGraph.spanMetrics: true` (flag
+`-ingest-span-metrics`, rendered onto the tier — not `agent.extraArgs`) and
+derived ahead of the sampler so RED metrics keep full coverage. Cross-node **tail** sampling
 (whole-trace decisions on buffered traces) is the `tailSampling` config
 section on the `-service-graph` trace tier: the shard buffers a trace's spans
 until `decisionWait` elapses and then exports or discards it whole. Note the

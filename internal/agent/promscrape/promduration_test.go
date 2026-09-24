@@ -16,7 +16,7 @@ import (
 // other invalid value; the compound-sum overflow ("292y52w") takes the same path.
 func TestOverflowDurationWarnsAndFallsBack(t *testing.T) {
 	h := &countingHandler{}
-	s := &Scraper{cfg: Config{Interval: time.Minute, Timeout: 30 * time.Second}, log: slog.New(h)}
+	s := New(Config{Interval: time.Minute, Timeout: 30 * time.Second, Logger: slog.New(h)})
 
 	tgt := testTarget("http://10.0.0.1:9090/metrics")
 	tgt.Source, tgt.Monitor = "servicemonitor", "monitoring/api"

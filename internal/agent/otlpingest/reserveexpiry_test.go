@@ -16,8 +16,9 @@ package otlpingest
 // different route.
 
 import (
-	"context"
+	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,8 +40,7 @@ func TestReserveWindowExpiryIsNotAnAdmissionRejection(t *testing.T) {
 	before := ingestRejectedTotal()
 	expiredBefore := obs.IngestReserveExpired.Value()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	for i := range 2 {
 		if _, err := conn.NewStream(ctx, &grpc.StreamDesc{ServerStreams: true, ClientStreams: true},
 			"/opentelemetry.proto.collector.logs.v1.LogsService/Export"); err != nil {
@@ -87,8 +87,7 @@ func TestBudgetRefusalStillCountsAsAnAdmissionRejection(t *testing.T) {
 	before := ingestRejectedTotal()
 	expiredBefore := obs.IngestReserveExpired.Value()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	// One abandoned stream takes the whole budget (the window is a minute).
 	if _, err := conn.NewStream(ctx, &grpc.StreamDesc{ServerStreams: true, ClientStreams: true},
 		"/opentelemetry.proto.collector.logs.v1.LogsService/Export"); err != nil {
@@ -120,7 +119,7 @@ func TestBudgetRefusalStillCountsAsAnAdmissionRejection(t *testing.T) {
 // leaving the window fixed turned that flag into a silent per-byte deadline. A
 // tier told to accept 64 MiB messages gave a sender 10s to deliver one — about
 // 54 Mbit/s per stream — and reaped every push that could not, under a counter
-// and a Warn that both say the peer "delivered no message".
+// and a Warn that both said the peer "delivered no message".
 func TestReserveWindowScalesWithTheConfiguredMessageCap(t *testing.T) {
 	base := reserveWindowFor(maxIngestGRPCMessage)
 	if base != grpcReserveWindow {
@@ -158,10 +157,10 @@ func TestReserveWindowScalesWithTheConfiguredMessageCap(t *testing.T) {
 	}
 }
 
-// The scaling must not be reachable through an overflow. The trace tier passes
-// math.MaxInt32 for an uncapped internal hop, and an operator may pass anything
-// at all; a multiply that wrapped would produce a SHORT window, which is the
-// exact failure this scaling exists to remove.
+// The scaling must not be reachable through an overflow. An operator may pass
+// any int at all (the values below are just large ones of each width); a
+// multiply that wrapped would produce a SHORT window, which is the exact failure
+// this scaling exists to remove.
 func TestReserveWindowNeverUnderflowsOnAnAbsurdMessageCap(t *testing.T) {
 	for _, recv := range []int{math.MaxInt32, math.MaxInt / 2, math.MaxInt} {
 		if got := reserveWindowFor(recv); got != maxReserveWindow {
@@ -172,5 +171,45 @@ func TestReserveWindowNeverUnderflowsOnAnAbsurdMessageCap(t *testing.T) {
 	// function must not answer a bound with a nonsense duration either way).
 	if got := reserveWindowFor(-1); got != grpcReserveWindow {
 		t.Errorf("reserveWindowFor(-1) = %v, want the default %v", got, grpcReserveWindow)
+	}
+}
+
+// The BUDGETS derived from the message cap must not be reachable through an
+// overflow either — reserveWindowFor guarded its multiply and NewServer's two
+// did not. At math.MaxInt the 4x buffer budget wrapped negative and was
+// ignored (the budget stayed at its floor while each tap reserved MaxInt, and a
+// reservation with any bytes already held wrapped `used` negative and was
+// ADMITTED — the budget off), and past MaxInt/8 the decoded limit went negative
+// and refused every push. No message larger than gRPC's uint32 length prefix
+// can exist, so the cap is clamped there before anything is derived from it.
+func TestAbsurdMessageCapCannotOverflowTheByteBudgets(t *testing.T) {
+	for _, recv := range []int{math.MaxUint32 + 1, math.MaxInt/8 + 1, math.MaxInt} {
+		s := NewServer(ServerConfig{MaxRecvBytes: recv})
+		if s.grpcMaxRecv != math.MaxUint32 {
+			t.Errorf("MaxRecvBytes=%d: grpcMaxRecv = %d, want the %d gRPC frame ceiling", recv, s.grpcMaxRecv, uint32(math.MaxUint32))
+		}
+		if s.buffer.limit < 4*int64(s.grpcMaxRecv) {
+			t.Errorf("MaxRecvBytes=%d: buffer budget = %d, want at least four reservations of %d", recv, s.buffer.limit, s.grpcMaxRecv)
+		}
+		if s.decoded.limit < s.buffer.limit {
+			t.Errorf("MaxRecvBytes=%d: decoded budget = %d, below the raw budget %d (a wrapped multiply refuses every push)",
+				recv, s.decoded.limit, s.buffer.limit)
+		}
+		// The reservation a gRPC push takes, with bytes already held: it must
+		// be ACCOUNTED, never wrap the counter.
+		held := int64(1 << 20)
+		if !s.buffer.reserve(held) {
+			t.Fatalf("MaxRecvBytes=%d: the budget refused 1 MiB", recv)
+		}
+		if s.buffer.reserve(int64(s.grpcMaxRecv)) {
+			if used := s.buffer.used.Load(); used < held {
+				t.Errorf("MaxRecvBytes=%d: an admitted reservation left the budget's in-use count at %d: "+
+					"it wrapped, and a wrapped counter admits everything", recv, used)
+			}
+			s.buffer.release(int64(s.grpcMaxRecv))
+		}
+		if args := fmt.Sprint(s.budgetSourceArgs()); !strings.Contains(args, "-ingest-grpc-max-recv-bytes") {
+			t.Errorf("MaxRecvBytes=%d: the shed line claims the budget is at its floor: %s", recv, args)
+		}
 	}
 }

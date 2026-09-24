@@ -182,7 +182,7 @@ func TestSecretRefsRejectPathSeparators(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Parse: %v", err)
 		}
-		if got := m.Endpoints[0].BearerSecret; got != "" {
+		if got := m.Endpoints[0].AuthSecret; got != "" {
 			t.Errorf("bearerTokenSecret {name:%q key:%q} rendered the ambiguous ref %q",
 				tc.name, tc.key, got)
 		}
@@ -199,7 +199,7 @@ func TestSecretRefsRejectPathSeparators(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := m.Endpoints[0].BearerSecret; got != "prod/bearer/token" {
-		t.Errorf("BearerSecret = %q, want prod/bearer/token", got)
+	if got := m.Endpoints[0].AuthSecret; got != "prod/bearer/token" {
+		t.Errorf("AuthSecret = %q, want prod/bearer/token", got)
 	}
 }

@@ -28,6 +28,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/cli"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/internal/peerip"
 )
 
 // victimLine is what a workload on this node printed. It must never leave the
@@ -90,8 +91,27 @@ func tapServer(t *testing.T, tokenFile string, fromPod bool) (*httptest.Server, 
 	return srv, tap
 }
 
+// streamRequest is a GET for a /debug/otlp STREAM, bounded by its own
+// deadline. The stream never ends on its own (debugtap clears the server's
+// deadlines; only the client's disconnect ends it), so without one a
+// regression in delivery left streamCarriesTheVictimLine blocked in Scan until
+// go test's ten-minute default timeout panicked the whole package, instead of
+// reporting the named failure. At the deadline the body read fails, Scan
+// returns false, and the caller's t.Error fires.
+func streamRequest(t *testing.T, url string) *http.Request {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return req
+}
+
 // streamCarriesTheVictimLine drives the tap until a payload line arrives, or
-// fails. It is the "did the attacker get the data" half.
+// fails. It is the "did the attacker get the data" half. resp must come from a
+// streamRequest, whose deadline is what lets the false return be reached.
 func streamCarriesTheVictimLine(t *testing.T, resp *http.Response, tap *debugtap.Tap) bool {
 	t.Helper()
 	sc := bufio.NewScanner(resp.Body)
@@ -189,7 +209,7 @@ func TestTheTokenGrantsTheStreamFromAnotherPod(t *testing.T) {
 	}
 	srv, tap := tapServer(t, tokenFile, true)
 
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/debug/otlp?signal=logs&sample=100", nil)
+	req := streamRequest(t, srv.URL+"/debug/otlp?signal=logs&sample=100")
 	req.Header.Set("Authorization", "Bearer s3cret-debug-token")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -210,7 +230,7 @@ func TestTheTokenGrantsTheStreamFromAnotherPod(t *testing.T) {
 func TestPortForwardStillReadsTheStreamWithNoToken(t *testing.T) {
 	srv, tap := tapServer(t, "", false)
 
-	resp, err := http.Get(srv.URL + "/debug/otlp?signal=logs&sample=100")
+	resp, err := http.DefaultClient.Do(streamRequest(t, srv.URL+"/debug/otlp?signal=logs&sample=100"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,25 +244,40 @@ func TestPortForwardStillReadsTheStreamWithNoToken(t *testing.T) {
 }
 
 // A loopback address that arrived through a relay proves nothing about the
-// caller — the same evidence /v1/self refuses on.
+// caller — the same evidence, by PRESENCE, that /v1/self refuses on. Every name
+// in peerip's shared list is driven through the real guard (Via included: it is
+// the one RFC 9110 REQUIRES a relay to add, so a spec-following proxy on the
+// pod's loopback may send nothing else), plus an EMPTY header, which is still a
+// hop declaring itself.
 func TestALocalButForwardedRequestIsRefused(t *testing.T) {
 	before := obs.DebugRefused.WithLabelValues("forwarded").Value()
 	srv, _ := tapServer(t, "", false)
 
-	for _, h := range []string{"X-Forwarded-For", "Forwarded", "X-Real-Ip"} {
+	example := map[string]string{"Forwarded": "for=10.244.3.7", "Via": "1.1 envoy"}
+	type hop struct{ header, value string }
+	var cases []hop
+	for _, h := range peerip.ForwardingHeaders() {
+		v, ok := example[h]
+		if !ok {
+			v = "10.244.3.7"
+		}
+		cases = append(cases, hop{h, v})
+	}
+	cases = append(cases, hop{"X-Forwarded-For", ""})
+	for _, tc := range cases {
 		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/debug/otlp?signal=logs", nil)
-		req.Header.Set(h, "10.244.3.7")
+		req.Header[tc.header] = []string{tc.value}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusForbidden {
-			t.Fatalf("%s got %d, want 403: a relayed request wears the relay's address", h, resp.StatusCode)
+			t.Fatalf("%s: %q got %d, want 403: a relayed request wears the relay's address", tc.header, tc.value, resp.StatusCode)
 		}
 	}
-	if d := obs.DebugRefused.WithLabelValues("forwarded").Value() - before; d != 3 {
-		t.Errorf("kubescrape_debug_refused_total{reason=forwarded} moved by %v, want 3", d)
+	if d := obs.DebugRefused.WithLabelValues("forwarded").Value() - before; d != float64(len(cases)) {
+		t.Errorf("kubescrape_debug_refused_total{reason=forwarded} moved by %v, want %d", d, len(cases))
 	}
 }
 
@@ -308,6 +343,15 @@ func TestTheStartupSummaryNamesWhoMayReadTheDebugStream(t *testing.T) {
 	*debugToken = "/var/run/secrets/kubescrape/debug-token"
 	if got := summaryLines(t, agentConfig{})["effective listeners"]["debugAccess"]; got != "token" {
 		t.Errorf("debugAccess = %q with a token file, want token", got)
+	}
+	// No -listen means no debug server and no read of the token file (run()
+	// builds the guard only with -listen set), so "token" would name an access
+	// mode for a surface that is not served.
+	addr := *listen
+	t.Cleanup(func() { *listen = addr })
+	*listen = ""
+	if got := summaryLines(t, agentConfig{})["effective listeners"]["debugAccess"]; got != "(no -listen)" {
+		t.Errorf("debugAccess = %q with -listen empty and a token file set, want (no -listen)", got)
 	}
 }
 
@@ -431,7 +475,7 @@ func TestTheTokenIsUnaffectedByTheHostCheck(t *testing.T) {
 	}
 	srv, tap := tapServer(t, tokenFile, false)
 
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/debug/otlp?signal=logs&sample=100", nil)
+	req := streamRequest(t, srv.URL+"/debug/otlp?signal=logs&sample=100")
 	req.Host = "debug.internal.example.com"
 	req.Header.Set("Authorization", "Bearer s3cret-debug-token")
 	resp, err := http.DefaultClient.Do(req)
@@ -482,14 +526,14 @@ var debugSurfaces = map[string]bool{ // pattern -> must be behind guard.protect
 // runtime probe can only ask about paths the test already knows; this fails on
 // a surface nobody thought to ask about, which is how an ungated one gets added.
 func TestEveryDebugRouteIsClassified(t *testing.T) {
-	src, err := os.ReadFile("main.go")
+	src, err := os.ReadFile("debugserver.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	body := string(src)
 	start := strings.Index(body, "func (p *pipelines) debugMux(")
 	if start < 0 {
-		t.Fatal("debugMux is gone from main.go; this test can no longer see the routing table it audits")
+		t.Fatal("debugMux is gone from debugserver.go; this test can no longer see the routing table it audits")
 	}
 	end := strings.Index(body[start:], "\n\treturn mux\n}")
 	if end < 0 {

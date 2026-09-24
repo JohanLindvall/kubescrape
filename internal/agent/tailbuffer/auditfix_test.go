@@ -2,6 +2,8 @@ package tailbuffer
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -75,6 +77,105 @@ func TestDecidedKeepsSurviveTheCallersCancellation(t *testing.T) {
 	}
 }
 
+// The same guarantee for keeps a BOUND forced out inside an application's push.
+// Those spans came out of the buffer — their senders were acked when they were
+// buffered — so they are just as much the only copy as a sweep's, and a
+// cancelled sender context (the application gave up on its RPC) must not be
+// what destroys them. They used to leave on the SENDER's context, one attempt,
+// so the delivery guarantee for an acked trace depended on which path decided
+// it.
+func TestEarlyDecidedKeepsSurviveTheSendersCancellation(t *testing.T) {
+	next := &ctxCapture{}
+	b, _ := newTestBuffer(t, Config{Config: alwaysCfg(), DecisionWait: "1m", MaxTraces: 1}, next)
+	if err := b.ExportTraces(context.Background(), payload("checkout", spanSpec{trace: 403, span: 1, end: 5})); err != nil {
+		t.Fatal(err)
+	}
+	lost0 := counter(obs.TailSampleSpans.WithLabelValues("lost"))
+
+	// The second push makes maxTraces bind: trace 403 is decided early and
+	// leaves inside THIS push, whose sender has already cancelled.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 404, span: 1, end: 5})); err != nil {
+		t.Fatalf("the push failed (%v): the early-decided keep's send ran on the sender's cancellation", err)
+	}
+	spans, owned := next.got()
+	if spans != 1 {
+		t.Fatalf("the early-decided keep was not delivered (%d spans exported); nobody else holds it", spans)
+	}
+	if !owned {
+		t.Fatal("the ownership marker did not survive the detach")
+	}
+	if lost := counter(obs.TailSampleSpans.WithLabelValues("lost")) - lost0; lost != 0 {
+		t.Fatalf("lost spans counted %v, want 0", lost)
+	}
+}
+
+// failFirst refuses its first n exports with a TRANSIENT error, then delivers.
+type failFirst struct {
+	mu        sync.Mutex
+	n         int
+	calls     int
+	delivered map[uint64]int // trace id's low 8 bytes -> spans
+}
+
+func (f *failFirst) ExportTraces(_ context.Context, td ptrace.Traces) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.n > 0 {
+		f.n--
+		return errors.New("blip")
+	}
+	if f.delivered == nil {
+		f.delivered = map[uint64]int{}
+	}
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		sss := rss.At(i).ScopeSpans()
+		for j := 0; j < sss.Len(); j++ {
+			sp := sss.At(j).Spans()
+			for k := 0; k < sp.Len(); k++ {
+				id := sp.At(k).TraceID()
+				f.delivered[binary.BigEndian.Uint64(id[8:])]++
+			}
+		}
+	}
+	return nil
+}
+
+// A keep a bound forced out inside a push is RETRIED like a sweep's keep: one
+// transient blip must not destroy an acked trace. It used to get a single
+// attempt, so the same blip that a sweep's retry absorbs counted the trace lost
+// (the sender's retransmission re-buffers only its OWN spans, never the early-
+// decided trace it happened to carry out).
+func TestEarlyDecidedKeepsSurviveATransientFailure(t *testing.T) {
+	next := &failFirst{n: 1}
+	b, _ := newTestBuffer(t, Config{Config: alwaysCfg(), DecisionWait: "1m", MaxTraces: 1}, next)
+	ctx := context.Background()
+	if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 405, span: 1, end: 5})); err != nil {
+		t.Fatal(err)
+	}
+	lost0 := counter(obs.TailSampleSpans.WithLabelValues("lost"))
+	kept0 := counter(obs.TailSampleSpans.WithLabelValues("kept"))
+
+	if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 406, span: 1, end: 5})); err != nil {
+		t.Fatalf("the push failed (%v) on a blip the retry should have absorbed", err)
+	}
+	next.mu.Lock()
+	calls, got := next.calls, next.delivered[405]
+	next.mu.Unlock()
+	if calls != 2 || got != 1 {
+		t.Fatalf("calls=%d delivered(405)=%d, want 2 attempts and the early-decided trace delivered once", calls, got)
+	}
+	if lost := counter(obs.TailSampleSpans.WithLabelValues("lost")) - lost0; lost != 0 {
+		t.Fatalf("lost spans counted %v, want 0", lost)
+	}
+	if kept := counter(obs.TailSampleSpans.WithLabelValues("kept")) - kept0; kept != 1 {
+		t.Fatalf("kept spans counted %v, want 1", kept)
+	}
+}
+
 // Detaching from the caller's CANCELLATION must not detach from its BUDGET: the
 // shutdown path hands Flush a deadline precisely so a dead collector cannot hold
 // the final pass past the pod's termination grace.
@@ -128,7 +229,7 @@ func (c *blockingCapture) ExportTraces(_ context.Context, td ptrace.Traces) erro
 // channel at that moment, and a select with two ready cases picks at random, so
 // one pass proves nothing: each iteration here is one coin flip.
 func TestRunDoesNotSweepOnceItsContextIsCancelled(t *testing.T) {
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		next := &blockingCapture{entered: make(chan struct{}), release: make(chan struct{})}
 		b, clk := newTestBuffer(t, Config{Config: alwaysCfg(), DecisionWait: "100ms"}, next)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -162,10 +263,10 @@ func TestRunDoesNotSweepOnceItsContextIsCancelled(t *testing.T) {
 
 // --- decide's scratch -------------------------------------------------------
 
-// decide's scratch is resliced, not cleared, so its tail keeps pdata handles
-// into the last decision's trace — one span message plus its group's resource
-// attributes each. On a DROP that is the payload the branch below it goes out of
-// its way to release.
+// decide's scratch used to be resliced (`[:0]`), not cleared, so its tail kept
+// pdata handles into the last decision's trace — one span message plus its
+// group's resource attributes each. On a DROP that was the payload the drop
+// branch goes out of its way to release. decide now clear()s it; this pins that.
 func TestDecideDoesNotRetainTheDecidedTracesSpans(t *testing.T) {
 	next := &capture{}
 	b, clk := newTestBuffer(t, Config{Config: errorsCfg(), DecisionWait: "1s"}, next)

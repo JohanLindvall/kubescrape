@@ -51,7 +51,7 @@ func enrichedResource(a pcommon.Map, i int) {
 
 func routedMetrics(resources int) pmetric.Metrics {
 	md := pmetric.NewMetrics()
-	for i := 0; i < resources; i++ {
+	for i := range resources {
 		rm := md.ResourceMetrics().AppendEmpty()
 		enrichedResource(rm.Resource().Attributes(), i)
 		dp := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetEmptyGauge().DataPoints().AppendEmpty()
@@ -79,29 +79,54 @@ func BenchmarkRouterNoDestinations(b *testing.B) {
 	}
 }
 
-// One route configured that nothing matches: the scan still walks every
-// resource and every pattern before falling to the default.
+// Routes configured that nothing matches: every resource's namespace is
+// resolved and falls to the default. Without the namespace memo this walked
+// every pattern of every route per resource, so it is measured at the route
+// counts a tenant-per-route config reaches.
 func BenchmarkRouterNoMatch(b *testing.B) {
 	ctx := context.Background()
-	dests := []Destination{{Name: "tenant-a", Namespaces: []string{"other-*"}, Exporter: nopExporter{}}}
-	for _, n := range []int{100, 4000} {
-		md := routedMetrics(n)
-		b.Run(fmt.Sprintf("resources=%d", n), func(b *testing.B) {
-			r := New(nopExporter{}, dests)
-			b.ReportAllocs()
-			for b.Loop() {
-				if err := r.ExportMetrics(ctx, md); err != nil {
-					b.Fatal(err)
+	for _, routes := range []int{1, 16, 64} {
+		dests := make([]Destination, routes)
+		for i := range dests {
+			dests[i] = Destination{Name: fmt.Sprintf("tenant-%d", i),
+				Namespaces: []string{fmt.Sprintf("other-%d-*", i), fmt.Sprintf("prod-%d", i)}, Exporter: nopExporter{}}
+		}
+		for _, n := range []int{100, 4000} {
+			md := routedMetrics(n)
+			b.Run(fmt.Sprintf("routes=%d/resources=%d", routes, n), func(b *testing.B) {
+				r := New(nopExporter{}, dests)
+				b.ReportAllocs()
+				for b.Loop() {
+					if err := r.ExportMetrics(ctx, md); err != nil {
+						b.Fatal(err)
+					}
 				}
-			}
-		})
+			})
+		}
 	}
 }
 
-// The split path, for scale: every matched resource is COPIED.
-func BenchmarkRouterSplit(b *testing.B) {
+// Every resource to ONE route: forwarded uncopied, like the all-default fast
+// path. This shape used to take the split and copy every resource.
+func BenchmarkRouterSingleDestination(b *testing.B) {
 	ctx := context.Background()
 	dests := []Destination{{Name: "tenant-a", Namespaces: []string{"team-*"}, Exporter: nopExporter{}}}
+	md := routedMetrics(100)
+	r := New(nopExporter{}, dests)
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := r.ExportMetrics(ctx, md); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// The split path, for scale: a payload spanning the default chain and a route,
+// so every resource is COPIED into its destination's part.
+func BenchmarkRouterSplit(b *testing.B) {
+	ctx := context.Background()
+	// team-1 and team-10..team-15 of routedMetrics' sixteen namespaces.
+	dests := []Destination{{Name: "tenant-a", Namespaces: []string{"team-1*"}, Exporter: nopExporter{}}}
 	md := routedMetrics(100)
 	r := New(nopExporter{}, dests)
 	b.ReportAllocs()

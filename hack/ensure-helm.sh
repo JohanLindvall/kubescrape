@@ -14,8 +14,13 @@ BIN_DIR="$SCRIPT_DIR/bin"
 # version string it cannot see is a pin it cannot enforce.
 HELM_VERSION="${HELM_VERSION:-$(tr -d '[:space:]' < "$SCRIPT_DIR/helm-version")}"
 
+# Cannot fail, by construction (`|| true`), for cluster-up.sh's reason: under
+# errexit and pipefail the `path_version="$(...)"` assignment below would take
+# the status of a helm that cannot run `version` (a wrong-architecture binary,
+# a version-manager shim with no version selected) and exit 126 in silence,
+# where it must read as "unknown" and take the download path.
 helm_version_of() {
-  "$1" version --short 2>/dev/null | cut -d+ -f1
+  "$1" version --short 2>/dev/null | cut -d+ -f1 || true
 }
 
 # An ALREADY-DOWNLOADED hack/bin/helm is checked like any other candidate. It

@@ -110,8 +110,11 @@ func fatPodFixture(t *testing.T, pods, bulkBytes, ports int) (*store.Store, *ser
 // chains, MaxContributorsPerTarget): 16 targets, a 3,283,798-byte body. Ten such
 // pods on a node is ~33 MB per GET /v1/nodes/{node}/targets, re-derived and
 // re-marshalled on every agent poll of that node, in the singleton the chart
-// requests 128Mi for and deliberately gives no memory limit — and writeCached
-// must BUILD the body to hash its ETag, so the 304 path does not save it.
+// requests 128Mi for and deliberately gives no memory limit. The change-token
+// memo answers a revalidation 304 only while nothing the node's list reads has
+// changed; a pod change on the node, or a Service, monitor or owner edit
+// anywhere in the cluster (the same tenant can make one at will), rebuilds it,
+// and writeCached must BUILD the body to hash its ETag.
 // scrape.MaxPortsPerPod cannot see it: 16 targets is exactly what it admits,
 // and its own comment models the per-target cost as "the ~2 KiB pod document".
 func TestFatPodAnnotationCannotMultiplyIntoTheNodeTargetsDocument(t *testing.T) {

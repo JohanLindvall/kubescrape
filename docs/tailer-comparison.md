@@ -6,11 +6,13 @@ layer, and it supports two things almost nobody else does. This document
 compares the design against the major log shippers and names honestly which
 parts of the complexity are essential and which are self-inflicted.
 
-Sizes (as of mid-2026): ~5,000 production lines, split by concern
-(`tailer.go`, `ledger.go`, `discover.go`, `pipeline.go`, `read.go`,
-`rotate.go`, `archive.go`, `flush.go`, `checkpoint.go`, `sources.go`,
-`podconfig.go`, `status.go`) and roughly one and two-thirds times that in
-tests, grouped the same way.
+Sizes (measured 2026-09 with `wc -l`): ~7,500 production lines — about
+3,400 of them code, the rest comments and blank lines — in 19 files split by
+concern (`tailer.go`, `file.go`, `ledger.go`, `fingerprint.go`, `observed.go`,
+`discover.go`, `watch.go`, `resolve.go`, `pipeline.go`, `read.go`,
+`rotate.go`, `replay.go`, `gone.go`, `archive.go`, `flush.go`,
+`checkpoint.go`, `sources.go`, `podconfig.go`, `status.go`), and about twice
+that in tests (~14,500 lines).
 The historical sections below describe the PRE-refactor design they analyzed;
 "If it should ever get simpler" records what has since been done.
 
@@ -20,7 +22,7 @@ Each competitor weakens at least one leg that this tailer keeps:
 
 | | kubescrape | Filebeat | Promtail | Vector | Fluent Bit |
 |---|---|---|---|---|---|
-| Offsets committed only after collector ack | **yes** | yes (via queue) | **no** — positions advance on read, send is decoupled | with acks enabled | only with filesystem storage |
+| Offsets committed only after collector ack | **yes** — except a PERMANENTLY rejected batch, dropped and counted (`kubescrape_log_permanent_dropped_total`); with `-buffer-dir` the fsync'd spool's acceptance is the ack | yes (via queue) | **no** — positions advance on read, send is decoupled | with acks enabled | only with filesystem storage |
 | Multiline joining coupled to offset safety | **yes** (watermark) | partial (per-harvester) | **no** — buffered groups can be lost on restart | mostly | loose (in-memory buffer) |
 | Multiline group joins **across** a rotation | **yes** | no | no | no | no |
 | copytruncate handled | **yes** (fingerprint re-verify) | docs say "don't use copytruncate" | poorly | via checksums | partially |
@@ -63,7 +65,7 @@ offset accounting entirely (a crash loses buffered groups).
 
 ## Why this code *looks* worse than it is
 
-1. **Concentration.** ~5,000 lines do what Filebeat spreads across harvester +
+1. **Concentration.** ~7,500 lines do what Filebeat spreads across harvester +
    input manager + spooler + queue + registrar — well over 10k lines before
    counting libbeat. No single Filebeat file looks scary; the complexity hides
    in the seams between abstractions. The single-sweep-goroutine design means
@@ -92,7 +94,7 @@ offset accounting entirely (a crash loses buffered groups).
    `restartAt`/fingerprint-extension/quarantine code is the shape correctness
    takes when those are *not* accepted as known limitations.
 
-The test suite runs about one and two-thirds the production line count — an
+The test suite runs about twice the production line count — an
 unusually strong
 ratio — and interleaving-exact tests are themselves a design constraint: the
 synchronous sweep exists partly so tests can drive exact orderings, which is
@@ -239,7 +241,8 @@ detection, archive decompression, and the entry-to-byte-range ledger all
 remain — the ledger becomes the assembly layer's provenance tracking rather
 than vanishing. Two risks need explicit guarding: the layer boundary must not
 introduce per-line allocations (chunks handed off as slice views, provenance
-pooled — the pinned `BenchmarkIngestLine` 0 allocs/op is the tripwire), and
+pooled — `TestIngestLineAllocationBudget`'s 0 allocs per line is the
+tripwire; `BenchmarkIngestLine` only reports it), and
 the cross-layer release rule (a segment may only close once the assembler has
 drained it) replaces today's watermark check and needs the same rigor.
 

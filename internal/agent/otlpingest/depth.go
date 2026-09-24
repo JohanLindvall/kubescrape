@@ -18,7 +18,7 @@ package otlpingest
 // be refused before it is decoded — a guard AFTER the decode is a guard that
 // runs on the far side of the crash.
 //
-// The existing depth bound (maxBodyScrubDepth, enrich.go) does not help and
+// The existing depth bound (maxBodyScrubDepth, scrub.go) does not help and
 // says so where it is used: it walks an ALREADY-DECODED pcommon.Value. The
 // decode is the unbounded step.
 //
@@ -71,10 +71,13 @@ package otlpingest
 
 import (
 	"errors"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/mem"
+
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // maxNestingDepth bounds length-delimited nesting in a pushed payload.
@@ -85,8 +88,9 @@ import (
 // each further level of a map/array body costs THREE wire levels (AnyValue ->
 // KeyValueList -> KeyValue -> AnyValue). So 100 admits roughly 31 levels of
 // nested attribute structure — an order of magnitude past what any SDK emits
-// (2-3 in practice), and past maxBodyScrubDepth (8), where this package already
-// stops walking a decoded body.
+// (2-3 in practice). maxBodyScrubDepth, where this package stops walking a
+// DECODED body, is derived from this bound, so the scrub reaches every leaf a
+// body the guard admits can hold; raising this raises it too.
 //
 // 100 is also protobuf's OWN portability limit: the C++ implementation's
 // default recursion limit is 100, so a payload deeper than this is already
@@ -324,18 +328,35 @@ var codecBufferPool = mem.NewTieredBufferPool(
 	16<<20,  // this receiver's raised cap
 )
 
-// depthGuardCodec is the registered proto codec plus the wire-shape check.
+// depthGuardCodec is the registered proto codec plus the wire-shape check —
+// and, on the application-facing receiver, the decoded-structure charge, which
+// has to be taken here for the same reason the shape check does: this is the
+// only code on the near side of the decode.
 type depthGuardCodec struct {
 	delegate encoding.CodecV2
 	// tooDeep reports a refusal (counted and warned by the Server). Never nil
 	// in production; a nil is tolerated so a bare codec is usable in tests.
 	tooDeep func()
+	// admit charges the decoded budget from the wire bytes before the decode
+	// (the Server; see decodedClaims). nil on a receiver with no such budget —
+	// the trace tier's authenticated internal hop.
+	admit decodeAdmission
+}
+
+// decodeAdmission is the decoded budget's hook into the codec.
+type decodeAdmission interface {
+	// claimDecode charges what b decodes into and reports whether v may be
+	// decoded at all; a refused message is left undecoded and its verdict is
+	// answered by the unary interceptor.
+	claimDecode(v any, b []byte) bool
+	// abandonDecode returns the claim of a decode that failed.
+	abandonDecode(v any)
 }
 
 // newDepthGuardCodec wraps the codec registered for "proto" — pdata's, since
 // its init() registers over grpc-go's default and this package imports pdata.
-func newDepthGuardCodec(tooDeep func()) *depthGuardCodec {
-	return &depthGuardCodec{delegate: encoding.GetCodecV2("proto"), tooDeep: tooDeep}
+func newDepthGuardCodec(tooDeep func(), admit decodeAdmission) *depthGuardCodec {
+	return &depthGuardCodec{delegate: encoding.GetCodecV2("proto"), tooDeep: tooDeep, admit: admit}
 }
 
 // NestingGuardOption is the server option that puts the shape check on a gRPC
@@ -349,7 +370,7 @@ func newDepthGuardCodec(tooDeep func()) *depthGuardCodec {
 // NewBodyReader turns its counting off there: that series means "an APPLICATION
 // push was refused at a listener nothing authenticates".
 func NestingGuardOption(onRefused func()) grpc.ServerOption {
-	return grpc.ForceServerCodecV2(newDepthGuardCodec(onRefused))
+	return grpc.ForceServerCodecV2(newDepthGuardCodec(onRefused, nil))
 }
 
 func (c *depthGuardCodec) Name() string { return "proto" }
@@ -372,5 +393,44 @@ func (c *depthGuardCodec) Unmarshal(data mem.BufferSlice, v any) error {
 		}
 		return err
 	}
-	return m.UnmarshalProto(b)
+	if c.admit != nil && !c.admit.claimDecode(v, b) {
+		// Refused, and deliberately NOT an error: grpc-go would answer any
+		// error from here as codes.Internal, i.e. permanently. The message
+		// stays undecoded — which is the whole saving — and the interceptor
+		// answers the retryable refusal (decodedClaims).
+		return nil
+	}
+	if err := m.UnmarshalProto(b); err != nil {
+		if c.admit != nil {
+			c.admit.abandonDecode(v)
+		}
+		return err
+	}
+	return nil
+}
+
+// codecOption is the gRPC codec for this receiver: the nesting guard every OTLP
+// listener gets (NestingGuardOption) plus the decoded-structure charge, which
+// only a receiver with a decoded budget can take.
+func (s *Server) codecOption() grpc.ServerOption {
+	return grpc.ForceServerCodecV2(newDepthGuardCodec(s.noteTooDeep, s))
+}
+
+// tooDeepWarnEvery paces the wire-shape refusal warning: a sender emitting a
+// body this deep emits it on every push, and one line names the condition.
+const tooDeepWarnEvery = time.Minute
+
+// noteTooDeep reports a payload refused for its nesting on the gRPC arm. It
+// counts into the same series as the HTTP door's refusals
+// (obs.IngestBodyRejected{reason="too_deep"}) because it is the same event —
+// an application push refused at a listener nothing authenticates — reached
+// through the other transport; the HTTP arm's own counting happens in
+// BodyReader.noteRejected.
+func (s *Server) noteTooDeep() {
+	obs.IngestBodyRejected.WithLabelValues(reasonTooDeep).Inc()
+	if s.tooDeepWarns.Allow(tooDeepWarnEvery) {
+		s.log.Warn("ingest: refused a gRPC push whose payload nests deeper than the decoder may recurse; "+
+			"decoding it costs unbounded goroutine stack, so the shape is refused before the decode",
+			"maxDepth", maxNestingDepth)
+	}
 }

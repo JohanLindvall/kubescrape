@@ -39,6 +39,34 @@ func TestAttrStringMatchesPcommon(t *testing.T) {
 	}
 }
 
+// A LIFTED attribute is read through attrString when a rule or label resolves
+// it off the resource, and through pcommon once Put has stored it on a record:
+// the two must read the same text for the same line field. -0.0 split them
+// ("-0" lifted, "0" stored, since a whole float is stored as an int), and so
+// did a whole float past 2^53 (the stored int "70000000000001728" against the
+// shortest decimal "70000000000001730").
+func TestLiftedAttributeReadsAsItIsStored(t *testing.T) {
+	e, err := logattrs.New(&logattrs.Config{Rules: []logattrs.Rule{{Key: "a"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tok := range []string{
+		"-0.0", "0.0", "-0", "0", "007", "1.0", "1e2", "-0.5", "5e-7", "1e21",
+		"7.0000000000001728e16", "9007199254740993", "9.007199254740993e15", `"s"`, "true",
+	} {
+		r := e.Extract(`{"a":` + tok + `}`)
+		if len(r.Log) != 1 {
+			t.Fatalf("%s: lifted %d attributes, want 1", tok, len(r.Log))
+		}
+		m := pcommon.NewMap()
+		logattrs.Put(m, r.Log)
+		v, _ := m.Get("a")
+		if got, want := attrString(r.Log[0].Val), v.AsString(); got != want {
+			t.Errorf("%s: resolves as %q, stored reads %q", tok, got, want)
+		}
+	}
+}
+
 // maps builds a record/resource attribute pair from literal string maps.
 func maps(rec, res map[string]string) (pcommon.Map, pcommon.Map) {
 	r, s := pcommon.NewMap(), pcommon.NewMap()
@@ -122,6 +150,58 @@ func TestRecordAttributesWinOverResource(t *testing.T) {
 		if got := r.RuleFn()(tc.key); got != tc.want {
 			t.Errorf("RuleFn(%s) = %q, want %q", tc.key, got, tc.want)
 		}
+	}
+}
+
+// The resolved-identity keys are the exception to record-first: identity is a
+// resource concern, so a record-level (or lifted) copy must not shadow the
+// resource's for a rule key or a metric label. Record-first, a pushed record
+// declaring k8s.namespace.name=payments satisfied a namespace keep-allowlist
+// while the resource it shipped under — the one routing reads — said default.
+// Without a resource value the lower ranks still answer.
+func TestIdentityKeysResolveResourceFirst(t *testing.T) {
+	rec, res := maps(
+		map[string]string{
+			"k8s.namespace.name": "payments", // shadowed
+			"container.name":     "from-record",
+			"service.name":       "from-the-line",
+		},
+		map[string]string{
+			"k8s.namespace.name": "default",
+			"k8s.pod.name":       "web-abc",
+			"service.name":       "from-the-pod",
+		},
+	)
+	r := New()
+	r.Set(rec, res, "")
+	r.SetLifted([]logattrs.Attr{
+		{Key: "k8s.pod.name", Val: "lifted-pod"},   // the resource still wins
+		{Key: "k8s.node.name", Val: "lifted-node"}, // no resource value: the lift answers
+	})
+	for _, tc := range []struct{ key, want string }{
+		{"k8s.namespace.name", "default"},
+		{"k8s.pod.name", "web-abc"},
+		{"k8s.node.name", "lifted-node"},
+		{"container.name", "from-record"}, // nothing above it: the record answers
+		{"service.name", "from-the-line"}, // not identity: record-first as ever
+	} {
+		if got := r.LabelFn()(tc.key); got != tc.want {
+			t.Errorf("LabelFn(%s) = %q, want %q", tc.key, got, tc.want)
+		}
+		if got := r.RuleFn()(tc.key); got != tc.want {
+			t.Errorf("RuleFn(%s) = %q, want %q", tc.key, got, tc.want)
+		}
+	}
+
+	// The VALUE half ranks the same way, so a metric's label and value name
+	// the same attribute.
+	num := pcommon.NewMap()
+	num.PutInt("k8s.pod.uid", 1)
+	resNum := pcommon.NewMap()
+	resNum.PutInt("k8s.pod.uid", 2)
+	r.Set(num, resNum, "")
+	if v, ok, present := r.ValueFn()("k8s.pod.uid"); !ok || !present || v != 2 {
+		t.Errorf("ValueFn(k8s.pod.uid) = %v, %v, present=%v; want the resource's 2", v, ok, present)
 	}
 }
 
@@ -269,7 +349,7 @@ func TestLowerSeverity(t *testing.T) {
 	}
 }
 
-// journald stamps the syslog severity texts lowercase (journald.go); every one
+// journald stamps the syslog severity texts lowercase (its severity()); every one
 // must take an allocation-free path — the journal is the pipeline whose
 // allocation-free severity lowering this function replaced, and five of its
 // eight texts used to miss the constant list and allocate per entry. Any

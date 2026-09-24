@@ -6,7 +6,6 @@ package main
 // suite green.
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -45,8 +44,7 @@ func nodeMetaServer(t *testing.T, labels map[string]string) (*metaclient.Client,
 func TestStartNodeInfoResolvesAndClearsTheGate(t *testing.T) {
 	meta, _ := nodeMetaServer(t, map[string]string{"topology.kubernetes.io/zone": "eu-1a"})
 	ready := newReadiness()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	info := startNodeInfo(ctx, meta, "node1", 50*time.Millisecond, discardLogger(), ready.gate(gateMetadata))
 	if n := info(); n == nil || n.Name != "node1" {
@@ -80,8 +78,7 @@ func TestStartNodeInfoResolvesAndClearsTheGate(t *testing.T) {
 // only requires it when the refresh is positive).
 func TestStartNodeInfoZeroRefreshMakesNoRequest(t *testing.T) {
 	meta, hits := nodeMetaServer(t, nil)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	info := startNodeInfo(ctx, meta, "node1", 0, discardLogger(), nil)
 	time.Sleep(30 * time.Millisecond)

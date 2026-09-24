@@ -2,7 +2,6 @@ package chartcheck
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -30,8 +29,7 @@ import (
 // expansion and not on brackets as such.
 func TestKubeletEndpointIsNotStaticallyBracketedAroundTheEnvVar(t *testing.T) {
 	helm := helmBin(t)
-	out, err := exec.Command(helm, "template", "kubescrape", "../../charts/kubescrape",
-		"--namespace", "monitoring", "--show-only", "templates/agent.yaml").CombinedOutput()
+	out, err := helmTemplate(helm, "monitoring", "--show-only", "templates/agent.yaml")
 	if err != nil {
 		t.Fatalf("helm template failed: %v\n%s", err, out)
 	}

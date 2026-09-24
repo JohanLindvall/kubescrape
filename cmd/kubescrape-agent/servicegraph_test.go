@@ -30,6 +30,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
 	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -175,7 +176,7 @@ serviceGraphShards:
 		t.Fatalf("validateConfig rejected the documented config: %v", err)
 	}
 	// And the values reach the objects a real start builds.
-	if got := servicegraph.NewProcessor(*cfg.ServiceGraph, slog.New(slog.DiscardHandler)).Wait(); got != 10*time.Second {
+	if got := servicegraph.NewProcessor(*cfg.ServiceGraph, nil, slog.New(slog.DiscardHandler)).Wait(); got != 10*time.Second {
 		t.Errorf("pairing window = %v, want 10s", got)
 	}
 }
@@ -264,6 +265,41 @@ func TestValidateConfigRejectsBadServiceGraph(t *testing.T) {
 	}
 }
 
+// The tier's two export periods: a typed non-positive value used to reach
+// cumagg.Store.Run, which silently exported every minute while -check-config
+// and the startup lines printed the value typed. Refused like the cgroup
+// sampler's period, naming the flag and what "off" is spelled as.
+func TestTraceTierExportIntervalsMustBePositive(t *testing.T) {
+	for _, tc := range []struct {
+		flag string
+		v    *time.Duration
+	}{
+		{"ingest-span-metrics-interval", spanMetricsIv},
+		{"service-graph-interval", serviceGraphIv},
+	} {
+		for _, v := range []time.Duration{0, -time.Second} {
+			old := *tc.v
+			typedFlags(t, tc.flag)
+			*tc.v = v
+			err := validateConfig(agentConfig{}, "")
+			*tc.v = old
+			if err == nil {
+				t.Fatalf("accepted -%s=%s", tc.flag, v)
+			}
+			for _, want := range []string{"-" + tc.flag, "positive duration"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not name %q", err, want)
+				}
+			}
+		}
+		// The default is legal.
+		typedFlags(t, tc.flag)
+		if err := validateConfig(agentConfig{}, ""); err != nil {
+			t.Fatalf("refused the default -%s=%s: %v", tc.flag, *tc.v, err)
+		}
+	}
+}
+
 // The shard's receiver takes spans from every pod in the cluster, so it must
 // never be reachable unauthenticated. The chart deliberately renders
 // -service-graph WITHOUT the token flag when no Secret is configured, so this
@@ -321,6 +357,42 @@ func TestServiceGraphShardRequiresATokenFile(t *testing.T) {
 	}
 	if p.serviceGraphReg != nil {
 		t.Error("the shard wired its registry before the token check")
+	}
+}
+
+// ACQUIRE BEFORE SERVING. The internal receiver feeds the owner chain, whose
+// tail buffer acks a sibling's push BEFORE deciding it, and the resharder is
+// the one step after the token read that can fail. It used to be built after
+// the receiver was already spawned, so a failing ring config returned out of
+// run() — never reaching the shutdown sequence's Flush — with spans a sibling
+// had been told had landed still buffered, and no counter moving. A start that
+// fails there must fail before the receiver exists: no readiness gate, nothing
+// bound.
+func TestServiceGraphReceiverIsNotServedWhenTheResharderFails(t *testing.T) {
+	defer restoreServiceGraphFlags(t)()
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("s3cr3t\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	*serviceGraphOn, *serviceGraphToken = true, tokenFile
+	*serviceGraphListen, *serviceGraphHTTPListen = freeAddr(t), ""
+	*serviceGraphIngest, *serviceGraphIngestGRPC, *serviceGraphIngestHTTP = true, freeAddr(t), ""
+	// A two-shard ring addressed by a URL: serviceGraphShardConfig refuses it
+	// (validateConfig would too — this drives the start path's own refusal).
+	*serviceGraphShards, *serviceGraphEndpoint = 2, "http://sg.monitoring.svc:4319"
+
+	ctx, p := testPipelines(t)
+	p.out = nopExporter{}
+	err := p.startServiceGraph(ctx)
+	if err == nil || !strings.Contains(err.Error(), "service-graph shards") {
+		t.Fatalf("startServiceGraph = %v, want the resharder's refusal", err)
+	}
+	if _, wired := p.ready.states()[gateServiceGraph]; wired {
+		t.Fatal("the internal receiver was wired (its readiness gate is registered) before the resharder failed: it can ack sibling pushes that the early return then drops")
+	}
+	if c, err := net.DialTimeout("tcp", *serviceGraphListen, 200*time.Millisecond); err == nil {
+		_ = c.Close()
+		t.Fatal("the internal receiver is listening after a start that failed")
 	}
 }
 
@@ -462,6 +534,7 @@ func TestServiceGraphReceiverAuthenticatesAndPairs(t *testing.T) {
 		grpcAddr: grpcAddr,
 		httpAddr: httpAddr,
 		tokens:   tok.Tokens,
+		cached:   tok.Cached,
 		consume: func(_ context.Context, td ptrace.Traces) error {
 			spans.Add(int64(td.SpanCount()))
 			return nil
@@ -642,29 +715,6 @@ func TestOwnerChainFailurePropagates(t *testing.T) {
 	}
 }
 
-// sgPairTap must feed the pairing store only after a SUCCESSFUL export: a failed
-// one is retried by the application with the identical batch, and an edge
-// counted before the export would be counted again on every retry.
-func TestPairTapCountsOnlyAfterASuccessfulExport(t *testing.T) {
-	proc := servicegraph.NewProcessor(servicegraph.Config{}, slog.New(slog.DiscardHandler))
-	inner := &captureTraces{err: errors.New("nope")}
-	tap := &sgPairTap{proc: proc, inner: inner}
-
-	if err := tap.ExportTraces(context.Background(), oneClientSpan()); err == nil {
-		t.Fatal("the tap swallowed an export failure")
-	}
-	if st := proc.Stats(); st.Items != 0 {
-		t.Errorf("the pairing store took %d half-edges from a failed export; a retry would double-count them", st.Items)
-	}
-	inner.err = nil
-	if err := tap.ExportTraces(context.Background(), oneClientSpan()); err != nil {
-		t.Fatalf("ExportTraces: %v", err)
-	}
-	if st := proc.Stats(); st.Items != 1 {
-		t.Errorf("the pairing store holds %d half-edges after one CLIENT span, want 1", st.Items)
-	}
-}
-
 // --- peer-IP attribution ---
 
 // The correctness trap of the whole topology: a peer address that resolves to
@@ -819,7 +869,7 @@ func TestEverySpanReachesExactlyOneOwnerChain(t *testing.T) {
 		rs := td.ResourceSpans().AppendEmpty()
 		rs.Resource().Attributes().PutStr("service.name", "checkout")
 		ss := rs.ScopeSpans().AppendEmpty()
-		for i := 0; i < traces; i++ {
+		for i := range traces {
 			sp := ss.Spans().AppendEmpty()
 			sp.SetTraceID(pcommon.TraceID{byte(i), byte(i >> 8), 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 1})
 			sp.SetSpanID(pcommon.SpanID{byte(i), 2, 3, 4, 5, 6, 7, 8})
@@ -886,6 +936,7 @@ func TestServiceGraphHTTPOversizedGzipIs413(t *testing.T) {
 	rcv := &sgReceiver{
 		httpAddr: freeAddr(t),
 		tokens:   func() []string { return []string{"s3cr3t"} },
+		cached:   func() []string { return []string{"s3cr3t"} },
 		consume:  func(context.Context, ptrace.Traces) error { return nil },
 		log:      slog.New(slog.DiscardHandler),
 	}
@@ -1034,13 +1085,43 @@ func TestSGMaxRecvBytesNegativeDisablesTheCapWithTheSplitting(t *testing.T) {
 	if got := sgMaxRecvBytes(); got != math.MaxInt32 {
 		t.Fatalf("sgMaxRecvBytes() with splitting disabled = %d, want unlimited (MaxInt32): a finite cap under an uncapped sender re-creates the rejection", got)
 	}
-	*otlpMaxSendBytes = 0
-	if got := sgMaxRecvBytes(); got != sgMaxRecvFloor {
-		t.Fatalf("sgMaxRecvBytes() at the default = %d, want the floor %d", got, sgMaxRecvFloor)
+	// A raised split cap past everything the application ports admit is the
+	// one case the flag itself decides the cap.
+	*otlpMaxSendBytes = 32 << 20
+	if got := sgMaxRecvBytes(); got != 32<<20 {
+		t.Fatalf("sgMaxRecvBytes() = %d, want the raised flag value 32 MiB", got)
 	}
-	*otlpMaxSendBytes = 8 << 20
-	if got := sgMaxRecvBytes(); got != 8<<20 {
-		t.Fatalf("sgMaxRecvBytes() = %d, want the raised flag value 8 MiB", got)
+}
+
+// A split cap is not an upper bound on a part: otlpsplit ships a single span
+// over it ALONE, so an entry shard forwards whatever one application push
+// admitted (plus its enrichment) as one message. The internal hop used to be
+// sized from -otlp-max-send-bytes alone — 4 MiB at the default — so a 5 MiB
+// span was refused when a SIBLING owned its trace and delivered when this shard
+// did: delivery decided by the trace id.
+func TestSGMaxRecvBytesAdmitsEverythingTheApplicationPortsAdmit(t *testing.T) {
+	oldSend, oldRecv := *otlpMaxSendBytes, *ingestGRPCMaxRecv
+	defer func() { *otlpMaxSendBytes, *ingestGRPCMaxRecv = oldSend, oldRecv }()
+
+	for _, tc := range []struct {
+		name       string
+		send, recv int
+		atLeast    int
+	}{
+		{"defaults: the 16 MiB OTLP/HTTP body", 0, 0, 16 << 20},
+		{"a split cap raised below the HTTP body", 8 << 20, 0, 16 << 20},
+		{"an application gRPC cap raised past the HTTP body", 0, 64 << 20, 64 << 20},
+		{"both raised", 32 << 20, 64 << 20, 64 << 20},
+	} {
+		*otlpMaxSendBytes, *ingestGRPCMaxRecv = tc.send, tc.recv
+		got := sgMaxRecvBytes()
+		// The enrichment the entry shard adds rides on top of what it admitted.
+		if want := tc.atLeast + sgEnrichHeadroom; got < want {
+			t.Errorf("%s: sgMaxRecvBytes() = %d, below the %d an entry shard can forward as ONE part: a sibling-owned trace carrying one big span is refused while a locally-owned one is not", tc.name, got, want)
+		}
+		if want := otlpingest.MaxPushBytes(tc.recv) + sgEnrichHeadroom; got < want {
+			t.Errorf("%s: sgMaxRecvBytes() = %d, below otlpingest.MaxPushBytes + headroom = %d", tc.name, got, want)
+		}
 	}
 }
 
@@ -1085,9 +1166,11 @@ func TestApplicationPortRefusesAForwardedPayloadAboveEnrichment(t *testing.T) {
 	p.attrBuilders = builders
 
 	owner := &captureTraces{}
-	if err := p.startServiceGraphIngest(ctx, owner); err != nil {
-		t.Fatalf("startServiceGraphIngest: %v", err)
+	resharder, err := p.startResharder()
+	if err != nil {
+		t.Fatalf("startResharder: %v", err)
 	}
+	p.startServiceGraphIngest(ctx, owner, resharder)
 
 	conn, err := grpc.NewClient(*serviceGraphIngestGRPC, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -1099,7 +1182,7 @@ func TestApplicationPortRefusesAForwardedPayloadAboveEnrichment(t *testing.T) {
 	sendGRPC := func(t *testing.T, td ptrace.Traces) error {
 		t.Helper()
 		var lastErr error
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			_, lastErr = grpcClient.Export(context.Background(), ptraceotlp.NewExportRequestFromTraces(td))
 			if status.Code(lastErr) != codes.Unavailable {
 				return lastErr // bound: this is the server's own answer
@@ -1114,7 +1197,7 @@ func TestApplicationPortRefusesAForwardedPayloadAboveEnrichment(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			resp, err := http.Post("http://"+*serviceGraphIngestHTTP+"/v1/traces", "application/x-protobuf", bytes.NewReader(body))
 			if err != nil {
 				time.Sleep(20 * time.Millisecond)
@@ -1195,6 +1278,7 @@ func TestInternalPortStripsTheMarkerAndAccepts(t *testing.T) {
 		grpcAddr: freeAddr(t),
 		httpAddr: freeAddr(t),
 		tokens:   tok.Tokens,
+		cached:   tok.Cached,
 		consume:  ownerReceive(owner), // the production callback
 		ready:    sync.OnceFunc(func() { close(ready) }),
 		log:      log,

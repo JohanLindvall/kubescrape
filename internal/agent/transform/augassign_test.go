@@ -345,7 +345,7 @@ func script(src string) []byte {
 func recordBody(snippet string) string {
 	var b strings.Builder
 	b.WriteString("for r in batch:\n")
-	for _, line := range strings.Split(strings.TrimRight(snippet, "\n"), "\n") {
+	for line := range strings.SplitSeq(strings.TrimRight(snippet, "\n"), "\n") {
 		b.WriteString("    " + line + "\n")
 	}
 	return b.String()

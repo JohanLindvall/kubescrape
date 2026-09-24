@@ -29,7 +29,7 @@ func TestBufferStatsTrackBacklog(t *testing.T) {
 	}
 
 	// Enqueue without draining: the backlog must grow.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if err := b.ExportLogs(context.Background(), logsWith("x")); err != nil {
 			t.Fatal(err)
 		}

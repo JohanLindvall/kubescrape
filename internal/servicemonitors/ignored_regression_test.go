@@ -255,3 +255,28 @@ func TestEndpointNamingNoPortIsReported(t *testing.T) {
 		t.Errorf("portNumber alone must report portNumber and nothing about an unset port; got %v", got)
 	}
 }
+
+// A custom separator is only ever WRITTEN between two sourceLabels values — by
+// the agent and by Prometheus alike — so a keep/drop naming zero or one of them
+// builds the identical string whatever its separator says, and is applied
+// exactly as the CR wrote it. Skipping it exported every series a
+// single-label allowlist excluded (fail-open), for a reason that was false.
+// The two-label case is still skipped and reported
+// (TestIgnoredFieldsCoverUninterpreted).
+//
+// Reverse-patch check: dropping the len(SourceLabels) > 1 condition skips both
+// rules and this fails.
+func TestCustomSeparatorOnOneSourceLabelIsApplied(t *testing.T) {
+	ep := monitorWithRelabelings(t, []any{
+		map[string]any{"action": "keep", "sourceLabels": []any{"__name__"}, "separator": ",", "regex": "up|foo_.*"},
+		map[string]any{"action": "drop", "separator": "@", "regex": "x"},
+	}).Endpoints[0]
+	if len(ep.MetricRelabelings) != 2 || ep.MetricRelabelings[0].Regex != "up|foo_.*" {
+		t.Fatalf("a rule whose separator is never written was not applied: %+v", ep.MetricRelabelings)
+	}
+	for _, ig := range ep.Ignored {
+		if strings.HasPrefix(ig, "metricRelabelings.separator=") {
+			t.Errorf("an applied rule is reported as skipped: %q", ig)
+		}
+	}
+}

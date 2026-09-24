@@ -9,6 +9,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -19,9 +21,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
-	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -206,8 +206,8 @@ func TestExportFailureLogsTheTransitionAndTheRecovery(t *testing.T) {
 	if n := strings.Count(logs.String(), "still failing"); n != 0 {
 		t.Fatalf("throttled repeats logged %d times inside the window, want 0", n)
 	}
-	if tl.exportFailures != 6 {
-		t.Fatalf("exportFailures = %d, want 6 (the count the log line carries)", tl.exportFailures)
+	if n := tl.exportOutage.Failures(); n != 6 {
+		t.Fatalf("exportOutage.Failures() = %d, want 6 (the count the log line carries)", n)
 	}
 
 	tl.commitBatch(inf)
@@ -215,8 +215,8 @@ func TestExportFailureLogsTheTransitionAndTheRecovery(t *testing.T) {
 	if !strings.Contains(out, "log export recovered") || !strings.Contains(out, "failures=6") {
 		t.Fatalf("recovery was not reported with its failure count; got:\n%s", out)
 	}
-	if tl.exportFailures != 0 {
-		t.Fatalf("exportFailures = %d after recovery, want 0", tl.exportFailures)
+	if n := tl.exportOutage.Failures(); n != 0 {
+		t.Fatalf("exportOutage.Failures() = %d after recovery, want 0", n)
 	}
 	// A second successful batch must not log again — Info stays quiet in the
 	// steady state.
@@ -254,6 +254,106 @@ func TestRotationArmIsNamedAtDebug(t *testing.T) {
 	out := logs.String()
 	if !strings.Contains(out, "log file rotated") || !strings.Contains(out, "reason=truncated") {
 		t.Fatalf("the truncation arm was not named at Debug; got:\n%s", out)
+	}
+}
+
+// TestPreReadCopytruncateIsNamedAtDebug: readFile's pre-read fingerprint
+// re-verify catches the copytruncate the post-read arms cannot — a replacement
+// LONGER than the read offset, whose bytes come back from the stale offset — and
+// it is the same event as handleRotation's copytruncate arm, so it is named the
+// same way. It used to reopen with no reason line at all, which left a lossy
+// in-place rewrite indistinguishable from a clean rename in the one place an
+// operator can tell them apart.
+func TestPreReadCopytruncateIsNamedAtDebug(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, logName)
+	writeLines(t, path, "2026-07-05T10:00:00.000000000Z stdout F one")
+
+	tl := newTestTailer(dir, "", &fakeExporter{})
+	logs := logTo(tl, slog.LevelDebug)
+	ctx := context.Background()
+	tl.scanDir(nil, true)
+	f := tl.files[path]
+	f.resolved = true
+	if err := tl.readFile(ctx, f); err != nil {
+		t.Fatalf("readFile: %v", err)
+	}
+	if f.readPos == 0 {
+		t.Fatal("test setup: the re-verify only runs past offset 0")
+	}
+	// Rewritten IN PLACE (same inode) with a different and LONGER head.
+	if err := os.WriteFile(path, []byte("2026-07-05T10:00:01.000000000Z stdout F a-much-longer-replacement-line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.lastMod = time.Time{} // the mtime moved, even on a coarse-mtime filesystem
+	if err := tl.readFile(ctx, f); err != nil {
+		t.Fatalf("readFile after the rewrite: %v", err)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "log file rotated") || !strings.Contains(out, "reason=copytruncate") {
+		t.Fatalf("the pre-read copytruncate re-verify was not named at Debug; got:\n%s", out)
+	}
+}
+
+// TestRotationUnderAnUnfinishedReplayIsNamedAtDebug: while a segment replay is
+// unfinished readFile does not read the live tail, but it still detects a
+// rotation of it (the held fd must not go stale) — and it does so through
+// handleRotation with draining refused, so the arm is named like every other
+// rotation. The gate used to carry its own copy of the classifier, without the
+// reason lines, so a rename there moved kubescrape_log_rotations_total with
+// nothing saying which kind of rotation it was.
+func TestRotationUnderAnUnfinishedReplayIsNamedAtDebug(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	pos := mustOpenPositions(t, filepath.Join(t.TempDir(), "pos.json"))
+	path := filepath.Join(dir, logName)
+
+	// Equal-length lines and a one-line budget: every sweep replays exactly one
+	// line of the checkpointed segment, so the replay stays unfinished across
+	// both sweeps below.
+	const ts = "2026-07-05T10:00:00.000000000Z"
+	var seg []string
+	for i := range 5 {
+		seg = append(seg, fmt.Sprintf("%s stdout F seg-%d", ts, i))
+	}
+	rot := path + ".1"
+	writeLines(t, rot, seg...)
+	rst, err := os.Stat(rot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, dir, ts+" stdout F tail-one")
+	if err := pos.SetLogs(map[string]positions.LogPos{path: {
+		Offset: 0, Inode: inodeOfPath(t, path),
+		Pending: []positions.Prefix{{Inode: inodeOfPath(t, rot), From: 0, To: rst.Size()}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	tl := driveTailer(dir, &fakeExporter{})
+	tl.cfg.Positions = pos
+	tl.cfg.MaxBytesPerSweep = len(seg[0]) + 1
+	logs := logTo(tl, slog.LevelDebug)
+	tl.scanDir(tl.loadCheckpoints(), true)
+	f := tl.files[path]
+	if f == nil {
+		t.Fatal("file not tracked")
+	}
+	tl.sweep(ctx, true)
+	if f.f == nil || f.segmentsFed || len(f.segments) == 0 {
+		t.Fatalf("test setup: want the tail open behind an unfinished replay (fd=%v segmentsFed=%v segments=%d)",
+			f.f != nil, f.segmentsFed, len(f.segments))
+	}
+
+	// Rename-rotate the live tail while the replay is still owed.
+	if err := os.Rename(path, path+".2"); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, dir, ts+" stdout F tail-two")
+	tl.sweep(ctx, true)
+	out := logs.String()
+	if !strings.Contains(out, "log file rotated") || !strings.Contains(out, "reason=rename") {
+		t.Fatalf("a rename under an unfinished replay was not named at Debug; got:\n%s", out)
 	}
 }
 
@@ -393,20 +493,31 @@ func TestUnstattableFileIsWarnedNotOnlyCounted(t *testing.T) {
 // between the readdir and the stat is a rename rotation caught mid-scan, which
 // is benign and constant on a busy node. It still COUNTS — the metric's help
 // enumerates stat_error as any unstattable path — but it must not warn.
+//
+// The ENOENT is recognised from the TYPED error, recorded through skipErr the
+// way claimPath records it, not from its text: this used to match the string
+// "no such file or directory", so an ENOENT spelled any other way (the second
+// case, fs.ErrNotExist wrapped) warned about a benign race.
 func TestVanishedFileIsCountedButNotWarned(t *testing.T) {
-	tl := newTestTailer(t.TempDir(), "", &fakeExporter{})
-	logs := logTo(tl, slog.LevelInfo)
+	for name, err := range map[string]error{
+		"stat ENOENT":            &fs.PathError{Op: "stat", Path: "/var/log/containers/gone.log", Err: syscall.ENOENT},
+		"wrapped fs.ErrNotExist": fmt.Errorf("resolving /var/log/containers/gone.log: %w", fs.ErrNotExist),
+	} {
+		t.Run(name, func(t *testing.T) {
+			tl := newTestTailer(t.TempDir(), "", &fakeExporter{})
+			logs := logTo(tl, slog.LevelInfo)
 
-	before := obs.LogFilesSkipped.WithLabelValues(skipStatError).Value()
-	tl.reportSkips(
-		map[string]string{"/var/log/containers/gone.log": skipStatError},
-		map[string]string{"/var/log/containers/gone.log": "stat /var/log/containers/gone.log: no such file or directory"},
-		true)
-	if got := obs.LogFilesSkipped.WithLabelValues(skipStatError).Value() - before; got != 1 {
-		t.Fatalf("a vanished file counted %v, want 1 (it is still an unstattable path)", got)
-	}
-	if strings.Contains(logs.String(), "could not be stat'd") {
-		t.Fatalf("a rotation race must not warn; got:\n%s", logs.String())
+			var sets scanSets
+			sets.skipErr("/var/log/containers/gone.log", skipStatError, err)
+			before := obs.LogFilesSkipped.WithLabelValues(skipStatError).Value()
+			tl.reportSkips(sets.skipped, sets.detail, true)
+			if got := obs.LogFilesSkipped.WithLabelValues(skipStatError).Value() - before; got != 1 {
+				t.Fatalf("a vanished file counted %v, want 1 (it is still an unstattable path)", got)
+			}
+			if strings.Contains(logs.String(), "could not be stat'd") {
+				t.Fatalf("a rotation race must not warn; got:\n%s", logs.String())
+			}
+		})
 	}
 }
 
@@ -418,13 +529,11 @@ func TestUnstattableFilesWarnOnceForTheWholeMountIsThrottled(t *testing.T) {
 	tl := newTestTailer(t.TempDir(), "", &fakeExporter{})
 	logs := logTo(tl, slog.LevelInfo)
 
-	skipped := map[string]string{}
-	detail := map[string]string{}
+	var sets scanSets
 	for _, p := range []string{"/a.log", "/b.log", "/c.log"} {
-		skipped[p] = skipStatError
-		detail[p] = "stat " + p + ": permission denied"
+		sets.skipErr(p, skipStatError, &fs.PathError{Op: "stat", Path: p, Err: syscall.EACCES})
 	}
-	tl.reportSkips(skipped, detail, true)
+	tl.reportSkips(sets.skipped, sets.detail, true)
 	if n := strings.Count(logs.String(), "could not be stat'd"); n != 1 {
 		t.Fatalf("three unstattable files produced %d warnings, want 1 aggregate line", n)
 	}
@@ -434,9 +543,9 @@ func TestUnstattableFilesWarnOnceForTheWholeMountIsThrottled(t *testing.T) {
 
 	// A second pass with a NEW unstattable file is inside the throttle window,
 	// so it stays silent: the condition is a state, not an event.
-	skipped2 := map[string]string{"/d.log": skipStatError}
-	detail2 := map[string]string{"/d.log": "stat /d.log: permission denied"}
-	tl.reportSkips(skipped2, detail2, true)
+	var sets2 scanSets
+	sets2.skipErr("/d.log", skipStatError, &fs.PathError{Op: "stat", Path: "/d.log", Err: syscall.EACCES})
+	tl.reportSkips(sets2.skipped, sets2.detail, true)
 	if n := strings.Count(logs.String(), "could not be stat'd"); n != 1 {
 		t.Fatalf("the throttle let a second line through within the window; got %d", n)
 	}
@@ -450,15 +559,12 @@ func TestUnstattableFilesWarnOnceForTheWholeMountIsThrottled(t *testing.T) {
 // file on the node, and slog's eager argument evaluation means an Enabled
 // guard around a separate reporting switch would not have removed it.
 //
-// The assertion is allocation-based because the read has no other observable:
-// computeFingerprint allocates its buffer per call, so the whole classification
-// must cost no more than ONE fp.matches. Measured against a live
-// fp.matches rather than a literal, so a change in what a fingerprint read
-// costs cannot silently turn the budget into "two are fine".
+// The reads are COUNTED through fingerprintReadHook. This used to be inferred
+// from allocations (a fingerprint read allocated its buffer, so the whole
+// classification had to cost no more than one fp.matches); computeFingerprint
+// now hashes through a stack buffer and allocates nothing, which would have made
+// that proxy vacuous — zero is never more than 1.5x zero.
 func TestRotationClassificationReadsTheFingerprintOnce(t *testing.T) {
-	if testrace.Enabled {
-		t.Skip("the race detector adds bookkeeping allocations")
-	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, logName)
 	writeLines(t, path, "2026-07-05T10:00:00.000000000Z stdout F one")
@@ -477,18 +583,19 @@ func TestRotationClassificationReadsTheFingerprintOnce(t *testing.T) {
 	}
 	// The shape that reaches the copytruncate guard and finds nothing wrong:
 	// same inode, no new bytes (read == 0), an mtime that moved since our last
-	// read, and a head that still matches. handleRotation is then inert, so it
-	// can be run repeatedly.
+	// read, and a head that still matches. handleRotation is then inert.
 	f.lastMod = time.Time{}
 	if !f.fp.matches(f.f) {
 		t.Fatal("test setup: the head fingerprint should still match")
 	}
 
-	perRead := testing.AllocsPerRun(50, func() { _ = f.fp.matches(f.f) })
-	whole := testing.AllocsPerRun(50, func() { tl.handleRotation(ctx, f, st, 0) })
-	if whole > perRead*1.5 {
-		t.Fatalf("handleRotation allocated %v, about %v fingerprint reads (one costs %v): "+
-			"the classification is being computed twice", whole, whole/perRead, perRead)
+	reads := 0
+	fingerprintReadHook = func() { reads++ }
+	t.Cleanup(func() { fingerprintReadHook = nil })
+	tl.handleRotation(ctx, f, st, 0, f.readPos, true)
+	if reads != 1 {
+		t.Fatalf("handleRotation read the file head %d times, want exactly 1: "+
+			"the classification is being computed twice (or not at all)", reads)
 	}
 	if f.f == nil || f.readPos == 0 {
 		t.Fatal("handleRotation should have been inert in this shape")
@@ -531,9 +638,12 @@ func TestFailedPositionsSaveIsThrottledAndItsRecoveryLogged(t *testing.T) {
 	if !strings.Contains(logs.String(), "positions file write recovered") {
 		t.Fatalf("the recovery was not logged, so the throttled warnings have no end marker; got:\n%s", logs.String())
 	}
-	// And a later outage warns again: the throttle must not latch the
-	// condition off for the process' lifetime.
-	tl.positionsWarn = logdedupe.Throttle{}
+	// And a later outage warns again — IMMEDIATELY, although it opens well
+	// inside the minute the first outage's Warn claimed: the first failure of
+	// every run announces itself. A bare throttle (this test used to reset it
+	// by hand here) kept a second outage silent until the window lapsed,
+	// directly under a "recovered" line that then read as a condition that
+	// stayed better.
 	if err := os.Chmod(posDir, 0o500); err != nil {
 		t.Fatal(err)
 	}

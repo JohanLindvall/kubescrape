@@ -14,30 +14,27 @@ package promscrape
 // all (Scraper.cycle's spawn), into kubescrape_scrape_failures_total{pipeline,
 // reason} plus a throttled Warn carrying the URL — the one thing a counter
 // cannot hold. The classification is by ERROR TYPE wherever the type exists
-// (statusError, net.OpError, tls/x509, context) and by an explicit wrapper
-// where only the site knows (auth, relabel, proto_refused, export, body), never
-// by matching error strings: a message an upstream library rewords must not
-// silently re-bucket a fleet's failures.
+// (statusError, net.OpError, tls/x509, context, io.ErrUnexpectedEOF) and by an
+// explicit wrapper where only the site knows (auth, relabel, proto_refused,
+// export, body), never by matching error strings: a message an upstream library
+// rewords must not silently re-bucket a fleet's failures.
 
 import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
-	"log/slog"
+	"io"
 	"net"
-	"sort"
-	"strconv"
-	"strings"
 	"time"
 
-	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
-// Failure reasons. Enumerated in obs.ScrapeFailures' help text, which is the
-// operator-facing definition of each — keep the two in step.
+// Failure reasons. Each is DEFINED in obs.ScrapeFailures' help text, as
+// `<reason> (<definition>)`, which is the operator-facing definition of it;
+// TestFailureReasonsAreDocumented holds the two in step (the repo-wide
+// help-enumeration guard cannot, since reportScrapeFailure passes a variable).
 const (
 	reasonDNS          = "dns"
 	reasonConnect      = "connect"
@@ -77,8 +74,7 @@ func classify(reason string, err error) error {
 	if err == nil {
 		return nil
 	}
-	var c *classifiedError
-	if errors.As(err, &c) {
+	if _, ok := errors.AsType[*classifiedError](err); ok {
 		return err
 	}
 	return &classifiedError{reason: reason, err: err}
@@ -95,12 +91,10 @@ func failureReason(err error) string {
 	if err == nil {
 		return ""
 	}
-	var c *classifiedError
-	if errors.As(err, &c) {
+	if c, ok := errors.AsType[*classifiedError](err); ok {
 		return c.reason
 	}
-	var se *statusError
-	if errors.As(err, &se) {
+	if se, ok := errors.AsType[*statusError](err); ok {
 		if se.code == 401 || se.code == 403 {
 			return reasonUnauthorized
 		}
@@ -121,8 +115,7 @@ func failureReason(err error) string {
 		errors.As(err, &uae) || errors.As(err, &hne) || errors.As(err, &cie) {
 		return reasonTLS
 	}
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
+	if dnsErr, ok := errors.AsType[*net.DNSError](err); ok {
 		// A DNS lookup that TIMED OUT is the metadata-service-style hang, not a
 		// missing record: reported as a timeout so it lands beside the other
 		// symptoms of a slow network rather than looking like a typo in a name.
@@ -141,8 +134,29 @@ func failureReason(err error) string {
 	if errors.Is(err, context.Canceled) {
 		return reasonCanceled
 	}
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
+	// A body that ENDED mid-stream — a Content-Length the target did not honour,
+	// a truncated chunked or gzip stream, a protobuf varint or message cut by
+	// EOF. Every reader in the chain reports it as io.ErrUnexpectedEOF, and it
+	// is a body fault, not an unclassified one (the parser already names it,
+	// MalformedDetail.TruncatedLines). After the context sentinels, so a cut the
+	// scrape's own deadline caused still reads as a timeout; a connection RESET
+	// is a *net.OpError and stays connect.
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return reasonBody
+	}
+	if opErr, ok := errors.AsType[*net.OpError](err); ok {
+		// A TLS ALERT from the peer: crypto/tls surfaces it as
+		// &net.OpError{Op: "remote error", Err: alert(n)}, and the alert type is
+		// unexported (tls.AlertError is QUIC's), so the Op FIELD is the only
+		// typed handle on it. It is how a target refuses this agent's CLIENT
+		// CERTIFICATE — missing, untrusted or expired — which is the main
+		// per-target mTLS failure and was counted `connect` with no note,
+		// pointing the operator at networking. The field is a crypto/tls
+		// constant rather than error text; were it ever renamed, the fallback
+		// is the `connect` this always was.
+		if opErr.Op == "remote error" {
+			return reasonTLS
+		}
 		return reasonConnect
 	}
 	return reasonOther
@@ -187,212 +201,72 @@ func (s *Scraper) reportScrapeFailure(pipeline, url, warnKey string, err error, 
 		return
 	}
 
-	s.failMu.Lock()
-	if s.failWarned == nil {
-		s.failWarned = logdedupe.New(maxScrapeFailKeys, scrapeFailWarnEvery)
-	}
-	tab := s.failWarned
-	s.failMu.Unlock()
-
-	allow, saturated := tab.Allow(pipeline + "\x00" + warnKey + "\x00" + reason)
-	if saturated {
-		s.log.Warn("scrape failure warning table is full; further distinct failures are counted but not logged",
-			"keys", maxScrapeFailKeys)
-	}
-	if !allow {
+	if !s.allowRepeatingWarn(pipeline + "\x00" + warnKey + "\x00" + reason) {
 		return
 	}
 	args := []any{"pipeline", pipeline, "reason", reason, "url", url, "error", err}
-	if note := failureNote(reason); note != "" {
+	if note := failureNote(pipeline, reason); note != "" {
 		args = append(args, "note", note)
 	}
 	s.log.Warn("scrape failed", args...)
 }
 
+// allowRepeatingWarn gates a per-target complaint about a condition that can
+// clear out of band — a failing scrape, a failing export of one — at most once
+// per scrapeFailWarnEvery per key, through the failWarned table. It is
+// warnOnce's re-warning sibling; keys must not collide across callers, so each
+// caller prefixes its own (a scrape failure's key starts with its pipeline).
+func (s *Scraper) allowRepeatingWarn(key string) bool {
+	allow, saturated := s.failWarned.Allow(key)
+	if saturated {
+		s.log.Warn("scrape failure warning table is full; further distinct failures are counted but not logged",
+			"keys", maxScrapeFailKeys)
+	}
+	return allow
+}
+
 // failureNote is the remediation hint the message itself cannot carry, for the
 // reasons whose first-run cause is specific enough to name. Deliberately empty
 // for the rest: a hint that fits every case tells an operator nothing.
-func failureNote(reason string) string {
+//
+// The PIPELINE matters for `auth`: on a discovered target it is a secret ref
+// the metadata service would not resolve, while on the three kubelet pipelines
+// it can only be the agent's own ServiceAccount token at -kubelet-token-file
+// (kubeletGet), which never goes near the metadata service — pointing that
+// operator at -scrape-auth-secrets, every five minutes, was a wrong remedy.
+// It matters for `unauthorized` for the same reason: a kubelet refused the
+// agent's own token, and a 403 names the pipeline's OWN subresource
+// (kubeletSubresource) — this note used to name nodes/metrics for every kubelet
+// pipeline, which on /stats/summary is the rule the operator already has.
+func failureNote(pipeline, reason string) string {
 	switch reason {
 	case reasonUnauthorized:
-		return "the target refused the credential: a monitor's bearerTokenSecret/basicAuth may be missing or wrong, and for the kubelet pipelines this is the nodes/metrics ClusterRole rule"
+		if isKubeletPipeline(pipeline) {
+			return "the kubelet refused this agent's ServiceAccount token: a 403 means the agent ClusterRole lacks " +
+				kubeletSubresource(pipeline) + ", a 401 that the kubelet did not accept the token at -kubelet-token-file at all"
+		}
+		return "the target refused the credential: a monitor's bearerTokenSecret/basicAuth may be missing or wrong"
 	case reasonAuth:
+		if isKubeletPipeline(pipeline) {
+			return "the kubelet bearer token at -kubelet-token-file has never been readable: check that the agent's pod mounts its ServiceAccount token (automountServiceAccountToken) or that the flag names the projected file"
+		}
 		return "this agent could not resolve the secret ref: the metadata service must run -scrape-auth-secrets and both sides must share -scrape-auth-token-file"
 	case reasonProtoRefused:
 		return "pass -scrape-native-histograms to accept the protobuf exposition, or fix the target to honour the Accept header"
 	case reasonExport:
 		return "the scrape itself succeeded; read kubescrape_export_requests_total and the collector's own logs"
 	case reasonTLS:
-		return "check the endpoint's scheme, the monitor's tlsConfig.ca and serverName, or set insecureSkipVerify deliberately"
+		return "check the endpoint's scheme, the monitor's tlsConfig.ca and serverName, or set insecureSkipVerify deliberately; a \"remote error\" means the target refused this agent's client certificate (tlsConfig.cert/keySecret)"
 	}
 	return ""
 }
 
-// emptyTargetsWarnEvery re-states "this node has no scrape targets" at this
-// cadence while it stays true. Longer than scrapeFailWarnEvery because it is a
-// STANDING condition an operator diagnoses once, not an incident that changes.
-const emptyTargetsWarnEvery = 30 * time.Minute
-
-// reportTargetSet publishes the discovered-target count and says something when
-// it is interesting: the set changing size (Debug), and the set being EMPTY
-// (Warn on the transition, re-warned on a window, Info on recovery).
-//
-// The empty list is the most common first-run failure and the one that produces
-// no other evidence at all — no scrape runs, so no scrape fails, so every
-// counter in this package stays flat and /debug/targets is a blank page that
-// looks exactly like a healthy agent whose targets happen to be elsewhere. The
-// transition/re-warn/recovery shape is cmd/kubescrape's api-server watchdog's.
-//
-// Called only from a cycle that FETCHED the list: a failed fetch has its own
-// Error line, and treating its empty slice as "no targets exist" would blame
-// discovery for a metadata-service outage.
-func (s *Scraper) reportTargetSet(targets []kubemeta.ScrapeTarget) {
-	n := len(targets)
-	obs.ScrapeTargets.Set(float64(n))
-
-	if s.lastTargetsSet && n != s.lastTargets && s.log.Enabled(context.Background(), slog.LevelDebug) {
-		// Guarded: the counts are field reads, but the by-source breakdown
-		// walks the list, and this runs once per cycle on every node.
-		s.log.Debug("scrape target set changed",
-			"node", s.cfg.Node, "targets", n, "previous", s.lastTargets, "bySource", targetSources(targets))
+// isKubeletPipeline reports whether pipeline scrapes the node's kubelet, with
+// the agent's own ServiceAccount token, rather than a discovered target.
+func isKubeletPipeline(pipeline string) bool {
+	switch pipeline {
+	case pipelineCadvisor, pipelineNode, pipelineSummary:
+		return true
 	}
-	s.lastTargets, s.lastTargetsSet = n, true
-
-	switch {
-	case n == 0:
-		if !s.emptyTargets {
-			s.emptyTargets = true
-			s.emptyTargetWarn = logdedupe.Throttle{} // a fresh outage says so at once
-		}
-		if !s.emptyTargetWarn.Allow(emptyTargetsWarnEvery) {
-			return
-		}
-		s.log.Warn("the metadata service returned NO scrape targets for this node, so nothing is being scraped from pods or Services here",
-			"node", s.cfg.Node,
-			"note", "annotate a pod or Service with prometheus.io/scrape=true, or check that the ServiceMonitor/PodMonitor selects a pod on THIS node and that the metadata service runs -servicemonitors; GET /v1/explain/{namespace}/{pod} on the metadata service says why one pod is not a target")
-	case s.emptyTargets:
-		s.emptyTargets = false
-		s.log.Info("scrape targets discovered for this node", "node", s.cfg.Node, "targets", n)
-	}
-}
-
-// targetSources is the by-source census the empty/changed report carries: pod
-// and service annotations, ServiceMonitors and PodMonitors are discovered by
-// three different mechanisms, and which of them produced nothing is most of the
-// diagnosis. Built only under a Debug-enabled guard.
-func targetSources(targets []kubemeta.ScrapeTarget) string {
-	counts := map[string]int{}
-	for i := range targets {
-		src := targets[i].Source
-		if src == "" {
-			src = "unknown"
-		}
-		counts[src]++
-	}
-	keys := make([]string, 0, len(counts))
-	for k := range counts {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var b strings.Builder
-	for i, k := range keys {
-		if i > 0 {
-			b.WriteByte(',')
-		}
-		b.WriteString(k)
-		b.WriteByte('=')
-		b.WriteString(strconv.Itoa(counts[k]))
-	}
-	return b.String()
-}
-
-// reportNegotiation says, at Debug, when a target served a format other than
-// the one this agent asked for. Nothing FAILS here — the parser reads whatever
-// arrived — but the consequence is invisible otherwise: with -scrape-exemplars
-// on, a target that answers text/plain simply produces no exemplars, forever,
-// and the only evidence is an absence.
-//
-// One Content-Type header read per scrape, so no Enabled guard is needed; the
-// call is skipped entirely once the levels agree.
-//
-// The header is the TARGET's bytes, bounded only by whatever the transport
-// accepted, so it goes on the line through clipForLog — the same rule the
-// protobuf refusal beside it follows.
-func (s *Scraper) reportNegotiation(t kubemeta.ScrapeTarget, askedProto bool, contentType string, openMetrics bool) {
-	if !s.log.Enabled(context.Background(), slog.LevelDebug) {
-		return
-	}
-	switch {
-	case askedProto && !strings.Contains(contentType, protoContentType) && !openMetrics:
-		s.log.Debug("target negotiated down from the protobuf exposition; native histograms will not be present",
-			"url", t.URL, "monitor", t.Monitor, "contentType", clipForLog(contentType))
-	case !askedProto && s.cfg.Exemplars && !openMetrics:
-		s.log.Debug("target served classic text although OpenMetrics was offered; no exemplars will be scraped from it",
-			"url", t.URL, "monitor", t.Monitor, "contentType", clipForLog(contentType))
-	}
-}
-
-// reportCadvisorIdentity counts a cadvisor resource the metadata service did
-// not place, and — at Debug — names it. The counter is the rate; the Debug line
-// is the only thing that says WHICH container, which is the whole question when
-// half a node's series lose their labels and the other half keep them.
-//
-// Not throttled, because it is Debug and because the count per scrape is
-// bounded by the node's container count: this is not a per-item path (one call
-// per resource per exported chunk) and an operator who turned Debug on during
-// an incident wants every one of them.
-func (s *Scraper) reportCadvisorIdentity(ident cadvisorIdentity) {
-	level := "pod"
-	if ident.containerID != "" || ident.container != "" {
-		level = "container"
-	}
-	obs.CadvisorUnresolved.WithLabelValues(level).Inc()
-	if !s.log.Enabled(context.Background(), slog.LevelDebug) {
-		return
-	}
-	// objectLevel, not "level": slog's own severity key IS "level", and a second
-	// pair of that name on the line makes a logfmt reader resolve the record's
-	// severity to "container". The line then reads as DEBUG to a human and as
-	// level="container" to Loki, so a severity filter silently drops it. The
-	// METRIC label stays "level" — a metric has no reserved key, and
-	// METRICS.md documents it under that name.
-	s.log.Debug("the metadata service did not place a cadvisor row; it is exported with the identity its own labels carried",
-		"objectLevel", level, "namespace", ident.namespace, "pod", ident.pod,
-		"container", ident.container, "id", ident.containerID, "uid", ident.podUID)
-}
-
-// debugSandboxFold reports, per pod per chunk, that a sandbox row was folded
-// into the pod's resource. It answers the question the fold's own doc comment
-// spends thirty lines on — "why does this pod have a resource carrying `pause`,
-// or why does it NOT" — with the evidence for the pod actually in front of the
-// operator. A row that declines the fold gets its own resource and shows up as
-// an ordinary unresolved one above, so the two branches are both visible.
-func (s *Scraper) debugSandboxFold(ident cadvisorIdentity) {
-	if !s.log.Enabled(context.Background(), slog.LevelDebug) {
-		return
-	}
-	s.log.Debug("folded a pod sandbox row into the pod's resource",
-		"namespace", ident.namespace, "pod", ident.pod, "uid", ident.podUID)
-}
-
-// cacheEvictWarnEvery throttles a bounded-cache eviction notice. Each cache
-// carries its OWN gate (Scraper.tlsEvictWarn / relabelEvictWarn) — the caches
-// thrash for different reasons and want different remedies, and a shared
-// keyless throttle would let the first condition silence the second.
-const cacheEvictWarnEvery = 30 * time.Minute
-
-// warnCacheEviction reports a bounded per-target cache running at its cap.
-// Nothing is LOST — the entry is rebuilt on demand — which is exactly why it
-// needs saying: the symptom is a scrape that gets slower and a node that opens
-// a connection per target per cycle, with every counter in this package flat.
-//
-// gate is the caller's per-cache throttle. Callers must invoke this OUTSIDE the
-// lock guarding the cache: rendering and writing a slog record is I/O, and the
-// scrape goroutines all contend for that lock.
-func (s *Scraper) warnCacheEviction(gate *logdedupe.Throttle, what string, entries int, note string) {
-	if !gate.Allow(cacheEvictWarnEvery) {
-		return
-	}
-	s.log.Warn("a bounded scrape cache is at its cap and is evicting; the entries are rebuilt on demand, so this costs work rather than data",
-		"cache", what, "entries", entries, "note", note)
+	return false
 }

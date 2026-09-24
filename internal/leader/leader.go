@@ -1,11 +1,12 @@
 // Package leader runs cluster-singleton work under a coordination.k8s.io
 // Lease, so exactly one replica does it at a time.
 //
-// Losing the lease must NOT take the process down. The binary running this
-// also serves other pipelines (and, in the metadata service, the API every
-// agent blocks on), so a lease flap stops the leader-only work and nothing
-// else — which is why this wraps client-go's elector in a re-entry loop
-// instead of the usual os.Exit(1) in OnStoppedLeading.
+// Losing the lease must NOT take the process down. The binary running this is
+// the agent's -events singleton Deployment, which also serves other work — the
+// unelected -azure-diagnostics consumer when both are on, its readiness and
+// debug listeners, its own self-metrics — so a lease flap stops the leader-only
+// work and nothing else. That is why this wraps client-go's elector in a
+// re-entry loop instead of the usual os.Exit(1) in OnStoppedLeading.
 package leader
 
 import (

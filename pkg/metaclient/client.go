@@ -6,10 +6,28 @@
 // second before the kubelet has posted it to the API server, so the service
 // holds the request until the ID appears or the wait elapses (see Container).
 //
-// Responses carrying Cache-Control/ETag are cached, so repeat lookups are
-// served locally or revalidated with a conditional GET. The client has no
+// A 200 carrying a positive Cache-Control max-age (and neither no-store nor
+// no-cache) is cached, so repeat lookups are served locally until it expires
+// and then revalidated — with a conditional GET when it carried an ETag; a
+// response without such a max-age is not cached at all. The client has no
 // metrics dependency; set Config.Observe to feed lookup outcomes into whatever
 // metrics library the caller uses.
+//
+// # Results are shared: treat them as read-only
+//
+// A cached response is decoded ONCE and every lookup of it — by any goroutine,
+// for as long as the entry lives — receives a SHALLOW copy of that one value.
+// The returned struct is the caller's own (reassigning a field of it affects
+// nobody else), but everything it reaches through a map, slice or pointer is
+// the cache's: a Pod's Labels, Annotations, PodIPs, Containers, Owners and
+// NamespaceMetadata (for ContainerMetadata, those of its Pod, and its
+// Container's Ports), a NodeMetadata's maps, and the slice NodeTargets returns
+// together with each target's embedded Pod. Writing into any of them corrupts
+// what every later lookup of that object returns, and doing so while another
+// goroutine reads it is a data race — for a map, the runtime's fatal
+// "concurrent map writes". Clone before modifying (maps.Clone, slices.Clone, or
+// a deep copy for nested values). Copying on every hit instead would cost the
+// allocations the cache exists to save, on the paths that call this most.
 package metaclient
 
 import (
@@ -23,7 +41,6 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,7 +49,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
-// Request outcomes reported to Client.Observe.
+// Request outcomes reported to Config.Observe.
 const (
 	// OutcomeOK is a fetch that hit the service and returned metadata.
 	OutcomeOK = "ok"
@@ -46,10 +63,14 @@ const (
 	OutcomeError = "error"
 )
 
-// Client talks to a kubescrape metadata service. Responses carrying
-// Cache-Control/ETag are cached so repeat lookups (common on the concurrent
-// ingest and cadvisor paths) are served locally or revalidated cheaply with a
-// conditional GET.
+// Client talks to a kubescrape metadata service. Responses carrying a positive
+// Cache-Control max-age (without no-store or no-cache) are cached so repeat
+// lookups (common on the concurrent ingest and cadvisor paths) are served
+// locally or, once stale, revalidated cheaply with a conditional GET.
+//
+// A Client is safe for concurrent use, and the values its lookups return share
+// their maps and slices with its cache and with every other caller: treat them
+// as read-only and clone before modifying (see the package documentation).
 type Client struct {
 	base string
 	http *http.Client
@@ -80,10 +101,15 @@ type Client struct {
 	// complaints; cacheReport paces the Debug summary.
 	//
 	// A LOCAL throttle rather than internal/logdedupe, which owns this rule for
-	// the rest of the repo: pkg/ must never import internal/ (the compiler
-	// allows it inside this module and it breaks every external consumer), so
-	// the type is re-stated here — deliberately with the SAME loser rule, which
-	// is the half of it that is easy to get wrong.
+	// the rest of the repo: pkg/ must never import internal/, so the type is
+	// re-stated here — deliberately with the SAME loser rule, which is the half
+	// of it that is easy to get wrong. (Go itself permits the import, even in
+	// an external consumer's build: the internal rule is checked against the
+	// IMPORTER's path, which is inside this module. The cost is what the rule
+	// exists to avoid — internal packages and their dependencies dragged into
+	// every consumer's build, and internal APIs, which promise nothing, made
+	// part of this package's public behaviour. pkg/boundary_test.go enforces
+	// it.)
 	statusWarn  throttle
 	decodeWarn  throttle
 	evictWarn   throttle
@@ -123,52 +149,12 @@ func (c *Client) observe(outcome string) {
 	}
 }
 
-// cacheReportInterval paces the Debug cache summary. The question it answers —
-// "is the ETag path working, or is every lookup a full body?" — is a RATIO, so
-// one line a minute carrying the cumulative tallies is strictly more useful
-// than a line per request.
-const cacheReportInterval = time.Minute
-
 // warnInterval throttles the three complaints that can persist: an unexpected
 // status, an undecodable body, and the cache running at its hard cap. Each is
 // a property of the deployment (a misdirected endpoint, a wrong service, a
 // node whose live URL count exceeds the cap), so it repeats on every lookup
 // until someone changes something.
 const warnInterval = 5 * time.Minute
-
-// reportCache writes the periodic Debug summary of the response cache.
-//
-// Logger.Enabled is checked BEFORE the throttle, and the order is load-bearing
-// because this runs once per lookup on the concurrent ingest and cadvisor
-// paths. It used to be the other way round, on the stated grounds that "Allow
-// is a single atomic load while Enabled is an interface call" — which is not
-// what allow does: its FIRST statement is time.Now().UnixNano(), and a clock
-// read is the expensive half. Measured on this repo's reference machine,
-// serially: time.Now().UnixNano() 57.9 ns, the whole throttle 63.3 ns,
-// Logger.Enabled 8.3 ns. Under -race-free parallel load the gap widens rather
-// than closing (time.Now 27.5 ns/op at 4 procs, Enabled 10.6 ns/op), so the
-// swap is worth strictly more on the path that motivated the ordering.
-//
-// It is also better on the behaviour the old order apologised for: no throttle
-// slot is spent while Debug is off, so raising the level mid-incident produces
-// a summary on the next lookup instead of up to a minute later.
-func (c *Client) reportCache() {
-	log := c.logger()
-	if !log.Enabled(context.Background(), slog.LevelDebug) {
-		return
-	}
-	if !c.cacheReport.allow(cacheReportInterval) {
-		return
-	}
-	c.mu.RLock()
-	entries := len(c.cache)
-	c.mu.RUnlock()
-	// Cumulative, not per-window: two consecutive lines differ by the window,
-	// and a cumulative number cannot be misread as a rate.
-	log.Debug("metadata cache", "entries", entries, "maxEntries", maxCacheEntries,
-		"hits", c.hits.Load(), "notModified", c.revalidated.Load(), "fetched", c.fetched.Load(),
-		"notFound", c.missing.Load(), "errors", c.failed.Load())
-}
 
 // logger is the client's logger, defaulting to the process default.
 func (c *Client) logger() *slog.Logger {
@@ -190,35 +176,20 @@ func (c *Client) logger() *slog.Logger {
 // log the same condition and must stay silent, because logging on a lost race
 // is the duplicate the throttle exists to prevent. It is copied rather than
 // imported because this package is public and pkg/ must never import internal/.
+// That includes measuring on the MONOTONIC clock (an offset from
+// throttleEpoch, plus one so zero keeps meaning "never fired"): wall-clock
+// UnixNano stamps let a backwards clock step silence a fired throttle for the
+// size of the step.
 type throttle struct{ last atomic.Int64 }
 
-func (t *throttle) allow(interval time.Duration) bool {
-	now := time.Now().UnixNano()
-	last := t.last.Load()
-	return now-last >= int64(interval) && t.last.CompareAndSwap(last, now)
-}
+// throttleEpoch is the process-local origin throttle measures from; time.Since
+// on it reads only the runtime's monotonic nanotime.
+var throttleEpoch = time.Now()
 
-type cacheEntry struct {
-	// decoded is the response body unmarshaled once into the caller's result
-	// type (a pointer), stored so cache hits and 304s skip the JSON decode. It
-	// is never mutated after storing; hits receive a SHALLOW copy — maps/slices
-	// are shared under the same treat-as-immutable contract the store uses.
-	// The raw body is NOT retained: every caller of a given URL asks for the
-	// same result type, so the decoded value serves every hit and a body kept
-	// beside it was ~18% of the cache's footprint for nothing (an entry that
-	// cannot be copied out is dropped and re-fetched — see lookupEntry).
-	decoded any
-	etag    string
-	expires time.Time
-	// used is when this entry was last READ or written. Eviction sweeps on
-	// it, not on expires: an EXPIRED entry is exactly the state If-None-Match
-	// is built on — it still carries the ETag that turns the next read into a
-	// 304 — so sweeping by expiry threw away the revalidation state for every
-	// URL polled slower than the sweep (the 1m self and node-metadata reads
-	// against a 10s TTL), and each of those re-fetched a full body forever.
-	// What the sweep is actually for is the dead container nobody asks about
-	// again, and that is idleness.
-	used time.Time
+func (t *throttle) allow(interval time.Duration) bool {
+	now := int64(time.Since(throttleEpoch)) + 1
+	last := t.last.Load()
+	return (last == 0 || now-last >= int64(interval)) && t.last.CompareAndSwap(last, now)
 }
 
 // Config configures a Client. Everything a caller can influence lives here, so
@@ -286,6 +257,8 @@ func NewTransport() *http.Transport {
 		// NO_PROXY=.svc,.cluster.local does not exclude for a bare
 		// "kubescrape.monitoring") would silently stamp the PROXY's pod onto
 		// every agent's own metrics, with the resolved gauge reading 1.
+		// TestClientNeverUsesAnEnvironmentProxy pins it (the server half is
+		// internal/server's TestASilentReOriginatingHopIsAnsweredWithTheHopsOwnIdentity).
 		Proxy: nil,
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
@@ -317,10 +290,13 @@ func New(cfg Config) *Client {
 	}
 }
 
-// ScrapeAuth fetches a monitor endpoint's bearer token by its
+// ScrapeAuth fetches the value of a secret key a monitor endpoint references —
+// its bearer token, basic-auth username or password, authorization
+// credentials, or TLS CA, client certificate or private key — by its
 // "namespace/name/key" Secret reference (served only when the metadata
-// service runs with -scrape-auth-secrets). Responses are no-store; callers
-// cache briefly themselves.
+// service runs with -scrape-auth-secrets, and only for a reference some
+// indexed monitor names). Responses are no-store; callers cache briefly
+// themselves.
 func (c *Client) ScrapeAuth(ctx context.Context, ref string) (string, error) {
 	// Escape each segment of the ref, keeping the "/" separators as route
 	// structure: a well-formed ns/name/key passes through byte-for-byte (DNS
@@ -332,15 +308,18 @@ func (c *Client) ScrapeAuth(ctx context.Context, ref string) (string, error) {
 	for i, seg := range segs {
 		segs[i] = url.PathEscape(seg)
 	}
-	var out struct {
-		Value string `json:"value"`
-	}
 	// authed: this is the ONE authenticated route; the bearer decision is made
 	// here, where the URL is built, not by re-matching the path later.
-	if err := c.get(ctx, c.base+"/v1/scrape-auth/"+strings.Join(segs, "/"), true, &out); err != nil {
+	out, err := getObject[scrapeAuthResponse](ctx, c, c.base+"/v1/scrape-auth/"+strings.Join(segs, "/"), request{authed: true})
+	if err != nil {
 		return "", err
 	}
 	return out.Value, nil
+}
+
+// scrapeAuthResponse is the /v1/scrape-auth document.
+type scrapeAuthResponse struct {
+	Value string `json:"value"`
 }
 
 // Container fetches metadata for a container ID, letting the service wait up
@@ -349,48 +328,35 @@ func (c *Client) ScrapeAuth(ctx context.Context, ref string) (string, error) {
 // wait included: a wait at or past it can never be honored (the client
 // deadline fires while the server is still legitimately holding the request),
 // so the combination is refused by name instead of surfacing as a timeout.
+//
+// The result shares its maps and slices with the cache: treat it as read-only
+// (see the package documentation).
 func (c *Client) Container(ctx context.Context, id string, wait time.Duration) (*kubemeta.ContainerMetadata, error) {
 	if wait > 0 && c.http.Timeout > 0 && wait >= c.http.Timeout {
 		c.observe(OutcomeError)
 		return nil, fmt.Errorf("metaclient: Container wait %v must be shorter than Config.Timeout %v (the timeout covers the whole request, so the server-side wait could never elapse)", wait, c.http.Timeout)
 	}
-	u := fmt.Sprintf("%s/v1/containers/%s?wait=%s", c.base, url.PathEscape(kubemeta.NormalizeContainerID(id)), wait)
-	var md kubemeta.ContainerMetadata
-	if err := c.getJSON(ctx, u, &md); err != nil {
-		return nil, err
-	}
-	return &md, nil
+	key := c.base + "/v1/containers/" + url.PathEscape(kubemeta.NormalizeContainerID(id))
+	return getObject[kubemeta.ContainerMetadata](ctx, c, key, request{wait: wait, hasWait: true})
 }
 
-// PodByName fetches metadata for one pod by namespace and name.
+// PodByName fetches metadata for one pod by namespace and name. The result
+// shares its maps and slices with the cache: treat it as read-only.
 func (c *Client) PodByName(ctx context.Context, namespace, name string) (*kubemeta.Pod, error) {
-	u := fmt.Sprintf("%s/v1/pods/%s/%s", c.base, url.PathEscape(namespace), url.PathEscape(name))
-	var pod kubemeta.Pod
-	if err := c.getJSON(ctx, u, &pod); err != nil {
-		return nil, err
-	}
-	return &pod, nil
+	return getObject[kubemeta.Pod](ctx, c, c.base+"/v1/pods/"+url.PathEscape(namespace)+"/"+url.PathEscape(name), request{})
 }
 
-// PodByUID fetches metadata for one pod by UID.
+// PodByUID fetches metadata for one pod by UID. The result shares its maps and
+// slices with the cache: treat it as read-only.
 func (c *Client) PodByUID(ctx context.Context, uid string) (*kubemeta.Pod, error) {
-	u := fmt.Sprintf("%s/v1/pod-uids/%s", c.base, url.PathEscape(uid))
-	var pod kubemeta.Pod
-	if err := c.getJSON(ctx, u, &pod); err != nil {
-		return nil, err
-	}
-	return &pod, nil
+	return getObject[kubemeta.Pod](ctx, c, c.base+"/v1/pod-uids/"+url.PathEscape(uid), request{})
 }
 
 // PodByIP fetches metadata for the live pod owning a pod IP (404 for
-// unknown, deleted, or hostNetwork pods).
+// unknown, deleted, or hostNetwork pods). The result shares its maps and
+// slices with the cache: treat it as read-only.
 func (c *Client) PodByIP(ctx context.Context, ip string) (*kubemeta.Pod, error) {
-	u := fmt.Sprintf("%s/v1/pod-ips/%s", c.base, url.PathEscape(ip))
-	var pod kubemeta.Pod
-	if err := c.getJSON(ctx, u, &pod); err != nil {
-		return nil, err
-	}
-	return &pod, nil
+	return getObject[kubemeta.Pod](ctx, c, c.base+"/v1/pod-ips/"+url.PathEscape(ip), request{})
 }
 
 // Self fetches metadata for the pod the CALLER runs in: the service attributes
@@ -403,50 +369,70 @@ func (c *Client) PodByIP(ctx context.Context, ip string) (*kubemeta.Pod, error) 
 // The response is cached like the other metadata lookups, and may be: it is
 // marked `private` — one Client belongs to one process, which is the one pod
 // the answer describes — so re-reading it to pick up a relabelled pod or
-// namespace costs a conditional GET, usually answered 304.
+// namespace costs a conditional GET, usually answered 304. Like every lookup's,
+// the result shares its maps and slices with the cache: treat it as read-only.
 func (c *Client) Self(ctx context.Context) (*kubemeta.Pod, error) {
-	var pod kubemeta.Pod
-	if err := c.getJSON(ctx, c.base+"/v1/self", &pod); err != nil {
-		return nil, err
-	}
-	return &pod, nil
+	return getObject[kubemeta.Pod](ctx, c, c.base+"/v1/self", request{})
 }
 
-// Node fetches the labels and annotations of a node.
+// Node fetches the labels and annotations of a node. The result shares its
+// maps with the cache: treat it as read-only.
 func (c *Client) Node(ctx context.Context, name string) (*kubemeta.NodeMetadata, error) {
-	u := fmt.Sprintf("%s/v1/nodes/%s/metadata", c.base, url.PathEscape(name))
-	var meta kubemeta.NodeMetadata
-	if err := c.getJSON(ctx, u, &meta); err != nil {
-		return nil, err
-	}
-	return &meta, nil
+	return getObject[kubemeta.NodeMetadata](ctx, c, c.base+"/v1/nodes/"+url.PathEscape(name)+"/metadata", request{})
 }
 
 // NodeTargets fetches the Prometheus scrape targets (with embedded pod
-// metadata) for a node.
+// metadata) for a node. The returned slice IS the cache's — its backing array
+// and every target's embedded Pod are shared with every other caller — so it
+// must not be sorted, compacted, appended to or written through: copy it
+// (slices.Clone, plus a deep copy of any Pod field you change) first.
 func (c *Client) NodeTargets(ctx context.Context, node string) ([]kubemeta.ScrapeTarget, error) {
-	var resp struct {
-		Targets []kubemeta.ScrapeTarget `json:"targets"`
-	}
-	u := fmt.Sprintf("%s/v1/nodes/%s/targets", c.base, url.PathEscape(node))
-	if err := c.getJSON(ctx, u, &resp); err != nil {
+	resp, err := getObject[kubemeta.NodeTargets](ctx, c, c.base+"/v1/nodes/"+url.PathEscape(node)+"/targets", request{})
+	if err != nil {
 		return nil, err
 	}
 	return resp.Targets, nil
 }
 
-// getJSON is the request path of the unauthenticated metadata endpoints.
-func (c *Client) getJSON(ctx context.Context, u string, v any) error {
-	return c.get(ctx, u, false, v)
+// getObject is every lookup's body: fetch the resource cached under key (see
+// get) into a fresh T and return it. A function rather than a method because a
+// method cannot take a type parameter.
+func getObject[T any](ctx context.Context, c *Client, key string, req request) (*T, error) {
+	v := new(T)
+	if err := c.get(ctx, key, req, v); err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
-// get fetches u into v. authed marks u as the one authenticated route
-// (/v1/scrape-auth): the decision is made where the URL is BUILT, so the
-// route is spelled in exactly one place rather than re-derived by matching
-// the URL here.
-func (c *Client) get(ctx context.Context, u string, authed bool, v any) error {
-	key := cacheKey(u)
+// request carries what a lookup sends BESIDE its cache key. Neither field is
+// part of the resource's identity, so neither is in the key.
+type request struct {
+	// authed marks the one authenticated route (/v1/scrape-auth): the
+	// decision is made where the URL is BUILT, so the route is spelled in
+	// exactly one place rather than re-derived by matching the URL later.
+	authed bool
+	// wait, when hasWait is set, is the container endpoint's server-side
+	// wait. It is rendered as "?wait=" only when a request is actually made —
+	// a cache hit never formats it — and two lookups of one container that
+	// differ only in their wait share one entry. hasWait rather than a zero
+	// check because ?wait=0s is not the same request as no wait at all: the
+	// service applies its own -wait-timeout to a lookup that names none.
+	wait    time.Duration
+	hasWait bool
+}
 
+// requestURL is the URL requested for key: the key plus any transient query.
+func (r request) requestURL(key string) string {
+	if !r.hasWait {
+		return key
+	}
+	return key + "?wait=" + r.wait.String()
+}
+
+// get fetches the resource cached under key into v. key is the request URL
+// WITHOUT a query; req carries the rest (see request).
+func (c *Client) get(ctx context.Context, key string, req request, v any) error {
 	// Fresh cache entry: serve without a request (and without re-decoding —
 	// the decoded value is stored once and shallow-copied out).
 	entry, cached, fresh := c.lookupEntry(key, v)
@@ -455,58 +441,8 @@ func (c *Client) get(ctx context.Context, u string, authed bool, v any) error {
 		copyDecoded(v, entry.decoded)
 		return nil
 	}
-	return c.fetch(ctx, u, key, entry, cached, authed, v)
+	return c.fetch(ctx, req.requestURL(key), key, entry, cached, req.authed, v)
 }
-
-// lookupEntry reads the cache under the lock, classifying the entry as fresh
-// (serve locally), stale-but-present (revalidate with If-None-Match), or
-// absent. An entry whose decoded value is not v's type is dropped and reported
-// absent, so this call re-fetches it from scratch: the cache holds one decoded
-// value per URL and every caller of an endpoint asks for the same type, making
-// that unreachable in practice — but a value that cannot be copied out must
-// never be served, and dropping it also re-populates the entry usefully.
-func (c *Client) lookupEntry(key string, v any) (entry cacheEntry, cached, fresh bool) {
-	now := c.now()
-	c.mu.RLock()
-	entry, cached = c.cache[key]
-	c.mu.RUnlock()
-	if !cached {
-		return cacheEntry{}, false, false
-	}
-	if !sameType(v, entry.decoded) {
-		c.mu.Lock()
-		// Re-check under the write lock: another goroutine may have replaced the
-		// entry with one this caller CAN use while the lock was released, and
-		// dropping that would throw away a good 200.
-		if cur, ok := c.cache[key]; ok && !sameType(v, cur.decoded) {
-			delete(c.cache, key)
-		}
-		c.mu.Unlock()
-		return cacheEntry{}, false, false
-	}
-	// The stamp feeds eviction and nothing else, against a 5-minute idle window,
-	// so it is refreshed COARSELY: writing it on every hit is what forced the
-	// exclusive lock onto the read path, and an entry read at all is re-stamped
-	// within a fraction of the window either way. (It also keeps a
-	// revalidated-but-stale entry alive, which is why it is not gated on
-	// freshness.)
-	if now.Sub(entry.used) >= usedStampGranularity {
-		c.mu.Lock()
-		if cur, ok := c.cache[key]; ok && cur.used.Equal(entry.used) {
-			cur.used = now
-			c.cache[key] = cur
-		}
-		c.mu.Unlock()
-		entry.used = now
-	}
-	return entry, true, now.Before(entry.expires)
-}
-
-// usedStampGranularity is how stale an entry's idle stamp may get before a hit
-// refreshes it. Small against cacheMaxIdle (so a live entry is never swept) and
-// large against a lookup (so the refresh is rare enough that the hit path is a
-// read-lock acquisition and nothing more).
-const usedStampGranularity = cacheMaxIdle / 10
 
 // fetch performs the HTTP request (revalidating with the entry's ETag when
 // cached), stores a cacheable 200, and decodes into v.
@@ -570,7 +506,14 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 		// proxy error page, another service entirely) could grow the agent's
 		// heap without limit — on the concurrent ingest path, on every node.
 		// A pod document is kilobytes; the whole node-targets response is the
-		// largest legitimate body and stays far under this.
+		// largest legitimate body and stays far under this — while its pods'
+		// own LABELS stay modest. Those are the one part of a pod document the
+		// metadata service does not bound (they are selection input), and every
+		// pod rides its node's response on its first target unconditionally,
+		// so a node carrying a few dozen pods with ~1.5 MiB of labels each
+		// reaches this cap: the decode then fails and that node's agent
+		// schedules no annotation or monitor target at all (an accepted
+		// residual, docs/CONFIGURATION.md).
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 		if err != nil {
 			c.observe(OutcomeError)
@@ -582,9 +525,7 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 			// cached copy. v gets a shallow copy of the owned value.
 			dec := reflect.New(reflect.TypeOf(v).Elem())
 			if err := json.Unmarshal(body, dec.Interface()); err != nil {
-				c.observe(OutcomeError)
-				c.warnUndecodable(u, body, err)
-				return decodeError(u, err)
+				return c.undecodable(u, body, err)
 			}
 			c.mu.Lock()
 			c.cache[key] = cacheEntry{decoded: dec.Interface(), etag: resp.Header.Get("ETag"), expires: c.now().Add(ttl), used: c.now()}
@@ -607,10 +548,7 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 			return nil
 		}
 		if err := json.Unmarshal(body, v); err != nil {
-			// Match the TTL path: an undecodable 200 is an error, not "ok".
-			c.observe(OutcomeError)
-			c.warnUndecodable(u, body, err)
-			return decodeError(u, err)
+			return c.undecodable(u, body, err)
 		}
 		c.observe(OutcomeOK)
 		return nil
@@ -640,6 +578,16 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 	}
 }
 
+// undecodable is the ONE exit for a 200 whose body this client could not
+// decode, on both 200 arms (cached and not): the lookup is an error outcome —
+// never "ok" — the condition is warned (throttled), and the caller gets the
+// typed *DecodeError. The two arms used to spell the three steps out each.
+func (c *Client) undecodable(u string, body []byte, err error) error {
+	c.observe(OutcomeError)
+	c.warnUndecodable(u, body, err)
+	return decodeError(u, err)
+}
+
 // warnUndecodable reports a 200 whose body this client could not decode.
 //
 // The typed *DecodeError already names the package and the URL, but only to
@@ -663,177 +611,10 @@ func (c *Client) warnUndecodable(u string, body []byte, err error) {
 
 // maxResponseBytes caps a metadata response body. The biggest legitimate one
 // is a node's full target list; anything approaching this is a misdirected
-// endpoint, and an unbounded read of it is an OOM on every node at once.
+// endpoint — or pods carrying enormous label sets, the one unbounded part of a
+// pod document (see the read above) — and an unbounded read of it is an OOM on
+// every node at once.
 const maxResponseBytes = 64 << 20
-
-// cacheSweepEvery is how often IDLE entries are swept below the cap.
-const cacheSweepEvery = time.Minute
-
-// cacheMaxIdle is how long an unread entry is kept. Comfortably above the
-// slowest poll any caller makes (the 1m self-attributes and node-metadata
-// refreshes), so a periodic reader always still finds its ETag and gets a
-// 304 instead of a full body; a container nobody looks up again is gone
-// within two sweeps of it.
-const cacheMaxIdle = 5 * time.Minute
-
-// maxCacheEntries bounds the response cache. Without a cap the map grows by
-// one entry per distinct container/pod URL ever fetched — a steady leak on
-// nodes with pod churn (dead containers are never requested again).
-const maxCacheEntries = 4096
-
-// evictLowWater is the size eviction trims down to once the cap is exceeded.
-// Trimming below the cap (rather than to it) amortizes the two O(n) map sweeps
-// over ~1000 inserts instead of running them on every insert while full — this
-// matters because the sweeps hold the mutex shared across concurrent ingest and
-// cadvisor lookups.
-const evictLowWater = maxCacheEntries * 3 / 4
-
-// evictLocked trims the cache when it exceeds the cap: IDLE entries first,
-// then arbitrary ones. An arbitrary eviction discards the ETag with the
-// entry, so that URL's next lookup is a full 200 re-fetch, not a cheap
-// revalidation — the price of the hard bound, paid only when 4096+ distinct
-// URLs are genuinely live. Caller holds the mutex.
-//
-// It DECIDES and returns; it does not log. Everything here runs under the
-// exclusive lock shared by every concurrent lookup, so the report is the
-// caller's to emit once the lock is gone (see reportEviction). dropped is how
-// many entries the ARBITRARY trim discarded, held how many remain.
-func (c *Client) evictLocked() (dropped, held int) {
-	now := c.now()
-	// Sweep idle entries periodically even below the cap. The cap alone
-	// only ran at 4096 entries, so on a node with pod churn the cache held
-	// thousands of dead containers' FULL pod documents — tens of MB of heap
-	// that nothing would ever ask for again — until the next insert crossed the
-	// threshold.
-	if len(c.cache) <= maxCacheEntries {
-		if now.Sub(c.lastSweep) < cacheSweepEvery {
-			return 0, len(c.cache)
-		}
-		c.lastSweep = now
-		for k, e := range c.cache {
-			if now.Sub(e.used) > cacheMaxIdle {
-				delete(c.cache, k)
-			}
-		}
-		return 0, len(c.cache)
-	}
-	// The hard-trim path performs the same idle sweep on its way to the cap,
-	// so the periodic cadence counts from it too: leaving lastSweep behind made
-	// the next below-cap insert re-run a full idle sweep immediately, however
-	// recently this one finished.
-	c.lastSweep = now
-	for k, e := range c.cache {
-		if now.Sub(e.used) > cacheMaxIdle {
-			delete(c.cache, k)
-		}
-	}
-	before := len(c.cache)
-	for k := range c.cache {
-		if len(c.cache) <= evictLowWater {
-			break
-		}
-		delete(c.cache, k)
-	}
-	return before - len(c.cache), len(c.cache)
-}
-
-// reportEviction warns that the ARBITRARY trim ran, which has a cost nothing
-// else reports: an entry evicted that way takes its ETag with it, so that
-// URL's next lookup is a full 200 instead of a 304. On a node whose live URL
-// count sits above the cap that is a permanent state — every lookup re-fetches
-// a full body from the singleton — and the only symptom is load on the
-// metadata service. Throttled, because it then happens on roughly every
-// insert.
-//
-// Called with c.mu NOT held; see the call site.
-func (c *Client) reportEviction(dropped, held int) {
-	if dropped <= 0 || !c.evictWarn.allow(warnInterval) {
-		return
-	}
-	c.logger().Warn("the metadata response cache is at its hard cap; evicted entries lose their ETag, so their next lookup re-fetches a full body",
-		"dropped", dropped, "entries", held, "maxEntries", maxCacheEntries)
-}
-
-// sameType reports whether a cached decoded value can be copied into dst: both
-// must be pointers to the same type.
-func sameType(dst, src any) bool {
-	if src == nil {
-		return false
-	}
-	dv, sv := reflect.ValueOf(dst), reflect.ValueOf(src)
-	return dv.Kind() == reflect.Pointer && dv.Type() == sv.Type()
-}
-
-// copyDecoded sets *dst = *src. The copy is shallow: maps and slices stay
-// shared with the cached value, which is never mutated (the store's
-// shallow-copy contract). Types are checked by lookupEntry.
-func copyDecoded(dst, src any) {
-	reflect.ValueOf(dst).Elem().Set(reflect.ValueOf(src).Elem())
-}
-
-// cacheKey identifies the resource independent of transient request params
-// (the container endpoint's ?wait= must not fragment the cache).
-func cacheKey(u string) string {
-	// Only the container endpoint ever carries a query (?wait=); everything
-	// else skips the parse/re-encode round trip.
-	i := strings.IndexByte(u, '?')
-	if i < 0 {
-		return u
-	}
-	// The common real query is exactly "wait=..." — cut it without the
-	// url.Parse/Encode round trip (~500ns and 5 allocs per Container lookup
-	// on the concurrent ingest path). Anything else (hypothetical future
-	// params) takes the exact strip-and-normalize below.
-	if q := u[i+1:]; strings.HasPrefix(q, "wait=") && !strings.ContainsAny(q, "&;") {
-		return u[:i]
-	}
-	parsed, err := url.Parse(u)
-	if err != nil {
-		return u
-	}
-	q := parsed.Query()
-	q.Del("wait")
-	parsed.RawQuery = q.Encode()
-	return parsed.String()
-}
-
-// maxCacheTTL caps the freshness lifetime this client will honour. The header
-// is the SERVER's, and time.Duration is int64 NANOseconds: 1.85e10 seconds
-// overflows it, so an unclamped `secs * time.Second` turns a large max-age into
-// either a ~49-year TTL (the entry is served forever, never revalidated, and
-// the idle sweep cannot reclaim it while something keeps reading it) or a
-// NEGATIVE one (caching silently off — the opposite of what the header asked
-// for). Clamping is not only overflow insurance: no metadata document is worth
-// holding for a day, and a header past this is a misdirected or hostile
-// endpoint, which the response-size and ETag paths already guard against.
-const maxCacheTTL = 24 * time.Hour
-
-// maxAge extracts the Cache-Control max-age; zero when absent or unparseable,
-// and zero whenever no-store or no-cache is also present — either directive
-// forbids serving a stored response without asking again, and this client's
-// only storage is its cache, so both mean "do not cache". kubescrape's own
-// server never combines them with a max-age, but this package is public.
-//
-// The value is clamped to maxCacheTTL BEFORE the multiply (see the constant).
-func maxAge(resp *http.Response) time.Duration {
-	var ttl time.Duration
-	for _, part := range strings.Split(resp.Header.Get("Cache-Control"), ",") {
-		part = strings.TrimSpace(part)
-		if part == "no-store" || part == "no-cache" {
-			return 0
-		}
-		if v, ok := strings.CutPrefix(part, "max-age="); ok {
-			if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
-				if secs > int(maxCacheTTL/time.Second) {
-					ttl = maxCacheTTL
-					continue
-				}
-				ttl = time.Duration(secs) * time.Second
-			}
-		}
-	}
-	return ttl
-}
 
 // StatusError is a non-200 response from the metadata service.
 type StatusError struct {

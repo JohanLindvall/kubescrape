@@ -12,7 +12,9 @@ import (
 // Deliberately written out here rather than imported from the repo's shared
 // internal/pdatacheck helper: this is a pkg/ package, and an import of
 // internal/ — even from a _test file — is the first step of the mistake that
-// would break every external consumer of it. Ten lines is a cheap boundary.
+// would drag internal/ into every external consumer's build (see
+// pkg/boundary_test.go for why that, not a compile error, is the cost). Ten
+// lines is a cheap boundary.
 func emptyMetricNames(md pmetric.Metrics) []string {
 	var out []string
 	rms := md.ResourceMetrics()
@@ -96,19 +98,19 @@ func TestSplittingNeverManufacturesAnEmptyMetric(t *testing.T) {
 // a tight cap has to cut inside a single family.
 func manyPointMetrics(kind pmetric.MetricType) pmetric.Metrics {
 	md := pmetric.NewMetrics()
-	for r := 0; r < 2; r++ {
+	for r := range 2 {
 		rm := md.ResourceMetrics().AppendEmpty()
 		rm.Resource().Attributes().PutStr("service.name", fmt.Sprintf("svc-%d", r))
 		rm.Resource().Attributes().PutStr("k8s.pod.name", fmt.Sprintf("pod-%d-aaaaaaaaaaaaaaaaaaaa", r))
-		for s := 0; s < 2; s++ {
+		for s := range 2 {
 			sm := rm.ScopeMetrics().AppendEmpty()
 			sm.Scope().SetName(fmt.Sprintf("scope-%d", s))
-			for n := 0; n < 3; n++ {
+			for n := range 3 {
 				m := sm.Metrics().AppendEmpty()
 				m.SetName(fmt.Sprintf("metric_%d_%d_%d", r, s, n))
 				m.SetDescription("a description long enough to matter to the byte estimate")
 				m.SetUnit("By")
-				for p := 0; p < 8; p++ {
+				for p := range 8 {
 					putPoint(m, kind, p)
 				}
 			}

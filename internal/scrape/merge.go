@@ -35,21 +35,23 @@ const (
 	relabelClass
 	// cadenceClass: interval/scrapeTimeout resolve through mergeCadence.
 	cadenceClass
-	// authClass: the auth/TLS group, compared and adopted whole through
-	// authMaterial (endpointAuth/targetAuth/stampAuth below).
+	// authClass: the auth/TLS group (kubemeta.ScrapeAuth, embedded in both
+	// the Endpoint and the target), compared and adopted whole.
 	authClass
 )
 
 // endpointMergeClass is the AUTHORITATIVE classification of every Endpoint
 // field for the merge — the servicemonitors.Endpoint.secretRefs pattern: one
-// declared list where there were four hand-maintained ones (the bare gate and
-// the three authMaterial functions). The gate and the adopt logic stay
-// hand-written field compares (the bare path is relied on to cost field
-// compares and no allocation — see targetDedup.monitorHolder), so
+// declared list where there were several hand-maintained ones. The gate and
+// the adopt logic stay hand-written compares (the bare path is relied on to
+// cost field compares and no allocation — see targetDedup.monitorHolder), so
 // merge_guard_test.go is what holds them to this map: an Endpoint field
 // missing here fails the sweep, and a field classified mergeable that the
-// gate cannot see — or that authMaterial does not carry through the adopt
-// round trip — fails the behavioural half. Without that, a newly interpreted
+// gate cannot see — or that the adopt does not carry onto the target — fails
+// the behavioural half. The auth/TLS group is ONE entry because it is one
+// comparable struct (kubemeta.ScrapeAuth) compared and assigned whole, so a
+// field added to it is in the gate and the adopt by construction; the guard
+// test walks its fields individually all the same. Without that, a newly interpreted
 // field carried ALONE reads as BARE at the gate and is silently dropped on
 // every URL two monitors share: no adoption, no MonitorTargetShadowed count,
 // up=0 the only symptom.
@@ -69,16 +71,7 @@ var endpointMergeClass = map[string]mergeClass{
 	"Interval":      cadenceClass,
 	"ScrapeTimeout": cadenceClass,
 
-	"InsecureSkipVerify": authClass,
-	"BearerSecret":       authClass,
-	"BasicAuthUser":      authClass,
-	"BasicAuthPass":      authClass,
-	"AuthType":           authClass,
-	"AuthCredentials":    authClass,
-	"TLSCA":              authClass,
-	"TLSCert":            authClass,
-	"TLSKey":             authClass,
-	"TLSServerName":      authClass,
+	"ScrapeAuth": authClass,
 }
 
 // MergeReport is what one fold of an endpoint into a served target could not
@@ -184,13 +177,12 @@ type MergeReport struct {
 // TestMergedChainIsTheUnionAcrossMatchingServices drives the real loop.
 func MergeMonitorEndpoint(t *kubemeta.ScrapeTarget, monitor string, ep *servicemonitors.Endpoint) MergeReport {
 	var rep MergeReport
-	epAuth := endpointAuth(ep)
 	// The bare gate: one arm per mergeable class of endpointMergeClass —
-	// relabel, cadence, and the whole auth group in a single authMaterial
+	// relabel, cadence, and the whole auth group in a single ScrapeAuth
 	// compare. A mergeable field no arm reads would make an endpoint carrying
 	// only it bare, silently dropping the declaration; merge_guard_test.go
 	// holds every classified field to an arm.
-	if len(ep.MetricRelabelings) == 0 && ep.Interval == "" && ep.ScrapeTimeout == "" && epAuth == (authMaterial{}) {
+	if len(ep.MetricRelabelings) == 0 && ep.Interval == "" && ep.ScrapeTimeout == "" && ep.ScrapeAuth == (kubemeta.ScrapeAuth{}) {
 		return rep
 	}
 	// In the byte budget's OWN accounting, so what the merge arm charges and
@@ -209,13 +201,15 @@ func MergeMonitorEndpoint(t *kubemeta.ScrapeTarget, monitor string, ep *servicem
 	if mergeCadence(t, ep) {
 		contributed = true
 	}
-	if epAuth != (authMaterial{}) {
-		switch targetAuth(t) {
-		case authMaterial{}:
-			stampAuth(t, epAuth)
+	// The auth/TLS group is compared and adopted WHOLE (see kubemeta.ScrapeAuth
+	// for why mixing two monitors' material is never an option).
+	if ep.ScrapeAuth != (kubemeta.ScrapeAuth{}) {
+		switch t.ScrapeAuth {
+		case kubemeta.ScrapeAuth{}:
+			t.ScrapeAuth = ep.ScrapeAuth
 			contributed = true
 			rep.AuthAdopted = true
-		case epAuth:
+		case ep.ScrapeAuth:
 			// The same material declared twice: served as-is, nothing lost.
 		default:
 			rep.AuthConflict = true // the holder's material is served
@@ -290,6 +284,9 @@ const MaxContributorsPerTarget = 32
 
 // appendRelabelChain folds a chain into the target under the ceiling above,
 // reporting whether anything was appended and whether anything was refused.
+// A rule is costed by servicemonitors.RelabelRuleBytes, the parse door's own
+// accounting (empty sourceLabels included), so the two ceilings measure one
+// quantity.
 //
 // The held size is recomputed per merge rather than carried on the target: the
 // wire model (kubemeta.ScrapeTarget) is served to agents and must not grow a
@@ -299,13 +296,14 @@ const MaxContributorsPerTarget = 32
 func appendRelabelChain(t *kubemeta.ScrapeTarget, add []kubemeta.RelabelRule) (added, capped bool) {
 	held := 0
 	for i := range t.MetricRelabelings {
-		held += relabelRuleBytes(&t.MetricRelabelings[i])
+		r := &t.MetricRelabelings[i]
+		held += servicemonitors.RelabelRuleBytes(r.Regex, r.SourceLabels)
 	}
 	for i := range add {
 		if len(t.MetricRelabelings) >= MaxRelabelChainRules {
 			return added, true
 		}
-		n := relabelRuleBytes(&add[i])
+		n := servicemonitors.RelabelRuleBytes(add[i].Regex, add[i].SourceLabels)
 		if held+n > MaxRelabelChainBytes {
 			return added, true
 		}
@@ -314,27 +312,6 @@ func appendRelabelChain(t *kubemeta.ScrapeTarget, add []kubemeta.RelabelRule) (a
 		added = true
 	}
 	return added, false
-}
-
-// relabelLabelBytes is what ONE sourceLabels entry costs beyond its own
-// characters: its JSON framing in the marshalled node-targets document (two
-// quotes and a comma) and its slice slot and per-sample visit in the agent's
-// relabelFilter. It is charged for the reason its twin in servicemonitors is
-// (servicemonitors.relabelLabelBytes, which carries the measurement): a list of
-// EMPTY strings walks straight past an accounting that charges only characters,
-// so a rule costed at 2 bytes marshals to 1.5 MB in every target. The two doors
-// must stay the same shape, which is why the constant exists on both sides.
-const relabelLabelBytes = 3
-
-// relabelRuleBytes is one rule's cost in the two places the ceiling defends:
-// the marshalled node-targets document, and the per-sample walk in the agent's
-// relabelFilter. The action is one of two constants and is not charged.
-func relabelRuleBytes(r *kubemeta.RelabelRule) int {
-	n := len(r.Regex)
-	for _, l := range r.SourceLabels {
-		n += len(l) + relabelLabelBytes
-	}
-	return n
 }
 
 // mergeCadence resolves the interval/scrapeTimeout pair, reporting whether the
@@ -381,69 +358,6 @@ func mergeCadence(t *kubemeta.ScrapeTarget, ep *servicemonitors.Endpoint) bool {
 	}
 	t.Interval, t.ScrapeTimeout = ep.Interval, ep.ScrapeTimeout
 	return true
-}
-
-// authMaterial is the auth/TLS group of an endpoint — the fields that select
-// WHAT credential and trust a scrape presents. It is one group, compared and
-// adopted whole: mixing one monitor's client cert with another's CA (or
-// serverName, or skip-verify) would build a TLS client neither CR describes.
-// Its fields correspond 1:1 to endpointMergeClass's authClass entries, and
-// merge_guard_test.go pins the endpointAuth → stampAuth → targetAuth round
-// trip, so a field cannot enter one of the three functions and miss another.
-type authMaterial struct {
-	insecureSkipVerify bool
-	bearer             string
-	basicAuthUser      string
-	basicAuthPass      string
-	authType           string
-	authCredentials    string
-	tlsCA              string
-	tlsCert            string
-	tlsKey             string
-	tlsServerName      string
-}
-
-func endpointAuth(ep *servicemonitors.Endpoint) authMaterial {
-	return authMaterial{
-		insecureSkipVerify: ep.InsecureSkipVerify,
-		bearer:             ep.BearerSecret,
-		basicAuthUser:      ep.BasicAuthUser,
-		basicAuthPass:      ep.BasicAuthPass,
-		authType:           ep.AuthType,
-		authCredentials:    ep.AuthCredentials,
-		tlsCA:              ep.TLSCA,
-		tlsCert:            ep.TLSCert,
-		tlsKey:             ep.TLSKey,
-		tlsServerName:      ep.TLSServerName,
-	}
-}
-
-func targetAuth(t *kubemeta.ScrapeTarget) authMaterial {
-	return authMaterial{
-		insecureSkipVerify: t.InsecureSkipVerify,
-		bearer:             t.AuthSecret,
-		basicAuthUser:      t.BasicAuthUser,
-		basicAuthPass:      t.BasicAuthPass,
-		authType:           t.AuthType,
-		authCredentials:    t.AuthCredentials,
-		tlsCA:              t.TLSCA,
-		tlsCert:            t.TLSCert,
-		tlsKey:             t.TLSKey,
-		tlsServerName:      t.TLSServerName,
-	}
-}
-
-func stampAuth(t *kubemeta.ScrapeTarget, a authMaterial) {
-	t.InsecureSkipVerify = a.insecureSkipVerify
-	t.AuthSecret = a.bearer
-	t.BasicAuthUser = a.basicAuthUser
-	t.BasicAuthPass = a.basicAuthPass
-	t.AuthType = a.authType
-	t.AuthCredentials = a.authCredentials
-	t.TLSCA = a.tlsCA
-	t.TLSCert = a.tlsCert
-	t.TLSKey = a.tlsKey
-	t.TLSServerName = a.tlsServerName
 }
 
 // addContributor records a monitor whose configuration the target now carries,
@@ -509,12 +423,11 @@ func relabelChainsEqual(a, b []kubemeta.RelabelRule) bool {
 // makes (which of two explicit intervals is finer), through internal/promdur —
 // the same parser the agent's promscrape schedules by, so the interval this
 // merge picks as "finer" is finer under the reading that will actually scrape.
-// The edge rule that is OURS, not the parser's: "0" (and anything else
-// non-positive) is not a usable interval, so ok is false for it exactly as for
-// an overflowing or unparseable value, which the merge reads as incomparable
-// (the holder keeps); the agent independently warns on such a value at scrape
-// time.
+// Which values are usable is promdur.Interval's rule, shared with that
+// scheduler: "0" (and anything else non-positive) is not a usable interval, so
+// ok is false for it exactly as for an overflowing or unparseable value. The
+// REACTION is ours: the merge reads an unusable value as incomparable (the
+// holder keeps), while the agent warns on it at scrape time.
 func promDuration(s string) (time.Duration, bool) {
-	d, err := promdur.Parse(s)
-	return d, err == nil && d > 0
+	return promdur.Interval(s)
 }

@@ -25,7 +25,10 @@ func TestWaitForContainer(t *testing.T) {
 		close(done)
 	}()
 
-	time.Sleep(50 * time.Millisecond)
+	// Parked, not merely started: a lookup that has not reached the waiter
+	// table yet would find the pod on its fast path and pass without ever
+	// exercising the wakeup this test is named for.
+	waitForCount(t, s, 1)
 	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "late999"}))
 
 	select {
@@ -51,28 +54,42 @@ func TestWaitIsPerContainer(t *testing.T) {
 		_, ok, _ := s.GetContainer(ctx, "wanted1")
 		got <- ok
 	}()
+	// The other lookup ends when the TEST says so, not on a short deadline of
+	// its own: a 300ms budget could lapse before the first lookup had even
+	// parked on a loaded machine, and then the two were never parked together.
+	otherCtx, cancelOther := context.WithCancel(context.Background())
+	defer cancelOther()
 	other := make(chan bool, 1)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-		defer cancel()
-		_, ok, _ := s.GetContainer(ctx, "other2")
+		_, ok, _ := s.GetContainer(otherCtx, "other2")
 		other <- ok
 	}()
 
-	time.Sleep(50 * time.Millisecond)
+	waitForCount(t, s, 2) // both parked: wanted1 and other2
 	// Indexing "wanted1" must release only its own waiter.
 	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "wanted1"}))
 
-	if ok := <-got; !ok {
-		t.Fatal("waiter for indexed container did not get a result")
+	select {
+	case ok := <-got:
+		if !ok {
+			t.Fatal("waiter for indexed container did not get a result")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the indexed container's waiter did not wake up")
 	}
+	select {
+	case ok := <-other:
+		t.Fatalf("waiter for a different container returned (ok=%v) before its budget ended", ok)
+	default:
+	}
+	cancelOther()
 	select {
 	case ok := <-other:
 		if ok {
 			t.Fatal("waiter for a different container was satisfied")
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("other waiter never timed out")
+		t.Fatal("other waiter never returned after its budget ended")
 	}
 
 	// All waiter registrations must be cleaned up.
@@ -88,7 +105,7 @@ func TestManyWaitersSameContainer(t *testing.T) {
 
 	const n = 20
 	results := make(chan bool, n)
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -97,10 +114,10 @@ func TestManyWaitersSameContainer(t *testing.T) {
 		}()
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	waitForCount(t, s, n) // every one of them parked on the same ID
 	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "shared123"}))
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		select {
 		case ok := <-results:
 			if !ok {
@@ -134,7 +151,7 @@ func TestExpiredTombstoneDoesNotWait(t *testing.T) {
 	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "abc123"}))
 	s.DeletePod("uid1")
 	clk.Advance(time.Minute + time.Second)
-	// No Sweep: the tombstone is expired but still present.
+	// No sweep: the tombstone is expired but still present.
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -171,25 +188,24 @@ func TestExpiredReplacedIDDoesNotWait(t *testing.T) {
 	}
 }
 
-// waitForCount polls waiterCount until it reaches want.
+// waitForCount polls BlockedLookups until it reaches want.
 func waitForCount(t *testing.T, s *Store, want int) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if s.waiterCount() == want {
+		if s.BlockedLookups() == want {
 			return
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("waiter count = %d, want %d", s.waiterCount(), want)
+	t.Fatalf("waiter count = %d, want %d", s.BlockedLookups(), want)
 }
 
 // The waiter cap sheds additional blocking lookups with ErrTooManyWaiters
 // instead of pinning unbounded memory; capped lookups are retryable, and the
 // already-registered waiters still wake normally.
 func TestWaiterOverflowSheds(t *testing.T) {
-	s, _ := newTestStore(time.Minute)
-	s.SetMaxWaiters(2)
+	s, _ := newTestStore(time.Minute, WithMaxWaiters(2))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -215,7 +231,7 @@ func TestWaiterOverflowSheds(t *testing.T) {
 	if d := time.Since(start); d > time.Second {
 		t.Fatalf("overflow lookup blocked %v, want immediate shed", d)
 	}
-	if got := s.waiterCount(); got != 2 {
+	if got := s.BlockedLookups(); got != 2 {
 		t.Fatalf("waiter count after shed = %d, want 2", got)
 	}
 
@@ -247,14 +263,12 @@ func TestWaiterAccountingDrains(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	for i := range 50 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			id := "garbage" + string(rune('a'+i%26)) + string(rune('a'+i/26))
 			_, _, _ = s.GetContainer(ctx, id)
-		}()
+		})
 	}
-	waitFn := func() int { return s.waiterCount() }
+	waitFn := func() int { return s.BlockedLookups() }
 	deadline := time.Now().Add(5 * time.Second)
 	for waitFn() < 50 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -264,7 +278,7 @@ func TestWaiterAccountingDrains(t *testing.T) {
 	}
 	cancel()
 	wg.Wait()
-	if got := s.waiterCount(); got != 0 {
+	if got := s.BlockedLookups(); got != 0 {
 		t.Fatalf("waiter count after cancel = %d, want 0", got)
 	}
 	s.mu.RLock()
@@ -305,7 +319,7 @@ func TestOversizedIDDoesNotWait(t *testing.T) {
 	if d := time.Since(start); d > time.Second {
 		t.Fatalf("oversized lookup blocked %v, want immediate miss", d)
 	}
-	if got := s.waiterCount(); got != 0 {
+	if got := s.BlockedLookups(); got != 0 {
 		t.Fatalf("oversized ID registered a waiter (count %d)", got)
 	}
 }
@@ -333,7 +347,7 @@ func TestNonBlockingMissDoesNotRegisterAWaiter(t *testing.T) {
 	if got != 0 {
 		t.Errorf("a non-blocking miss allocates %v times per call, want 0", got)
 	}
-	if n := s.waiterCount(); n != 0 {
+	if n := s.BlockedLookups(); n != 0 {
 		t.Errorf("%d waiters left registered", n)
 	}
 }

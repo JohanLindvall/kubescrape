@@ -128,8 +128,17 @@ func New(cfg *Config) (*Extractor, error) {
 // the configured attributes. A nil Extractor returns an empty Result. JSON is
 // scanned once for all rule paths with the lightning toolkit; logfmt uses the
 // logfmt reader. Per-call state is pooled and scalars decode straight off the
-// raw tokens (string values alias the line where escape-free), keeping the
-// per-line allocations to the extracted values themselves.
+// raw tokens: in BOTH formats a string value aliases the line unless it has an
+// escape to decode, so the per-line allocations are the Result's slices and
+// the decoded escapes. The returned strings therefore share the line's memory,
+// which is safe because Go strings are immutable — and means a retained
+// attribute keeps the line alive. Put does not copy them either (pcommon's
+// PutStr stores the Go string as given), so the line lives as long as the
+// payload the attributes were put into. That is free when the line is that
+// payload's own record body, as it is for every producer; a caller extracting
+// from a string the payload does NOT otherwise hold — a transient rendering of
+// a structured body — pins it for the payload's life, and should copy
+// (strings.Clone) whatever it keeps.
 //
 // DUPLICATE KEYS resolve differently by format, and deliberately stay that way:
 // JSON keeps the FIRST occurrence (lightning's GetPaths fills a path's slot
@@ -206,8 +215,14 @@ func (e *Extractor) Extract(line string) Result {
 			// unrelated logAttributes rule would otherwise change what a
 			// logMetrics label or a logs.rules selector matches. QUOTED values
 			// only — see DecodeLogfmtValue.
-			// The no-escape path (the common one) costs one byte scan, no copy.
-			decoded := DecodeLogfmtValue(buf, val)
+			//
+			// Nothing to decode — the common path, and every UNQUOTED value —
+			// aliases the line, as the JSON arm does; only a quoted value with
+			// an escape in it is copied (LogfmtValueView, the decision
+			// internal/logline shares). DecodeLogfmtValue always copied, which
+			// was two allocations of this path's six and a comment saying "no
+			// copy" above it.
+			decoded := LogfmtValueView(buf, val)
 			for _, i := range idxs {
 				vals[i] = decoded
 				found[i] = true
@@ -231,14 +246,15 @@ func (e *Extractor) Extract(line string) Result {
 // eviction. The twin holder in internal/logline clears for the same reason.
 func (e *Extractor) release(sc *scratch) {
 	clear(sc.raws[:cap(sc.raws)])
+	clear(sc.vals) // the logfmt arm's values alias the line too
 	e.scratch.Put(sc)
 }
 
 // decodeScalar renders a raw JSON scalar token as its typed value; objects,
 // arrays and null are not attribute-worthy and report false. Numbers decode as
 // int64 when integral (float64 cannot hold a 64-bit id exactly) and float64
-// otherwise; escape-free strings alias the input line, which outlives
-// the extracted attributes (they are copied into pdata at flush).
+// otherwise; escape-free strings alias the input line (see Extract on what
+// that pins).
 func decodeScalar(raw []byte) (any, bool) {
 	if len(raw) == 0 {
 		return nil, false // shape check at the parse seam; GetPaths never yields this
@@ -263,7 +279,8 @@ func decodeScalar(raw []byte) (any, bool) {
 		// Integral tokens parse as int64 first: float64 loses precision above
 		// 2^53, so a 64-bit id (snowflake, order/user id) lifted from a JSON log
 		// silently landed one or more off — and looked exact afterwards, since
-		// whole floats are stored with PutInt anyway.
+		// Put then stored the whole float with PutInt (it now does so only
+		// inside ±2^53, see storedAsInt).
 		if IsIntegerToken(raw) {
 			if i, err := strconv.ParseInt(string(raw), 10, 64); err == nil {
 				return i, true
@@ -272,6 +289,14 @@ func decodeScalar(raw []byte) (any, bool) {
 		f, err := ljson.ParseFloat(raw)
 		if err != nil {
 			return nil, false
+		}
+		if f == 0 {
+			// Negative zero reads as 0 wherever this value goes. Put already
+			// stored it that way (a small whole float is PutInt, and an int has no
+			// sign) while a lifted attribute rendered as a label kept the sign
+			// (FloatString(-0) is "-0", matching pcommon's own double) — one
+			// `-0.0` field, two readings.
+			f = 0
 		}
 		return f, true
 	}
@@ -284,7 +309,8 @@ func decodeScalar(raw []byte) (any, bool) {
 // render the same line field as an attribute and as a metric label, and two
 // classifiers here drifted once (a lax reject-.eE version beside a strict
 // digits-only one). The strict form is required by the label path, which
-// returns the token text verbatim on true.
+// renders the token TEXT on true (canonicalised: leading zeros and a negative
+// zero stripped, so it reads as decodeScalar's ParseInt of it does).
 //
 // Known residual divergence between the two consumers, accepted: a token
 // exceeding int64's range is verbatim text as a label (exact) but falls back

@@ -105,15 +105,18 @@ type PathAttribute struct {
 type SourcesConfig struct {
 	Sources []Source `json:"sources"`
 	// Rules are ordered first-match-wins keep/drop/sample rules applied to
-	// every exported log record (all sources; journald is not filtered). No
-	// match keeps. Compiled via logline.NewLineFilter; key resolution matches
+	// every exported log record: every tailer source, and the journald,
+	// events, Azure diagnostics and -ingest paths, which share this one
+	// compiled chain (compileLogRules in cmd/kubescrape-agent). No match
+	// keeps. Compiled via logline.NewLineFilter; key resolution matches
 	// the logMetrics selectors, plus the synthetic __severity__ key.
 	Rules []logline.LineRule `json:"rules,omitempty"`
 }
 
 // ValidateSources checks include patterns and globs, returning the sources
-// unchanged on success. It is shared by LoadSourcesConfig and the unified agent
-// config loader.
+// unchanged on success. It is the startup refusal every pattern goes through:
+// used by the unified agent config loader (validateConfig, so -check-config
+// refuses what a start would) and by tests.
 func ValidateSources(sources []Source) ([]Source, error) {
 	for i, s := range sources {
 		if len(s.Include) == 0 {
@@ -278,14 +281,31 @@ func subexpIndex(re *regexp.Regexp, ref string) (int, error) {
 	return 0, fmt.Errorf("no capture group named %q", ref)
 }
 
-// wantNamespace reports whether a containerd source accepts this namespace.
-// An empty allowlist accepts everything; the denylist wins.
-func (s *compiledSource) wantNamespace(ns string) bool {
+// deniesNamespace is the DENY half of a containerd source's namespace
+// selection: its excludeNamespaces globs. allowsNamespace is the other half.
+//
+// The two are kept apart on purpose because they have opposite claim semantics
+// (claimPath): a DENY claims the file so no later source can resurrect it, an
+// allowlist MISS leaves it for one. A source accepts a namespace when it
+// neither denies it nor fails to allow it — the denylist wins. There used to be
+// a merged wantNamespace as well, whose only production caller ran it right
+// after deniesNamespace had already said no, re-running the deny globs per
+// listed file per discovery pass; and testing a merged predicate ALONE for the
+// claim is the trap that once lost the deny guard. Patterns are validated at
+// startup (ValidateSources), so a path.Match error in either cannot happen and
+// reads as "no match".
+func (s *compiledSource) deniesNamespace(ns string) bool {
 	for _, pat := range s.excludeNamespaces {
 		if ok, _ := path.Match(pat, ns); ok {
-			return false
+			return true
 		}
 	}
+	return false
+}
+
+// allowsNamespace is the ALLOW half: the source's namespaces allowlist. An
+// empty allowlist accepts everything.
+func (s *compiledSource) allowsNamespace(ns string) bool {
 	if len(s.namespaces) == 0 {
 		return true
 	}
@@ -378,17 +398,17 @@ func (s *compiledSource) excluded(path string) bool {
 }
 
 // glob returns the paths currently matching this source's include patterns
-// (before exclude filtering, which matches() applies per file). Directories
-// are filtered by the caller; container logs are symlinks to files, so
-// symlink following (os.Stat) is left to the caller.
+// (before exclude filtering, which excluded() applies per file in scanDir).
+// Directories are filtered by the caller; container logs are symlinks to files,
+// so symlink following (os.Stat) is left to the caller.
 func (s *compiledSource) glob() ([]string, bool) {
 	var out []string
 	ok := true
 	for _, g := range s.include {
 		// WithFailOnIOErrors is the whole point of the bool. By default
 		// FilepathGlob documents itself as IGNORING filesystem errors — its
-		// only error is ErrBadPattern, which compileSources already rejected
-		// at startup — so this never once reported false, and the two guards
+		// only error is ErrBadPattern, which ValidateSources rejects at
+		// startup — so this never once reported false, and the two guards
 		// it gates (gone-detection and checkpoint pruning) were dead code. An
 		// unreadable or vanished include base then listed as EMPTY: every
 		// tracked file marked gone, and saveCheckpoints pruned the persisted
@@ -412,7 +432,7 @@ func (s *compiledSource) glob() ([]string, bool) {
 		// on an ordinary steady state. Statting the fixed prefix separates the
 		// two exactly — "I could not look" versus "I looked and there is
 		// nothing".
-		if base, _ := doublestar.SplitPattern(g); base != "" && base != "." {
+		if base, fixed := includeBase(g); fixed {
 			if _, serr := os.Stat(base); serr != nil {
 				ok = false
 				continue
@@ -443,13 +463,22 @@ func (s *compiledSource) glob() ([]string, bool) {
 	return out, ok
 }
 
-// scanBaseDirs returns the fixed directory prefixes of the include globs (the
-// part before the first wildcard), used to watch for newly appearing files.
+// includeBase is an include glob's fixed directory prefix (the part before the
+// first wildcard), and whether it has one. ONE derivation for the two uses —
+// glob stats it to tell "I could not look" from "there is nothing", and
+// scanBaseDirs watches it — so the base that is checked and the base that is
+// watched cannot diverge.
+func includeBase(g string) (string, bool) {
+	base, _ := doublestar.SplitPattern(g)
+	return base, base != "" && base != "."
+}
+
+// scanBaseDirs returns the fixed directory prefixes of the include globs (see
+// includeBase), used to watch for newly appearing files.
 func (s *compiledSource) scanBaseDirs() []string {
 	var out []string
 	for _, g := range s.include {
-		base, _ := doublestar.SplitPattern(g)
-		if base != "" && base != "." {
+		if base, fixed := includeBase(g); fixed {
 			out = append(out, base)
 		}
 	}

@@ -23,7 +23,7 @@ func TestExplainServicePortsStopsWhereServiceTargetsStops(t *testing.T) {
 	delete(pod.Annotations, AnnotationScrape) // the Service door alone
 	svc := baseService()
 	svc.Ports = nil
-	for i := 0; i < ports; i++ {
+	for i := range ports {
 		n := int32(9000 + i)
 		svc.Ports = append(svc.Ports, services.Port{
 			Name: "p" + strconv.Itoa(int(n)), Port: n, TargetPortNum: n,

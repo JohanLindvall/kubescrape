@@ -2,6 +2,7 @@ package events
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -17,8 +19,11 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/backoff"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/leader"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
@@ -127,14 +132,45 @@ func newReader(t *testing.T, cfg Config) (*Reader, *fake.Clientset, *watch.FakeW
 	return New(cfg), client, w
 }
 
+// The API server closes every watch opened without TimeoutSeconds after a
+// random 30-60 minutes, so a healthy cluster restarts this watch 24-48 times a
+// day. That close is steady state, and a Warn for it is one nobody reads — the
+// stream says which it was (errWatchClosed) and only a routine one, after a
+// healthy run, is demoted. A close that came QUICKLY, and every real error,
+// stays a Warn.
+func TestRoutineWatchCloseIsNotAWarning(t *testing.T) {
+	r, _, w := newReader(t, Config{})
+	r.committed.ResourceVersion = "5" // positioned: no List, straight to the watch
+	w.Stop()                          // the server's clean close
+	if err := r.stream(context.Background()); !errors.Is(err, errWatchClosed) {
+		t.Fatalf("stream after a clean server close = %v, want errWatchClosed", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		err     error
+		lasted  time.Duration
+		routine bool
+	}{
+		{"server timeout after a healthy run", errWatchClosed, 45 * time.Minute, true},
+		{"at the healthy-run threshold", errWatchClosed, backoff.Cap, true},
+		{"closed right after opening", errWatchClosed, time.Second, false},
+		{"expired", fmt.Errorf("watch error: %w", apierrors.NewResourceExpired("too old")), time.Hour, false},
+		{"export failure", errors.New("exporting events: collector down"), time.Hour, false},
+	} {
+		if got := routineWatchClose(tc.err, tc.lasted); got != tc.routine {
+			t.Errorf("%s: routineWatchClose = %v, want %v", tc.name, got, tc.routine)
+		}
+	}
+}
+
 // A Modified event is a NEW occurrence: Kubernetes aggregates repeats into
 // one object with a growing count, so handling only Added would lose
 // "BackOff x47" — the most diagnostically valuable event there is.
 func TestModifiedIsAnOccurrence(t *testing.T) {
 	exp := &captureExporter{}
 	r, _, _ := newReader(t, Config{Exporter: exp, BatchSize: 1})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	now := time.Now()
 	if err := r.handle(ctx, watch.Event{Type: watch.Added, Object: event("a", "BackOff", "back-off", "Warning", "10", 1, now)}); err != nil {
@@ -308,7 +344,7 @@ func TestRulesDropEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	exp := &captureExporter{}
-	r, _, _ := newReader(t, Config{Exporter: exp, BatchSize: 2, Rules: rules})
+	r, _, _ := newReader(t, Config{Exporter: exp, BatchSize: 2, Chain: logchain.Config{Rules: rules}})
 	ctx := context.Background()
 	now := time.Now()
 	if err := r.handle(ctx, watch.Event{Type: watch.Added, Object: event("n", "Started", "normal", "Normal", "10", 1, now)}); err != nil {
@@ -418,7 +454,7 @@ func TestExpiryRelistsRatherThanSkippingAhead(t *testing.T) {
 		t.Fatalf("an uncommitted relist must persist (%+v, err=%v)", start, err)
 	}
 	// A commit secures the replay and disarms it.
-	r.settle(entry{rv: "1001", when: time.Now()}, len(r.batch))
+	r.settle(Position{ResourceVersion: "1001", Watermark: time.Now()}, len(r.batch))
 	if start, err = r.startResourceVersion(context.Background()); err != nil || start.rv != "1001" || start.replay {
 		t.Fatalf("after a commit the reader resumes from it (%+v, err=%v)", start, err)
 	}
@@ -613,7 +649,9 @@ func TestStreamDeathMidReplayRelistsAgain(t *testing.T) {
 	// The replay delivers in STORE order: [100, 900] flush and ack while 200
 	// is still undelivered.
 	for _, ev := range []string{"9900100", "9900900"} {
-		r.replayItem(ctx, event("e"+ev, "R", "m", "Normal", ev, 1, base.Add(time.Minute)))
+		if _, err := r.replayItem(ctx, event("e"+ev, "R", "m", "Normal", ev, 1, base.Add(time.Minute))); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := r.flush(ctx); err != nil {
 		t.Fatal(err)
@@ -732,7 +770,7 @@ func TestSettleNeverRegressesTheCommittedPosition(t *testing.T) {
 	mark := time.Now()
 	r.committed.Watermark = mark
 
-	r.settle(entry{rv: "9880001", when: mark.Add(-time.Minute)}, len(r.batch))
+	r.settle(Position{ResourceVersion: "9880001", Watermark: mark.Add(-time.Minute)}, len(r.batch))
 	if got := r.committed.ResourceVersion; got != "9900400" {
 		t.Errorf("committed %q after settling an older batch; want 9900400 held — a backwards position redelivers every event in between on the next resume", got)
 	}
@@ -744,7 +782,7 @@ func TestSettleNeverRegressesTheCommittedPosition(t *testing.T) {
 	// A non-numeric resourceVersion is not comparable, so it must be REFUSED
 	// rather than guessed at — the conservative direction is keeping what we
 	// have, since a wrong guess forward is outright loss.
-	r.settle(entry{rv: "not-a-number", when: mark}, len(r.batch))
+	r.settle(Position{ResourceVersion: "not-a-number", Watermark: mark}, len(r.batch))
 	if got := r.committed.ResourceVersion; got != "9900400" {
 		t.Errorf("committed %q from an uncomparable resourceVersion; want the known-good 9900400 kept", got)
 	}
@@ -1042,8 +1080,8 @@ func TestWatermarkIsClampedToWallClock(t *testing.T) {
 	r.now = func() time.Time { return now }
 
 	future := now.Add(2 * time.Hour)
-	r.batch = []entry{{when: future}}
-	r.settle(entry{when: future}, len(r.batch))
+	r.batch = []entry{{ts: future}}
+	r.settle(Position{Watermark: future}, len(r.batch))
 
 	if r.committed.Watermark.After(now) {
 		t.Errorf("watermark = %v, later than wall clock %v: a fast reporter clock latched the boundary",
@@ -1184,7 +1222,7 @@ func TestRetainedBatchIsBoundedDuringOutage(t *testing.T) {
 	limit := r.retainCap()
 	over := 2*shedChunk + 25
 	total := limit + over
-	for i := 0; i < total; i++ {
+	for i := range total {
 		// Flush attempts past BatchSize fail transiently; the batch is retained
 		// for the retry, which is exactly the retention path under test.
 		if err := r.handle(ctx, watch.Event{Type: watch.Added,
@@ -1310,7 +1348,7 @@ func TestExportFailureKeepsTheWatchOpen(t *testing.T) {
 	now := time.Now()
 
 	const n = 10
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if err := r.handle(ctx, watch.Event{Type: watch.Added,
 			Object: event(fmt.Sprintf("e%d", i), "R", "m", "Normal", strconv.Itoa(100+i), 1, now)}); err != nil {
 			t.Fatalf("event %d: handle returned %v; stream() turns that into a watch teardown", i, err)
@@ -1361,7 +1399,7 @@ func TestResourceIsBuiltOncePerInvolvedObject(t *testing.T) {
 	now := time.Now()
 
 	// 50 occurrences of the same event object (the "BackOff x47" shape).
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		e := event("a", "BackOff", "back-off", "Warning", strconv.Itoa(100+i), int32(i+1), now)
 		if err := r.handle(ctx, watch.Event{Type: watch.Modified, Object: e}); err != nil {
 			t.Fatal(err)
@@ -1395,6 +1433,58 @@ func TestResourceIsBuiltOncePerInvolvedObject(t *testing.T) {
 	}
 	if len(r.resCache) != 0 {
 		t.Fatalf("resCache holds %d entries after the batch settled", len(r.resCache))
+	}
+}
+
+// The event's own attributes render in ONE order. They were a map[string]any
+// retained per batch entry and RANGED into the record at convert, so one event
+// came out in a different attribute order on every render (12 orders in 50),
+// and identical events never rendered byte-identically. The set is unchanged:
+// an unset string field is absent, the count always present, a series count
+// wins over the legacy one.
+func TestEventAttributesAreWrittenInOneFixedOrder(t *testing.T) {
+	e := event("a", "BackOff", "back-off", "Warning", "10", 3, time.Now())
+	e.Action = "Restarting"
+	e.InvolvedObject.FieldPath = "spec.containers{app}"
+	e.ReportingInstance = "node-1"
+	e.Series = &corev1.EventSeries{Count: 47}
+	want := []string{
+		"k8s.event.uid", "k8s.event.name", "k8s.event.reason", "k8s.event.action", "k8s.event.type",
+		"k8s.event.count", "k8s.event.involved_object.kind", "k8s.event.involved_object.name",
+		"k8s.event.involved_object.uid", "k8s.event.involved_object.field_path",
+		"k8s.event.reporting_component", "k8s.event.reporting_instance",
+	}
+	for i := range 20 {
+		lr := plog.NewLogRecord()
+		m := newEventMeta(e)
+		m.put(lr.Attributes())
+		var got []string
+		lr.Attributes().Range(func(k string, _ pcommon.Value) bool {
+			got = append(got, k)
+			return true
+		})
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("render %d attribute order =\n  %v\nwant\n  %v", i, got, want)
+		}
+		if v, _ := lr.Attributes().Get("k8s.event.count"); v.Int() != 47 {
+			t.Fatalf("k8s.event.count = %d, want the series count 47", v.Int())
+		}
+	}
+
+	// Unset fields are absent, never "".
+	bare := event("b", "Pulled", "pulled", "Normal", "11", 0, time.Now())
+	bare.Source.Component = ""
+	lr := plog.NewLogRecord()
+	m := newEventMeta(bare)
+	m.put(lr.Attributes())
+	for _, k := range []string{"k8s.event.action", "k8s.event.involved_object.field_path",
+		"k8s.event.reporting_component", "k8s.event.reporting_instance"} {
+		if _, ok := lr.Attributes().Get(k); ok {
+			t.Errorf("%s present on an event that does not set it", k)
+		}
+	}
+	if v, ok := lr.Attributes().Get("k8s.event.count"); !ok || v.Int() != 0 {
+		t.Errorf("k8s.event.count = %v (present %v), want 0 and present", v.AsRaw(), ok)
 	}
 }
 

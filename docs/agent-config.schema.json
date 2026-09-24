@@ -7,39 +7,79 @@
       "properties": {
         "attributes": {
           "additionalProperties": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "defaults": {
-          "type": "boolean"
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "disable": {
           "items": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "enable": {
           "items": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "instancePrefix": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "pipelines": {
           "additionalProperties": {
-            "$ref": "#/definitions/attrs.Config"
+            "anyOf": [
+              {
+                "$ref": "#/definitions/attrs.Config"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "static": {
           "additionalProperties": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -52,147 +92,272 @@
           "properties": {
             "andSubPolicy": {
               "items": {
-                "$ref": "#/definitions/tailsample.PolicyConfig"
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/tailsample.PolicyConfig"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               },
-              "type": "array"
+              "type": [
+                "array",
+                "null"
+              ]
             }
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "booleanAttribute": {
           "additionalProperties": false,
           "properties": {
             "key": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "value": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ]
             }
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "composite": {
           "additionalProperties": false,
           "properties": {
             "compositeSubPolicy": {
               "items": {
-                "$ref": "#/definitions/tailsample.PolicyConfig"
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/tailsample.PolicyConfig"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               },
-              "type": "array"
+              "type": [
+                "array",
+                "null"
+              ]
             },
             "maxTotalSpansPerSecond": {
-              "type": "number"
+              "type": [
+                "number",
+                "null"
+              ]
             },
             "policyOrder": {
               "items": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
-              "type": "array"
+              "type": [
+                "array",
+                "null"
+              ]
             },
             "rateAllocation": {
               "items": {
                 "additionalProperties": false,
                 "properties": {
                   "percent": {
-                    "type": "number"
+                    "type": [
+                      "number",
+                      "null"
+                    ]
                   },
                   "policy": {
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   }
                 },
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
-              "type": "array"
+              "type": [
+                "array",
+                "null"
+              ]
             }
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "latency": {
           "additionalProperties": false,
           "properties": {
             "threshold": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "upper": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "name": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "numericAttribute": {
           "additionalProperties": false,
           "properties": {
             "key": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "maxValue": {
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "minValue": {
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             }
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "probabilistic": {
           "additionalProperties": false,
           "properties": {
             "samplingPercentage": {
-              "type": "number"
+              "type": [
+                "number",
+                "null"
+              ]
             }
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "rateLimiting": {
           "additionalProperties": false,
           "properties": {
             "spansPerSecond": {
-              "type": "number"
+              "type": [
+                "number",
+                "null"
+              ]
             }
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "statusCode": {
           "additionalProperties": false,
           "properties": {
             "statusCodes": {
               "items": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
-              "type": "array"
+              "type": [
+                "array",
+                "null"
+              ]
             }
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "stringAttribute": {
           "additionalProperties": false,
           "properties": {
             "cacheMaxSize": {
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "enabledRegexMatching": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "invertMatch": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "key": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "values": {
               "items": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
-              "type": "array"
+              "type": [
+                "array",
+                "null"
+              ]
             }
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "type": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -204,136 +369,259 @@
       "additionalProperties": false,
       "properties": {
         "clientCertFile": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "clientKeyFile": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "headers": {
           "additionalProperties": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "logs": {
           "additionalProperties": false,
           "properties": {
             "bearerTokenFile": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "caFile": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "clientCertFile": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "clientKeyFile": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "compression": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "endpoint": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "headers": {
               "additionalProperties": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
-              "type": "object"
+              "type": [
+                "object",
+                "null"
+              ]
             },
             "insecure": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "insecureSkipVerify": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "protocol": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "metrics": {
           "additionalProperties": false,
           "properties": {
             "bearerTokenFile": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "caFile": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "clientCertFile": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "clientKeyFile": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "compression": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "endpoint": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "headers": {
               "additionalProperties": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
-              "type": "object"
+              "type": [
+                "object",
+                "null"
+              ]
             },
             "insecure": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "insecureSkipVerify": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "protocol": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "traces": {
           "additionalProperties": false,
           "properties": {
             "bearerTokenFile": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "caFile": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "clientCertFile": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "clientKeyFile": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "compression": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "endpoint": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "headers": {
               "additionalProperties": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
-              "type": "object"
+              "type": [
+                "object",
+                "null"
+              ]
             },
             "insecure": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "insecureSkipVerify": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "protocol": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         }
       },
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "logAttributes": {
       "additionalProperties": false,
@@ -343,21 +631,39 @@
             "additionalProperties": false,
             "properties": {
               "attribute": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "key": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "target": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         }
       },
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "logMetrics": {
       "additionalProperties": false,
@@ -367,99 +673,189 @@
             "additionalProperties": false,
             "properties": {
               "action": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "buckets": {
                 "items": {
-                  "type": "number"
+                  "type": [
+                    "number",
+                    "null"
+                  ]
                 },
-                "type": "array"
+                "type": [
+                  "array",
+                  "null"
+                ]
               },
               "description": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "labelPrefix": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "labels": {
                 "items": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
-                "type": "array"
+                "type": [
+                  "array",
+                  "null"
+                ]
               },
               "match": {
                 "items": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
-                "type": "array"
+                "type": [
+                  "array",
+                  "null"
+                ]
               },
               "matchRegexp": {
                 "items": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
-                "type": "array"
+                "type": [
+                  "array",
+                  "null"
+                ]
               },
               "maxAge": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "maxCardinality": {
-                "type": "integer"
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "name": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "resourceLabels": {
                 "items": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
-                "type": "array"
+                "type": [
+                  "array",
+                  "null"
+                ]
               },
               "type": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "value": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "valueRegexp": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         }
       },
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "logScrubbing": {
       "additionalProperties": false,
       "properties": {
         "builtin": {
           "items": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "rules": {
           "items": {
             "additionalProperties": false,
             "properties": {
               "name": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "regexp": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "replacement": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         }
       },
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "logs": {
       "additionalProperties": false,
@@ -469,27 +865,51 @@
             "additionalProperties": false,
             "properties": {
               "action": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "match": {
                 "items": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
-                "type": "array"
+                "type": [
+                  "array",
+                  "null"
+                ]
               },
               "matchRegexp": {
                 "items": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
-                "type": "array"
+                "type": [
+                  "array",
+                  "null"
+                ]
               },
               "sample": {
-                "type": "number"
+                "type": [
+                  "number",
+                  "null"
+                ]
               }
             },
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "sources": {
           "items": {
@@ -497,51 +917,99 @@
             "properties": {
               "attributes": {
                 "additionalProperties": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "compressed": {
-                "type": "boolean"
+                "type": [
+                  "boolean",
+                  "null"
+                ]
               },
               "containerd": {
-                "type": "boolean"
+                "type": [
+                  "boolean",
+                  "null"
+                ]
               },
               "exclude": {
                 "items": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
-                "type": "array"
+                "type": [
+                  "array",
+                  "null"
+                ]
               },
               "excludeNamespaces": {
                 "items": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
-                "type": "array"
+                "type": [
+                  "array",
+                  "null"
+                ]
               },
               "ignoreOlder": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "include": {
                 "items": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
-                "type": "array"
+                "type": [
+                  "array",
+                  "null"
+                ]
               },
               "multiline": {
-                "type": "boolean"
+                "type": [
+                  "boolean",
+                  "null"
+                ]
               },
               "name": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "namespaces": {
                 "items": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
-                "type": "array"
+                "type": [
+                  "array",
+                  "null"
+                ]
               },
               "parseScript": {
-                "type": "boolean"
+                "type": [
+                  "boolean",
+                  "null"
+                ]
               },
               "pathAttributes": {
                 "items": {
@@ -549,31 +1017,61 @@
                   "properties": {
                     "attributes": {
                       "additionalProperties": {
-                        "type": "string"
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
-                      "type": "object"
+                      "type": [
+                        "object",
+                        "null"
+                      ]
                     },
                     "regexp": {
-                      "type": "string"
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   },
-                  "type": "object"
+                  "type": [
+                    "object",
+                    "null"
+                  ]
                 },
-                "type": "array"
+                "type": [
+                  "array",
+                  "null"
+                ]
               },
               "selector": {
                 "additionalProperties": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               }
             },
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         }
       },
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "metrics": {
       "additionalProperties": false,
@@ -584,23 +1082,44 @@
               "additionalProperties": false,
               "properties": {
                 "action": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "labels": {
                   "additionalProperties": {
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
-                  "type": "object"
+                  "type": [
+                    "object",
+                    "null"
+                  ]
                 },
                 "metrics": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
-              "type": "object"
+              "type": [
+                "object",
+                "null"
+              ]
             },
-            "type": "array"
+            "type": [
+              "array",
+              "null"
+            ]
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "splitters": {
           "items": {
@@ -610,19 +1129,34 @@
                 "additionalProperties": false,
                 "properties": {
                   "namespace": {
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "podLabels": {
                     "additionalProperties": {
-                      "type": "string"
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     },
-                    "type": "object"
+                    "type": [
+                      "object",
+                      "null"
+                    ]
                   },
                   "podName": {
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   }
                 },
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "rules": {
                 "items": {
@@ -630,88 +1164,176 @@
                   "properties": {
                     "attributes": {
                       "additionalProperties": {
-                        "type": "string"
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
-                      "type": "object"
+                      "type": [
+                        "object",
+                        "null"
+                      ]
                     },
                     "datapointAttributes": {
                       "items": {
-                        "type": "string"
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
-                      "type": "array"
+                      "type": [
+                        "array",
+                        "null"
+                      ]
                     },
                     "dropLabels": {
-                      "type": "string"
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     },
                     "enrich": {
-                      "type": "boolean"
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
                     },
                     "groupBy": {
                       "additionalProperties": {
-                        "type": "string"
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
-                      "type": "object"
+                      "type": [
+                        "object",
+                        "null"
+                      ]
                     },
                     "instancePrefix": {
-                      "type": "string"
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     },
                     "metrics": {
-                      "type": "string"
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   },
-                  "type": "object"
+                  "type": [
+                    "object",
+                    "null"
+                  ]
                 },
-                "type": "array"
+                "type": [
+                  "array",
+                  "null"
+                ]
               }
             },
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         }
       },
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "resourceAttributes": {
       "additionalProperties": false,
       "properties": {
         "attributes": {
           "additionalProperties": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "defaults": {
-          "type": "boolean"
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "disable": {
           "items": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "enable": {
           "items": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "instancePrefix": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "pipelines": {
           "additionalProperties": {
-            "$ref": "#/definitions/attrs.Config"
+            "anyOf": [
+              {
+                "$ref": "#/definitions/attrs.Config"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "static": {
           "additionalProperties": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         }
       },
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "routing": {
       "additionalProperties": false,
@@ -721,159 +1343,312 @@
             "additionalProperties": false,
             "properties": {
               "bearerTokenFile": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "caFile": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "clientCertFile": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "clientKeyFile": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "endpoint": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "headers": {
                 "additionalProperties": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "insecure": {
-                "type": "boolean"
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "insecureSkipVerify": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
               },
               "name": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "namespaces": {
                 "items": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
-                "type": "array"
+                "type": [
+                  "array",
+                  "null"
+                ]
               }
             },
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         }
       },
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "serviceGraph": {
       "additionalProperties": false,
       "properties": {
         "dimensions": {
           "items": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "exemplars": {
-          "type": "boolean"
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "histogramBuckets": {
           "items": {
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "maxCardinality": {
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "maxItems": {
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "staleAfter": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "virtualNodePeerAttributes": {
           "items": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "wait": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "serviceGraphShards": {
       "additionalProperties": false,
       "properties": {
         "bearerTokenFile": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "caFile": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "endpoints": {
           "items": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "headers": {
           "additionalProperties": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "insecure": {
-          "type": "boolean"
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "insecureSkipVerify": {
-          "type": "boolean"
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "namespace": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "port": {
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "protocol": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "replicas": {
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "self": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "service": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "statefulSet": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "tokensPerShard": {
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "tailSampling": {
       "additionalProperties": false,
       "properties": {
         "decisionCacheSize": {
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "decisionCacheTTL": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "decisionWait": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "maxSpans": {
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "maxSpansPerTrace": {
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "maxTraces": {
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "policies": {
           "items": {
@@ -884,203 +1659,379 @@
                 "properties": {
                   "andSubPolicy": {
                     "items": {
-                      "$ref": "#/definitions/tailsample.PolicyConfig"
+                      "anyOf": [
+                        {
+                          "$ref": "#/definitions/tailsample.PolicyConfig"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     },
-                    "type": "array"
+                    "type": [
+                      "array",
+                      "null"
+                    ]
                   }
                 },
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "booleanAttribute": {
                 "additionalProperties": false,
                 "properties": {
                   "key": {
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "value": {
-                    "type": "boolean"
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
                   }
                 },
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "composite": {
                 "additionalProperties": false,
                 "properties": {
                   "compositeSubPolicy": {
                     "items": {
-                      "$ref": "#/definitions/tailsample.PolicyConfig"
+                      "anyOf": [
+                        {
+                          "$ref": "#/definitions/tailsample.PolicyConfig"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     },
-                    "type": "array"
+                    "type": [
+                      "array",
+                      "null"
+                    ]
                   },
                   "maxTotalSpansPerSecond": {
-                    "type": "number"
+                    "type": [
+                      "number",
+                      "null"
+                    ]
                   },
                   "policyOrder": {
                     "items": {
-                      "type": "string"
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     },
-                    "type": "array"
+                    "type": [
+                      "array",
+                      "null"
+                    ]
                   },
                   "rateAllocation": {
                     "items": {
                       "additionalProperties": false,
                       "properties": {
                         "percent": {
-                          "type": "number"
+                          "type": [
+                            "number",
+                            "null"
+                          ]
                         },
                         "policy": {
-                          "type": "string"
+                          "type": [
+                            "string",
+                            "null"
+                          ]
                         }
                       },
-                      "type": "object"
+                      "type": [
+                        "object",
+                        "null"
+                      ]
                     },
-                    "type": "array"
+                    "type": [
+                      "array",
+                      "null"
+                    ]
                   }
                 },
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "latency": {
                 "additionalProperties": false,
                 "properties": {
                   "threshold": {
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "upper": {
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   }
                 },
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "name": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "numericAttribute": {
                 "additionalProperties": false,
                 "properties": {
                   "key": {
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "maxValue": {
-                    "type": "integer"
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
                   },
                   "minValue": {
-                    "type": "integer"
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
                   }
                 },
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "probabilistic": {
                 "additionalProperties": false,
                 "properties": {
                   "samplingPercentage": {
-                    "type": "number"
+                    "type": [
+                      "number",
+                      "null"
+                    ]
                   }
                 },
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "rateLimiting": {
                 "additionalProperties": false,
                 "properties": {
                   "spansPerSecond": {
-                    "type": "number"
+                    "type": [
+                      "number",
+                      "null"
+                    ]
                   }
                 },
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "statusCode": {
                 "additionalProperties": false,
                 "properties": {
                   "statusCodes": {
                     "items": {
-                      "type": "string"
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     },
-                    "type": "array"
+                    "type": [
+                      "array",
+                      "null"
+                    ]
                   }
                 },
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "stringAttribute": {
                 "additionalProperties": false,
                 "properties": {
                   "cacheMaxSize": {
-                    "type": "integer"
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
                   },
                   "enabledRegexMatching": {
-                    "type": "boolean"
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
                   },
                   "invertMatch": {
-                    "type": "boolean"
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
                   },
                   "key": {
-                    "type": "string"
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "values": {
                     "items": {
-                      "type": "string"
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     },
-                    "type": "array"
+                    "type": [
+                      "array",
+                      "null"
+                    ]
                   }
                 },
-                "type": "object"
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "type": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         }
       },
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "traceMetrics": {
       "additionalProperties": false,
       "properties": {
         "buckets": {
           "items": {
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "dimensions": {
           "items": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "exemplars": {
-          "type": "boolean"
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "maxCardinality": {
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "namePrefix": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "staleAfter": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "traceSampling": {
       "additionalProperties": false,
       "properties": {
         "keepErrors": {
-          "type": "boolean"
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "keepSlowerThan": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "maxSpansPerSecond": {
-          "type": "number"
+          "type": [
+            "number",
+            "null"
+          ]
         },
         "probability": {
-          "type": "number"
+          "type": [
+            "number",
+            "null"
+          ]
         }
       },
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     }
   },
   "title": "kubescrape-agent -config",

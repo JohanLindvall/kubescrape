@@ -161,17 +161,11 @@ func (ki *KeyIndex) Get(lf *Fields, key string) string {
 // Parse fills lf.vals (by slot) with the referenced keys from the line: JSON
 // when it starts with '{', otherwise logfmt (flat keys only).
 //
-// DUPLICATE KEYS resolve differently by format, and deliberately stay that way:
-// JSON keeps the FIRST occurrence (lightning's GetPaths fills a path's slot
-// only while it is still nil — its documented contract, and re-resolving it
-// would mean a second pass over the line) while the logfmt scan below keeps the
-// LAST (the callback writes the slot on every match). So `{"level":"info",
-// "level":"warn"}` reads info and `level=info level=warn` reads warn. Both
-// inputs are malformed, and neither format's reader dictates an answer — the
-// logfmt reader's own Get resolves first-NON-EMPTY-wins, a third rule again —
-// so unifying it would mean inventing a rule here and keeping the twin
-// extractor in pkg/logattrs (which has the identical asymmetry, for the
-// identical reason) in step with it forever. It is written down instead.
+// DUPLICATE KEYS resolve differently by format, deliberately: JSON keeps the
+// FIRST occurrence and the logfmt scan below the LAST, so `{"level":"info",
+// "level":"warn"}` reads info and `level=info level=warn` reads warn. The twin
+// extractor, pkg/logattrs' Extractor.Extract, has the identical asymmetry and
+// carries the reasoning for both.
 func (ki *KeyIndex) Parse(lf *Fields) {
 	if t := strings.TrimSpace(lf.line); strings.HasPrefix(t, "{") {
 		// Read-only view: GetPaths only reads the buffer; its outputs alias it.
@@ -222,21 +216,45 @@ func (ki *KeyIndex) Parse(lf *Fields) {
 		// QUOTED values only: an unquoted `path=C:\logs\app.log` holds no
 		// escapes, and decoding it deleted the backslashes — or, for a
 		// recognised letter, minted a label value with a real newline in
-		// it. logattrs.DecodeLogfmtValue is the shared decision and stays
-		// the one that makes it.
-		//
-		// Its no-escape answer is the raw bytes verbatim, whatever the
-		// quoting, so that case is served with a read-only view into the
-		// line instead of a copy — the same aliasing the JSON arm above
-		// relies on (lightning never mutates its input, and lf.line owns
-		// the backing array for as long as these values are valid).
-		if !logfmt.NeedsUnescape(val) {
-			lf.vals[slot] = unsafe.String(unsafe.SliceData(val), len(val))
-		} else {
-			lf.vals[slot] = logattrs.DecodeLogfmtValue(buf, val)
-		}
+		// it. logattrs.LogfmtValueView is the shared decision, shared with
+		// the twin extractor so the two cannot drift: a value with nothing
+		// to decode is served as a read-only view into the line instead of
+		// a copy — the same aliasing the JSON arm above relies on (lf.line
+		// owns the backing array for as long as these values are valid).
+		lf.vals[slot] = logattrs.LogfmtValueView(buf, val)
 		return true
 	})
+}
+
+// canonicalInteger renders an integer token as the decimal the attribute
+// lifted from the same field reads (decodeScalar's ParseInt, rendered by
+// FormatInt): no leading zeros, and no negative zero — `-0` is what Go's
+// json.Marshal writes for a negative-zero float. It used to be the token
+// verbatim, so {"a":-0}, {"a":007} or {"a":-01} labelled a series "-0", "007",
+// "-01" while the record attribute from the very same field read "0", "7",
+// "-1". Stripping rather than re-parsing keeps it exact past int64's range,
+// where the token is still rendered verbatim (IsIntegerToken's documented
+// residual). An already-canonical token — every real one — is one copy, as
+// before.
+func canonicalInteger(raw []byte) string {
+	neg := raw[0] == '-'
+	digits := raw
+	if neg {
+		digits = raw[1:]
+	}
+	i := 0
+	for i < len(digits)-1 && digits[i] == '0' {
+		i++
+	}
+	digits = digits[i:]
+	isZero := len(digits) == 1 && digits[0] == '0'
+	switch {
+	case i == 0 && (!neg || !isZero):
+		return string(raw)
+	case neg && !isZero:
+		return "-" + string(digits)
+	}
+	return string(digits)
 }
 
 // RawScalarString renders a raw JSON scalar token as a string; objects, arrays
@@ -278,11 +296,17 @@ func RawScalarString(raw []byte) (string, bool) {
 		// token exceeding int64 renders verbatim here but rounds through
 		// float64 in decodeScalar — see IsIntegerToken's doc.)
 		if logattrs.IsIntegerToken(raw) {
-			return string(raw), true
+			return canonicalInteger(raw), true
 		}
 		f, err := ljson.ParseFloat(raw)
 		if err != nil {
 			return "", false
+		}
+		if f == 0 {
+			// Negative zero (`-0.0`, what Python's json.dumps writes) reads as
+			// 0, as the attribute lifted from the same field does: a whole
+			// float is stored as the int it equals, and an int has no sign.
+			f = 0
 		}
 		// logattrs.FloatString, not FormatFloat('f'): the SAME field reaches an
 		// exported string through three paths — this one (a line field read

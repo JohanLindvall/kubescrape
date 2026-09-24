@@ -2,6 +2,7 @@ package tracesample
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -36,7 +37,7 @@ func payload(n int, withErr bool, slow time.Duration) ptrace.Traces {
 	td := ptrace.NewTraces()
 	ss := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
 	base := time.Unix(1000, 0)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		sp := ss.Spans().AppendEmpty()
 		var id pcommon.TraceID
 		id[0] = byte(i >> 8)
@@ -80,16 +81,141 @@ func TestProbabilisticConsistentAndProportional(t *testing.T) {
 	}
 }
 
-func TestGuardRailsKeepErrorsAndSlowSpans(t *testing.T) {
-	next := &capExporter{}
-	s := New(Config{Probability: 0.0000001, KeepSlowerThan: "1s"}, next)
+// keepErrors, isolated from keepSlowerThan: an ERROR span is kept at a
+// probability that keeps nothing else, and only while the guard rail is on —
+// which it is by DEFAULT. The test this replaced used one span that was both
+// an error and slow, so either arm of keep() could be deleted with every test
+// in this package (and tailbuffer's and tailsample's) still passing.
+func TestKeepErrorsGuardRail(t *testing.T) {
+	off := false
+	for _, tc := range []struct {
+		name       string
+		keepErrors *bool
+		withErr    bool
+		want       int
+	}{
+		{"default keeps the error span", nil, true, 1},
+		{"keepErrors false samples it like any other", &off, true, 0},
+		{"no error span, nothing kept", nil, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			next := &capExporter{}
+			s := New(Config{Probability: 0.0000001, KeepErrors: tc.keepErrors}, next)
+			if err := s.ExportTraces(context.Background(), payload(3, tc.withErr, 0)); err != nil {
+				t.Fatal(err)
+			}
+			if got := next.spans(); got != tc.want {
+				t.Fatalf("kept %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
 
-	td := payload(3, true, 2*time.Second) // span 0 is BOTH error and slow
+// KeepsErrors is the answer configWarnings reads, so it must be the one the
+// sampler arms — including the unset-means-on default, which is what a
+// re-derived copy of it would drift on.
+func TestKeepsErrorsIsWhatTheSamplerArms(t *testing.T) {
+	on, off := true, false
+	for _, tc := range []struct {
+		name       string
+		keepErrors *bool
+		want       bool
+	}{
+		{"unset defaults on", nil, true},
+		{"explicit true", &on, true},
+		{"explicit false", &off, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Probability: 0.5, KeepErrors: tc.keepErrors}
+			if got := cfg.KeepsErrors(); got != tc.want {
+				t.Fatalf("KeepsErrors() = %v, want %v", got, tc.want)
+			}
+			if got := New(cfg, &capExporter{}).keepErr; got != tc.want {
+				t.Fatalf("the sampler armed keepErrors = %v, KeepsErrors() says %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// keepSlowerThan, isolated from keepErrors (off here): a span at or above the
+// threshold is kept, one below it is sampled like any other.
+func TestKeepSlowerThanGuardRail(t *testing.T) {
+	off := false
+	for _, tc := range []struct {
+		name string
+		slow time.Duration // span 0's duration; 0 = 1ms like the rest
+		want int
+	}{
+		{"a slower span is kept", 2 * time.Second, 1},
+		{"the threshold itself is kept (>=)", time.Second, 1},
+		{"a faster span is sampled like any other", 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			next := &capExporter{}
+			s := New(Config{Probability: 0.0000001, KeepErrors: &off, KeepSlowerThan: "1s"}, next)
+			if err := s.ExportTraces(context.Background(), payload(3, false, tc.slow)); err != nil {
+				t.Fatal(err)
+			}
+			if got := next.spans(); got != tc.want {
+				t.Fatalf("kept %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// A span that ENDS before it starts (unfinished, or a clock that stepped) is
+// not slow either, however the timestamps sit. A modest inversion converts to a
+// negative duration on its own; an EXTREME one — a garbage start near the top
+// of the uint64 range — wraps end-start around to a small POSITIVE number, and
+// only the end > start guard keeps that from reading as a slow span that must
+// be kept at any probability.
+func TestKeepSlowerThanIgnoresASpanThatEndsBeforeItStarts(t *testing.T) {
+	off := false
+	for _, tc := range []struct {
+		name       string
+		start, end pcommon.Timestamp
+	}{
+		{"five seconds inverted", pcommon.Timestamp(20 * time.Second), pcommon.Timestamp(15 * time.Second)},
+		// end-start wraps to 20s + 11ns: past the 10s threshold if measured.
+		{"a start near the top of the range", pcommon.Timestamp(math.MaxUint64 - 10), pcommon.Timestamp(20 * time.Second)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			next := &capExporter{}
+			s := New(Config{Probability: 0.0000001, KeepErrors: &off, KeepSlowerThan: "10s"}, next)
+			td := payload(1000, false, 0)
+			sps := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+			for i := 0; i < sps.Len(); i++ {
+				sps.At(i).SetStartTimestamp(tc.start)
+				sps.At(i).SetEndTimestamp(tc.end)
+			}
+			if err := s.ExportTraces(context.Background(), td); err != nil {
+				t.Fatal(err)
+			}
+			if got := next.spans(); got != 0 {
+				t.Fatalf("kept %d of 1000 spans that end before they start, at probability 1e-7", got)
+			}
+		})
+	}
+}
+
+// A span with no start timestamp (0 = unknown in OTLP) is not "slow": measured
+// anyway it spans from the Unix epoch to its end, ~56 years, and every such
+// span was kept whatever the probability. tailsample's traceDuration skips
+// start-less spans for the same reason.
+func TestKeepSlowerThanIgnoresASpanWithNoStart(t *testing.T) {
+	off := false
+	next := &capExporter{}
+	s := New(Config{Probability: 0.0000001, KeepErrors: &off, KeepSlowerThan: "10s"}, next)
+	td := payload(1000, false, 0)
+	sps := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	for i := 0; i < sps.Len(); i++ {
+		sps.At(i).SetStartTimestamp(0)
+	}
 	if err := s.ExportTraces(context.Background(), td); err != nil {
 		t.Fatal(err)
 	}
-	if next.spans() != 1 {
-		t.Fatalf("kept %d, want exactly the error/slow span", next.spans())
+	if got := next.spans(); got != 0 {
+		t.Fatalf("kept %d of 1000 start-less spans at probability 1e-7: a missing start read as ~56 years", got)
 	}
 }
 
@@ -201,7 +327,7 @@ func TestRateCapBindsWhenNothingIsSampledAway(t *testing.T) {
 
 	// Twenty payloads of five spans each, all within one second: 100 spans
 	// offered against a 10/s cap with a 10-span burst.
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		if err := s.ExportTraces(context.Background(), payload(5, false, 0)); err != nil {
 			t.Fatal(err)
 		}

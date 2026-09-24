@@ -19,6 +19,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/route"
+	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -232,5 +233,56 @@ func TestIdentityStripIsReportedApartFromThePlumbingMarkers(t *testing.T) {
 	}
 	if !strings.Contains(out, "level=DEBUG") || !strings.Contains(out, idKey) {
 		t.Errorf("the strip went unreported at debug level: %s", out)
+	}
+}
+
+// The receipt strip is RESOURCE-only (a record's attributes are the sender's
+// content), so a pushed RECORD may still carry k8s.namespace.name. Rules and
+// log-metric labels must not read it as the record's identity: the resolver
+// ranks the resolved-identity keys resource-first, so a namespace allowlist
+// selects on the namespace the resource resolved to — the one routing reads —
+// and a record declaring another tenant's namespace does not get past it.
+func TestRecordNamespaceCannotSatisfyANamespaceAllowlist(t *testing.T) {
+	allow := func(ns string) *logline.LineFilter {
+		t.Helper()
+		f, err := logline.NewLineFilter([]logline.LineRule{
+			{Action: "keep", Match: []string{"k8s.namespace.name=" + ns}},
+			{Action: "drop", MatchRegexp: []string{"__line__=.*"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	push := func() plog.Logs {
+		ld := plog.NewLogs()
+		rl := ld.ResourceLogs().AppendEmpty()
+		rl.Resource().Attributes().PutStr("container.id", "cafe01") // resolves to ns default
+		lr := rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+		lr.Body().SetStr("forged audit line")
+		lr.Attributes().PutStr("k8s.namespace.name", "payments")
+		return ld
+	}
+
+	exp := &captureExporter{}
+	s := NewServer(ServerConfig{Enricher: newEnricher(newMeta(), MetricsAuto), Exporter: exp, Rules: allow("payments")})
+	if err := grpcExportLogs(s, push()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(exp.logs); n != 0 {
+		t.Fatalf("a record declaring k8s.namespace.name=payments on a resource resolved to default passed "+
+			"the payments allowlist (%d export(s))", n)
+	}
+
+	// CONTROL: the same push under the allowlist for the namespace it really
+	// resolved to is kept, so the rule reads the resolved value rather than
+	// matching nothing.
+	exp = &captureExporter{}
+	s = NewServer(ServerConfig{Enricher: newEnricher(newMeta(), MetricsAuto), Exporter: exp, Rules: allow("default")})
+	if err := grpcExportLogs(s, push()); err != nil {
+		t.Fatal(err)
+	}
+	if len(exp.logs) != 1 || exp.logs[0].LogRecordCount() != 1 {
+		t.Fatalf("the default allowlist dropped a record whose resource resolved to default: %d export(s)", len(exp.logs))
 	}
 }

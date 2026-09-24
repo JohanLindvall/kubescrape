@@ -1,18 +1,23 @@
 package promscrape
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
+	"io"
 	"maps"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	dto "github.com/prometheus/client_model/go"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -36,37 +41,35 @@ func protoBody(t testing.TB, families ...*dto.MetricFamily) []byte {
 	return out
 }
 
-func ptr[T any](v T) *T { return &v }
-
 // A native histogram converts to an OTLP exponential histogram: scale =
 // schema, zero bucket carried, span/delta buckets decoded to dense counts
 // with the right offset; classic families in the same exposition convert as
 // usual.
 func TestNativeHistogramScrape(t *testing.T) {
 	nh := &dto.MetricFamily{
-		Name: ptr("rpc_latency_seconds"),
+		Name: new("rpc_latency_seconds"),
 		Type: dto.MetricType_HISTOGRAM.Enum(),
 		Metric: []*dto.Metric{{
-			Label: []*dto.LabelPair{{Name: ptr("svc"), Value: ptr("a")}},
+			Label: []*dto.LabelPair{{Name: new("svc"), Value: new("a")}},
 			Histogram: &dto.Histogram{
-				SampleCount:   ptr(uint64(10)),
-				SampleSum:     ptr(3.5),
-				Schema:        ptr(int32(3)),
-				ZeroThreshold: ptr(1e-9),
-				ZeroCount:     ptr(uint64(2)),
+				SampleCount:   new(uint64(10)),
+				SampleSum:     new(3.5),
+				Schema:        new(int32(3)),
+				ZeroThreshold: new(1e-9),
+				ZeroCount:     new(uint64(2)),
 				// Buckets at indexes 1,2 then a gap of 2, then 5: counts 3,2,1.
 				PositiveSpan: []*dto.BucketSpan{
-					{Offset: ptr(int32(1)), Length: ptr(uint32(2))},
-					{Offset: ptr(int32(2)), Length: ptr(uint32(1))},
+					{Offset: new(int32(1)), Length: new(uint32(2))},
+					{Offset: new(int32(2)), Length: new(uint32(1))},
 				},
 				PositiveDelta: []int64{3, -1, -1},
 			},
 		}},
 	}
 	classic := &dto.MetricFamily{
-		Name:   ptr("http_requests_total"),
+		Name:   new("http_requests_total"),
 		Type:   dto.MetricType_COUNTER.Enum(),
-		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: ptr(7.0)}}},
+		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: new(7.0)}}},
 	}
 	body := protoBody(t, nh, classic)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -143,32 +146,32 @@ func TestProtoExemplarsAndDescriptions(t *testing.T) {
 	const spanID = "00f067aa0ba902b7"
 	exTime := time.Unix(1700000000, 0).UTC()
 	counter := &dto.MetricFamily{
-		Name: ptr("http_requests_total"), Help: ptr("Total requests."), Unit: ptr("requests"),
+		Name: new("http_requests_total"), Help: new("Total requests."), Unit: new("requests"),
 		Type: dto.MetricType_COUNTER.Enum(),
 		Metric: []*dto.Metric{{
-			Counter: &dto.Counter{Value: ptr(7.0), Exemplar: &dto.Exemplar{
+			Counter: &dto.Counter{Value: new(7.0), Exemplar: &dto.Exemplar{
 				Label: []*dto.LabelPair{
-					{Name: ptr("trace_id"), Value: ptr(traceID)},
-					{Name: ptr("span_id"), Value: ptr(spanID)},
-					{Name: ptr("shard"), Value: ptr("b")},
+					{Name: new("trace_id"), Value: new(traceID)},
+					{Name: new("span_id"), Value: new(spanID)},
+					{Name: new("shard"), Value: new("b")},
 				},
-				Value:     ptr(1.0),
+				Value:     new(1.0),
 				Timestamp: timestamppb.New(exTime),
 			}},
 		}},
 	}
 	hist := &dto.MetricFamily{
-		Name: ptr("rpc_latency_seconds"), Help: ptr("RPC latency."), Unit: ptr("seconds"),
+		Name: new("rpc_latency_seconds"), Help: new("RPC latency."), Unit: new("seconds"),
 		Type: dto.MetricType_HISTOGRAM.Enum(),
 		Metric: []*dto.Metric{{
 			Histogram: &dto.Histogram{
-				SampleCount: ptr(uint64(3)), SampleSum: ptr(0.6),
+				SampleCount: new(uint64(3)), SampleSum: new(0.6),
 				Bucket: []*dto.Bucket{
-					{UpperBound: ptr(0.5), CumulativeCount: ptr(uint64(2)), Exemplar: &dto.Exemplar{
-						Label: []*dto.LabelPair{{Name: ptr("trace_id"), Value: ptr(traceID)}},
-						Value: ptr(0.3),
+					{UpperBound: new(0.5), CumulativeCount: new(uint64(2)), Exemplar: &dto.Exemplar{
+						Label: []*dto.LabelPair{{Name: new("trace_id"), Value: new(traceID)}},
+						Value: new(0.3),
 					}},
-					{UpperBound: ptr(math.Inf(1)), CumulativeCount: ptr(uint64(3))},
+					{UpperBound: new(math.Inf(1)), CumulativeCount: new(uint64(3))},
 				},
 			},
 		}},
@@ -263,17 +266,17 @@ func TestProtoExemplarsAndDescriptions(t *testing.T) {
 func TestProtoNativeHistogramExemplars(t *testing.T) {
 	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
 	nh := &dto.MetricFamily{
-		Name: ptr("rpc_latency_seconds"), Help: ptr("RPC latency."), Unit: ptr("seconds"),
+		Name: new("rpc_latency_seconds"), Help: new("RPC latency."), Unit: new("seconds"),
 		Type: dto.MetricType_HISTOGRAM.Enum(),
 		Metric: []*dto.Metric{{
 			Histogram: &dto.Histogram{
-				SampleCount: ptr(uint64(4)), SampleSum: ptr(1.5),
-				Schema: ptr(int32(2)), ZeroThreshold: ptr(1e-9), ZeroCount: ptr(uint64(1)),
-				PositiveSpan:  []*dto.BucketSpan{{Offset: ptr(int32(1)), Length: ptr(uint32(1))}},
+				SampleCount: new(uint64(4)), SampleSum: new(1.5),
+				Schema: new(int32(2)), ZeroThreshold: new(1e-9), ZeroCount: new(uint64(1)),
+				PositiveSpan:  []*dto.BucketSpan{{Offset: new(int32(1)), Length: new(uint32(1))}},
 				PositiveDelta: []int64{3},
 				Exemplars: []*dto.Exemplar{{
-					Label: []*dto.LabelPair{{Name: ptr("trace_id"), Value: ptr(traceID)}},
-					Value: ptr(0.25),
+					Label: []*dto.LabelPair{{Name: new("trace_id"), Value: new(traceID)}},
+					Value: new(0.25),
 				}},
 			},
 		}},
@@ -311,19 +314,19 @@ func TestProtoNativeHistogramExemplars(t *testing.T) {
 func TestDecodeSpansGuards(t *testing.T) {
 	// Gap past the cap.
 	_, _, ok := decodeSpans([]*dto.BucketSpan{
-		{Offset: ptr(int32(0)), Length: ptr(uint32(1))},
-		{Offset: ptr(int32(100000)), Length: ptr(uint32(1))},
+		{Offset: new(int32(0)), Length: new(uint32(1))},
+		{Offset: new(int32(100000)), Length: new(uint32(1))},
 	}, []int64{1, 0}, nil)
 	if ok {
 		t.Fatal("unbounded gap accepted")
 	}
 	// Negative running count.
-	_, _, ok = decodeSpans([]*dto.BucketSpan{{Offset: ptr(int32(0)), Length: ptr(uint32(2))}}, []int64{1, -5}, nil)
+	_, _, ok = decodeSpans([]*dto.BucketSpan{{Offset: new(int32(0)), Length: new(uint32(2))}}, []int64{1, -5}, nil)
 	if ok {
 		t.Fatal("negative count accepted")
 	}
 	// Missing deltas.
-	_, _, ok = decodeSpans([]*dto.BucketSpan{{Offset: ptr(int32(0)), Length: ptr(uint32(3))}}, []int64{1}, nil)
+	_, _, ok = decodeSpans([]*dto.BucketSpan{{Offset: new(int32(0)), Length: new(uint32(3))}}, []int64{1}, nil)
 	if ok {
 		t.Fatal("missing deltas accepted")
 	}
@@ -337,14 +340,14 @@ func TestDecodeSpansGuards(t *testing.T) {
 // int32 range is rejected rather than folded back into it.
 func TestDecodeSpansRejectsIndexOverflow(t *testing.T) {
 	if _, _, ok := decodeSpans([]*dto.BucketSpan{
-		{Offset: ptr(int32(math.MaxInt32)), Length: ptr(uint32(1))},
-		{Offset: ptr(int32(2)), Length: ptr(uint32(1))},
+		{Offset: new(int32(math.MaxInt32)), Length: new(uint32(1))},
+		{Offset: new(int32(2)), Length: new(uint32(1))},
 	}, []int64{1, 1}, nil); ok {
 		t.Fatal("span index past MaxInt32 accepted: the gap guard was bypassed by the wrap")
 	}
 	// The OTLP offset is the first index MINUS ONE, which underflows on its own.
 	if _, _, ok := decodeSpans([]*dto.BucketSpan{
-		{Offset: ptr(int32(math.MinInt32)), Length: ptr(uint32(1))},
+		{Offset: new(int32(math.MinInt32)), Length: new(uint32(1))},
 	}, []int64{1}, nil); ok {
 		t.Fatal("span index at MinInt32 accepted: offset-1 underflows to a positive index")
 	}
@@ -356,16 +359,16 @@ func TestDecodeSpansRejectsIndexOverflow(t *testing.T) {
 // no count, no sum, no classic fallback.
 func TestFloatNativeHistogramConverts(t *testing.T) {
 	fam := &dto.MetricFamily{
-		Name: ptr("rpc_latency_seconds"),
+		Name: new("rpc_latency_seconds"),
 		Type: dto.MetricType_HISTOGRAM.Enum(),
 		Metric: []*dto.Metric{{
 			Histogram: &dto.Histogram{
-				SampleCountFloat: ptr(9.0),
-				SampleSum:        ptr(2.25),
-				Schema:           ptr(int32(2)),
-				ZeroThreshold:    ptr(1e-9),
-				ZeroCountFloat:   ptr(2.0),
-				PositiveSpan:     []*dto.BucketSpan{{Offset: ptr(int32(1)), Length: ptr(uint32(3))}},
+				SampleCountFloat: new(9.0),
+				SampleSum:        new(2.25),
+				Schema:           new(int32(2)),
+				ZeroThreshold:    new(1e-9),
+				ZeroCountFloat:   new(2.0),
+				PositiveSpan:     []*dto.BucketSpan{{Offset: new(int32(1)), Length: new(uint32(3))}},
 				PositiveCount:    []float64{4, 2, 1}, // absolute, not deltas
 			},
 		}},
@@ -397,18 +400,18 @@ func TestFloatNativeHistogramConverts(t *testing.T) {
 // all. Detection is on the VALUES, exactly as Prometheus decides it.
 func TestClassicHistogramWithZeroValuedNativeFields(t *testing.T) {
 	fam := &dto.MetricFamily{
-		Name: ptr("rpc_latency_seconds"),
+		Name: new("rpc_latency_seconds"),
 		Type: dto.MetricType_HISTOGRAM.Enum(),
 		Metric: []*dto.Metric{{
 			Histogram: &dto.Histogram{
-				SampleCount:   ptr(uint64(4)),
-				SampleSum:     ptr(1.5),
-				Schema:        ptr(int32(0)),
-				ZeroThreshold: ptr(0.0),
-				ZeroCount:     ptr(uint64(0)),
+				SampleCount:   new(uint64(4)),
+				SampleSum:     new(1.5),
+				Schema:        new(int32(0)),
+				ZeroThreshold: new(0.0),
+				ZeroCount:     new(uint64(0)),
 				Bucket: []*dto.Bucket{
-					{UpperBound: ptr(0.5), CumulativeCount: ptr(uint64(3))},
-					{UpperBound: ptr(math.Inf(1)), CumulativeCount: ptr(uint64(4))},
+					{UpperBound: new(0.5), CumulativeCount: new(uint64(3))},
+					{UpperBound: new(math.Inf(1)), CumulativeCount: new(uint64(4))},
 				},
 			},
 		}},
@@ -435,9 +438,9 @@ func TestClassicHistogramWithZeroValuedNativeFields(t *testing.T) {
 // own convention breaks.
 func TestNoOpSpanIsStillNative(t *testing.T) {
 	h := &dto.Histogram{
-		SampleCount:  ptr(uint64(0)),
-		Schema:       ptr(int32(3)),
-		PositiveSpan: []*dto.BucketSpan{{Offset: ptr(int32(0)), Length: ptr(uint32(0))}},
+		SampleCount:  new(uint64(0)),
+		Schema:       new(int32(3)),
+		PositiveSpan: []*dto.BucketSpan{{Offset: new(int32(0)), Length: new(uint32(0))}},
 	}
 	if !isNative(h) {
 		t.Fatal("a no-op span must mark a histogram native")
@@ -450,15 +453,15 @@ func TestNoOpSpanIsStillNative(t *testing.T) {
 // two formats disagreed about one target. Both ship gauges now.
 func TestGaugeHistogramConvertsToGauges(t *testing.T) {
 	fam := &dto.MetricFamily{
-		Name: ptr("cache_entries"),
+		Name: new("cache_entries"),
 		Type: dto.MetricType_GAUGE_HISTOGRAM.Enum(),
 		Metric: []*dto.Metric{{
 			Histogram: &dto.Histogram{
-				SampleCount: ptr(uint64(4)),
-				SampleSum:   ptr(1.5),
+				SampleCount: new(uint64(4)),
+				SampleSum:   new(1.5),
 				Bucket: []*dto.Bucket{
-					{UpperBound: ptr(0.5), CumulativeCount: ptr(uint64(3))},
-					{UpperBound: ptr(math.Inf(1)), CumulativeCount: ptr(uint64(4))},
+					{UpperBound: new(0.5), CumulativeCount: new(uint64(3))},
+					{UpperBound: new(math.Inf(1)), CumulativeCount: new(uint64(4))},
 				},
 			},
 		}},
@@ -521,12 +524,12 @@ func scrapeProtoFamilies(t *testing.T, families ...*dto.MetricFamily) map[string
 // the shared counter; the family must not also add it to c.samples). A
 // double-count inflated scrape_samples_scraped and halved MaxSamples.
 func TestProtoClassicSampleCountAccurate(t *testing.T) {
-	c := &dto.Counter{Value: ptr(1.0)}
-	g1 := &dto.Gauge{Value: ptr(2.0)}
-	g2 := &dto.Gauge{Value: ptr(3.0)}
+	c := &dto.Counter{Value: new(1.0)}
+	g1 := &dto.Gauge{Value: new(2.0)}
+	g2 := &dto.Gauge{Value: new(3.0)}
 	fams := []*dto.MetricFamily{
-		{Name: ptr("reqs_total"), Type: dto.MetricType_COUNTER.Enum(), Metric: []*dto.Metric{{Counter: c}}},
-		{Name: ptr("temp"), Type: dto.MetricType_GAUGE.Enum(), Metric: []*dto.Metric{{Gauge: g1}, {Gauge: g2}}},
+		{Name: new("reqs_total"), Type: dto.MetricType_COUNTER.Enum(), Metric: []*dto.Metric{{Counter: c}}},
+		{Name: new("temp"), Type: dto.MetricType_GAUGE.Enum(), Metric: []*dto.Metric{{Gauge: g1}, {Gauge: g2}}},
 	}
 	body := protoBody(t, fams...)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -566,15 +569,15 @@ func TestProtoHistogramWithNoHistogramSubmessage(t *testing.T) {
 	for _, mt := range []dto.MetricType{dto.MetricType_HISTOGRAM, dto.MetricType_GAUGE_HISTOGRAM} {
 		t.Run(mt.String(), func(t *testing.T) {
 			bad := &dto.MetricFamily{
-				Name:   ptr("broken_histogram_seconds"),
+				Name:   new("broken_histogram_seconds"),
 				Type:   mt.Enum(),
-				Metric: []*dto.Metric{{Label: []*dto.LabelPair{{Name: ptr("a"), Value: ptr("b")}}}}, // no Histogram
+				Metric: []*dto.Metric{{Label: []*dto.LabelPair{{Name: new("a"), Value: new("b")}}}}, // no Histogram
 			}
 			// A well-formed family after it: the exposition must keep parsing.
 			good := &dto.MetricFamily{
-				Name:   ptr("http_requests_total"),
+				Name:   new("http_requests_total"),
 				Type:   dto.MetricType_COUNTER.Enum(),
-				Metric: []*dto.Metric{{Counter: &dto.Counter{Value: ptr(7.0)}}},
+				Metric: []*dto.Metric{{Counter: &dto.Counter{Value: new(7.0)}}},
 			}
 			body := protoBody(t, bad, good)
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -617,26 +620,26 @@ func TestProtoHistogramWithNoHistogramSubmessage(t *testing.T) {
 // with -buffer-dir. The three sibling export sites all guard.
 func TestProtoFlushDoesNotExportEmptyChunks(t *testing.T) {
 	classic := &dto.MetricFamily{
-		Name: ptr("rpc_latency_seconds"),
+		Name: new("rpc_latency_seconds"),
 		Type: dto.MetricType_HISTOGRAM.Enum(),
 		Metric: []*dto.Metric{{
 			Histogram: &dto.Histogram{
-				SampleCount: ptr(uint64(4)), SampleSum: ptr(1.5),
+				SampleCount: new(uint64(4)), SampleSum: new(1.5),
 				Bucket: []*dto.Bucket{
-					{UpperBound: ptr(0.5), CumulativeCount: ptr(uint64(3))},
-					{UpperBound: ptr(math.Inf(1)), CumulativeCount: ptr(uint64(4))},
+					{UpperBound: new(0.5), CumulativeCount: new(uint64(3))},
+					{UpperBound: new(math.Inf(1)), CumulativeCount: new(uint64(4))},
 				},
 			},
 		}},
 	}
 	native := &dto.MetricFamily{
-		Name: ptr("io_latency_seconds"),
+		Name: new("io_latency_seconds"),
 		Type: dto.MetricType_HISTOGRAM.Enum(),
 		Metric: []*dto.Metric{{
 			Histogram: &dto.Histogram{
-				SampleCount: ptr(uint64(3)), SampleSum: ptr(0.9),
-				Schema: ptr(int32(2)), ZeroThreshold: ptr(1e-9), ZeroCount: ptr(uint64(1)),
-				PositiveSpan:  []*dto.BucketSpan{{Offset: ptr(int32(1)), Length: ptr(uint32(1))}},
+				SampleCount: new(uint64(3)), SampleSum: new(0.9),
+				Schema: new(int32(2)), ZeroThreshold: new(1e-9), ZeroCount: new(uint64(1)),
+				PositiveSpan:  []*dto.BucketSpan{{Offset: new(int32(1)), Length: new(uint32(1))}},
 				PositiveDelta: []int64{2},
 			},
 		}},
@@ -678,7 +681,7 @@ func protoConvert(t *testing.T, families ...*dto.MetricFamily) (map[string]pmetr
 	})
 	cb := newBatcher(func(pcommon.Resource) {}, time.Now(), time.Now())
 	ss := s.newScrapeSession(context.Background(), cb, pipelineTargets, "t", "t", nil, true)
-	malformed, err := s.parseProtoAndExport(ss, strings.NewReader(string(body)))
+	malformed, err := ss.parseProtoAndExport(strings.NewReader(string(body)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -708,20 +711,20 @@ func protoConvert(t *testing.T, families ...*dto.MetricFamily) (map[string]pmetr
 // the text front's whole-line reject; well-formed neighbours still convert.
 func TestProtoRejectsEmptyNames(t *testing.T) {
 	nameless := &dto.MetricFamily{ // Name unset entirely
-		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: ptr(1.0)}}},
+		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: new(1.0)}}},
 	}
 	badLabel := &dto.MetricFamily{
-		Name: ptr("bad_label_total"),
+		Name: new("bad_label_total"),
 		Type: dto.MetricType_COUNTER.Enum(),
 		Metric: []*dto.Metric{{
-			Label:   []*dto.LabelPair{{Value: ptr("v")}}, // Name unset
-			Counter: &dto.Counter{Value: ptr(2.0)},
+			Label:   []*dto.LabelPair{{Value: new("v")}}, // Name unset
+			Counter: &dto.Counter{Value: new(2.0)},
 		}},
 	}
 	good := &dto.MetricFamily{
-		Name:   ptr("good_total"),
+		Name:   new("good_total"),
 		Type:   dto.MetricType_COUNTER.Enum(),
-		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: ptr(3.0)}}},
+		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: new(3.0)}}},
 	}
 	got, malformed := protoConvert(t, nameless, badLabel, good)
 	if _, ok := got[""]; ok {
@@ -745,15 +748,15 @@ func TestProtoRejectsEmptyNames(t *testing.T) {
 // empty.
 func TestProtoClassicHistogramFloatCounts(t *testing.T) {
 	fam := &dto.MetricFamily{
-		Name: ptr("rpc_latency_seconds"),
+		Name: new("rpc_latency_seconds"),
 		Type: dto.MetricType_HISTOGRAM.Enum(),
 		Metric: []*dto.Metric{{
 			Histogram: &dto.Histogram{
-				SampleCountFloat: ptr(6.5),
-				SampleSum:        ptr(1.5),
+				SampleCountFloat: new(6.5),
+				SampleSum:        new(1.5),
 				Bucket: []*dto.Bucket{
-					{UpperBound: ptr(1.0), CumulativeCount: ptr(uint64(0)), CumulativeCountFloat: ptr(2.5)},
-					{UpperBound: ptr(5.0), CumulativeCount: ptr(uint64(0)), CumulativeCountFloat: ptr(6.5)},
+					{UpperBound: new(1.0), CumulativeCount: new(uint64(0)), CumulativeCountFloat: new(2.5)},
+					{UpperBound: new(5.0), CumulativeCount: new(uint64(0)), CumulativeCountFloat: new(6.5)},
 				},
 			},
 		}},
@@ -767,14 +770,64 @@ func TestProtoClassicHistogramFloatCounts(t *testing.T) {
 		t.Fatalf("malformed = %d, want 0", malformed)
 	}
 	dp := m.Histogram().DataPoints().At(0)
-	if dp.Count() != 6 {
-		t.Errorf("count = %d, want 6 (sample_count_float overrides the zero integer field)", dp.Count())
+	// 6.5 and 2.5 round to nearest (countOf), exactly as a float NATIVE
+	// histogram's counts do.
+	if dp.Count() != 7 {
+		t.Errorf("count = %d, want 7 (sample_count_float overrides the zero integer field)", dp.Count())
 	}
 	if b := dp.ExplicitBounds().AsRaw(); !slices.Equal(b, []float64{1, 5}) {
 		t.Errorf("bounds = %v, want [1 5]", b)
 	}
-	if c := dp.BucketCounts().AsRaw(); !slices.Equal(c, []uint64{2, 4, 0}) {
-		t.Errorf("bucket counts = %v, want [2 4 0]: cumulative_count_float overrides the zero integer field", c)
+	if c := dp.BucketCounts().AsRaw(); !slices.Equal(c, []uint64{3, 4, 0}) {
+		t.Errorf("bucket counts = %v, want [3 4 0]: cumulative_count_float overrides the zero integer field", c)
+	}
+}
+
+// TestFloatCountConvertsIdenticallyClassicAndNative: one float count becomes
+// one uint64 whichever representation carries it. The classic converter used to
+// TRUNCATE (and refuse anything at or past 2^63) while the native path ROUNDED
+// (and accepted up to 2^64), so the same float histogram exported count=2 as
+// classic buckets and count=3 as a native one — and a classic count of 1e19,
+// which a uint64 represents exactly, was counted malformed and lost.
+func TestFloatCountConvertsIdenticallyClassicAndNative(t *testing.T) {
+	for _, v := range []float64{2.5, 2.4, 0.5, 1e19} {
+		classic := &dto.MetricFamily{
+			Name: new("classic_h"),
+			Type: dto.MetricType_HISTOGRAM.Enum(),
+			Metric: []*dto.Metric{{Histogram: &dto.Histogram{
+				SampleCountFloat: new(v),
+				SampleSum:        new(1.0),
+				Bucket:           []*dto.Bucket{{UpperBound: new(1.0), CumulativeCountFloat: new(v)}},
+			}}},
+		}
+		native := &dto.MetricFamily{
+			Name: new("native_h"),
+			Type: dto.MetricType_HISTOGRAM.Enum(),
+			Metric: []*dto.Metric{{Histogram: &dto.Histogram{
+				SampleCountFloat: new(v),
+				SampleSum:        new(1.0),
+				Schema:           new(int32(0)),
+				ZeroThreshold:    new(1e-9),
+				ZeroCountFloat:   new(v),
+			}}},
+		}
+		got, malformed := protoConvert(t, classic, native)
+		if malformed != 0 {
+			t.Fatalf("count %g: malformed = %d, want 0 — a count a uint64 can hold is a count", v, malformed)
+		}
+		cm, ok := got["classic_h"]
+		nm, ok2 := got["native_h"]
+		if !ok || !ok2 {
+			t.Fatalf("count %g: a family was dropped; exported %v", v, slices.Sorted(maps.Keys(got)))
+		}
+		c := cm.Histogram().DataPoints().At(0)
+		n := nm.ExponentialHistogram().DataPoints().At(0)
+		if c.Count() != n.Count() {
+			t.Errorf("count %g: classic exported count=%d, native count=%d", v, c.Count(), n.Count())
+		}
+		if first := c.BucketCounts().At(0); first != n.ZeroCount() {
+			t.Errorf("count %g: classic bucket=%d, native zero bucket=%d", v, first, n.ZeroCount())
+		}
 	}
 }
 
@@ -782,15 +835,15 @@ func TestProtoClassicHistogramFloatCounts(t *testing.T) {
 // gauges: a float gauge histogram got a correct _gcount beside all-zero buckets.
 func TestProtoGaugeHistogramFloatBucketCounts(t *testing.T) {
 	fam := &dto.MetricFamily{
-		Name: ptr("cache_entries"),
+		Name: new("cache_entries"),
 		Type: dto.MetricType_GAUGE_HISTOGRAM.Enum(),
 		Metric: []*dto.Metric{{
 			Histogram: &dto.Histogram{
-				SampleCountFloat: ptr(6.5),
-				SampleSum:        ptr(1.5),
+				SampleCountFloat: new(6.5),
+				SampleSum:        new(1.5),
 				Bucket: []*dto.Bucket{
-					{UpperBound: ptr(1.0), CumulativeCount: ptr(uint64(0)), CumulativeCountFloat: ptr(2.5)},
-					{UpperBound: ptr(math.Inf(1)), CumulativeCount: ptr(uint64(0)), CumulativeCountFloat: ptr(6.5)},
+					{UpperBound: new(1.0), CumulativeCount: new(uint64(0)), CumulativeCountFloat: new(2.5)},
+					{UpperBound: new(math.Inf(1)), CumulativeCount: new(uint64(0)), CumulativeCountFloat: new(6.5)},
 				},
 			},
 		}},
@@ -824,21 +877,21 @@ func TestProtoGaugeHistogramFloatBucketCounts(t *testing.T) {
 // survive it.
 func TestProtoNHCBIsRefusedRatherThanShippedBucketless(t *testing.T) {
 	nhcb := &dto.MetricFamily{
-		Name: ptr("rpc_latency_seconds"),
+		Name: new("rpc_latency_seconds"),
 		Type: dto.MetricType_HISTOGRAM.Enum(),
 		Metric: []*dto.Metric{{
 			Histogram: &dto.Histogram{
-				SampleCount: ptr(uint64(6)), SampleSum: ptr(1.5),
-				Schema:        ptr(int32(-53)),
-				PositiveSpan:  []*dto.BucketSpan{{Offset: ptr(int32(0)), Length: ptr(uint32(2))}},
+				SampleCount: new(uint64(6)), SampleSum: new(1.5),
+				Schema:        new(int32(-53)),
+				PositiveSpan:  []*dto.BucketSpan{{Offset: new(int32(0)), Length: new(uint32(2))}},
 				PositiveDelta: []int64{2, 2},
 			},
 		}},
 	}
 	after := &dto.MetricFamily{
-		Name:   ptr("http_requests_total"),
+		Name:   new("http_requests_total"),
 		Type:   dto.MetricType_COUNTER.Enum(),
-		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: ptr(7.0)}}},
+		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: new(7.0)}}},
 	}
 	got, malformed := protoConvert(t, nhcb, after)
 	if m, ok := got["rpc_latency_seconds"]; ok {
@@ -862,21 +915,21 @@ func TestProtoNHCBIsRefusedRatherThanShippedBucketless(t *testing.T) {
 // native wins, and the loser is counted with a pipeline label.
 func TestProtoMixedHistogramFamilyResolvesOnceAndCountsTheLoser(t *testing.T) {
 	nativeChild := &dto.Metric{
-		Label: []*dto.LabelPair{{Name: ptr("svc"), Value: ptr("a")}},
+		Label: []*dto.LabelPair{{Name: new("svc"), Value: new("a")}},
 		Histogram: &dto.Histogram{
-			SampleCount: ptr(uint64(3)), SampleSum: ptr(0.9),
-			Schema: ptr(int32(2)), ZeroThreshold: ptr(1e-9), ZeroCount: ptr(uint64(1)),
-			PositiveSpan:  []*dto.BucketSpan{{Offset: ptr(int32(1)), Length: ptr(uint32(1))}},
+			SampleCount: new(uint64(3)), SampleSum: new(0.9),
+			Schema: new(int32(2)), ZeroThreshold: new(1e-9), ZeroCount: new(uint64(1)),
+			PositiveSpan:  []*dto.BucketSpan{{Offset: new(int32(1)), Length: new(uint32(1))}},
 			PositiveDelta: []int64{2},
 		},
 	}
 	classicChild := &dto.Metric{
-		Label: []*dto.LabelPair{{Name: ptr("svc"), Value: ptr("b")}},
+		Label: []*dto.LabelPair{{Name: new("svc"), Value: new("b")}},
 		Histogram: &dto.Histogram{
-			SampleCount: ptr(uint64(4)), SampleSum: ptr(1.5),
+			SampleCount: new(uint64(4)), SampleSum: new(1.5),
 			Bucket: []*dto.Bucket{
-				{UpperBound: ptr(0.5), CumulativeCount: ptr(uint64(3))},
-				{UpperBound: ptr(math.Inf(1)), CumulativeCount: ptr(uint64(4))},
+				{UpperBound: new(0.5), CumulativeCount: new(uint64(3))},
+				{UpperBound: new(math.Inf(1)), CumulativeCount: new(uint64(4))},
 			},
 		},
 	}
@@ -888,7 +941,7 @@ func TestProtoMixedHistogramFamilyResolvesOnceAndCountsTheLoser(t *testing.T) {
 		{"classic first", []*dto.Metric{classicChild, nativeChild}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fam := &dto.MetricFamily{Name: ptr("h"), Type: dto.MetricType_HISTOGRAM.Enum(), Metric: tc.metrics}
+			fam := &dto.MetricFamily{Name: new("h"), Type: dto.MetricType_HISTOGRAM.Enum(), Metric: tc.metrics}
 			beforeMixed := obs.ScrapeHistogramMixed.WithLabelValues(pipelineTargets, "classic").Value()
 			beforeCollisions := obs.ScrapeCollisions.Value()
 
@@ -928,22 +981,22 @@ func TestProtoMixedHistogramFamilyResolvesOnceAndCountsTheLoser(t *testing.T) {
 func TestNativeHistogramSchemaAndZeroThresholdBounds(t *testing.T) {
 	mk := func(schema int32, zeroTh float64) *dto.MetricFamily {
 		return &dto.MetricFamily{
-			Name: ptr("rpc_latency_seconds"),
+			Name: new("rpc_latency_seconds"),
 			Type: dto.MetricType_HISTOGRAM.Enum(),
 			Metric: []*dto.Metric{{
 				Histogram: &dto.Histogram{
-					SampleCount: ptr(uint64(3)), SampleSum: ptr(0.9),
-					Schema: ptr(schema), ZeroThreshold: ptr(zeroTh), ZeroCount: ptr(uint64(1)),
-					PositiveSpan:  []*dto.BucketSpan{{Offset: ptr(int32(1)), Length: ptr(uint32(1))}},
+					SampleCount: new(uint64(3)), SampleSum: new(0.9),
+					Schema: new(schema), ZeroThreshold: new(zeroTh), ZeroCount: new(uint64(1)),
+					PositiveSpan:  []*dto.BucketSpan{{Offset: new(int32(1)), Length: new(uint32(1))}},
 					PositiveDelta: []int64{2},
 				},
 			}},
 		}
 	}
 	after := &dto.MetricFamily{
-		Name:   ptr("http_requests_total"),
+		Name:   new("http_requests_total"),
 		Type:   dto.MetricType_COUNTER.Enum(),
-		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: ptr(7.0)}}},
+		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: new(7.0)}}},
 	}
 	for _, tc := range []struct {
 		name   string
@@ -996,7 +1049,7 @@ func TestNativeHistogramSchemaAndZeroThresholdBounds(t *testing.T) {
 // in addNativeHistogram.
 //
 // A FLOAT native histogram carries its counts as floats, and OTLP buckets are
-// uint64, so roundCount is applied to the sample count, the zero count and
+// uint64, so countOf is applied to the sample count, the zero count and
 // every absolute bucket count — INDEPENDENTLY. A message that is perfectly
 // consistent on the wire (0.6+0.6+0.6 == 1.8) therefore converted to count=2
 // against buckets [1 1 1]: three observations claimed by a point declaring two.
@@ -1008,16 +1061,16 @@ func TestNativeHistogramSchemaAndZeroThresholdBounds(t *testing.T) {
 func TestFloatNativeHistogramBucketsNeverExceedTheirCount(t *testing.T) {
 	mk := func(name string, sampleCount, zero float64, counts []float64) *dto.MetricFamily {
 		return &dto.MetricFamily{
-			Name: ptr(name),
+			Name: new(name),
 			Type: dto.MetricType_HISTOGRAM.Enum(),
 			Metric: []*dto.Metric{{
 				Histogram: &dto.Histogram{
-					SampleCountFloat: ptr(sampleCount),
-					SampleSum:        ptr(3.5),
-					Schema:           ptr(int32(3)),
-					ZeroThreshold:    ptr(1e-9),
-					ZeroCountFloat:   ptr(zero),
-					PositiveSpan:     []*dto.BucketSpan{{Offset: ptr(int32(1)), Length: ptr(uint32(len(counts)))}},
+					SampleCountFloat: new(sampleCount),
+					SampleSum:        new(3.5),
+					Schema:           new(int32(3)),
+					ZeroThreshold:    new(1e-9),
+					ZeroCountFloat:   new(zero),
+					PositiveSpan:     []*dto.BucketSpan{{Offset: new(int32(1)), Length: new(uint32(len(counts)))}},
 					PositiveCount:    counts,
 				},
 			}},
@@ -1073,14 +1126,14 @@ func TestFloatNativeHistogramBucketsNeverExceedTheirCount(t *testing.T) {
 // observations from every histogram that has them.
 func TestNativeHistogramCountAboveItsBucketsIsPassedThrough(t *testing.T) {
 	fam := &dto.MetricFamily{
-		Name: ptr("h_nan_observations"),
+		Name: new("h_nan_observations"),
 		Type: dto.MetricType_HISTOGRAM.Enum(),
 		Metric: []*dto.Metric{{
 			Histogram: &dto.Histogram{
-				SampleCount:   ptr(uint64(1000000)),
-				Schema:        ptr(int32(0)),
-				ZeroThreshold: ptr(1e-9),
-				PositiveSpan:  []*dto.BucketSpan{{Offset: ptr(int32(1)), Length: ptr(uint32(1))}},
+				SampleCount:   new(uint64(1000000)),
+				Schema:        new(int32(0)),
+				ZeroThreshold: new(1e-9),
+				PositiveSpan:  []*dto.BucketSpan{{Offset: new(int32(1)), Length: new(uint32(1))}},
 				PositiveDelta: []int64{3},
 			},
 		}},
@@ -1095,5 +1148,180 @@ func TestNativeHistogramCountAboveItsBucketsIsPassedThrough(t *testing.T) {
 	}
 	if bs := dp.Positive().BucketCounts().AsRaw(); !slices.Equal(bs, []uint64{3}) {
 		t.Fatalf("buckets = %v, want the target's own [3] — a symmetric clamp would have rewritten them", bs)
+	}
+}
+
+// The length prefix is the TARGET's claim, so readDelimited must size its
+// buffer from what ARRIVES, never from the claim: a target declaring the whole
+// maxProtoMessageBytes and then sending nothing (or a little) must cost at most
+// the bounded head, or it pins the full cap per concurrent scrape for free.
+func TestReadDelimitedAllocatesOnlyWhatArrives(t *testing.T) {
+	t.Run("nothing arrives", func(t *testing.T) {
+		buf, err := readDelimited(strings.NewReader(""), nil, maxProtoMessageBytes)
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("err = %v, want io.ErrUnexpectedEOF: the prefix promised bytes that never came", err)
+		}
+		if cap(buf) > protoPresizeBytes {
+			t.Fatalf("cap = %d for a message that sent nothing, want <= %d (the bounded head)", cap(buf), protoPresizeBytes)
+		}
+	})
+	t.Run("a little arrives", func(t *testing.T) {
+		const arrived = 100 << 10
+		buf, err := readDelimited(bytes.NewReader(make([]byte, arrived)), nil, maxProtoMessageBytes)
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("err = %v, want io.ErrUnexpectedEOF", err)
+		}
+		if len(buf) != arrived {
+			t.Fatalf("len = %d, want the %d bytes that arrived", len(buf), arrived)
+		}
+		if limit := max(protoPresizeBytes, 2*arrived); cap(buf) > limit {
+			t.Fatalf("cap = %d after %d bytes arrived, want <= %d: growth must track the bytes, not the claim", cap(buf), arrived, limit)
+		}
+	})
+	t.Run("a whole message is read exactly and reuses the buffer", func(t *testing.T) {
+		msg := bytes.Repeat([]byte("0123456789abcdef"), (3*protoPresizeBytes)/16+1)
+		buf, err := readDelimited(bytes.NewReader(msg), nil, len(msg))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(buf, msg) {
+			t.Fatal("the message read back differs from the one sent")
+		}
+		again, err := readDelimited(bytes.NewReader(msg[:10]), buf, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if &again[0] != &buf[0] || string(again) != string(msg[:10]) {
+			t.Fatal("a buffer already large enough was not reused for the next message")
+		}
+	})
+}
+
+// countingReader counts the bytes the scrape actually pulled from the body.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
+// An over-cap length prefix is refused on the PREFIX alone, even when the
+// target goes on to deliver every byte it declared: the message is never read,
+// never decoded, and the refusal names the cap. (Delivering the body is what
+// separates this from a truncation, which also reads as reason=body.)
+func TestProtoOverCapLengthPrefixIsRefused(t *testing.T) {
+	s := New(Config{Node: "n1", Interval: time.Hour, Timeout: time.Hour, NativeHistograms: true,
+		Targets: staticTargets{}, Exporter: &captureExporter{}, StartTime: time.Now()})
+	cb := newBatcher(func(pcommon.Resource) {}, time.Now(), time.Now())
+	body := binary.AppendUvarint(nil, maxProtoMessageBytes+1)
+	body = append(body, make([]byte, maxProtoMessageBytes+1)...)
+	cr := &countingReader{r: bytes.NewReader(body)}
+	_, err := s.scrapeProto(context.Background(), cr, cb, nil, "t", "t")
+	if err == nil {
+		t.Fatal("an over-cap message was accepted")
+	}
+	if !strings.Contains(err.Error(), "exceeds the") || !strings.Contains(err.Error(), strconv.Itoa(maxProtoMessageBytes)) {
+		t.Fatalf("err = %v, want the over-cap refusal naming the %d-byte cap", err, maxProtoMessageBytes)
+	}
+	if got := failureReason(err); got != reasonBody {
+		t.Fatalf("reason = %q, want %q", got, reasonBody)
+	}
+	// One bufio fill at most: the declared message itself was never pulled.
+	if cr.n > 64<<10 {
+		t.Fatalf("read %d bytes of a body refused on its prefix, want <= %d (one buffered read)", cr.n, 64<<10)
+	}
+}
+
+// A native histogram has no `_bucket`/`_sum`/`_count` component series, so the
+// pipeline filter and a metricRelabelings `__name__` rule see its FAMILY name —
+// as Prometheus' own relabeling does. A component-name rule written for the
+// classic shape therefore does not reach it, and a family-name rule keeps or
+// drops the whole point. Pinned because the filter docs spoke only of
+// component names (`foo_bucket`), which on this front match nothing.
+func TestNativeHistogramIsFilteredByItsFamilyName(t *testing.T) {
+	native := &dto.MetricFamily{
+		Name: new("rpc_latency_seconds"),
+		Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{
+			Histogram: &dto.Histogram{
+				SampleCount:   new(uint64(4)),
+				SampleSum:     new(1.5),
+				Schema:        new(int32(3)),
+				ZeroThreshold: new(1e-9),
+				ZeroCount:     new(uint64(1)),
+				PositiveSpan:  []*dto.BucketSpan{{Offset: new(int32(1)), Length: new(uint32(1))}},
+				PositiveDelta: []int64{3},
+			},
+		}},
+	}
+	neighbour := &dto.MetricFamily{
+		Name:   new("http_requests_total"),
+		Type:   dto.MetricType_COUNTER.Enum(),
+		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: new(7.0)}}},
+	}
+	body := protoBody(t, native, neighbour)
+
+	components := "rpc_latency_seconds_(bucket|sum|count)"
+	for _, tc := range []struct {
+		name       string
+		filter     []FilterRule
+		relabel    []kubemeta.RelabelRule
+		wantNative bool
+	}{
+		{name: "filter on the component names", filter: []FilterRule{{Action: "drop", Metrics: components}}, wantNative: true},
+		{name: "filter on the family name", filter: []FilterRule{{Action: "drop", Metrics: "rpc_latency_seconds"}}, wantNative: false},
+		{name: "relabel on the component names", relabel: []kubemeta.RelabelRule{{Action: "drop", SourceLabels: []string{"__name__"}, Regex: components}}, wantNative: true},
+		{name: "relabel on the family name", relabel: []kubemeta.RelabelRule{{Action: "drop", SourceLabels: []string{"__name__"}, Regex: "rpc_latency_seconds"}}, wantNative: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var filters *MetricFilters
+			if tc.filter != nil {
+				var err error
+				if filters, err = NewMetricFilters(map[string][]FilterRule{"targets": tc.filter}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var relabel *relabelFilter
+			if tc.relabel != nil {
+				var c relabelCache
+				var err error
+				if relabel, _, err = c.session(tc.relabel); err != nil {
+					t.Fatal(err)
+				}
+			}
+			exp := &captureExporter{}
+			s := New(Config{Node: "n1", Interval: time.Hour, Timeout: 5 * time.Second, NativeHistograms: true,
+				Filters: filters, Targets: staticTargets{}, Exporter: exp, StartTime: time.Now()})
+			cb := newBatcher(func(pcommon.Resource) {}, time.Now(), time.Now())
+			if _, err := s.scrapeProto(context.Background(), bytes.NewReader(body), cb, relabel, "t", "t"); err != nil {
+				t.Fatal(err)
+			}
+			got := map[string]pmetric.Metric{}
+			for _, md := range exp.batches {
+				rms := md.ResourceMetrics()
+				for i := range rms.Len() {
+					ms := rms.At(i).ScopeMetrics().At(0).Metrics()
+					for j := range ms.Len() {
+						got[ms.At(j).Name()] = ms.At(j)
+					}
+				}
+			}
+			if _, ok := got["http_requests_total"]; !ok {
+				t.Fatalf("the unfiltered neighbour is missing; exported %v", slices.Collect(maps.Keys(got)))
+			}
+			m, ok := got["rpc_latency_seconds"]
+			if ok != tc.wantNative {
+				t.Fatalf("native histogram exported = %v, want %v", ok, tc.wantNative)
+			}
+			if ok {
+				if m.Type() != pmetric.MetricTypeExponentialHistogram || m.ExponentialHistogram().DataPoints().At(0).Count() != 4 {
+					t.Fatalf("native point was altered: type %v", m.Type())
+				}
+			}
+		})
 	}
 }

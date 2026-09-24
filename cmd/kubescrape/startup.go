@@ -8,6 +8,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -57,13 +58,9 @@ func logStartupSummary(log *slog.Logger, apiServer string) {
 		"kubeconfig", *kubeconfig,
 	}
 	if *selfMetricsIntv > 0 {
-		dest = append(dest,
-			"otlpEndpoint", *otlpEndpoint,
-			"otlpProtocol", *otlpProtocol,
-			"otlpInsecure", *otlpInsecure,
-			"otlpCAFile", *otlpCAFile,
-			"otlpBearerTokenFile", *otlpBearer,
-		)
+		// The whole block, as the agent reports it. The -otlp-header values
+		// stay out: they may be credentials.
+		dest = append(dest, otlpFlags.SummaryAttrs()...)
 	}
 	log.Info("effective destinations", dest...)
 	// An address already in use names itself at startup; a listener left EMPTY
@@ -125,42 +122,56 @@ var (
 // endpoints, and every agent in the fleet blocks on a lookup that never
 // resolves. Before this, the only trace was a klog line from the reflector.
 func waitForCaches(ctx context.Context, gates []syncGate, st *store.Store, log *slog.Logger, ready chan<- struct{}) {
-	start := time.Now()
-	// A steady poll, never a backoff: readiness must be announced as soon as the
-	// caches sync (this is what gates the Service endpoints), and the check is
-	// two bool reads — the same 100ms cadence client-go's own WaitForCacheSync
-	// uses. Only the WARNING is throttled.
-	wait := min(100*time.Millisecond, cacheSyncGrace)
-	var lastWarn time.Time
-	t := time.NewTimer(wait)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			if pending := pendingGates(gates); len(pending) > 0 {
-				log.Warn("shutting down before the informer caches synced",
-					"caches", strings.Join(pending, ","), "waited", time.Since(start).Round(time.Second))
-			}
-			return
-		case <-t.C:
-		}
-		pending := pendingGates(gates)
-		if len(pending) == 0 {
-			pods, containers := st.Stats()
-			log.Info("informer caches synced", "pods", pods, "containers", containers,
-				"waited", time.Since(start).Round(time.Millisecond))
-			close(ready)
-			return
-		}
-		if elapsed := time.Since(start); elapsed >= cacheSyncGrace &&
-			(lastWarn.IsZero() || time.Since(lastWarn) >= cacheSyncReWarn) {
-			log.Warn("not ready: informer caches have not synced, so /readyz is 503 and this replica has no Service endpoints",
-				"caches", strings.Join(pending, ","), "waited", elapsed.Round(time.Second),
-				"note", "a cache that never syncs is usually a missing RBAC rule for that resource; the reflector retries it forever")
-			lastWarn = time.Now()
-		}
-		t.Reset(wait)
+	synced, waited := cli.WatchGates(ctx, log, cli.GateWatch{
+		Pending: func() []string { return pendingGates(gates) },
+		// The same 100ms cadence client-go's own WaitForCacheSync uses; the
+		// check is two bool reads.
+		Poll:         min(100*time.Millisecond, cacheSyncGrace),
+		Grace:        cacheSyncGrace,
+		ReWarn:       cacheSyncReWarn,
+		NotReady:     "not ready: informer caches have not synced, so /readyz is 503 and this replica has no Service endpoints",
+		Note:         "a cache that never syncs is usually a missing RBAC rule for that resource; the reflector retries it forever",
+		ShuttingDown: "shutting down before the informer caches synced",
+	})
+	if !synced {
+		return
 	}
+	pods, containers := st.Stats()
+	log.Info("informer caches synced", "pods", pods, "containers", containers,
+		"elapsed", waited.Round(time.Millisecond))
+	close(ready)
+}
+
+// gatesSynced returns a channel closed once every gate NAMED has synced, and
+// never closed if ctx ends first. It is the narrow sibling of waitForCaches for
+// a consumer that needs one cache rather than readiness as a whole — the
+// self-pod lookup needs the POD store and nothing else, and waiting on every
+// gate would tie its attributes to a cache it never reads (a monitor informer
+// 403-looping on a missing RBAC rule would hold them back forever). Same
+// steady 100ms poll as waitForCaches, and no log line of its own: a gate that
+// never syncs is waitForCaches' to report. A name no gate carries is not
+// waited for.
+func gatesSynced(ctx context.Context, gates []syncGate, names ...string) <-chan struct{} {
+	var want []syncGate
+	for _, g := range gates {
+		if slices.Contains(names, g.name) {
+			want = append(want, g)
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(min(100*time.Millisecond, cacheSyncGrace))
+		defer t.Stop()
+		for len(pendingGates(want)) > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+		}
+		close(done)
+	}()
+	return done
 }
 
 // pendingGates is the unsynced gates, sorted by registration order (which is

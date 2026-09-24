@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -25,6 +27,21 @@ import (
 // ..data symlink swap, and re-reading on the first of them can catch the
 // half-swapped state.
 const debounce = 100 * time.Millisecond
+
+// reloadsFailing counts the watched files whose CURRENT content does not
+// compile (or cannot be read), published as kubescrape_transform_reload_failing
+// — the state the per-edit counter cannot carry: the failed counter is deduped
+// by content hash, so it moves once per broken edit and an alert on its rate
+// resolves while the file on disk is still broken. That matters beyond the
+// edit, because the startup compile is fatal: a node restarted while this is
+// nonzero CrashLoops. A count rather than a flag so that more than one reloader
+// in a process (tests) cannot clear each other's state; the agent runs one.
+var reloadsFailing atomic.Int64
+
+// registerReloadGauge registers the gauge the first time a reloader RUNS, so a
+// process without -transforms-file publishes nothing and a 0 means "watching,
+// and the file compiles".
+var registerReloadGauge sync.Once
 
 // Reload watches path and swaps recompiled programs into w until ctx ends.
 // The poll interval is a fallback for filesystems without inotify (and for
@@ -47,7 +64,12 @@ func Reload(ctx context.Context, w *Wrapper, path string, poll time.Duration, lo
 
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
+	registerReloadGauge.Do(func() {
+		obs.RegisterTransformReloadFailing(func() float64 { return float64(reloadsFailing.Load()) })
+	})
 	r := &reloader{w: w, path: path, log: log}
+	// A watcher that stops watching stops vouching for the file either way.
+	defer r.setFailing(false)
 	if current := w.Active(); current != nil {
 		r.currentHash = current.Hash
 	}
@@ -119,10 +141,29 @@ type reloader struct {
 	// rather than as the poll rate.
 	currentHash string
 	failedHash  string
+	// failing is whether the file as last read is broken — this reloader's
+	// share of reloadsFailing. Unlike the report, it is not deduped: it is set
+	// on every failed read and cleared by every compiling one.
+	failing bool
 }
 
-// fail reports a reload failure once per distinct cause.
+// setFailing moves this reloader's share of the failing gauge on a change.
+func (r *reloader) setFailing(broken bool) {
+	if broken == r.failing {
+		return
+	}
+	r.failing = broken
+	if broken {
+		reloadsFailing.Add(1)
+	} else {
+		reloadsFailing.Add(-1)
+	}
+}
+
+// fail reports a reload failure once per distinct cause, and marks the file
+// broken every time.
 func (r *reloader) fail(hash, msg string, err error) {
+	r.setFailing(true)
 	if hash == r.failedHash {
 		return
 	}
@@ -139,15 +180,28 @@ func (r *reloader) apply() {
 		r.fail(contentHash([]byte("read:"+err.Error())), "transforms file unreadable; keeping the last good program", err)
 		return
 	}
+	// Hash FIRST. Unchanged content (a duplicate event, every poll tick) is
+	// the active program's own source, compiled already, so there is nothing
+	// to compile — and compiling is not free of effects: it runs every
+	// section's module top level again, under its own wall-clock budget, so a
+	// module-level print() logged a line on every node every poll period and
+	// the fresh program was then thrown away. A hash equal to failedHash is
+	// still recompiled: a module can fail on the clock alone on a CPU-starved
+	// node, and re-reading the same bytes is the only retry it gets (fail()
+	// keeps that silent).
+	h := contentHash(raw)
+	if h == r.currentHash {
+		r.failedHash = ""
+		r.setFailing(false) // the file on disk is the active program: it compiles
+		return
+	}
 	p, err := Compile(raw)
 	if err != nil {
-		r.fail(contentHash(raw), "transforms reload failed; keeping the last good program", err)
+		r.fail(h, "transforms reload failed; keeping the last good program", err)
 		return
 	}
 	r.failedHash = ""
-	if p.Hash == r.currentHash {
-		return // unchanged content (duplicate event / poll tick)
-	}
+	r.setFailing(false)
 	r.w.Swap(p)
 	r.currentHash = p.Hash
 	obs.TransformReloads.WithLabelValues("applied").Inc()

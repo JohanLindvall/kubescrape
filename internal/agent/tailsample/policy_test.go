@@ -3,6 +3,7 @@ package tailsample
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"regexp/syntax"
 	"strings"
 	"testing"
@@ -98,8 +99,6 @@ func mustNew(t testing.TB, policies ...PolicyConfig) *Evaluator {
 // fixedClock pins the evaluator's clock; the caller advances it by assignment.
 func fixedClock(e *Evaluator, now *time.Time) { e.now = func() time.Time { return *now } }
 
-func boolp(b bool) *bool  { return &b }
-func i64p(i int64) *int64 { return &i }
 func pol(name, typ string) PolicyConfig {
 	return PolicyConfig{Name: name, Type: typ}
 }
@@ -181,6 +180,62 @@ func TestLatencyPolicy(t *testing.T) {
 				t.Fatalf("Policy = %q, want \"slow\"", got.Policy)
 			}
 		})
+	}
+}
+
+// A span whose end timestamp is garbage — more than a time.Duration can hold
+// past its start — is malformed the way a span with no start is, and must not
+// flip a genuinely slow trace's duration NEGATIVE. The uint64 difference used
+// to be converted unchecked, so one such span made every latency window fail,
+// threshold 0 included ("every trace carrying a usable timestamp qualifies").
+func TestLatencyIgnoresASpanLongerThanADurationCanHold(t *testing.T) {
+	t.Parallel()
+	slowWithGarbage := func() Trace {
+		tr := mkTrace(1, nil, spanDef{start: 0, end: 10_000}) // a genuinely slow 10s trace
+		// The bogus span: a real start, an end at the top of the uint64 range.
+		sp := ptrace.NewSpan()
+		sp.SetStartTimestamp(ts(5))
+		sp.SetEndTimestamp(pcommon.Timestamp(math.MaxUint64))
+		tr.Spans = append(tr.Spans, Span{Span: sp, Resource: tr.Spans[0].Resource})
+		return tr
+	}
+	for _, tc := range []struct {
+		name      string
+		threshold string
+	}{
+		{"a 1s threshold still sees the 10s trace", "1s"},
+		{"threshold 0 still qualifies a trace with a usable timestamp", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mustNew(t, latCfg(tc.threshold, "")).Decide(slowWithGarbage()); !got.Sampled {
+				t.Fatalf("Decide = %+v: the garbage-end span turned the trace's duration negative", got)
+			}
+		})
+	}
+	// The garbage span on its own is the only span, so there is nothing usable.
+	tr := mkTrace(1, nil)
+	sp := ptrace.NewSpan()
+	sp.SetStartTimestamp(ts(5))
+	sp.SetEndTimestamp(pcommon.Timestamp(math.MaxUint64))
+	tr.Spans = append(tr.Spans, Span{Span: sp})
+	if d, ok := traceDuration(tr); ok {
+		t.Fatalf("traceDuration = %v, true for a trace whose only span is unmeasurable; want abstain", d)
+	}
+}
+
+// Two individually-sane spans whose interval between them exceeds what a
+// Duration can hold (a wrong-but-nonzero start is indistinguishable from a
+// real one) saturate — the trace reads as very slow, never as negative.
+func TestTraceDurationSaturatesInsteadOfWrapping(t *testing.T) {
+	t.Parallel()
+	a, b := ptrace.NewSpan(), ptrace.NewSpan()
+	a.SetStartTimestamp(1)
+	a.SetEndTimestamp(2)
+	b.SetStartTimestamp(pcommon.Timestamp(uint64(math.MaxInt64) + 10))
+	b.SetEndTimestamp(pcommon.Timestamp(uint64(math.MaxInt64) + 20))
+	d, ok := traceDuration(Trace{Spans: []Span{{Span: a}, {Span: b}}})
+	if !ok || d != time.Duration(math.MaxInt64) {
+		t.Fatalf("traceDuration = %v, %v; want the saturated maximum", d, ok)
 	}
 }
 
@@ -314,7 +369,7 @@ func TestStringAttributeRegexCacheIsBounded(t *testing.T) {
 	e := mustNew(t, p)
 	sp := e.policies[0].p.(*stringAttrPolicy)
 
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		val := "/api/" + strings.Repeat("x", i%7) + string(rune('a'+i%26)) + string(rune('0'+i%10))
 		if !sp.match(val) {
 			t.Fatalf("%q should match ^/api/", val)
@@ -358,30 +413,44 @@ func TestNumericAttributePolicy(t *testing.T) {
 		tr   Trace
 		want bool
 	}{
-		{"in range", na(NumericAttributeConfig{Key: "http.status_code", MinValue: i64p(500), MaxValue: i64p(599)}),
+		{"in range", na(NumericAttributeConfig{Key: "http.status_code", MinValue: new(int64(500)), MaxValue: new(int64(599))}),
 			mkTrace(1, nil, spanDef{attrs: map[string]any{"http.status_code": 503}}), true},
-		{"min is inclusive", na(NumericAttributeConfig{Key: "k", MinValue: i64p(500), MaxValue: i64p(599)}),
+		{"min is inclusive", na(NumericAttributeConfig{Key: "k", MinValue: new(int64(500)), MaxValue: new(int64(599))}),
 			mkTrace(1, nil, spanDef{attrs: map[string]any{"k": 500}}), true},
-		{"max is inclusive", na(NumericAttributeConfig{Key: "k", MinValue: i64p(500), MaxValue: i64p(599)}),
+		{"max is inclusive", na(NumericAttributeConfig{Key: "k", MinValue: new(int64(500)), MaxValue: new(int64(599))}),
 			mkTrace(1, nil, spanDef{attrs: map[string]any{"k": 599}}), true},
-		{"just below", na(NumericAttributeConfig{Key: "k", MinValue: i64p(500), MaxValue: i64p(599)}),
+		{"just below", na(NumericAttributeConfig{Key: "k", MinValue: new(int64(500)), MaxValue: new(int64(599))}),
 			mkTrace(1, nil, spanDef{attrs: map[string]any{"k": 499}}), false},
-		{"just above", na(NumericAttributeConfig{Key: "k", MinValue: i64p(500), MaxValue: i64p(599)}),
+		{"just above", na(NumericAttributeConfig{Key: "k", MinValue: new(int64(500)), MaxValue: new(int64(599))}),
 			mkTrace(1, nil, spanDef{attrs: map[string]any{"k": 600}}), false},
-		{"min only leaves the top open", na(NumericAttributeConfig{Key: "k", MinValue: i64p(500)}),
+		{"min only leaves the top open", na(NumericAttributeConfig{Key: "k", MinValue: new(int64(500))}),
 			mkTrace(1, nil, spanDef{attrs: map[string]any{"k": 1 << 40}}), true},
-		{"max only leaves the bottom open", na(NumericAttributeConfig{Key: "k", MaxValue: i64p(0)}),
+		{"max only leaves the bottom open", na(NumericAttributeConfig{Key: "k", MaxValue: new(int64(0))}),
 			mkTrace(1, nil, spanDef{attrs: map[string]any{"k": -5}}), true},
-		{"a double is compared, not ignored", na(NumericAttributeConfig{Key: "k", MinValue: i64p(1), MaxValue: i64p(2)}),
+		{"a double is compared, not ignored", na(NumericAttributeConfig{Key: "k", MinValue: new(int64(1)), MaxValue: new(int64(2))}),
 			mkTrace(1, nil, spanDef{attrs: map[string]any{"k": 1.5}}), true},
-		{"a double outside the range", na(NumericAttributeConfig{Key: "k", MinValue: i64p(1), MaxValue: i64p(2)}),
+		{"a double outside the range", na(NumericAttributeConfig{Key: "k", MinValue: new(int64(1)), MaxValue: new(int64(2))}),
 			mkTrace(1, nil, spanDef{attrs: map[string]any{"k": 2.5}}), false},
-		{"a string value is not parsed", na(NumericAttributeConfig{Key: "k", MinValue: i64p(1), MaxValue: i64p(2)}),
+		{"a string value is not parsed", na(NumericAttributeConfig{Key: "k", MinValue: new(int64(1)), MaxValue: new(int64(2))}),
 			mkTrace(1, nil, spanDef{attrs: map[string]any{"k": "1"}}), false},
-		{"resource attributes count too", na(NumericAttributeConfig{Key: "k", MinValue: i64p(1)}),
+		{"resource attributes count too", na(NumericAttributeConfig{Key: "k", MinValue: new(int64(1))}),
 			mkTrace(1, map[string]any{"k": 7}, spanDef{}), true},
-		{"missing key", na(NumericAttributeConfig{Key: "k", MinValue: i64p(1)}),
+		{"missing key", na(NumericAttributeConfig{Key: "k", MinValue: new(int64(1))}),
 			mkTrace(1, nil, spanDef{}), false},
+		// An OMITTED side is open for doubles too, all the way to infinity: it
+		// used to be float64 of the int64 extreme, i.e. closed at ±2^63.
+		{"min only: a double past 2^63 matches", na(NumericAttributeConfig{Key: "k", MinValue: new(int64(1000))}),
+			mkTrace(1, nil, spanDef{attrs: map[string]any{"k": 1e19}}), true},
+		{"min only: +Inf matches", na(NumericAttributeConfig{Key: "k", MinValue: new(int64(1000))}),
+			mkTrace(1, nil, spanDef{attrs: map[string]any{"k": math.Inf(1)}}), true},
+		{"max only: a double below -2^63 matches", na(NumericAttributeConfig{Key: "k", MaxValue: new(int64(0))}),
+			mkTrace(1, nil, spanDef{attrs: map[string]any{"k": -1e19}}), true},
+		{"max only: -Inf matches", na(NumericAttributeConfig{Key: "k", MaxValue: new(int64(0))}),
+			mkTrace(1, nil, spanDef{attrs: map[string]any{"k": math.Inf(-1)}}), true},
+		{"a SET bound still closes its side for doubles", na(NumericAttributeConfig{Key: "k", MinValue: new(int64(1000))}),
+			mkTrace(1, nil, spanDef{attrs: map[string]any{"k": math.Inf(-1)}}), false},
+		{"NaN matches nothing", na(NumericAttributeConfig{Key: "k", MinValue: new(int64(0))}),
+			mkTrace(1, nil, spanDef{attrs: map[string]any{"k": math.NaN()}}), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := mustNew(t, tc.cfg).Decide(tc.tr); got.Sampled != tc.want {
@@ -397,7 +466,7 @@ func TestBooleanAttributePolicy(t *testing.T) {
 	t.Parallel()
 	ba := func(key string, want bool) PolicyConfig {
 		p := pol("bool", TypeBooleanAttribute)
-		p.BooleanAttribute = &BooleanAttributeConfig{Key: key, Value: boolp(want)}
+		p.BooleanAttribute = &BooleanAttributeConfig{Key: key, Value: new(want)}
 		return p
 	}
 	for _, tc := range []struct {
@@ -445,7 +514,7 @@ func TestProbabilisticIsProportionalAndConsistent(t *testing.T) {
 		a := mustNew(t, probPol(pct))
 		b := mustNew(t, probPol(pct))
 		kept := 0
-		for i := uint64(0); i < n; i++ {
+		for i := range uint64(n) {
 			tr := Trace{TraceID: traceID(i)}
 			da, db := a.Decide(tr), b.Decide(tr)
 			if da != db {
@@ -473,7 +542,7 @@ func TestProbabilisticIsProportionalAndConsistent(t *testing.T) {
 func TestProbabilisticIgnoresTheSpanSet(t *testing.T) {
 	t.Parallel()
 	e := mustNew(t, probPol(50))
-	for i := uint64(0); i < 1000; i++ {
+	for i := range uint64(1000) {
 		id := traceID(i)
 		bare := Trace{TraceID: id}
 		full := mkTrace(1, map[string]any{"service.name": "x"},
@@ -502,7 +571,7 @@ func TestRateLimitingBoundsAndRefills(t *testing.T) {
 
 	tr := mkTrace(1, nil, spanDef{start: 0, end: 1}, spanDef{start: 0, end: 1}) // 2 spans
 	kept := 0
-	for i := 0; i < 20; i++ { // 40 spans offered in one instant against a 10-span burst
+	for range 20 { // 40 spans offered in one instant against a 10-span burst
 		if e.Decide(tr).Sampled {
 			kept++
 		}
@@ -512,7 +581,7 @@ func TestRateLimitingBoundsAndRefills(t *testing.T) {
 	}
 	now = now.Add(500 * time.Millisecond) // refills 5 tokens
 	kept = 0
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		if e.Decide(tr).Sampled {
 			kept++
 		}
@@ -644,7 +713,7 @@ func TestCompositeAllocatesPerSubPolicyBudgets(t *testing.T) {
 	okTrace := mkTrace(2, nil, spanDef{start: 0, end: 1})
 
 	byPolicy := map[string]int{}
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		if d := e.Decide(errTrace); d.Sampled {
 			byPolicy[d.Policy]++
 		}
@@ -729,8 +798,7 @@ func TestCompileErrorsWrapTheirCause(t *testing.T) {
 		if err == nil {
 			t.Fatal("an unparseable regex compiled")
 		}
-		var se *syntax.Error
-		if !errors.As(err, &se) {
+		if _, ok := errors.AsType[*syntax.Error](err); !ok {
 			t.Fatalf("errors.As cannot reach regexp's *syntax.Error through the policy compiler: %v", err)
 		}
 		if !strings.Contains(err.Error(), `"route"`) {
@@ -776,4 +844,178 @@ func TestCompileErrorsWrapTheirCause(t *testing.T) {
 			t.Fatalf("errPolicy did not wrap its cause: %v", err)
 		}
 	})
+}
+
+// --- span-then-resource resolution across resources ------------------------
+
+// resGroup is one ResourceSpans of a multi-resource trace: its attributes and
+// its spans.
+type resGroup struct {
+	res  map[string]any
+	defs []spanDef
+}
+
+// mkMultiResTrace assembles a trace from several resources the way the buffer
+// does: every span of a group shares its resource's ONE attributes handle.
+func mkMultiResTrace(id byte, groups ...resGroup) Trace {
+	td := ptrace.NewTraces()
+	var tid pcommon.TraceID
+	tid[15] = id
+	t := Trace{TraceID: tid}
+	for _, g := range groups {
+		rs := td.ResourceSpans().AppendEmpty()
+		putAttrs(rs.Resource().Attributes(), g.res)
+		ss := rs.ScopeSpans().AppendEmpty()
+		for _, d := range g.defs {
+			sp := ss.Spans().AppendEmpty()
+			sp.SetTraceID(tid)
+			sp.SetStartTimestamp(ts(d.start))
+			sp.SetEndTimestamp(ts(d.end))
+			putAttrs(sp.Attributes(), d.attrs)
+			t.Spans = append(t.Spans, Span{Span: sp, Resource: rs.Resource().Attributes()})
+		}
+	}
+	return t
+}
+
+// reorder permutes a trace's spans (an assembler may hand them over in any
+// order, resources interleaved).
+func reorder(tr Trace, order ...int) Trace {
+	spans := make([]Span, 0, len(order))
+	for _, i := range order {
+		spans = append(spans, tr.Spans[i])
+	}
+	tr.Spans = spans
+	return tr
+}
+
+// The attribute policies evaluate a resource once per distinct resource
+// HANDLE, not once per span. That memo must never carry one resource's answer
+// to another, nor let a span's resource answer for a span that carries the key
+// itself — so each case below separates a correct resolution from a wrong one.
+// All three attribute policy types share the resolution, and each is run.
+func TestAttributePoliciesResolvePerSpanAcrossResources(t *testing.T) {
+	t.Parallel()
+	str := pol("p", TypeStringAttribute)
+	str.StringAttribute = &StringAttributeConfig{Key: "k", Values: []string{"yes"}}
+	num := pol("p", TypeNumericAttribute)
+	num.NumericAttribute = &NumericAttributeConfig{Key: "k", MinValue: new(int64(500)), MaxValue: new(int64(599))}
+	bl := pol("p", TypeBooleanAttribute)
+	bl.BooleanAttribute = &BooleanAttributeConfig{Key: "k", Value: new(true)}
+
+	for _, kind := range []struct {
+		name     string
+		cfg      PolicyConfig
+		hit, mis any
+	}{
+		{"stringAttribute", str, "yes", "no"},
+		{"numericAttribute", num, 503, 200},
+		{"booleanAttribute", bl, true, false},
+	} {
+		plain := spanDef{start: 0, end: 1}
+		own := func(v any) spanDef { return spanDef{start: 0, end: 1, attrs: map[string]any{"k": v}} }
+		res := func(v any, defs ...spanDef) resGroup { return resGroup{res: map[string]any{"k": v}, defs: defs} }
+		for _, tc := range []struct {
+			name   string
+			tr     Trace
+			sample bool
+		}{
+			{"a later resource matches after an earlier one did not",
+				mkMultiResTrace(1, res(kind.mis, plain, plain), res(kind.hit, plain)), true},
+			{"several non-matching resources before a matching one",
+				mkMultiResTrace(2, res(kind.mis, plain), res(kind.mis, plain), res(kind.mis, plain), res(kind.hit, plain)), true},
+			{"spans of two resources interleaved, the second matching",
+				reorder(mkMultiResTrace(8, res(kind.mis, plain, plain), res(kind.hit, plain)), 0, 2, 1), true},
+			{"spans of two resources interleaved, neither matching",
+				reorder(mkMultiResTrace(9, res(kind.mis, plain, plain), res(kind.mis, plain)), 0, 2, 1), false},
+			{"no resource matches",
+				mkMultiResTrace(3, res(kind.mis, plain, plain), res(kind.mis, plain)), false},
+			{"a span's own value shadows its resource, a keyless sibling does not",
+				mkMultiResTrace(4, res(kind.hit, own(kind.mis), plain)), true},
+			{"every span shadows the matching resource",
+				mkMultiResTrace(5, res(kind.hit, own(kind.mis), own(kind.mis))), false},
+			{"a span's own match wins after a non-matching resource",
+				mkMultiResTrace(6, res(kind.mis, plain, own(kind.hit))), true},
+		} {
+			t.Run(kind.name+"/"+tc.name, func(t *testing.T) {
+				d := mustNew(t, kind.cfg).Decide(tc.tr)
+				if d.Sampled != tc.sample {
+					t.Fatalf("Decide = %+v, want Sampled=%v", d, tc.sample)
+				}
+			})
+		}
+	}
+
+	// A zero resource map beside a real one: tolerated, and never mistaken for
+	// the resource memoized before it.
+	t.Run("zero resource after a non-matching one", func(t *testing.T) {
+		tr := mkMultiResTrace(7, resGroup{res: map[string]any{"k": "no"}, defs: []spanDef{{start: 0, end: 1}}})
+		td := ptrace.NewTraces()
+		sp := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+		tr.Spans = append(tr.Spans, Span{Span: sp}) // Resource left zero
+		if d := mustNew(t, str).Decide(tr); d.Sampled {
+			t.Fatalf("Decide = %+v, want no match", d)
+		}
+	})
+}
+
+// --- script -----------------------------------------------------------------
+
+// scriptEvaluator compiles policies against an injected decide(trace) body.
+func scriptEvaluator(t *testing.T, script func(Trace) (bool, bool), policies ...PolicyConfig) *Evaluator {
+	t.Helper()
+	e, err := New(Config{Policies: policies, Script: script})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return e
+}
+
+// A script's three answers map onto the three verdicts: True samples, None
+// (abstain, which is also what a script ERROR reports) falls to the next
+// policy, and False VETOES — the trace is dropped and nothing after the script
+// is consulted, exactly like an inverted policy's match. Nested inside `and`
+// or `composite` the veto propagates as theirs does.
+func TestScriptPolicyVerdicts(t *testing.T) {
+	t.Parallel()
+	tr := mkTrace(1, nil, spanDef{start: 0, end: 1})
+	and := func(subs ...PolicyConfig) PolicyConfig {
+		p := pol("and", TypeAnd)
+		p.And = &AndConfig{SubPolicies: subs}
+		return p
+	}
+	answers := []struct {
+		name            string
+		sample, abstain bool
+	}{
+		{"true samples", true, false},
+		{"none abstains", false, true},
+		{"false vetoes", false, false},
+	}
+	for _, shape := range []struct {
+		name     string
+		policies []PolicyConfig
+		// want per answer, in answers' order
+		want [3]Decision
+	}{
+		{"top level",
+			[]PolicyConfig{pol("s", TypeScript), pol("catch-all", TypeAlwaysSample)},
+			[3]Decision{{Sampled: true, Policy: "s"}, {Sampled: true, Policy: "catch-all"}, {Sampled: false, Policy: "s"}}},
+		{"inside and",
+			[]PolicyConfig{and(pol("s", TypeScript)), pol("catch-all", TypeAlwaysSample)},
+			[3]Decision{{Sampled: true, Policy: "and"}, {Sampled: true, Policy: "catch-all"}, {Sampled: false, Policy: "and"}}},
+		{"inside composite",
+			[]PolicyConfig{compositeCfg(1e12, nil, nil, pol("s", TypeScript), pol("rest", TypeAlwaysSample))},
+			[3]Decision{{Sampled: true, Policy: "composite/s"}, {Sampled: true, Policy: "composite/rest"}, {Sampled: false, Policy: "composite/s"}}},
+	} {
+		for i, a := range answers {
+			t.Run(shape.name+"/"+a.name, func(t *testing.T) {
+				e := scriptEvaluator(t, func(Trace) (bool, bool) { return a.sample, a.abstain }, shape.policies...)
+				d := e.Decide(tr)
+				if d.Sampled != shape.want[i].Sampled || d.Policy != shape.want[i].Policy {
+					t.Fatalf("Decide = %+v, want %+v", d, shape.want[i])
+				}
+			})
+		}
+	}
 }

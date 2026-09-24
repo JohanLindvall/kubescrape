@@ -16,8 +16,9 @@ Kubernetes-only, Linux-only, OTLP-only node agent plus a cluster metadata
 service. The comparison is against the *overlapping* feature set: collecting
 container logs and Prometheus metrics on Kubernetes nodes, attributing them
 with Kubernetes metadata, and shipping them via OTLP. Comparator behavior is
-described as of mid-2026; measured numbers are from this repository's
-benchmarks (see [Performance](#performance)).
+described as of mid-2026; kubescrape's measured numbers are from this
+repository's benchmarks (see [Performance](#performance), which says where each
+figure comes from).
 
 ## Architecture
 
@@ -38,8 +39,10 @@ OTel Target Allocator already centralizes discovery into one component, and
 node-filtered watches shrink the per-node cost without removing it. What no
 comparator centralizes is the attribution lookup itself — and kubescrape's
 trade-off is that agents depend on the metadata service being reachable
-(lookups block, then retry; log data is never lost — files are not consumed
-until they can be attributed).
+(lookups block, then retry; a file is not read until it can be attributed, so
+an outage delays logs rather than dropping them — unless the file is deleted
+before the service answers, a loss counted in
+`kubescrape_log_unresolved_lost_total`).
 
 Also structural: the tailer *blocks per container ID* with tombstones for
 deleted pods, so logs from containers that live seconds (CronJobs) are still
@@ -58,7 +61,7 @@ issue tracker.
 | | kubescrape | Alloy/Promtail† | Vector | Fluent Bit | OTel filelog | Filebeat/Elastic Agent |
 |---|---|---|---|---|---|---|
 | CRI parsing + partial-line rejoin | ✔ built-in | ✔ stage | ✔ | ✔ | ✔ operator | ✔ `container` parser |
-| Multiline (stack traces) | ✔ 7 languages, zero config, literal-prefiltered | config per format | ✘ in `kubernetes_logs` (open requests; `reduce` transform as workaround) | config | config | config (or `co.elastic.logs/multiline.*` hints) |
+| Multiline (stack traces) | ✔ 9 runtimes (Go, Java, .NET, Node.js, Python, Ruby, Rust, PHP, Elixir), zero config, literal-prefiltered | config per format | ✘ in `kubernetes_logs` (open requests; `reduce` transform as workaround) | config | config | config (or `co.elastic.logs/multiline.*` hints) |
 | Multiline **across rotations** | ✔ incl. across crashes | ✘ breaks at rotation | ✘ | ✘ | ✘ | ✘ |
 | Rotation: rename / copytruncate / inode reuse | ✔ (inode + head fingerprint) | rename + truncate-reset (copytruncate loss window) | ✔ | ✔ | ✔ | ✔ since 9.0 (head fingerprint is now the default file identity; `native` inode identity before it duplicated on copytruncate) |
 | Auto enrichment (timestamp, severity, trace IDs, exceptions) | ✔ zero config ([enrich](https://github.com/JohanLindvall/enrich)) | config stages | config (VRL) | config parsers | config operators | ✘ agent-side — the curated module/integration pipelines run **in Elasticsearch** |
@@ -131,7 +134,7 @@ logs+metrics over OTLP is kubescrape's.
 | OTLP ingest (push) with k8s enrichment | ✔ logs/metrics on the node agent, traces on the trace tier, peer-IP fallback; pushed logs run the full chain (scrub, enrich, `logMetrics`, `logs.rules`); payloads forwarded as received — batch in the SDK or downstream | ✔ | ~ OTLP source decodes, but no k8s enrichment of pushed data | ✔ | ✔ | ✘ in Beats; APM Server and the EDOT collector take OTLP (EDOT enriches via `k8sattributes`) |
 | Traces | a dedicated sharded tier: enrichment + re-sharding by trace id + RED span metrics + consistent probabilistic sampling (`traceSampling`) + **whole-trace tail sampling** (`tailSampling`, the Collector's policy vocabulary, first-match-wins attribution) + Grafana-Tempo-compatible service-graph edges (opt-in) | ✔ full | ~ pass-through (practical since v0.50); OSS has no sampling or span metrics | ✔ head **and** conditional tail sampling (v4 sampling processor: latency/status/attribute policies) | ✔ full (tail sampling etc.) | ✔ but in a **separate product** — APM Server: OTLP in, whole-trace tail sampling on local disk with a cross-instance sync interval; service maps are computed backend-side |
 | Multi-destination / tenant routing | ✔ per-signal destinations + tenant headers on the buffered default chain (`export` section: Mimir/Loki/Tempo's distinct OTLP endpoints, collectorless); plus per-namespace fan-out (`routing`; unbuffered by design) | ✔ | ✔ | ✔ | ✔ routing connector | ~ one output per Beat process; Elastic Agent maps outputs per integration |
-| Log delivery | **ack-gated at-least-once** + rewind; offsets never pass unacked data | positions synced on timer (loss/dup window) | ✔ e2e acks + disk buffers | offsets on read; `storage.type filesystem` persists read-but-undelivered chunks across restarts | checkpoints when the downstream consumer accepts (not backend ack); persistent sending queue bounds outage loss | ✔ registry advances on the output's ack — for Elasticsearch that **is** the bulk response; unacked events held in memory |
+| Log delivery | **ack-gated at-least-once** + rewind; offsets advance past undelivered data only for a batch the collector rejects permanently (dropped, counted in `kubescrape_log_permanent_dropped_total`) | positions synced on timer (loss/dup window) | ✔ e2e acks + disk buffers | offsets on read; `storage.type filesystem` persists read-but-undelivered chunks across restarts | checkpoints when the downstream consumer accepts (not backend ack); persistent sending queue bounds outage loss | ✔ registry advances on the output's ack — for Elasticsearch that **is** the bulk response; unacked events held in memory |
 | Disk buffering | ✔ logs, metrics and tail-sampled traces (fsync'd frames, checksummed cursor, poison-batch handling); a *forwarded* trace passes through by design, since its sender still holds it | ✔ metrics WAL (GA, agent-mode); otelcol file-storage queues since v1.9; the *log* WAL never went GA | ✔ mature | ✔ filesystem storage | ✔ file storage ext | ✔ `queue.disk` (one queue for the whole process, not per signal) |
 | Compression | gzip (klauspost) | snappy/gzip | ✔ several | ✔ | ✔ several | ✔ gzip (`compression_level`) |
 | Backpressure to source | ✔ rewind = files wait on disk | partial | ✔ | ✔ | partial | ✔ (harvesters block on a full queue) |
@@ -191,15 +194,33 @@ Elasticsearch exposes a native OTLP/HTTP endpoint (and Elastic Cloud a managed
 one), so kubescrape can ship to Elastic directly — point
 `-otlp-protocol=http` and `-otlp-endpoint` at the OTLP base URL (the exporter
 appends `/v1/logs`, `/v1/metrics`, `/v1/traces`) and carry the API key as a
-static `Authorization: ApiKey …` header in the `export` section.
+static `Authorization: ApiKey …` header in the `export` section. `export.headers`
+is also sent to every `routing` route, including one naming its own endpoint,
+so if any route points at another host put the key in the per-signal
+overrides' `headers` (`export.logs`/`metrics`/`traces`) instead — routes do not
+inherit those, so a route with no endpoint of its own (one that still ships to
+Elastic) then needs the key in its own `headers` too.
 
 ## Performance
 
-Measured on the same machine (AMD Ryzen 7 8840HS, Go 1.25) with this repo's
-committed benchmarks; comparator figures below the table are order-of-
-magnitude from public benchmarks, not same-machine measurements.
+The kubescrape timings come from this repo's committed benchmarks, named per
+table below, and were taken in July 2026 on Go 1.26.3 (the toolchain the tree
+required then); none has been re-timed since. Where a date's machine was
+recorded it is named; where it was not, the page does not guess. The
+Prometheus `textparse` row is the one exception to "committed": see its table.
+Figures for Vector, Fluent Bit, Promtail/Alloy and Filebeat are
+order-of-magnitude from public benchmarks, not same-machine measurements.
+**Only the allocation columns and the ratios are portable.** The log
+pipeline's allocation counts are not a measurement at all but a budget the
+test suite enforces on every build (`TestIngestLineAllocationBudget`,
+`TestIngestFlushAllocationBudget`), and the parse-alone count below was
+re-measured in August 2026 and is held under a whole-scrape ceiling by
+`pkg/promparse`'s `TestParseAllocationBudget`. Each ns and MB/s figure is one
+machine's, so a different absolute on your hardware is a different CPU, not a
+regression.
 
-**Log pipeline, per line** (`BenchmarkIngestLine` / `BenchmarkIngestFlush`):
+**Log pipeline, per line** (`BenchmarkIngestLine` / `BenchmarkIngestFlush` in
+`internal/agent/tailer`; timings from 2026-07-21, machine not recorded):
 
 | Stage | ns/line | allocs |
 |---|---|---|
@@ -221,7 +242,12 @@ Vector/Fluent Bit parallelize across sources.
 
 **Metrics pipeline** — a same-input, same-machine comparison against the
 reference implementation (Prometheus `textparse` v0.313, 12k-sample
-Kubernetes-shaped exposition):
+Kubernetes-shaped exposition), measured on 2026-07-11 on an AMD Ryzen 7
+8840HS. The kubescrape row is `BenchmarkConvertScrape` in
+`internal/agent/promscrape`. The `textparse` row was measured ONCE, on the same
+machine and corpus, with a harness that is not in this repo (the tree does not
+depend on `prometheus/prometheus`), so it cannot be reproduced from here:
+treat it as a one-off reference point, not a committed benchmark.
 
 | | Work | Throughput | Allocs |
 |---|---|---|---|
@@ -230,17 +256,19 @@ Kubernetes-shaped exposition):
 
 The full kubescrape pipeline outruns the reference parser doing strictly less
 work (Prometheus still has relabeling + append ahead at that point). Parse
-alone: 552 MB/s, 2 allocs per 10k-series scrape, constant memory. (The 21 this
-said until 2026-08 predated the last-seen memcmp caches and the pooled
-parser/reader; the allocation count is machine-independent, the throughput is
-not.) **Every MB/s figure on this page came from one machine in one sitting**,
-which is what makes the comparison meaningful — the same corpus, the same box,
-the same afternoon. Only the RATIOS travel: re-measuring parse alone on other
-hardware has read 233 and 368 MB/s against the 552 here, so treat a lower
-absolute on your own machine as a different CPU, not a regression, and
-re-measure the comparators beside it before concluding anything.
+alone (`BenchmarkParseLargeScrape` in `pkg/promparse`): 552 MB/s, 2 allocs per
+10k-series scrape, constant memory; the allocation count is
+machine-independent, the throughput is not. **Every MB/s figure on this page
+came from one machine in one sitting**, which is what makes the comparison
+meaningful — the same corpus, the same box, the same afternoon. Only the RATIOS
+travel: re-measuring parse alone on other hardware has read 233 and 368 MB/s
+against the 552 here, so treat a lower absolute on your own machine as a
+different CPU, not a regression. Before concluding anything against
+`textparse` on your hardware, time it beside the kubescrape benchmarks with a
+harness of your own; this repo does not ship one.
 
-**Log-derived metrics**: ≤1 alloc where the keys resolve through the caller's
+**Log-derived metrics** (`BenchmarkDynamicAdd*` in `internal/metrics`): ≤1
+alloc where the keys resolve through the caller's
 bound closures or off a logfmt line, 3 on the JSON fallback (`GetPaths` into
 the reused `Fields` buffer — a small constant, not a function of the line's
 field count), 0 on a line matching no rule; per-line time is hardware-relative
@@ -248,9 +276,10 @@ like the throughputs above (sub-µs through the bound closures, 1.4-1.8 µs on t
 logfmt and JSON fallbacks on the machine this paragraph was last checked on) — µs-scale in the
 comparators (Promtail metrics stage, Vector log_to_metric).
 
-**Cluster-scoped pipelines** (the events/Azure singleton, same committed
-benchmarks): an Azure Event Hubs diagnostics record decodes in ~1.4 µs at
-~1 alloc (the envelope walk itself is 36 ns/record and 0 allocs, via
+**Cluster-scoped pipelines** (the events/Azure singleton; the `bench_test.go`
+files in `internal/agent/azurediag` and `internal/agent/events`, timed on
+2026-07-28, machine not recorded): an Azure Event Hubs diagnostics record
+decodes in ~1.4 µs at ~1 alloc (the envelope walk itself is 36 ns/record and 0 allocs, via
 lightning's SIMD-backed `ArrayEach`) and runs the FULL log chain — scrub +
 logAttributes + enrich + log-metrics + rules — in ~9.7 µs/record: ≈100k
 records/s on the consumer goroutine, an order of magnitude above realistic
@@ -262,9 +291,16 @@ rates (tens per second).
 
 kubescrape commits log offsets **only after the collector acknowledges the
 batch**, never past lines still buffered in the multiline pipeline; failures
-rewind and re-read. Multi-line groups survive rename rotations *and* crashes
-mid-rotation (rotated-away files are recorded in the checkpoint and re-read
-in order). The disk buffer fsyncs every frame, checksums its cursor, rolls
+rewind and re-read. The one exception is a batch the collector rejects
+**permanently** (malformed, over the receiver's limit): retrying it can never
+succeed and would stall every file on the node, so it is dropped and its
+offsets advance, counted in `kubescrape_log_permanent_dropped_total`. With
+`-buffer-dir` the commit gate is the durable enqueue instead of the collector's
+ack, and that loss surfaces as
+`kubescrape_buffer_dropped_batches_total{signal="logs"}`
+([README](../README.md#the-node-agent)). Multi-line groups survive rename
+rotations *and* crashes mid-rotation (rotated-away files are recorded in the
+checkpoint and re-read in order). The disk buffer fsyncs every frame, checksums its cursor, rolls
 back partial writes (ENOSPC), and classifies permanent rejections so a poison
 batch cannot wedge a signal. This is Vector-class delivery; it is strictly
 stronger than Promtail (timer-synced positions) and Fluent Bit's default
@@ -283,9 +319,11 @@ are held in *memory* rather than re-read from disk on failure; the multiline
 buffers sit per-harvester outside the offset accounting, so a group breaks at
 a rotation; and the fd/state trade-offs are exposed as a config surface
 (`close_*`, `clean_*`, `ignore_older`) instead of being decided in code.
-Events Elasticsearch itself rejects are dropped by default, or routed to a
-dead-letter index — a setting deprecated in 9.5. `docs/tailer-comparison.md`
-works through that comparison file by file.
+Both drop what the backend rejects definitively: events Elasticsearch itself
+rejects are dropped by default, or routed to a dead-letter index — a setting
+deprecated in 9.5 — and kubescrape drops a permanently rejected batch too,
+counted and logged at ERROR, with no dead-letter destination.
+[tailer-comparison.md](tailer-comparison.md) works through that comparison file by file.
 
 ## Migrating off Promtail
 
@@ -363,37 +401,18 @@ production soak time than any comparator — the invariants are tested
 (race-tested suite, crash/rotation/power-loss cases) but the field mileage
 is not.
 
-Two things are **deliberately out of scope** — kubescrape does not try to
-replace the standard component for each:
+Two things are **deliberately out of scope** — host/node system metrics
+(node_exporter's job) and kube-state-metrics *generation* (the splitters still
+re-attribute KSM's output) — and the systemd journal is the deliberate
+**in-scope** exception to that host/node line, worth its cgo dependency on
+libsystemd; the argument is in the README's
+[Out of scope](../README.md#out-of-scope).
 
-- **Host/node system metrics** (`/proc`, node_exporter territory): run a
-  node_exporter DaemonSet and scrape it via `prometheus.io/*` annotations or a
-  PodMonitor.
-- **kube-state-metrics generation**: kubescrape does not produce KSM series —
-  deploy kube-state-metrics itself and scrape it. kubescrape's metrics
-  splitters then re-attribute its output into per-object resources; only the
-  generation is out of scope, the split/enrich capability stays.
-
-The systemd journal (`-journald`) is the deliberate **in-scope** exception to
-the host/node line: node/system *logs* (kubelet, containerd, systemd units)
-are collected even though host *metrics* are not. The distinction is
-operational necessity — those unit logs are how you debug a node's Kubernetes
-plane, and on many distros they exist only in the journal — and it is worth
-the cgo dependency on libsystemd (a non-static agent binary) that host
-metrics, already covered by node_exporter, are not. Even that cost is now a
-choice: the reader sits behind the `journald` build tag, which the default
-build sets — dropping it yields a cgo-free, fully static agent at the price
-of the node's unit logs.
-
-The same lever applies twice more, and the second one is the large one.
-`azure` compiles out the Event Hubs consumer (11 franz-go packages, ≈5 MB
-stripped) and `events` compiles out the Kubernetes events reader and its
-leader election — which are the *only* reason the agent links
-`k8s.io/client-go`. Both pipelines run exclusively in a one-replica
-Deployment, so a DaemonSet that will never run either can drop both:
-`make build TAGS=journald` takes the stripped agent from **59.16 MB to
-21.27 MB**, and `TAGS=journald,azure` (dropping only `events`) takes it to
-**26.27 MB**, −55.6%. `make verify-tags` asserts the exclusions really
-happen, which is what makes "this agent talks to no Kubernetes API" a
-property a build can fail on rather than a claim on a comparison page.
-Figures measured on go1.26.6, `-trimpath -ldflags="-s -w"`.
+Every pipeline a given workload may never run is also a build-time option: the
+`journald`, `azure` and `events` build tags compile out the journal reader (the
+agent's only cgo), the Event Hubs consumer and the Kubernetes events reader (the
+agent's only reason to link `k8s.io/client-go`, about half the stripped binary),
+and `make verify-tags` asserts the exclusions really happen — which is what
+makes "this agent talks to no Kubernetes API" a property a build can fail on
+rather than a claim on a comparison page. Per-variant sizes are in
+[CONFIGURATION.md](CONFIGURATION.md#build-variants-optional-pipelines).

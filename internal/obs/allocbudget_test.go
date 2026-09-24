@@ -10,17 +10,21 @@ package obs_test
 // — would have shown up as a tailer per-line regression attributed to the
 // tailer.
 //
-// Two ceilings, both at zero, both measured (bench_test.go reports the wall
+// Three ceilings, all at zero, all measured (bench_test.go reports the wall
 // clock beside them):
 //
 //	a pre-bound Inc                     0 allocs
-//	a SINGLE-label WithLabelValues+Inc  0 allocs  (vecKey's alloc-free arm)
+//	a SINGLE-label WithLabelValues+Inc  0 allocs  (the value IS the cache key)
+//	a MULTI-label WithLabelValues+Inc   0 allocs  (on a cache hit)
 //
-// The MULTI-label WithLabelValues arm deliberately has no zero budget: vecKey
-// builds a length-prefixed tuple, which is one 16 B allocation per call. That
-// is the price of the per-call form and the reason every hot site pre-binds
-// instead; TestMultiLabelResolutionAllocatesOncePerCall pins it as a KNOWN
-// cost so nobody puts one on a per-record path believing it is free.
+// The multi-label arm used to cost one 16 B allocation per call — the
+// length-prefixed tuple key was built as a string before the cache lookup — and
+// its test pinned that as a known price with a note to lower the number if it
+// ever became free. It did: the key is now built into a stack buffer and
+// probed with m[string(key)], which does not allocate, so only a MISS (a tuple
+// seen for the first time) materialises it. Pre-binding stays the discipline
+// on per-record paths — a lookup under the vec's mutex is still work — but it
+// is no longer the only way to stay off the heap.
 
 import (
 	"testing"
@@ -56,18 +60,17 @@ func TestSingleLabelResolutionIsAllocationFree(t *testing.T) {
 	}
 }
 
-// Not a budget so much as a documented price: this is why the hot sites bind
-// up front. If it ever becomes free the number here should be lowered, not the
-// discipline relaxed.
-func TestMultiLabelResolutionAllocatesOncePerCall(t *testing.T) {
+// Per-event call sites resolve two-label tuples per call — obs.HTTPRequests
+// (pattern, code) per metadata request, obs.Exports (signal, class) per wire
+// send — so a cache HIT must not allocate the tuple key.
+func TestMultiLabelResolutionIsAllocationFree(t *testing.T) {
 	if testrace.Enabled {
 		t.Skip("the race detector adds bookkeeping allocations; the ceiling is meaningless under it")
 	}
 	r := metrics.NewRegistry()
 	v := r.CounterVec("kubescrape_budget_wlv2_total", "budget", "outcome", "pipeline")
-	v.WithLabelValues("ok", "logs")
-	got := testing.AllocsPerRun(2000, func() { v.WithLabelValues("ok", "logs").Inc() })
-	if got > 1 {
-		t.Errorf("a two-label WithLabelValues bump allocated %v per call; want at most 1 (the tuple key)", got)
+	v.WithLabelValues("ok", "logs") // warm the wrapper cache; a miss legitimately allocates
+	if got := testing.AllocsPerRun(2000, func() { v.WithLabelValues("ok", "logs").Inc() }); got != 0 {
+		t.Errorf("a two-label WithLabelValues bump allocated %v per call; want 0 (the key is built on the stack)", got)
 	}
 }

@@ -5,9 +5,15 @@ image:
   # renders byte-identical workload specs (the image string does not change, and
   # the only rollout-forcing annotation hashes the CONFIG), so `helm upgrade`
   # rolls nothing, and the `version=` field on the startup log line is the only
-  # place the running build is stated at all. A released version, or a
-  # `@sha256:...` digest, is what makes the deployed binary a fact.
+  # place the running build is stated at all. A released version, or a digest
+  # (`digest` below), is what makes the deployed binary a fact.
   tag: ""
+  # A `sha256:<64 hex>` digest. Renders `repository@digest` (or
+  # `repository:tag@digest` beside a tag — the digest is what is pulled), and
+  # makes the default pull policy IfNotPresent, since a digest cannot move. A
+  # `tag` starting with `@sha256:` or `sha256:` is read as a digest too; setting
+  # both is refused.
+  digest: ""
   # Empty follows Kubernetes' own rule rather than overriding it: `Always` while
   # the resolved tag is `latest`, `IfNotPresent` once it is pinned. With a
   # floating tag IfNotPresent is the trap — every node that already cached
@@ -21,12 +27,14 @@ image:
 
 # Grace period for ALL THREE workloads — the agent DaemonSet, the events/Azure
 # singleton AND the service-graph StatefulSet. It has to cover the bounded
-# shutdown sequence: producers stop, the final log-metrics, span-metrics and
-# self-metrics exports run, then the disk buffer drains. Lowering it to speed up
-# node drains truncates the trace tier too, where the shutdown flush is the only
-# thing that saves the in-memory pairing store and the tail-sampling buffer's
-# undecided spans — those have no sender still holding them and are simply lost
-# to a SIGKILL.
+# shutdown sequence: producers stop, then each workload's final exports run
+# (log-metrics and self-metrics everywhere, cgroup-stats on the DaemonSet,
+# span-metrics and the service graph on the trace tier), then, where a
+# -buffer-dir is set, the disk buffer drains. Lowering it to speed up node
+# drains truncates the trace tier too, where the shutdown flush is the only
+# thing that emits the pairing store's due half-edges and decides the
+# tail-sampling buffer's undecided spans — those have no sender still holding
+# them and are simply lost to a SIGKILL.
 terminationGracePeriodSeconds: 60
 
 # Prometheus /metrics endpoint on a DEDICATED port, serving this process's Go
@@ -72,6 +80,26 @@ logLevel: info
 # `privileged`. The other three can and now do.)
 seccompProfile:
   type: RuntimeDefault
+
+# A ResourceQuota in the release namespace covering the `system-*` priority
+# classes the rendered workloads use (service.priorityClassName,
+# agent.priorityClassName, and events/serviceGraph's when those are enabled).
+#
+# Some clusters — GKE among them — configure the ResourceQuota admission plugin
+# to refuse pods of `system-node-critical` / `system-cluster-critical` OUTSIDE
+# kube-system unless a quota in the pod's namespace covers that class. Without
+# one, a default install creates ZERO agent and ZERO metadata-service pods, and
+# the only symptom is a FailedCreate event on the controllers ("insufficient
+# quota to match these scopes"). The quota bounds only `pods`, and far above
+# any fleet, so it restricts nothing on a cluster that does not have that
+# policy. Set `enabled: false` if your namespace already carries such a quota,
+# or set every priorityClassName to "" (which renders no quota at all).
+priorityClassQuota:
+  enabled: true
+  # Pods of the covered classes allowed in this namespace: one agent per node
+  # plus rolling-update surge, the metadata service, the singletons. Sized
+  # above the largest supported cluster; raise it only if you run far more.
+  pods: "100000"
 
 # The metadata service (Deployment).
 service:
@@ -162,10 +190,12 @@ service:
   # when nobody will remember this paragraph.
   #
   # Rotation needs NO restart, of the service or of the agents: updating the
-  # Secret is sufficient. The service re-reads the file about once a minute and
-  # keeps accepting the PREVIOUS token for a 5-minute grace window, and the
-  # agents re-read their copy on the same cadence — so neither side has to flip
-  # in lockstep with the other.
+  # Secret is sufficient. The service re-reads its accept set about once a
+  # SECOND (a failed read that persists backs off to a minute), so an agent
+  # that picked the new token up first costs at most one retryable 401; each
+  # agent re-reads the token it PRESENTS about once a minute, and the service
+  # keeps accepting the PREVIOUS token for a 5-minute grace window to cover
+  # that lag — so neither side has to flip in lockstep with the other.
   scrapeAuthToken:
     existingSecret: ""   # use a Secret you manage instead of the generated one
     key: token           # key within the Secret (mounted at /etc/kubescrape/scrape-auth/<key>)
@@ -251,9 +281,10 @@ agent:
     # no configuration; set this only when something must read an agent
     # REMOTELY — a central debug UI, a support script, a proxy.
     #
-    # The token is re-read about once a minute, and the previous value stays
-    # accepted for a grace window, exactly like service.scrapeAuthToken — so
-    # rotating the Secret needs no restart of anything.
+    # The token is re-read about once a second (a failed read that persists
+    # backs off to a minute), and the previous value stays accepted for a
+    # 5-minute grace window, exactly like service.scrapeAuthToken — so rotating
+    # the Secret needs no restart of anything.
     #
     #   kubectl -n <ns> create secret generic kubescrape-debug \
     #     --from-literal=token="$(openssl rand -hex 24)"
@@ -319,16 +350,18 @@ agent:
   #     imagefs, which containerfs — and the eviction thresholds are written
   #     per role, not per device. The cadvisor rows also disappear under
   #     agent.cadvisorRollups=false;
-  #   * k8s.pod.process.count is the kubelet's sum of its containers' cadvisor
-  #     process counts — the numbers container_processes already carries,
-  #     pre-summed, and the per-container rows survive cadvisorRollups=false;
-  #   * k8s.container.ephemeral_storage.usage{fs.type=rootfs} covers the same
-  #     ground as container_fs_usage_bytes, computed separately by the kubelet
-  #     and per rootfs rather than per device, so the two can disagree;
   #   * on a PVC-BACKED volume the six k8s.volume.* restate the six
   #     kubelet_volume_stats_* that agent.nodeMetrics already collects from
   #     /metrics — those carry namespace and persistentvolumeclaim labels and no
   #     pod, which is the attribution this adds.
+  # WHAT LOOKS LIKE A RESTATEMENT AND IS NOT (measured on a live node):
+  #   * k8s.pod.process.count is the kubelet's own per-pod figure, NOT a
+  #     pre-summed container_processes — one pod read 0 on its pod-cgroup row,
+  #     1 on its sandbox row and its own count on the app container — and it
+  #     survives cadvisorRollups=false;
+  #   * k8s.container.ephemeral_storage.usage{fs.type=rootfs} has no cadvisor
+  #     counterpart on a modern node: container_fs_usage_bytes is emitted only
+  #     for id="/", keyed by device, with no per-container rows.
   # CPU, memory, network and swap are deliberately not collected here at all —
   # /metrics/cadvisor already reports them, on the same resources.
   #
@@ -384,6 +417,16 @@ agent:
   #     which is exactly why the volatile case works without it and the
   #     persistent case silently does not. Promtail, Alloy and fluent-bit all
   #     require the same mount.
+  #
+  # The machine-id mount is hostPath type File, deliberately (see the
+  # template), which makes /etc/machine-id a requirement on EVERY node the
+  # DaemonSet schedules on: a node without one keeps its WHOLE agent (logs,
+  # metrics, cadvisor, not just the journal) in ContainerCreating with a
+  # FailedMount event, and the rollout stalls there. Every systemd node has
+  # one; a non-systemd node (an OpenRC/Alpine edge node) has no journal to read
+  # either, so give it a machine id
+  # (`tr -d - < /proc/sys/kernel/random/uuid > /etc/machine-id`) or leave
+  # journald off for the fleet.
   #
   # dir "" reads BOTH, which is what you
   # want; setting dir restricts the reader to that ONE directory, and a
@@ -472,17 +515,26 @@ agent:
     # each cgroup that has not resolved yet, and each pod contributes one that
     # never will (its sandbox). Below 5s the agent warns; below 1s it refuses.
     discoverInterval: 15s
-    # cgroup v2 mount point INSIDE the agent container; empty means
-    # /sys/fs/cgroup. Only the MOUNT POINT — the layout beneath it is
-    # discovered, so kind's kubelet.slice nesting, a stock systemd node's
-    # kubepods.slice and a cgroupfs-driver node's kubepods all work unset.
+    # Where the node's cgroup v2 hierarchy is mounted INSIDE the agent
+    # container; empty means /host/sys/fs/cgroup. Only the MOUNT POINT — the
+    # layout beneath it is discovered, so kind's kubelet.slice nesting, a stock
+    # systemd node's kubepods.slice and a cgroupfs-driver node's kubepods all
+    # work unset.
     #
-    # This drives the mount as well as the flag, so setting it to e.g.
-    # /host/sys/fs/cgroup relocates both together. (It used to render only the
-    # flag, against a mount fixed at /sys/fs/cgroup, so every value except the
-    # default CrashLooped the DaemonSet.) The host side is always the node's
-    # /sys/fs/cgroup; mounting some other host path is what extraVolumes and
-    # extraVolumeMounts are for.
+    # This drives the mount AND the -cgroup-stats-root flag (always rendered),
+    # so both move together. (It used to render only the flag, against a mount
+    # fixed at /sys/fs/cgroup, so every value except the default CrashLooped
+    # the DaemonSet.) The host side is always the node's /sys/fs/cgroup;
+    # mounting some other host path is what extraVolumes and extraVolumeMounts
+    # are for.
+    #
+    # Do NOT set it to /sys/fs/cgroup. The container has its own cgroup
+    # namespace, and its own /sys/fs/cgroup is where the agent reads its OWN
+    # memory limit to set the Go soft memory limit (GOMEMLIMIT); the node's
+    # hierarchy mounted over it hides that limit, so the agent runs without the
+    # OOM insurance (it logs a Warn saying so). A cgroup v1 node still merely
+    # disables this pipeline at an explicit root — the version is the node's
+    # property, not a typo — while a root with nothing mounted is fatal.
     root: ""
 
   # Receive OTLP LOGS AND METRICS pushed by apps on the node and enrich them
@@ -498,38 +550,74 @@ agent:
     enabled: false
     grpcEndpoint: ":4317"       # empty disables gRPC
     httpEndpoint: ":4318"       # empty disables HTTP (/v1/logs, /v1/metrics)
-    # HOW AN APPLICATION ADDRESSES THIS. With hostPort off, the listeners are
-    # reachable at the agent's pod IP and nothing else — the DaemonSet sets no
-    # hostNetwork and the chart renders no Service for it — so there is no
-    # stable address to put in OTEL_EXPORTER_OTLP_ENDPOINT.
+    # HOW AN APPLICATION ADDRESSES THIS. With service.enabled and hostPort both
+    # off, the listeners are reachable at the agent's pod IP and nothing else —
+    # the DaemonSet sets no hostNetwork — so there is no stable address to put
+    # in OTEL_EXPORTER_OTLP_ENDPOINT. In order of preference:
     #
-    # Do NOT reach for a ClusterIP Service over the DaemonSet: it round-robins
-    # a push to some other node's agent, which silently defeats
-    # `peerIpFallback` (the connection's source address no longer names a pod
-    # that agent's node hosts) and invalidates the node-local reasoning behind
-    # `-ingest-max-in-flight`. The trace tier is the opposite case and does
-    # ship a Service — traces MUST leave the node.
+    # 1. service.enabled: true renders a Service, <release>-agent-ingest, with
+    #    internalTrafficPolicy: Local — kube-proxy sends a connection only to
+    #    an agent on the SENDER's node:
     #
-    # true binds grpcEndpoint's and httpEndpoint's ports on the NODE, and an
-    # SDK then addresses its own node through the downward API:
+    #      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    #        value: "http://kubescrape-agent-ingest.monitoring:4318"
     #
-    #   env:
-    #     - name: NODE_IP
-    #       valueFrom: {fieldRef: {fieldPath: status.hostIP}}
-    #     - name: OTEL_EXPORTER_OTLP_ENDPOINT
-    #       value: "http://$(NODE_IP):4318"
+    #    It has a DNS name, keeps the push on the node, claims no host port,
+    #    stays under `allowFrom` below (the traffic arrives at the agent's pod
+    #    IP), and keeps the sender's source address — kube-proxy does not, by
+    #    default, masquerade pod-to-Service traffic — so `peerIpFallback` still
+    #    works. With no ready agent on the node (starting, mid-rollout) the push
+    #    fails instead of leaving the node; the SDK's retry covers the gap.
     #
-    # It is off by default because a hostPort claims that port on EVERY node —
-    # 4317/4318 are the OTLP defaults, so a collector DaemonSet or another
-    # agent already holding them makes these pods unschedulable — and because
-    # it widens the listeners' reach from the pod network to the node's own
-    # addresses, which `allowFrom` below does not cover (a NetworkPolicy does
-    # not filter traffic arriving on a hostPort). Set it deliberately.
+    # 2. hostPort: true (below) binds grpcEndpoint's and httpEndpoint's ports on
+    #    the NODE, for a sender that cannot use cluster DNS:
+    #
+    #      env:
+    #        - name: NODE_IP
+    #          valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+    #        - name: POD_UID
+    #          valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+    #        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    #          value: "http://$(NODE_IP):4318"
+    #        - name: OTEL_RESOURCE_ATTRIBUTES
+    #          value: "k8s.pod.uid=$(POD_UID)"
+    #
+    #    The POD_UID half is not optional in practice: on a CNI that implements
+    #    hostPort with the portmap plugin (kind's does), the hop MASQUERADES a
+    #    same-node sender, so the agent sees the node's address and
+    #    `peerIpFallback` resolves nothing — the pod uid the sender carries is
+    #    what the enricher resolves instead, through any NAT. (Setting it is
+    #    worth doing on every path; it is simply required on this one.)
+    #
+    #    It is off by default because a hostPort claims that port on EVERY
+    #    node — 4317/4318 are the OTLP defaults, so a collector DaemonSet or
+    #    another agent already holding them makes these pods unschedulable —
+    #    and because it widens the listeners' reach from the pod network to the
+    #    node's own addresses, which `allowFrom` below does not cover (a
+    #    NetworkPolicy does not filter traffic arriving on a hostPort). Set it
+    #    deliberately.
+    #
+    # NOT a plain ClusterIP Service over the DaemonSet: it round-robins a push
+    # to some other node's agent, which breaks node locality and the
+    # node-local reasoning behind `-ingest-max-in-flight`. (It does not defeat
+    # `peerIpFallback` — the pod-IP lookup is cluster-wide — but nothing is
+    # gained over option 1.) The trace tier is the opposite case and does ship
+    # a round-robin Service — traces MUST leave the node.
+    service:
+      enabled: false
     hostPort: false
     metricsMode: auto           # resource | datapoint | auto
     # Attribute telemetry with no container id / pod uid to the pod owning the
-    # connection's source address (opt-in; hostNetwork senders never resolve).
+    # connection's source address (opt-in; hostNetwork senders never resolve,
+    # and neither does a sender whose address a hop rewrote — see hostPort
+    # above).
     peerIpFallback: false
+    # The resource keys the enricher resolves a sender BY. Also applied to the
+    # trace tier's application ports (serviceGraph.ingest has no copy of its
+    # own, and they apply there even with agent.ingest disabled) — and on both
+    # they decide which keys the receipt-time identity strip exempts: a lookup
+    # key is never stripped, because stripping what the attribution is made of
+    # would leave nothing to resolve.
     containerIdKeys: []         # default: [container.id, k8s.container.id]
     podUidKeys: []              # default: [k8s.pod.uid]
     # Cap on one decoded OTLP/gRPC message, in bytes (0 = gRPC's own 4 MiB
@@ -773,6 +861,9 @@ events:
   enabled: false
   replicas: 1
   # Watch one namespace instead of the whole cluster (empty = cluster-wide).
+  # The READ grant follows it: set, the chart renders a Role + RoleBinding in
+  # THAT namespace instead of the cluster-wide events ClusterRole, so the
+  # singleton can read only the events it asks for.
   namespace: ""
   # Where a cold start begins: end (skip the backlog), start (replay
   # everything still within the API server's event TTL), auto (resume the
@@ -791,6 +882,13 @@ events:
   nodeSelector: {}
   tolerations: []
   extraArgs: []
+  # Extra volumes/mounts on the events/Azure pod, verbatim, as on the agent —
+  # e.g. the -transforms-file ConfigMap, passed through extraArgs above (see
+  # agent.extraArgs for the directory-mount recipe). This replica runs the
+  # agent's processing chain, transforms included, and a -transforms-file
+  # nothing mounts fails its startup.
+  extraVolumes: []
+  extraVolumeMounts: []
   resources:
     requests:
       cpu: 20m
@@ -848,21 +946,27 @@ serviceGraph:
     name: ""
     key: token
   # The APPLICATION-facing OTLP trace listeners, fronted by a ClusterIP Service
-  # named <release>-traces.
+  # named <release>-traces. Three of their settings are NOT here but under
+  # agent.ingest, and apply even with agent.ingest disabled: containerIdKeys /
+  # podUidKeys (what the tier resolves a sender by, and so which keys its
+  # identity strip exempts) and grpcMaxRecvBytes.
   ingest:
     enabled: true
     grpcEndpoint: ":4317"       # empty disables gRPC
     httpEndpoint: ":4318"       # empty disables HTTP (/v1/traces)
-    # Attribute a push whose resource carries no container.id / k8s.pod.uid to
-    # the pod owning the connection's SOURCE address. Opt-in, and worth
-    # understanding before enabling it here: it is only correct while that
-    # address still names the sender. A ClusterIP normally preserves it, but a
-    # service mesh that terminates the connection, an ingress, or any NAT hop
-    # replaces it. A source address belonging to THIS tier's own pods is refused
-    # and counted (kubescrape_ingest_resources_total{outcome="peer_ip_rejected"})
+    # Attribute a push whose resource carries none of the lookup keys
+    # (agent.ingest.containerIdKeys / podUidKeys — by default container.id,
+    # k8s.container.id / k8s.pod.uid) to the pod owning the connection's SOURCE
+    # address. Opt-in, and worth understanding before enabling it here: it is
+    # only correct while that address still names the sender. A ClusterIP
+    # normally preserves it, but a service mesh that terminates the connection,
+    # an ingress, or any NAT hop replaces it. A source address belonging to
+    # THIS tier's own pods is refused and counted
+    # (kubescrape_ingest_resources_total{outcome="peer_ip_rejected"})
     # rather than attributed — an application's traces must never be labelled
     # with a kubescrape pod. The dependable alternative is for senders to set a
-    # resource-level container.id (every SDK's container detector does).
+    # resource-level container.id (every SDK's container detector does) or
+    # k8s.pod.uid (downward API: the recipe under agent.ingest.hostPort).
     peerIpFallback: false
     # NetworkPolicy `from` selectors for the trace ports, and for those ONLY.
     # EMPTY MEANS ANY POD IN THE CLUSTER MAY PUSH TRACES, with no credential —
@@ -947,8 +1051,16 @@ serviceGraph:
   # The tier's root filesystem is read-only and this template creates no
   # writable volume, so -buffer-dir (which is what makes a TAIL-SAMPLING
   # decision durable across a collector outage — see tailSampling above) needs
-  # one mounted here. A PVC or an emptyDir both work; an emptyDir survives a
-  # container restart and the outage itself, not a reschedule:
+  # one mounted here. Use an emptyDir: it survives a container restart and the
+  # outage itself, not a reschedule. A PVC through extraVolumes does NOT work
+  # with this chart: the StatefulSet has no volumeClaimTemplates, so a claim
+  # named here is ONE claim shared by every shard (replicas defaults to 2).
+  # A ReadWriteOnce volume then fails to attach to a shard on a second node
+  # (Multi-Attach), and wherever shards CAN share it (one node, or
+  # ReadWriteMany) they contend for the SAME buffer directory, whose lock
+  # refuses the second at startup, which is fatal. The pod also sets no fsGroup, so a freshly provisioned root-owned
+  # volume is not writable by the tier's UID 65532 in the first place. An
+  # emptyDir is per pod and created world-writable, so it has neither problem.
   #   extraVolumes:
   #     - name: buffer
   #       emptyDir: {sizeLimit: 2Gi}
@@ -1067,7 +1179,10 @@ azure:
 #
 # WHAT TO TIGHTEN FIRST, in order: agent.ingest.allowFrom and
 # serviceGraph.ingest.allowFrom (unauthenticated writers — a stranger pushing
-# telemetry costs you storage and pollutes your data), then agent.debug.allowFrom
+# telemetry costs you storage and pollutes your data, and where `routing`
+# separates tenants a pod presenting another pod's container.id is delivered
+# AS that pod, to its tenant: docs/CONFIGURATION.md "Accepted security
+# residuals" #1), then agent.debug.allowFrom
 # (a reader, and one already gated in-process), then the metadata API if your
 # threat model needs it restricted to the agents — add a `from` selector to the
 # service policy in templates/service.yaml for that one; it has no value yet

@@ -52,6 +52,10 @@ agent:
   # against a mountPath hardcoded to /sys/fs/cgroup), so the shipped chart
   # CrashLooped on it and this fixture froze the contradiction into a golden
   # file. The golden now has the mount and the flag naming the same path.
+  # (/host/sys/fs/cgroup has since become the DEFAULT as well — mounting the
+  # node's hierarchy over the container's own /sys/fs/cgroup hid the agent's
+  # memory limit — so non-default roots are covered by
+  # TestCgroupStatsRootDrivesItsMount rather than here.)
   cgroupStats:
     enabled: true
     interval: 500ms

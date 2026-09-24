@@ -100,7 +100,7 @@ func (c *capture) sends() int {
 
 func traceID(n uint64) pcommon.TraceID {
 	var id pcommon.TraceID
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		id[15-i] = byte(n >> (8 * i))
 	}
 	return id
@@ -108,7 +108,7 @@ func traceID(n uint64) pcommon.TraceID {
 
 func spanID(n uint64) pcommon.SpanID {
 	var id pcommon.SpanID
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		id[7-i] = byte(n >> (8 * i))
 	}
 	return id
@@ -255,7 +255,7 @@ func TestUnsampledTraceIsDroppedWhole(t *testing.T) {
 	ctx := context.Background()
 
 	before := counter(obs.TailSampleSpans.WithLabelValues("dropped"))
-	dropped := counter(obs.TailSampleTraces.WithLabelValues("drop", "none"))
+	dropped := counter(obs.TailSampleTraces.WithLabelValues("drop", tailsample.NoPolicyLabel))
 
 	if err := b.ExportTraces(ctx, payload("checkout",
 		spanSpec{trace: 11, span: 1, end: 5}, spanSpec{trace: 11, span: 2, end: 5})); err != nil {
@@ -270,8 +270,8 @@ func TestUnsampledTraceIsDroppedWhole(t *testing.T) {
 	if got := counter(obs.TailSampleSpans.WithLabelValues("dropped")) - before; got != 2 {
 		t.Fatalf("dropped spans counted %v, want 2", got)
 	}
-	if got := counter(obs.TailSampleTraces.WithLabelValues("drop", "none")) - dropped; got != 1 {
-		t.Fatalf("drop{policy=none} counted %v, want 1 (no policy had an opinion)", got)
+	if got := counter(obs.TailSampleTraces.WithLabelValues("drop", tailsample.NoPolicyLabel)) - dropped; got != 1 {
+		t.Fatalf("drop{policy=%s} counted %v, want 1 (no policy had an opinion)", tailsample.NoPolicyLabel, got)
 	}
 }
 
@@ -474,6 +474,60 @@ func TestDecisionCacheHandlesARedecidedTrace(t *testing.T) {
 	}
 }
 
+// Spans with the all-zero (OTLP-invalid) trace id name no trace. The resharder
+// keeps them local rather than hashing them, so they do reach this buffer — and
+// keyed by the zero id like any other, unrelated senders' id-less spans merged
+// into ONE pseudo-trace, were judged once, and the verdict was cached under the
+// zero id for decisionCacheTTL: every id-less span from any sender in that
+// window then followed a stranger's verdict. Each push's id-less spans are now
+// judged on arrival, on their own, and nothing about them is cached.
+func TestIdlessSpansAreJudgedPerPushAndNeverCached(t *testing.T) {
+	cap := &capture{}
+	b, clk := newTestBuffer(t, Config{Config: errorsCfg(), DecisionWait: "1s"}, cap)
+	ctx := context.Background()
+	lateDrop0 := counter(obs.TailSampleLate.WithLabelValues("dropped"))
+	dropped0 := counter(obs.TailSampleSpans.WithLabelValues("dropped"))
+
+	// Sender A: an id-less span that no policy keeps. Decided on arrival.
+	if err := b.ExportTraces(ctx, payload("a", spanSpec{trace: 0, span: 1, end: 5})); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.Stats(); got != (Stats{}) {
+		t.Fatalf("the buffer holds %+v: an id-less span was buffered, to be merged with any other sender's", got)
+	}
+	if got := counter(obs.TailSampleSpans.WithLabelValues("dropped")) - dropped0; got != 1 {
+		t.Fatalf("spans{dropped} counted %v, want 1", got)
+	}
+	clk.advance(10 * time.Second)
+	b.Sweep(ctx)
+
+	// Sender B, inside what would have been the cached verdict's lifetime: an
+	// id-less ERROR span. Judged on its own merits, it is kept.
+	if err := b.ExportTraces(ctx, payload("b", spanSpec{trace: 0, span: 2, end: 5, status: ptrace.StatusCodeError})); err != nil {
+		t.Fatal(err)
+	}
+	if got := cap.count(); got != 1 {
+		t.Fatalf("exported %d spans, want sender B's error span: it followed sender A's cached verdict", got)
+	}
+	if got := counter(obs.TailSampleLate.WithLabelValues("dropped")) - lateDrop0; got != 0 {
+		t.Fatalf("late{dropped} counted %v: an id-less span was treated as late for a trace it has nothing to do with", got)
+	}
+
+	// One push carrying an id-less span beside a real trace: the real one is
+	// buffered as usual, the id-less one is decided now.
+	if err := b.ExportTraces(ctx, payload("c",
+		spanSpec{trace: 0, span: 3, end: 5, status: ptrace.StatusCodeError},
+		spanSpec{trace: 130, span: 4, end: 5})); err != nil {
+		t.Fatal(err)
+	}
+	if got := cap.count(); got != 2 {
+		t.Fatalf("exported %d spans, want 2 (the id-less error span decided on arrival)", got)
+	}
+	if got := b.Stats(); got != (Stats{Traces: 1, Spans: 1}) {
+		t.Fatalf("the buffer holds %+v, want only trace 130", got)
+	}
+}
+
 // --- the memory bounds ------------------------------------------------------
 
 // maxSpansPerTrace: the trace is decided on what it has, and the rest of it
@@ -483,7 +537,7 @@ func TestMaxSpansPerTraceDecidesEarly(t *testing.T) {
 	b, _ := newTestBuffer(t, Config{Config: alwaysCfg(), DecisionWait: "1m", MaxSpansPerTrace: 3}, cap)
 	ctx := context.Background()
 
-	before := counter(obs.TailSampleEarly.WithLabelValues(reasonSpansPerTrace))
+	before := counter(obs.TailSampleEarly.WithLabelValues(reasonSpansPerTrace.String()))
 	specs := make([]spanSpec, 5)
 	for i := range specs {
 		specs[i] = spanSpec{trace: 31, span: uint64(i + 1), end: 5}
@@ -491,7 +545,7 @@ func TestMaxSpansPerTraceDecidesEarly(t *testing.T) {
 	if err := b.ExportTraces(ctx, payload("checkout", specs...)); err != nil {
 		t.Fatal(err)
 	}
-	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonSpansPerTrace)) - before; got != 1 {
+	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonSpansPerTrace.String())) - before; got != 1 {
 		t.Fatalf("early{spans_per_trace} counted %v, want 1", got)
 	}
 	if got, want := cap.count(), 5; got != want {
@@ -509,14 +563,14 @@ func TestMaxTracesDecidesTheOldestEarly(t *testing.T) {
 	b, clk := newTestBuffer(t, Config{Config: alwaysCfg(), DecisionWait: "1m", MaxTraces: 2}, cap)
 	ctx := context.Background()
 
-	before := counter(obs.TailSampleEarly.WithLabelValues(reasonMaxTraces))
+	before := counter(obs.TailSampleEarly.WithLabelValues(reasonMaxTraces.String()))
 	for i := uint64(1); i <= 3; i++ {
 		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 40 + i, span: i, end: 5})); err != nil {
 			t.Fatal(err)
 		}
 		clk.advance(time.Millisecond)
 	}
-	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonMaxTraces)) - before; got != 1 {
+	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonMaxTraces.String())) - before; got != 1 {
 		t.Fatalf("early{max_traces} counted %v, want 1", got)
 	}
 	if got := b.Stats().Traces; got != 2 {
@@ -534,7 +588,7 @@ func TestMaxSpansDecidesOldestUntilUnderTheCeiling(t *testing.T) {
 	b, clk := newTestBuffer(t, Config{Config: alwaysCfg(), DecisionWait: "1m", MaxSpans: 6, MaxSpansPerTrace: 6}, cap)
 	ctx := context.Background()
 
-	before := counter(obs.TailSampleEarly.WithLabelValues(reasonMaxSpans))
+	before := counter(obs.TailSampleEarly.WithLabelValues(reasonMaxSpans.String()))
 	// Three traces of three spans each: 9 spans against a ceiling of 6.
 	for tr := uint64(1); tr <= 3; tr++ {
 		specs := make([]spanSpec, 3)
@@ -546,7 +600,7 @@ func TestMaxSpansDecidesOldestUntilUnderTheCeiling(t *testing.T) {
 		}
 		clk.advance(time.Millisecond)
 	}
-	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonMaxSpans)) - before; got != 1 {
+	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonMaxSpans.String())) - before; got != 1 {
 		t.Fatalf("early{max_spans} counted %v, want 1", got)
 	}
 	if got := b.Stats().Spans; got > 6 {
@@ -555,6 +609,68 @@ func TestMaxSpansDecidesOldestUntilUnderTheCeiling(t *testing.T) {
 	if got := cap.traces(); got[traceID(51)] != 3 {
 		t.Fatalf("exported %v, want the oldest trace's 3 spans", got)
 	}
+}
+
+// A bound that catches a trace whose window has ALREADY closed — it was only
+// waiting for the next sweep tick — is not an early decision: that trace was
+// judged on its full window. Counting it inflated
+// kubescrape_tail_sampling_early_decisions_total and the "slow traces can be
+// missed" warning in exactly the band where maxSpans sits between R*decisionWait
+// and R*(decisionWait+tick), and during a chunked drain's backlog.
+func TestABoundCatchingADueTraceIsNotAnEarlyDecision(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("max_traces", func(t *testing.T) {
+		cap := &capture{}
+		b, clk := newTestBuffer(t, Config{Config: alwaysCfg(), DecisionWait: "1s", MaxTraces: 2}, cap)
+		early0 := counter(obs.TailSampleEarly.WithLabelValues(reasonMaxTraces.String()))
+		for i := uint64(1); i <= 2; i++ {
+			if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 110 + i, span: i, end: 5})); err != nil {
+				t.Fatal(err)
+			}
+		}
+		clk.advance(1500 * time.Millisecond) // both due; no sweep has run yet
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 113, span: 3, end: 5})); err != nil {
+			t.Fatal(err)
+		}
+		if got := cap.traces(); got[traceID(111)] != 1 {
+			t.Fatalf("exported %v, want the oldest trace decided by the bound", got)
+		}
+		if got := counter(obs.TailSampleEarly.WithLabelValues(reasonMaxTraces.String())) - early0; got != 0 {
+			t.Fatalf("early{max_traces} counted %v for a trace judged AFTER its window closed, want 0", got)
+		}
+
+		// The control: the same bound on a trace still inside its window IS early.
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 114, span: 4, end: 5})); err != nil {
+			t.Fatal(err)
+		}
+		// 112 is due too; 113 is not, and it is next once 112 goes.
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 115, span: 5, end: 5})); err != nil {
+			t.Fatal(err)
+		}
+		if got := counter(obs.TailSampleEarly.WithLabelValues(reasonMaxTraces.String())) - early0; got != 1 {
+			t.Fatalf("early{max_traces} counted %v, want exactly 1 (trace 113, decided inside its window)", got)
+		}
+	})
+
+	t.Run("spans_per_trace", func(t *testing.T) {
+		cap := &capture{}
+		b, clk := newTestBuffer(t, Config{Config: alwaysCfg(), DecisionWait: "1s", MaxSpansPerTrace: 2}, cap)
+		early0 := counter(obs.TailSampleEarly.WithLabelValues(reasonSpansPerTrace.String()))
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 120, span: 1, end: 5})); err != nil {
+			t.Fatal(err)
+		}
+		clk.advance(1500 * time.Millisecond)
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 120, span: 2, end: 5})); err != nil {
+			t.Fatal(err)
+		}
+		if got := cap.traces(); got[traceID(120)] != 2 {
+			t.Fatalf("exported %v, want trace 120's two spans", got)
+		}
+		if got := counter(obs.TailSampleEarly.WithLabelValues(reasonSpansPerTrace.String())) - early0; got != 0 {
+			t.Fatalf("early{spans_per_trace} counted %v for a trace judged AFTER its window closed, want 0", got)
+		}
+	})
 }
 
 // The ceiling holds even when a single push is larger than the whole buffer:
@@ -589,7 +705,7 @@ func TestFlushDecidesEveryBufferedTrace(t *testing.T) {
 	b, _ := newTestBuffer(t, Config{Config: alwaysCfg(), DecisionWait: "1m"}, cap)
 	ctx := context.Background()
 
-	before := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown))
+	before := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown.String()))
 	for i := uint64(1); i <= 4; i++ {
 		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 70 + i, span: i, end: 5})); err != nil {
 			t.Fatal(err)
@@ -605,7 +721,7 @@ func TestFlushDecidesEveryBufferedTrace(t *testing.T) {
 	if got := b.Stats(); got != (Stats{}) {
 		t.Fatalf("the buffer still holds %+v after the flush", got)
 	}
-	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown)) - before; got != 4 {
+	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown.String())) - before; got != 4 {
 		t.Fatalf("early{shutdown} counted %v, want 4", got)
 	}
 }
@@ -685,7 +801,7 @@ func TestNestsWithTheHeadSampler(t *testing.T) {
 	ctx := context.Background()
 
 	specs := make([]spanSpec, 0, n)
-	for i := uint64(0); i < n; i++ {
+	for i := range uint64(n) {
 		specs = append(specs, spanSpec{trace: i, span: i, end: 5})
 	}
 	if err := head.ExportTraces(ctx, payload("checkout", specs...)); err != nil {
@@ -713,11 +829,11 @@ func TestConcurrentReceive(t *testing.T) {
 	ctx := context.Background()
 
 	var wg sync.WaitGroup
-	for g := 0; g < goroutines; g++ {
+	for g := range goroutines {
 		wg.Add(1)
 		go func(g int) {
 			defer wg.Done()
-			for i := 0; i < per; i++ {
+			for i := range per {
 				id := uint64(g*per + i)
 				// Two traces: one shared by every goroutine, one per span, so the
 				// test exercises both the contended entry and map growth.
@@ -891,8 +1007,7 @@ func TestTickFollowsTheWindow(t *testing.T) {
 func TestRunDecidesOnItsTicker(t *testing.T) {
 	cap := &capture{}
 	b, clk := newTestBuffer(t, Config{Config: alwaysCfg(), DecisionWait: "100ms"}, cap)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 91, span: 1, end: 5})); err != nil {
 		t.Fatal(err)
@@ -927,7 +1042,7 @@ func TestSweepDoesNotStallReceive(t *testing.T) {
 	if runtime.GOMAXPROCS(0) < 2 {
 		t.Skip("needs a second core: the measurement is a concurrent push against a running sweep")
 	}
-	const due = 8192 // 16 chunks
+	const due = 8192 // 64 chunks of decideChunk
 	// Stand in for a Starlark policy body: a decision that costs real time.
 	slow := func(tailsample.Trace) (bool, bool) {
 		t0 := time.Now()
@@ -997,4 +1112,231 @@ func TestSweepDoesNotStallReceive(t *testing.T) {
 	if stall > sweep/2 && stall > 2*time.Millisecond {
 		t.Errorf("a concurrent push blocked for %v during a %v sweep: the drain is holding the buffer mutex across its whole decision batch", stall, sweep)
 	}
+}
+
+// Between chunks the sweep must actually HAND the mutex to a waiting push, not
+// just release it. sync.Mutex in normal mode lets the unlocking goroutine
+// re-acquire ahead of the waiter it woke, so an Unlock immediately followed by
+// a Lock gave the next chunk straight back to the sweep, and a push got in only
+// once it had waited past the mutex's 1ms starvation threshold — or, on one
+// core, not before the scheduler's 10ms preemption. GOMAXPROCS=1 makes that
+// deterministic: with the yield the push lands at the FIRST chunk boundary;
+// without it, many chunks later (TestSweepDoesNotStallReceive's relative
+// threshold cannot see the difference).
+func TestSweepHandsTheMutexToAWaitingPushBetweenChunks(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	const due = 16 * decideChunk
+	var decided atomic.Int64
+	first := make(chan struct{})
+	var once sync.Once
+	slow := func(tailsample.Trace) (bool, bool) {
+		once.Do(func() { close(first) })
+		decided.Add(1)
+		t0 := time.Now()
+		for time.Since(t0) < 20*time.Microsecond { // stand in for a Starlark policy
+		}
+		return false, false // drop: the sweep's cost is the decisions alone
+	}
+	b, clk := newTestBuffer(t, Config{
+		Config: tailsample.Config{
+			Policies: []tailsample.PolicyConfig{{Name: "slow", Type: tailsample.TypeScript}},
+			Script:   slow,
+		},
+		DecisionWait: "1m",
+		MaxTraces:    due + 2,
+	}, &capture{})
+	ctx := context.Background()
+	for i := uint64(1); i <= due; i++ {
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: i, span: 1, end: 5})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clk.advance(2 * time.Minute) // every buffered trace is due
+
+	var atPush atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-first // the sweep is deciding, holding the mutex
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 1_000_000, span: 1, end: 5})); err != nil {
+			t.Error(err)
+		}
+		atPush.Store(decided.Load())
+	}()
+	b.Sweep(ctx)
+	<-done
+
+	if got := atPush.Load(); got > 2*decideChunk {
+		t.Fatalf("the concurrent push got the mutex only after %d of %d decisions (chunks of %d): the sweep re-took the lock at every chunk boundary instead of handing it over", got, due, decideChunk)
+	}
+}
+
+// --- the arrival FIFO's memory -----------------------------------------------
+
+// The arrival FIFO is a slice behind a bounded map: remove() leaves a decided
+// trace's slot in place to be skipped at the front, and compact() is the only
+// thing that ever gives those slots back. A shard runs for months, so without it
+// `order` grows by one slot per trace ever buffered while the live set stays at
+// one.
+func TestArrivalFIFOStaysBounded(t *testing.T) {
+	b, clk := newTestBuffer(t, Config{Config: errorsCfg(), DecisionWait: "5s"}, &capture{})
+	ctx := context.Background()
+	for i := uint64(1); i <= 10_000; i++ {
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: i, span: 1, end: 5})); err != nil {
+			t.Fatal(err)
+		}
+		clk.advance(6 * time.Second)
+		b.Sweep(ctx)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	live := len(b.trace)
+	if len(b.order)-b.head > live || len(b.order) > 2*live+1 {
+		t.Fatalf("arrival FIFO holds %d slots (head %d) for %d live traces after 10000 decided ones: the consumed prefix is never compacted", len(b.order), b.head, live)
+	}
+}
+
+// A DROPPED trace's payload must be released when it is decided, not when its
+// FIFO slot is finally compacted away: until then the slot still points at the
+// entry, and dropping is the NORMAL verdict of a tail sampler, so a retained
+// payload per slot was up to ~2x the live heap maxSpans promises.
+//
+// The setup keeps the decided slots in the FIFO on purpose: 4 due traces
+// behind 21 that are not, so the head (4) stays below half the slice and
+// compact() does not run — otherwise every gone slot is cleared and there is
+// nothing left to inspect.
+func TestDroppedTraceReleasesItsPayload(t *testing.T) {
+	b, clk := newTestBuffer(t, Config{Config: errorsCfg(), DecisionWait: "5s"}, &capture{})
+	ctx := context.Background()
+	push := func(from, to uint64) {
+		t.Helper()
+		for i := from; i <= to; i++ {
+			if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: i, span: 1, end: 5})); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	push(1, 4)
+	clk.advance(3 * time.Second)
+	push(5, 25)
+	clk.advance(3 * time.Second) // 1-4 are 6s old and due; 5-25 are 3s old
+	b.Sweep(ctx)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	gone := 0
+	for _, e := range b.order {
+		if e == nil || !e.gone {
+			continue
+		}
+		gone++
+		if e.td != (ptrace.Traces{}) && e.td.SpanCount() != 0 {
+			t.Errorf("decided-drop trace %s still pins %d spans from its FIFO slot", e.id, e.td.SpanCount())
+		}
+	}
+	if gone == 0 {
+		t.Fatal("no decided slot left in the FIFO to inspect: the setup no longer exercises the release")
+	}
+}
+
+// Every early-decision reason must have a metric label and a counter: the
+// per-reason tables are arrays indexed by the reason, so a reason added to the
+// const block without an entry here would count into an empty label. The
+// line's half is TestEveryEarlyReasonIsReportedOnTheLine.
+func TestEveryEarlyReasonHasALabelAndACounter(t *testing.T) {
+	b, _ := newTestBuffer(t, Config{Config: alwaysCfg()}, &capture{})
+	seen := map[string]earlyReason{}
+	for r := reasonNone + 1; r < numEarlyReasons; r++ {
+		label := r.String()
+		if label == "" {
+			t.Errorf("early reason %d has no metric label", r)
+		}
+		if prev, dup := seen[label]; dup {
+			t.Errorf("early reasons %d and %d share the label %q", prev, r, label)
+		}
+		seen[label] = r
+		if b.earlyCount[r] == nil {
+			t.Errorf("early reason %q has no counter resolved at New", label)
+		}
+	}
+}
+
+// The chunked sweep drops and re-takes the mutex between chunks, and a push
+// landing in a gap may buffer a trace AND force the oldest out early (maxTraces
+// is set just above the due set here) — which removes, and may compact, the very
+// FIFO the sweep is walking. Whatever interleaving the scheduler picks, every
+// due trace must be decided by the sweep itself, and every span must leave
+// exactly once.
+func TestChunkedSweepDecidesEveryTraceExactlyOnce(t *testing.T) {
+	const due = 16 * decideChunk
+	slow := func(tailsample.Trace) (bool, bool) {
+		t0 := time.Now()
+		for time.Since(t0) < 20*time.Microsecond { // stand in for a Starlark policy
+		}
+		return true, false
+	}
+	cap := &capture{}
+	b, clk := newTestBuffer(t, Config{
+		Config: tailsample.Config{
+			Policies: []tailsample.PolicyConfig{{Name: "slow", Type: tailsample.TypeScript}},
+			Script:   slow,
+		},
+		DecisionWait: "1m",
+		MaxTraces:    due + 5,
+	}, cap)
+	ctx := context.Background()
+	for i := uint64(1); i <= due; i++ {
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: i, span: 1, end: 5})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clk.advance(2 * time.Minute) // every buffered trace is due
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var pushes atomic.Int64
+	go func() {
+		defer close(done)
+		for id := uint64(1_000_000); ; id++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: id, span: 1, end: 5})); err != nil {
+				t.Error(err)
+				return
+			}
+			pushes.Add(1)
+		}
+	}()
+	b.Sweep(ctx)
+	close(stop)
+	<-done
+
+	b.mu.Lock()
+	for id := range b.trace {
+		var n uint64
+		for _, c := range id[8:] {
+			n = n<<8 | uint64(c)
+		}
+		if n <= due {
+			t.Errorf("due trace %d is still buffered after the sweep", n)
+		}
+	}
+	b.mu.Unlock()
+
+	b.Flush(ctx)
+	for pair, n := range cap.spans() {
+		if n != 1 {
+			t.Errorf("span %x exported %d times, want exactly once", pair, n)
+		}
+	}
+	if got, want := len(cap.traces()), due+int(pushes.Load()); got != want {
+		t.Errorf("exported %d distinct traces, want %d (%d due + %d pushed during the sweep)", got, want, due, pushes.Load())
+	}
+	if st := b.Stats(); st != (Stats{}) {
+		t.Errorf("the buffer still holds %+v after Flush", st)
+	}
+	t.Logf("%d pushes interleaved with a sweep of %d due traces", pushes.Load(), due)
 }

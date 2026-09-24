@@ -1,11 +1,13 @@
 package otlpsplit
 
 // One table-driven test asserting the FIVE properties every splitter shares,
-// against all three of them. The three splitters are deliberately not
-// genericized — pdata's three type families would need an adapter layer that
-// costs more than the duplication — so the shared CONTRACT is enforced here
-// instead: a fix (or a regression) landing in one splitter fails this test for
-// the others.
+// against all three of them. The three splitters' pdata halves are
+// deliberately not genericized — pdata's three type families would need an
+// adapter layer that costs more than the duplication — so the shared CONTRACT
+// is enforced here instead: a fix (or a regression) landing in one splitter
+// fails this test for the others. (Their pdata-FREE half — the chunk estimate,
+// the abandon latch, the cut rules and the over-cap accounting — is one type,
+// chunkBudget, which needs no adapter.)
 //
 // The five properties:
 //
@@ -46,6 +48,9 @@ type crossSignal struct {
 	buildEmptyScope func(itemsPer, itemBytes int) any
 	// split runs the splitter.
 	split func(payload any, maxBytes int) []any
+	// splitReport runs the splitter's WithReport form, so a case can pin what
+	// the split reports as well as what it emits.
+	splitReport func(payload any, maxBytes int) ([]any, Report)
 	// size is the exact encoded size of one payload or part.
 	size func(payload any) int
 	// leaves counts leaf items (records/data points/spans) in a payload/part.
@@ -63,12 +68,12 @@ func crossSignals() []crossSignal {
 			name: "logs",
 			build: func(resources, itemsPer, itemBytes int) any {
 				ld := plog.NewLogs()
-				for r := 0; r < resources; r++ {
+				for range resources {
 					rl := ld.ResourceLogs().AppendEmpty()
 					rl.Resource().Attributes().PutStr("k8s.pod.name", "pod")
 					sl := rl.ScopeLogs().AppendEmpty()
 					sl.Scope().SetName("cross")
-					for i := 0; i < itemsPer; i++ {
+					for range itemsPer {
 						sl.LogRecords().AppendEmpty().Body().SetStr(body(itemBytes))
 					}
 				}
@@ -86,7 +91,7 @@ func crossSignals() []crossSignal {
 				empty.Scope().SetName("empty-scope")
 				big := rl.ScopeLogs().AppendEmpty()
 				big.Scope().SetName("big")
-				for i := 0; i < itemsPer; i++ {
+				for range itemsPer {
 					big.LogRecords().AppendEmpty().Body().SetStr(body(itemBytes))
 				}
 				return ld
@@ -98,6 +103,14 @@ func crossSignals() []crossSignal {
 					out[i] = p
 				}
 				return out
+			},
+			splitReport: func(payload any, maxBytes int) ([]any, Report) {
+				parts, rep := LogsWithReport(payload.(plog.Logs), maxBytes)
+				out := make([]any, len(parts))
+				for i, p := range parts {
+					out[i] = p
+				}
+				return out, rep
 			},
 			size:   func(p any) int { return logMarshaler.LogsSize(p.(plog.Logs)) },
 			leaves: func(p any) int { return p.(plog.Logs).LogRecordCount() },
@@ -121,12 +134,12 @@ func crossSignals() []crossSignal {
 			name: "metrics",
 			build: func(resources, itemsPer, itemBytes int) any {
 				md := pmetric.NewMetrics()
-				for r := 0; r < resources; r++ {
+				for range resources {
 					rm := md.ResourceMetrics().AppendEmpty()
 					rm.Resource().Attributes().PutStr("k8s.pod.name", "pod")
 					sm := rm.ScopeMetrics().AppendEmpty()
 					sm.Scope().SetName("cross")
-					for i := 0; i < itemsPer; i++ {
+					for range itemsPer {
 						m := sm.Metrics().AppendEmpty()
 						m.SetName("m")
 						dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
@@ -148,7 +161,7 @@ func crossSignals() []crossSignal {
 				empty.Scope().SetName("empty-scope")
 				big := rm.ScopeMetrics().AppendEmpty()
 				big.Scope().SetName("big")
-				for i := 0; i < itemsPer; i++ {
+				for range itemsPer {
 					m := big.Metrics().AppendEmpty()
 					m.SetName("m")
 					dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
@@ -164,6 +177,14 @@ func crossSignals() []crossSignal {
 					out[i] = p
 				}
 				return out
+			},
+			splitReport: func(payload any, maxBytes int) ([]any, Report) {
+				parts, rep := MetricsWithReport(payload.(pmetric.Metrics), maxBytes)
+				out := make([]any, len(parts))
+				for i, p := range parts {
+					out[i] = p
+				}
+				return out, rep
 			},
 			size:   func(p any) int { return metricMarshaler.MetricsSize(p.(pmetric.Metrics)) },
 			leaves: func(p any) int { return p.(pmetric.Metrics).DataPointCount() },
@@ -187,12 +208,12 @@ func crossSignals() []crossSignal {
 			name: "traces",
 			build: func(resources, itemsPer, itemBytes int) any {
 				td := ptrace.NewTraces()
-				for r := 0; r < resources; r++ {
+				for range resources {
 					rs := td.ResourceSpans().AppendEmpty()
 					rs.Resource().Attributes().PutStr("k8s.pod.name", "pod")
 					ss := rs.ScopeSpans().AppendEmpty()
 					ss.Scope().SetName("cross")
-					for i := 0; i < itemsPer; i++ {
+					for range itemsPer {
 						sp := ss.Spans().AppendEmpty()
 						sp.SetName("span")
 						sp.SetTraceID(pcommon.TraceID{1})
@@ -213,7 +234,7 @@ func crossSignals() []crossSignal {
 				empty.Scope().SetName("empty-scope")
 				big := rs.ScopeSpans().AppendEmpty()
 				big.Scope().SetName("big")
-				for i := 0; i < itemsPer; i++ {
+				for range itemsPer {
 					sp := big.Spans().AppendEmpty()
 					sp.SetName("span")
 					sp.Attributes().PutStr("pad", body(itemBytes))
@@ -227,6 +248,14 @@ func crossSignals() []crossSignal {
 					out[i] = p
 				}
 				return out
+			},
+			splitReport: func(payload any, maxBytes int) ([]any, Report) {
+				parts, rep := TracesWithReport(payload.(ptrace.Traces), maxBytes)
+				out := make([]any, len(parts))
+				for i, p := range parts {
+					out[i] = p
+				}
+				return out, rep
 			},
 			size:   func(p any) int { return traceMarshaler.TracesSize(p.(ptrace.Traces)) },
 			leaves: func(p any) int { return p.(ptrace.Traces).SpanCount() },
@@ -278,9 +307,15 @@ func TestCrossSignalSplitInvariants(t *testing.T) {
 
 			t.Run("scope-less over-cap resource ships whole", func(t *testing.T) {
 				payload := sig.buildScopeless(2 * capBytes)
-				parts := sig.split(payload, capBytes)
+				parts, rep := sig.splitReport(payload, capBytes)
 				if len(parts) == 0 {
 					t.Fatal("a non-empty input yielded zero parts")
+				}
+				// It ships over the cap, so the collector rejects it: that is
+				// kubescrape_export_oversize_parts_total{reason="item"}, and a
+				// split that stopped counting it would hide the loss.
+				if rep != (Report{Oversize: 1}) {
+					t.Errorf("report = %+v, want exactly one Oversize part", rep)
 				}
 				got := 0
 				for _, p := range parts {
@@ -327,9 +362,12 @@ func TestCrossSignalSplitInvariants(t *testing.T) {
 
 			t.Run("single leaf over the cap goes alone", func(t *testing.T) {
 				payload := sig.build(1, 3, 2*capBytes) // three leaves, each alone over the capBytes
-				parts := sig.split(payload, capBytes)
+				parts, rep := sig.splitReport(payload, capBytes)
 				if len(parts) != 3 {
 					t.Fatalf("3 over-cap leaves must yield 3 single-leaf parts, got %d", len(parts))
+				}
+				if rep != (Report{Oversize: 3}) {
+					t.Errorf("report = %+v, want each of the 3 over-cap parts counted Oversize", rep)
 				}
 				for i, p := range parts {
 					if got := sig.leaves(p); got != 1 {

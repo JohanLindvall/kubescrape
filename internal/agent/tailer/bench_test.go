@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 )
@@ -131,51 +132,77 @@ func BenchmarkIngestChunk(b *testing.B) {
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(lines), "ns/line")
 }
 
+// flushShape is one production flush configuration and the per-line
+// allocation ceiling it is held to. BenchmarkIngestFlush REPORTS every shape and
+// TestIngestFlushAllocationBudget ENFORCES every shape: a benchmark cannot fail
+// a build, so a shape carrying a figure but no assertion is documentation, not
+// a budget — which is what enrich+metrics+rules (the one shape through
+// logchain's rules scratch record and MoveAndAppendTo) was until both read
+// their shapes from here.
+type flushShape struct {
+	name    string
+	cfg     Config
+	lines   []string
+	ceiling float64 // allocations per line
+}
+
+// flushShapes builds the shapes afresh (a log-metrics set and a line filter are
+// per-tailer state, so two runs must not share them).
+func flushShapes(tb testing.TB) []flushShape {
+	tb.Helper()
+	set, err := metrics.NewDynamicMetricSet([]metrics.Dynamic{{
+		Name: "http_requests_total", Type: metrics.CounterType, Value: "1",
+		Match:  []string{"level=info"},
+		Labels: []string{"status=$http_status(_xx)"},
+	}})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	rules, err := logline.NewLineFilter([]logline.LineRule{
+		{Action: "drop", Match: []string{"__severity__=debug"}},
+	})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return []flushShape{
+		{"plain", Config{Multiline: true}, benchLines(1024), 4},
+		{"enrich", Config{Multiline: true, Chain: logchain.Config{Enrich: true}}, benchLines(1024), 4},
+		{"enrich+metrics+rules", Config{Multiline: true, Chain: logchain.Config{Enrich: true, LogMetrics: set, Rules: rules}}, benchLines(1024), 5},
+		// Every line lifts a resource and a scope attribute. A record lifting a
+		// RESOURCE attribute used to build logattrs.Key up to five times —
+		// twice in scope, once more for the log-metrics bind key, and twice
+		// again when Dest re-ran scope to find the group buildRecord already
+		// had — six allocations a record that no budget covered, since no
+		// other shape configures lifting. Measured 18 allocs/line before the
+		// resource key was built once and the group reused by Dest, 12 after.
+		{"enrich+lift", Config{Multiline: true, Chain: logchain.Config{Enrich: true, LogAttrs: liftExtractor(tb)}}, liftLines(1024), 12},
+	}
+}
+
 // BenchmarkIngestFlush measures the full ingestion path per line: pipeline +
-// record building + export (null), with enrichment on — the production shape.
+// record building + export (null), per flushShape — enrich is the production
+// shape.
 func BenchmarkIngestFlush(b *testing.B) {
-	for _, tc := range []struct {
-		name string
-		cfg  Config
-	}{
-		{"plain", Config{Multiline: true}},
-		{"enrich", Config{Multiline: true, Enrich: true}},
-		{"enrich+metrics+rules", Config{Multiline: true, Enrich: true}},
-	} {
+	for _, tc := range flushShapes(b) {
 		b.Run(tc.name, func(b *testing.B) {
-			cfg := tc.cfg
-			if tc.name == "enrich+metrics+rules" {
-				set, err := metrics.NewDynamicMetricSet([]metrics.Dynamic{{
-					Name: "http_requests_total", Type: metrics.CounterType, Value: "1",
-					Match:  []string{"level=info"},
-					Labels: []string{"status=$http_status(_xx)"},
-				}})
-				if err != nil {
-					b.Fatal(err)
-				}
-				cfg.LogMetrics = set
-				rules, err := logline.NewLineFilter([]logline.LineRule{
-					{Action: "drop", Match: []string{"__severity__=debug"}},
-				})
-				if err != nil {
-					b.Fatal(err)
-				}
-				cfg.Rules = rules
-			}
-			tl, f := benchTailer(b, cfg)
-			lines := benchLines(1024)
+			tl, f := benchTailer(b, tc.cfg)
 			ctx := context.Background()
 			b.ReportAllocs()
 			i := 0
 			for b.Loop() {
-				feedOne(tl, f, lines[i])
-				if i++; i == len(lines) {
+				feedOne(tl, f, tc.lines[i])
+				if i++; i == len(tc.lines) {
 					i = 0
 					tl.flush(ctx)
 				}
 			}
-			b.StopTimer()
+			// The tail batch's lines are already counted in N, so its flush is
+			// charged too: left outside the timer (b.Loop stops it on exit),
+			// allocs/op read low by however much of the last batch was
+			// unflushed — 0 at -benchtime=1000x, the true 4/4/5 only at 1s.
+			b.StartTimer()
 			tl.flush(ctx)
+			b.StopTimer()
 			if got := strconv.Itoa(len(tl.batch)); got != "0" {
 				b.Fatalf("batch not flushed: %s", got)
 			}

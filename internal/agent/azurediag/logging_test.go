@@ -63,7 +63,7 @@ func TestUndecodableDataIsLoggedWithoutItsBody(t *testing.T) {
 func TestUndecodableDataWarningIsThrottled(t *testing.T) {
 	log, dump := capturedLog()
 	r := New(Config{Logger: log})
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		r.decode([][]byte{[]byte("not json")})
 	}
 	if n := strings.Count(dump(), "level=WARN"); n != 1 {
@@ -126,7 +126,7 @@ func TestFetchErrorWarningIsThrottledPerTopic(t *testing.T) {
 	log, dump := capturedLog()
 	tab := logdedupe.New(fetchWarnKeys, fetchWarnEvery)
 	f := errFetch("insights-logs-audit", 0, kerr.TopicAuthorizationFailed)
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		if _, _, err := pollResult(f, log, tab); err != nil {
 			t.Fatal(err)
 		}
@@ -152,7 +152,8 @@ func TestFetchErrorWarningIsThrottledPerTopic(t *testing.T) {
 // log must not make that look like the retried per-topic case.
 func TestFatalFetchErrorIsLoggedAsSuch(t *testing.T) {
 	log, dump := capturedLog()
-	f := errFetch("", -1, kerr.SaslAuthenticationFailed)
+	// The shape kgo produces for a namespace-wide credential refusal.
+	f := errFetch("", 0, &kgo.ErrGroupSession{Err: kerr.GroupAuthorizationFailed})
 	if _, _, err := pollResult(f, log, logdedupe.New(fetchWarnKeys, fetchWarnEvery)); err == nil {
 		t.Fatal("want the poll to fail")
 	}

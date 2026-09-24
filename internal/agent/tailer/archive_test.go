@@ -89,7 +89,7 @@ func TestReplacedArchiveAfterFailedExportIsRead(t *testing.T) {
 	exp.fail = 0
 	exp.mu.Unlock()
 
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		tl.scanDir(nil, false)
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
@@ -237,7 +237,7 @@ func TestArchiveReplacementRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		tl.scanDir(nil, false)
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
@@ -287,7 +287,7 @@ func TestArchiveRewriteInPlaceDetected(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	writeGzip(t, path, "new-1", "new-2", "new-3", "new-4")
 
-	for i := 0; i < 8; i++ {
+	for range 8 {
 		tl.scanDir(nil, false)
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
@@ -420,7 +420,7 @@ func TestCompressedArchiveSurvivesDeletionAfterFailedExport(t *testing.T) {
 	if exp.fail != 0 {
 		t.Fatalf("test setup: %d export failures left unconsumed", exp.fail)
 	}
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		tl.scanDir(nil, false)
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
@@ -456,7 +456,7 @@ func TestCompressedArchiveGrowsAfterFirstRead(t *testing.T) {
 	// Append a second gzip member (concatenated gzip = valid multistream).
 	appendGzip(t, path, "g-three")
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		tl.scanDir(nil, false)
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
@@ -485,7 +485,7 @@ func TestCompressedTruncatedArchiveExportsPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	tl.scanDir(nil, false)
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
 	}
@@ -789,7 +789,7 @@ func TestArchiveReplacedWhileDownCountsLostRemainder(t *testing.T) {
 	}
 	writeGzip(t, path, "new-one", "new-two")
 
-	prefixBefore := obs.LogPrefixLost.Value()
+	prefixBefore, rotationsBefore := obs.LogPrefixLost.Value(), obs.LogRotations.Value()
 	exp := &fakeExporter{}
 	tl := newArchiveTailer(dir, exp)
 	tl.cfg.Positions = pos
@@ -804,6 +804,13 @@ func TestArchiveReplacedWhileDownCountsLostRemainder(t *testing.T) {
 	}
 	if got := obs.LogPrefixLost.Value() - prefixBefore; got != 1 {
 		t.Fatalf("replaced-archive loss counted %v times, want exactly once", got)
+	}
+	// A replacement handled, like readArchive's archiveReplaced sibling: it is
+	// a rotation for kubescrape_log_rotations_total ("rotations and
+	// truncations handled"), which openArchive's identity-change arm never
+	// counted.
+	if got := obs.LogRotations.Value() - rotationsBefore; got != 1 {
+		t.Fatalf("kubescrape_log_rotations_total moved by %v for an archive replaced while down, want 1", got)
 	}
 }
 

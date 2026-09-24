@@ -38,7 +38,7 @@ func TestPostFlushPushIsDecidedImmediatelyAndItsAckIsHonest(t *testing.T) {
 	// unconditionally, and the straggler window opens after it either way.
 	b.Flush(ctx)
 
-	early0 := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown))
+	early0 := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown.String()))
 	kept0 := counter(obs.TailSampleSpans.WithLabelValues("kept"))
 
 	// The straggler: two spans of one new trace, in one push.
@@ -55,7 +55,7 @@ func TestPostFlushPushIsDecidedImmediatelyAndItsAckIsHonest(t *testing.T) {
 	if got := b.Stats(); got != (Stats{}) {
 		t.Fatalf("the buffer holds %+v after a post-Flush push; nothing will ever flush it again", got)
 	}
-	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown)) - early0; got != 1 {
+	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown.String())) - early0; got != 1 {
 		t.Fatalf("early{shutdown} counted %v, want 1 (one trace, decided once on both spans present)", got)
 	}
 	if got := counter(obs.TailSampleSpans.WithLabelValues("kept")) - kept0; got != 2 {
@@ -71,7 +71,7 @@ func TestPostFlushPushIsDecidedImmediatelyAndItsAckIsHonest(t *testing.T) {
 	if got := counter(obs.TailSampleLate.WithLabelValues("kept")) - late0; got != 1 {
 		t.Fatalf("late{kept} counted %v, want 1 (the second straggler must follow the cached verdict)", got)
 	}
-	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown)) - early0; got != 1 {
+	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown.String())) - early0; got != 1 {
 		t.Fatalf("early{shutdown} counted %v after the second straggler, want still 1", got)
 	}
 	if got := b.Stats(); got != (Stats{}) {
@@ -110,7 +110,7 @@ func TestPostFlushPushNACKsWithoutTallyingAndTheRetryTalliesOnce(t *testing.T) {
 	ctx := context.Background()
 	b.Flush(ctx)
 
-	early0 := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown))
+	early0 := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown.String()))
 	kept0 := counter(obs.TailSampleSpans.WithLabelValues("kept"))
 	lost0 := counter(obs.TailSampleSpans.WithLabelValues("lost"))
 	late0 := counter(obs.TailSampleLate.WithLabelValues("kept"))
@@ -126,7 +126,7 @@ func TestPostFlushPushNACKsWithoutTallyingAndTheRetryTalliesOnce(t *testing.T) {
 	if got := counter(obs.TailSampleSpans.WithLabelValues("lost")) - lost0; got != 0 {
 		t.Fatalf("spans{lost} counted %v, want 0: the sender still holds the payload, so a NACK is not loss", got)
 	}
-	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown)) - early0; got != 1 {
+	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown.String())) - early0; got != 1 {
 		t.Fatalf("early{shutdown} counted %v, want 1 (the decision happened and its verdict was cached even though the forward failed)", got)
 	}
 	if got := b.Stats(); got != (Stats{}) {
@@ -160,7 +160,7 @@ func TestPostFlushDecidedDropAcksWithoutASend(t *testing.T) {
 	b.Flush(ctx)
 
 	dropped0 := counter(obs.TailSampleSpans.WithLabelValues("dropped"))
-	early0 := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown))
+	early0 := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown.String()))
 	if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 931, span: 1, end: 5})); err != nil {
 		t.Fatalf("a post-Flush push decided DROP must still be acked: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestPostFlushDecidedDropAcksWithoutASend(t *testing.T) {
 	if got := counter(obs.TailSampleSpans.WithLabelValues("dropped")) - dropped0; got != 1 {
 		t.Fatalf("spans{dropped} counted %v, want 1", got)
 	}
-	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown)) - early0; got != 1 {
+	if got := counter(obs.TailSampleEarly.WithLabelValues(reasonShutdown.String())) - early0; got != 1 {
 		t.Fatalf("early{shutdown} counted %v, want 1", got)
 	}
 	if got := b.Stats(); got != (Stats{}) {
@@ -307,5 +307,54 @@ func TestFlushDoesNotHandOtherSendersSpansToAStraggler(t *testing.T) {
 		if mine && others > 0 {
 			t.Fatalf("a straggler push landing mid-flush acked %d other senders' spans: the flush released the mutex between chunks, so take() decided traces that were never this push's", others)
 		}
+	}
+}
+
+// The DROP half of the same discipline: a post-Flush push's trace decided DROP
+// is the sender's too, so its spans{dropped} tally waits for the push's ack
+// like the keep tally does. It used to be counted at decision time, so a push
+// NACKed by a sibling keep's failed forward counted its dropped spans once
+// there and again when the retransmission followed the cached drop verdict as
+// late{dropped} — one span, pushed once and retransmitted once, in two drop
+// series.
+func TestPostFlushDropTallyWaitsForTheAck(t *testing.T) {
+	cap := &capture{}
+	b, _ := newTestBuffer(t, Config{Config: errorsCfg(), DecisionWait: "1m"}, cap)
+	ctx := context.Background()
+	b.Flush(ctx)
+
+	dropped0 := counter(obs.TailSampleSpans.WithLabelValues("dropped"))
+	lateDrop0 := counter(obs.TailSampleLate.WithLabelValues("dropped"))
+	kept0 := counter(obs.TailSampleSpans.WithLabelValues("kept"))
+	lateKept0 := counter(obs.TailSampleLate.WithLabelValues("kept"))
+
+	// One push, two new traces: 951 errors (kept), 952 does not (dropped).
+	push := payload("checkout",
+		spanSpec{trace: 951, span: 1, end: 5, status: ptrace.StatusCodeError},
+		spanSpec{trace: 952, span: 2, end: 5})
+	cap.fail(errors.New("collector down"))
+	if err := b.ExportTraces(ctx, push); err == nil {
+		t.Fatal("the keep's failed forward must NACK the push")
+	}
+	if got := counter(obs.TailSampleSpans.WithLabelValues("dropped")) - dropped0; got != 0 {
+		t.Fatalf("spans{dropped} counted %v on a NACKed push, want 0: the sender still holds the span and will re-present it", got)
+	}
+
+	// The retransmission follows both cached verdicts as late spans.
+	cap.fail(nil)
+	if err := b.ExportTraces(ctx, push); err != nil {
+		t.Fatal(err)
+	}
+	if got := counter(obs.TailSampleSpans.WithLabelValues("dropped")) - dropped0; got != 0 {
+		t.Fatalf("spans{dropped} = %v, want 0 (the retry rides the late path)", got)
+	}
+	if got := counter(obs.TailSampleLate.WithLabelValues("dropped")) - lateDrop0; got != 1 {
+		t.Fatalf("late{dropped} = %v, want 1: one dropped span, reported once across the NACK and its retry", got)
+	}
+	if got := counter(obs.TailSampleLate.WithLabelValues("kept")) - lateKept0; got != 1 {
+		t.Fatalf("late{kept} = %v, want 1", got)
+	}
+	if got := counter(obs.TailSampleSpans.WithLabelValues("kept")) - kept0; got != 0 {
+		t.Fatalf("spans{kept} = %v, want 0", got)
 	}
 }

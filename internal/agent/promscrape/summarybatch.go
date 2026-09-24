@@ -59,7 +59,6 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
-	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -260,6 +259,12 @@ type summaryTarget struct {
 	// level is the object this target describes, for the unresolved accounting;
 	// only pod and container can fail to resolve.
 	level string
+	// created is a CONTAINER's creation time as the kubelet reports it (zero
+	// for every other level, and for a payload without one): what lets the
+	// by-name match refuse a pod document older than this incarnation
+	// (Scraper.containerIncarnation). Not part of the resource key — one name
+	// is one container per pod at any instant.
+	created time.Time
 }
 
 // summaryNodeKey is the node resource's slot in the batch. cadvisorIdentity's
@@ -379,7 +384,11 @@ func (sb *summaryBatcher) flush() error {
 	if sb.points == 0 {
 		return nil
 	}
-	if err := sb.s.cfg.Exporter.ExportMetrics(sb.ctx, sb.take()); err != nil {
+	// exportChunk classifies the failure reason=export, like every exposition
+	// chunk: the kubelet answered and the COLLECTOR refused the payload. Sticky
+	// once classified, so the ArrayEach callback path carries the reason out
+	// too.
+	if err := sb.s.exportChunk(sb.ctx, sb); err != nil {
 		sb.exportErr = err
 		return err
 	}
@@ -408,12 +417,15 @@ func (sb *summaryBatcher) scope(t summaryTarget) summaryScope {
 		// deliberately not cgroupstats'. The asymmetry is the reason both exist: a
 		// cgroup path yields two hex ids and no service.name, so such a series has
 		// no Prometheus job and joins nothing — while the summary carries pod name,
-		// namespace, uid and container name, i.e. MORE identity than a cadvisor
-		// row, so fillIdentityResource's label fallback produces exactly what an
-		// unresolved cadvisor row for the same object produces. Consistency in both
-		// states is the point: resolved or not, the two rows are built by one
-		// function from the same inputs.
-		resolved, _ := sb.s.fillIdentityResource(sb.ctx, res, t.ident)
+		// namespace, uid and container name, so fillIdentityResource's label
+		// fallback still yields a named, placeable resource. For a POD that is
+		// exactly what an unresolved cadvisor row for the same pod produces. For a
+		// CONTAINER it matches on everything except container.id and
+		// container.image.name, which the cadvisor row takes from its cgroup path
+		// and labels and the summary has no source for — and hence
+		// service.instance.id, which is the join loss report() describes. Both
+		// states go through one function, so nothing ELSE can differ.
+		resolved, _ := sb.s.fillIdentityResourceCreated(sb.ctx, res, t.ident, t.created)
 		switch t.level {
 		case levelPod:
 			if !resolved {
@@ -428,17 +440,23 @@ func (sb *summaryBatcher) scope(t summaryTarget) summaryScope {
 			// resource without one does not line up with anything, which is the
 			// loss this counter and the warning below both describe.
 			//
-			// `resolved` alone reports only ONE of the three ways to get here (a
-			// pod the service could not place) and stays TRUE for the other two:
-			// resolveContext stamps k8s.container.name and returns true for a
-			// placed pod whose document does not name the container, and returns
-			// true again for a container the document DOES name from the pod spec
-			// but whose status has not reached the API server yet — kubemeta
-			// builds Containers from the spec with status folded in, so that one
-			// has an empty ID and attrs.Container writes no container.id. That
-			// last shape is the ~1s start-up window (widened to podMetaCacheTTL by
-			// this scraper's own cache), i.e. the common case, and a name-miss
-			// test would not see it at all.
+			// `resolved` alone reports only ONE of the four ways to get here (a
+			// pod the service could not place) and stays TRUE for the other
+			// three: it is true, with k8s.container.name stamped from the row,
+			// for a placed pod whose document does not name the container, and
+			// true again for a container the document DOES name from the
+			// pod spec but whose status has not reached the API server yet —
+			// kubemeta builds Containers from the spec with status folded in, so
+			// that one has an empty ID and attrs.Container writes no
+			// container.id. That shape is the ~1s start-up window of a FIRST
+			// start, i.e. the common case, and a name-miss test would not see it
+			// at all. The fourth is its RESTART twin: the document still names
+			// the PREVIOUS incarnation, id and all, because it predates this
+			// one's creation. containerIncarnation re-asks when the scraper's own
+			// cache is why, and while the service itself is still behind it
+			// withholds the incarnation (no container.id, no restart_count)
+			// rather than stamp the dead one's id — service.instance.id would
+			// be cadvisor-<old id>, joining nothing — so it lands here too.
 			if _, ok := res.Attributes().Get("container.id"); !ok {
 				sb.unresolved.containers++
 			}
@@ -472,10 +490,7 @@ func (sb *summaryBatcher) newScope(key string, fill func(pcommon.Resource)) summ
 // this agent; a disagreement between the two is warned about where it is
 // noticed (addNode).
 func (sb *summaryBatcher) fillNodeResource(res pcommon.Resource) {
-	a := res.Attributes()
-	a.PutStr("service.name", "kubelet")
-	a.PutStr("url.full", sb.url)
-	sb.s.attrsFor(pipelineSummary).Build(res, attrs.Context{Node: sb.s.nodeInfo()})
+	sb.s.fillKubeletResource(res, pipelineSummary, sb.url)
 }
 
 // metric returns the (per-resource) gauge for one metric name, creating it on
@@ -580,8 +595,9 @@ func (sb *summaryBatcher) report() {
 		// BOTH when its pod could not be placed (so the two labels do move
 		// together for that cause) and when the pod was placed while the
 		// container was not: an ephemeral container the cached document predates,
-		// or the start-up window where the container is listed from the spec with
-		// no status yet. See scope(); the log line below says it once for the
+		// the start-up window where the container is listed from the spec with
+		// no status yet, or a restart the document has not caught up with
+		// (containerIncarnation). See scope(); the log line below says it once for the
 		// whole process. A condition nobody can alert on is a condition nobody
 		// knows about — the closest sibling is kubescrape_cgroup_unresolved_total,
 		// which exists for exactly this.

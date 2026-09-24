@@ -92,9 +92,7 @@ func TestSlowClientsAreDropped(t *testing.T) {
 	var closedWithin atomic.Int64
 	var wg sync.WaitGroup
 	for range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			conn, err := net.Dial("tcp", addr)
 			if err != nil {
 				return
@@ -114,7 +112,7 @@ func TestSlowClientsAreDropped(t *testing.T) {
 			if time.Since(start) < 4*time.Second {
 				closedWithin.Add(1)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if got := closedWithin.Load(); got != n {
@@ -192,8 +190,7 @@ func TestContainerIDTooLong(t *testing.T) {
 
 // Waiter overflow surfaces as a retryable 503 (with Retry-After), never 404.
 func TestContainerWaiterOverflow503(t *testing.T) {
-	st := store.New(time.Minute)
-	st.SetMaxWaiters(2)
+	st := store.New(time.Minute, store.WithMaxWaiters(2))
 	srv := httptest.NewServer(newAPI(st, 10*time.Second).Handler())
 	defer srv.Close()
 
@@ -202,11 +199,9 @@ func TestContainerWaiterOverflow503(t *testing.T) {
 	pctx, pcancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	for i := range 2 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_, _, _ = st.GetContainer(pctx, fmt.Sprintf("park%d", i))
-		}()
+		})
 	}
 	defer func() {
 		pcancel()
@@ -364,9 +359,7 @@ func TestServerConcurrentLoad(t *testing.T) {
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	// Writer: churn upserts/deletes.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		rv := 2
 		for {
 			for p := range pods {
@@ -383,7 +376,7 @@ func TestServerConcurrentLoad(t *testing.T) {
 				}
 			}
 		}
-	}()
+	})
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	var requests atomic.Int64
@@ -395,9 +388,7 @@ func TestServerConcurrentLoad(t *testing.T) {
 		}
 	}
 	for r := range 32 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			i := r
 			for {
 				select {
@@ -474,7 +465,7 @@ func TestServerConcurrentLoad(t *testing.T) {
 				}
 				requests.Add(1)
 			}
-		}()
+		})
 	}
 
 	time.Sleep(duration)

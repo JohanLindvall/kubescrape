@@ -56,7 +56,7 @@ func TestPollReportsRecoveryAfterAFailedLookup(t *testing.T) {
 	if !strings.Contains(line, `level=WARN msg="resolving this pod's own metadata failed`) {
 		t.Errorf("the first failure must warn and name WHAT failed:\n%s", line)
 	}
-	if !strings.Contains(line, "attempts=1") {
+	if !strings.Contains(line, "failures=1") {
 		t.Errorf("the recovery must say how many attempts the outage cost:\n%s", line)
 	}
 	if p := get(); p == nil {

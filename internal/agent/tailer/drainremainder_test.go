@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -55,7 +56,7 @@ func TestDrainCapReplaysTheRemainderInsteadOfAbandoningIt(t *testing.T) {
 	ts := timeNowCRI()
 	body := strings.Repeat("x", 80)
 	all := make([]string, 0, lines)
-	for i := 0; i < lines; i++ {
+	for i := range lines {
 		all = append(all, fmt.Sprintf("%s stdout F %04d %s", ts, i, body))
 	}
 	writeLog(t, dir, all...)
@@ -84,7 +85,7 @@ func TestDrainCapReplaysTheRemainderInsteadOfAbandoningIt(t *testing.T) {
 		}
 	}
 	var missing []string
-	for i := 0; i < lines; i++ {
+	for i := range lines {
 		if k := fmt.Sprintf("%04d", i); !seen[k] {
 			missing = append(missing, k)
 		}
@@ -120,7 +121,7 @@ func TestGoneFileDrainCapDoesNotSettleWithBytesUnread(t *testing.T) {
 	ts := timeNowCRI()
 	body := strings.Repeat("y", 80)
 	all := make([]string, 0, lines)
-	for i := 0; i < lines; i++ {
+	for i := range lines {
 		all = append(all, fmt.Sprintf("%s stdout F %04d %s", ts, i, body))
 	}
 	writeLog(t, dir, all...)
@@ -144,7 +145,7 @@ func TestGoneFileDrainCapDoesNotSettleWithBytesUnread(t *testing.T) {
 			seen[r[:4]] = true
 		}
 	}
-	for i := 0; i < lines; i++ {
+	for i := range lines {
 		if k := fmt.Sprintf("%04d", i); !seen[k] {
 			t.Fatalf("line %s of %d was never exported: the gone drain settled with bytes still behind its fd", k, lines)
 		}
@@ -188,16 +189,80 @@ func TestOversizedLineRemainderIsNotCountedAsATornFinalLine(t *testing.T) {
 	rotateAway(t, dir, 1)
 	writeLog(t, dir, timeNowCRI()+" stdout F next")
 	driveUntil(t, ctx, tl, func() bool {
-		for _, r := range exp.get() {
-			if r == "next" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(exp.get(), "next")
 	}, "the post-rotation line to export")
 
 	if got := obs.LogTornFinalLines.Value() - tornBefore; got != 0 {
 		t.Fatalf("one oversized line also moved kubescrape_log_torn_final_lines_total by %v (oversized moved by %v)",
 			got, obs.LogOversizedDropped.Value()-overBefore)
+	}
+}
+
+// A rename rotation whose drain stops at the per-drain CAP records the old
+// inode as an open-ended segment and forces the replay flag false — which must
+// not re-feed an OLDER segment whose lines are still live in the unflushed
+// batch. The cap purges nothing (unlike a flush failure, which rewinds first),
+// yet the older segment's fed state was dropped with the pipeline reset and its
+// rotation-recorded fedTo is 0, so feedSegments replayed it from `committed`
+// and every one of its lines was delivered twice with no export failing.
+func TestDrainCapAbortDoesNotReplayAnOlderFedSegment(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := capTailer(dir, exp, 4096, 8192)
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	ts := timeNowCRI()
+	writeLog(t, dir, ts+" stdout F A0", ts+" stdout F A1", ts+" stdout F A2")
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true) // A0..A2 fed; nothing flushes (the test flushes)
+
+	// First rotation: fully drained, so A's lines become a FED segment whose
+	// entries sit in the unflushed batch.
+	rotateAway(t, dir, 1)
+	const lines = 2000
+	body := strings.Repeat("x", 80)
+	big := make([]string, 0, lines)
+	for i := range lines {
+		big = append(big, fmt.Sprintf("%s stdout F %04d %s", ts, i, body))
+	}
+	writeLog(t, dir, big...)
+	tl.sweep(ctx, true)
+	path := filepath.Join(dir, logName)
+	f := tl.files[path]
+	if len(f.segments) != 1 || !f.segmentsFed {
+		t.Fatalf("setup: want one fed segment after the first rotation, got %d (fed=%v)", len(f.segments), f.segmentsFed)
+	}
+
+	// Second rotation: B is far larger than the drain cap, so the drain stops
+	// there and reopen takes its aborted arm.
+	rotateAway(t, dir, 2)
+	writeLog(t, dir, ts+" stdout F after-rotation")
+	tl.sweep(ctx, true)
+
+	driveUntil(t, ctx, tl, func() bool {
+		return slices.Contains(exp.get(), "after-rotation") && len(f.segments) == 0
+	}, "the post-rotation line exported and every segment retired")
+
+	counts := map[string]int{}
+	for _, r := range exp.get() {
+		counts[r]++
+	}
+	for _, a := range []string{"A0", "A1", "A2"} {
+		if counts[a] != 1 {
+			t.Fatalf("%s exported %d times, want exactly once: the older fed segment was replayed after a "+
+				"cap-aborted drain", a, counts[a])
+		}
+	}
+	seen := map[string]bool{}
+	for r := range counts {
+		if len(r) >= 4 {
+			seen[r[:4]] = true
+		}
+	}
+	for i := range lines {
+		if k := fmt.Sprintf("%04d", i); !seen[k] {
+			t.Fatalf("line %s of the cap-drained incarnation never exported", k)
+		}
 	}
 }

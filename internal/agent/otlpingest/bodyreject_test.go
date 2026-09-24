@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -118,7 +119,7 @@ func TestBodyRefusalsAreCountedByReasonAndKeepTheirStatus(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			br := newBodyReader(limit, nil, discardLogger())
+			br := newIngestBodyReader(limit, nil, discardLogger())
 			before := snapshotRejects()
 			_, _, err := br.Read(tc.req())
 			if err == nil {
@@ -180,7 +181,7 @@ func compressedOnlyOverCap(tb testing.TB, max int64) []byte {
 // it is answered and counted as too_large rather than as a malformed payload.
 func TestOversizeCompressedBodyCountsAsTooLargeNotMalformed(t *testing.T) {
 	const limit = 64
-	br := newBodyReader(limit, nil, discardLogger())
+	br := newIngestBodyReader(limit, nil, discardLogger())
 	r := httptest.NewRequest("POST", "/v1/logs", bytes.NewReader(compressedOnlyOverCap(t, limit)))
 	r.Header.Set("Content-Type", "application/x-protobuf")
 	r.Header.Set("Content-Encoding", "gzip")
@@ -205,7 +206,7 @@ func TestOversizeCompressedBodyCountsAsTooLargeNotMalformed(t *testing.T) {
 // bounds. Folding it into the door counter would put a back-pressure signal in
 // the series an operator reads as "senders are misconfigured".
 func TestBudgetRefusalStaysOnTheAdmissionCounter(t *testing.T) {
-	br := newBodyReader(1<<20, &byteBudget{limit: 8}, discardLogger())
+	br := newIngestBodyReader(1<<20, &byteBudget{limit: 8}, discardLogger())
 	r := httptest.NewRequest("POST", "/v1/logs", bytes.NewReader(bytes.Repeat([]byte{0x0a}, 4096)))
 	r.Header.Set("Content-Type", "application/x-protobuf")
 
@@ -234,7 +235,7 @@ func TestBudgetRefusalStaysOnTheAdmissionCounter(t *testing.T) {
 func TestBudgetRefusalKeepsItsClassWhenTheUploadAlsoAborted(t *testing.T) {
 	// limit 1 refuses the first granule, so the refusal lands on the same Read
 	// the transport fails on rather than a later one.
-	br := newBodyReader(1<<20, &byteBudget{limit: 1}, discardLogger())
+	br := newIngestBodyReader(1<<20, &byteBudget{limit: 1}, discardLogger())
 	r := httptest.NewRequest("POST", "/v1/logs", &abortingBody{err: syscall.ECONNRESET})
 	r.Header.Set("Content-Type", "application/x-protobuf")
 
@@ -278,7 +279,7 @@ func (b *abortingBody) Read(p []byte) (int, error) {
 // per reason per window, because a misconfigured sender retries forever.
 func TestDoorRefusalWarnsOncePerReasonAndNamesThePeer(t *testing.T) {
 	var logged bytes.Buffer
-	br := newBodyReader(64, nil, slog.New(slog.NewTextHandler(&logged, nil)))
+	br := newIngestBodyReader(64, nil, slog.New(slog.NewTextHandler(&logged, nil)))
 
 	badType := func() *http.Request {
 		r := httptest.NewRequest("POST", "/v1/logs", strings.NewReader("{}"))
@@ -286,7 +287,7 @@ func TestDoorRefusalWarnsOncePerReasonAndNamesThePeer(t *testing.T) {
 		r.RemoteAddr = "10.42.7.9:54321"
 		return r
 	}
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if _, _, err := br.Read(badType()); err == nil {
 			t.Fatal("the request must be refused")
 		}
@@ -511,12 +512,7 @@ var otlpRetryableStatuses = []int{
 }
 
 func isOTLPRetryable(code int) bool {
-	for _, c := range otlpRetryableStatuses {
-		if c == code {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(otlpRetryableStatuses, code)
 }
 
 // A retryable status, not 400 and not 408. On a full disconnect nothing reads
@@ -593,7 +589,7 @@ func TestTransportErrorsClassifyAsAborted(t *testing.T) {
 		{"context cancelled", context.Canceled},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			br := newBodyReader(1<<20, nil, discardLogger())
+			br := newIngestBodyReader(1<<20, nil, discardLogger())
 			r := httptest.NewRequest("POST", "/v1/logs", &failingBody{err: tc.err})
 			r.Header.Set("Content-Type", "application/x-protobuf")
 			before := snapshotRejects()
@@ -622,7 +618,7 @@ func TestTransportErrorsClassifyAsAborted(t *testing.T) {
 // Both sites have to classify, or a sender that dies early is guilty and one
 // that dies late is not.
 func TestUploadCutShortInsideTheGzipHeaderIsAnAbort(t *testing.T) {
-	br := newBodyReader(1<<20, nil, discardLogger())
+	br := newIngestBodyReader(1<<20, nil, discardLogger())
 	r := httptest.NewRequest("POST", "/v1/logs", &failingBody{err: io.ErrUnexpectedEOF})
 	r.Header.Set("Content-Type", "application/x-protobuf")
 	r.Header.Set("Content-Encoding", "gzip")
@@ -657,7 +653,7 @@ func TestUnrecognisedTransportFailureIsAnAbortOnlyWhenTheClientIsGone(t *testing
 		{"client still there", false, reasonMalformed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			br := newBodyReader(1<<20, nil, discardLogger())
+			br := newIngestBodyReader(1<<20, nil, discardLogger())
 			r := httptest.NewRequest("POST", "/v1/logs", &failingBody{err: odd})
 			r.Header.Set("Content-Type", "application/x-protobuf")
 			if tc.cancelled {
@@ -688,7 +684,7 @@ func TestUnrecognisedTransportFailureIsAnAbortOnlyWhenTheClientIsGone(t *testing
 // gzip stream that is corrupt in the middle of a body that arrived whole is the
 // sender's payload being wrong.
 func TestCorruptGzipFromAnIntactUploadStaysMalformed(t *testing.T) {
-	br := newBodyReader(1<<20, nil, discardLogger())
+	br := newIngestBodyReader(1<<20, nil, discardLogger())
 	gz := gzipped(t, bytes.Repeat([]byte("payload "), 500))
 	corrupt := append([]byte(nil), gz[:len(gz)-8]...) // truncated, but fully delivered
 	r := httptest.NewRequest("POST", "/v1/logs", bytes.NewReader(corrupt))
@@ -786,7 +782,7 @@ func TestDecodablePayloadCountsNothing(t *testing.T) {
 // admitted only with a bearer token must not land in the series an operator
 // reads as "somebody out there is pushing wrong".
 func TestInternalHopBodyReaderIsNotOnTheApplicationCounter(t *testing.T) {
-	br := NewBodyReader(64) // what cmd/kubescrape-agent/servicegraph.go builds
+	br := NewBodyReader(64) // what cmd/kubescrape-agent/sgreceiver.go builds
 	cases := []func() *http.Request{
 		func() *http.Request {
 			r := httptest.NewRequest("POST", "/v1/traces", strings.NewReader("{}"))

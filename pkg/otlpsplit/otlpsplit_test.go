@@ -15,7 +15,7 @@ import (
 // whose body is bodyLen bytes and which carry a fat attribute set.
 func buildLogs(resources, recordsPer, bodyLen int) plog.Logs {
 	ld := plog.NewLogs()
-	for r := 0; r < resources; r++ {
+	for r := range resources {
 		rl := ld.ResourceLogs().AppendEmpty()
 		res := rl.Resource().Attributes()
 		res.PutStr("service.name", fmt.Sprintf("svc-%d", r))
@@ -24,7 +24,7 @@ func buildLogs(resources, recordsPer, bodyLen int) plog.Logs {
 		res.PutStr("k8s.node.name", "node-01.internal.example.com")
 		sl := rl.ScopeLogs().AppendEmpty()
 		sl.Scope().SetName("test")
-		for i := 0; i < recordsPer; i++ {
+		for i := range recordsPer {
 			lr := sl.LogRecords().AppendEmpty()
 			lr.Body().SetStr(strings.Repeat("x", bodyLen))
 			lr.Attributes().PutStr("log.iostream", "stdout")
@@ -99,11 +99,11 @@ func TestSplitMetricsBounds(t *testing.T) {
 	var m pmetric.ProtoMarshaler
 	md := pmetric.NewMetrics()
 	total := 0
-	for r := 0; r < 5; r++ {
+	for r := range 5 {
 		rm := md.ResourceMetrics().AppendEmpty()
 		rm.Resource().Attributes().PutStr("service.name", fmt.Sprintf("svc-%d", r))
 		sm := rm.ScopeMetrics().AppendEmpty()
-		for i := 0; i < 400; i++ {
+		for i := range 400 {
 			mm := sm.Metrics().AppendEmpty()
 			mm.SetName(fmt.Sprintf("metric_%d_%d_with_a_longish_name", r, i))
 			dp := mm.SetEmptyGauge().DataPoints().AppendEmpty()
@@ -136,11 +136,11 @@ func TestSplitTracesBounds(t *testing.T) {
 	var m ptrace.ProtoMarshaler
 	td := ptrace.NewTraces()
 	total := 0
-	for r := 0; r < 4; r++ {
+	for r := range 4 {
 		rs := td.ResourceSpans().AppendEmpty()
 		rs.Resource().Attributes().PutStr("service.name", fmt.Sprintf("svc-%d", r))
 		ss := rs.ScopeSpans().AppendEmpty()
-		for i := 0; i < 300; i++ {
+		for i := range 300 {
 			sp := ss.Spans().AppendEmpty()
 			sp.SetName(fmt.Sprintf("operation-%d-%d", r, i))
 			sp.SetTraceID(pcommon.TraceID([16]byte{byte(i), byte(r), 3}))
@@ -211,7 +211,7 @@ func buildOneBigMetric(typ pmetric.MetricType, points int) pmetric.Metrics {
 	switch typ {
 	case pmetric.MetricTypeGauge:
 		dps := m.SetEmptyGauge().DataPoints()
-		for i := 0; i < points; i++ {
+		for i := range points {
 			d := dps.AppendEmpty()
 			fill(d.Attributes(), i)
 			d.SetStartTimestamp(start)
@@ -222,7 +222,7 @@ func buildOneBigMetric(typ pmetric.MetricType, points int) pmetric.Metrics {
 		s := m.SetEmptySum()
 		s.SetIsMonotonic(true)
 		s.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
-		for i := 0; i < points; i++ {
+		for i := range points {
 			d := s.DataPoints().AppendEmpty()
 			fill(d.Attributes(), i)
 			d.SetStartTimestamp(start)
@@ -232,7 +232,7 @@ func buildOneBigMetric(typ pmetric.MetricType, points int) pmetric.Metrics {
 	case pmetric.MetricTypeHistogram:
 		h := m.SetEmptyHistogram()
 		h.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-		for i := 0; i < points; i++ {
+		for i := range points {
 			d := h.DataPoints().AppendEmpty()
 			fill(d.Attributes(), i)
 			d.SetStartTimestamp(start)
@@ -248,7 +248,7 @@ func buildOneBigMetric(typ pmetric.MetricType, points int) pmetric.Metrics {
 	case pmetric.MetricTypeExponentialHistogram:
 		e := m.SetEmptyExponentialHistogram()
 		e.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
-		for i := 0; i < points; i++ {
+		for i := range points {
 			d := e.DataPoints().AppendEmpty()
 			fill(d.Attributes(), i)
 			d.SetStartTimestamp(start)
@@ -262,7 +262,7 @@ func buildOneBigMetric(typ pmetric.MetricType, points int) pmetric.Metrics {
 		}
 	case pmetric.MetricTypeSummary:
 		su := m.SetEmptySummary()
-		for i := 0; i < points; i++ {
+		for i := range points {
 			d := su.DataPoints().AppendEmpty()
 			fill(d.Attributes(), i)
 			d.SetStartTimestamp(start)
@@ -465,7 +465,7 @@ func TestSplitMetricsSinglePointOverCapGoesAlone(t *testing.T) {
 		m := sm.Metrics().AppendEmpty()
 		m.SetName("huge_gauge")
 		dps := m.SetEmptyGauge().DataPoints()
-		for i := 0; i < points; i++ {
+		for i := range points {
 			d := dps.AppendEmpty()
 			d.Attributes().PutInt("idx", int64(i))
 			d.Attributes().PutStr("blob", strings.Repeat("z", 40<<10)) // one point > cap
@@ -491,5 +491,34 @@ func TestSplitMetricsSinglePointOverCapGoesAlone(t *testing.T) {
 		if len(seen) != points {
 			t.Fatalf("lost points: %d of %d survived", len(seen), points)
 		}
+	}
+}
+
+// DataPointCount is exported for every in-module caller that used to carry its
+// own five-arm switch, so it must count every kind — and an untyped metric as
+// zero, which is what the empty-metric prunes turn on.
+func TestDataPointCountCountsEveryKind(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		add  func(pmetric.Metric)
+	}{
+		{"gauge", func(m pmetric.Metric) { ps := m.SetEmptyGauge().DataPoints(); ps.AppendEmpty(); ps.AppendEmpty() }},
+		{"sum", func(m pmetric.Metric) { ps := m.SetEmptySum().DataPoints(); ps.AppendEmpty(); ps.AppendEmpty() }},
+		{"histogram", func(m pmetric.Metric) { ps := m.SetEmptyHistogram().DataPoints(); ps.AppendEmpty(); ps.AppendEmpty() }},
+		{"exponential", func(m pmetric.Metric) {
+			ps := m.SetEmptyExponentialHistogram().DataPoints()
+			ps.AppendEmpty()
+			ps.AppendEmpty()
+		}},
+		{"summary", func(m pmetric.Metric) { ps := m.SetEmptySummary().DataPoints(); ps.AppendEmpty(); ps.AppendEmpty() }},
+	} {
+		m := pmetric.NewMetric()
+		tc.add(m)
+		if n := DataPointCount(m); n != 2 {
+			t.Errorf("%s: DataPointCount = %d, want 2", tc.name, n)
+		}
+	}
+	if n := DataPointCount(pmetric.NewMetric()); n != 0 {
+		t.Errorf("untyped: DataPointCount = %d, want 0", n)
 	}
 }

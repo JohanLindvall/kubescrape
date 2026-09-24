@@ -59,3 +59,35 @@ func TestFilterAnnotationsDropsEveryAppliedObjectCopy(t *testing.T) {
 		t.Error("a checksum annotation must survive the filter")
 	}
 }
+
+// Both doors refuse the SAME keys: the read filter (FilterAnnotations, on the
+// fast path and on the budgeted slow path alike) and the informer transform
+// (StripDroppedAnnotations) each read refusedAnnotations. A key refused at one
+// door and not the other is either refused on read while resident in every
+// cached object, or stripped from the cache while a hand-built object still
+// serves it — which is the drift one list exists to make impossible.
+func TestEveryRefusedAnnotationIsRefusedAtBothDoors(t *testing.T) {
+	blob := string(make([]byte, MaxAnnotationValueBytes+1)) // forces the slow path
+	for key := range refusedAnnotations {
+		m := map[string]string{key: "x", "keep": "me"}
+		if !StripDroppedAnnotations(m) || len(m) != 1 || m["keep"] != "me" {
+			t.Errorf("%s: the informer transform did not strip exactly the refused key: %v", key, m)
+		}
+		if got := FilterAnnotations(map[string]string{key: "x", "keep": "me"}); len(got) != 1 || got["keep"] != "me" {
+			t.Errorf("%s: the read filter's fast path served it: %v", key, got)
+		}
+		got := FilterAnnotations(map[string]string{key: "x", "keep": "me", "zz/blob": blob})
+		if got["keep"] != "me" || !AnnotationsOmitted(got) {
+			t.Fatalf("%s: the fixture no longer reaches the budgeted slow path: %v", key, got)
+		}
+		if key != OmittedAnnotation && got[key] != "" {
+			t.Errorf("%s: the read filter's slow path served it", key)
+		}
+		if got[OmittedAnnotation] == "x" {
+			t.Errorf("%s: the slow path served a forged note", key)
+		}
+		if AnnotationWasOmitted(got, key) {
+			t.Errorf("%s: a refused key was reported as omitted for SIZE", key)
+		}
+	}
+}

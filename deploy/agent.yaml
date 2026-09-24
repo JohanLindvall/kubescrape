@@ -70,8 +70,8 @@ spec:
     spec:
       serviceAccountName: kubescrape-agent
       # The shutdown sequence is bounded but not instant: the tailer gets a
-      # final sweep+flush budget, then the final log-metrics, span-metrics
-      # and self-metrics exports run, then the disk buffer drains. The
+      # final sweep+flush budget, then the final log-metrics and self-metrics
+      # exports run, then (with -buffer-dir) the disk buffer drains. The
       # kubelet default of 30s cuts that short during a collector outage.
       terminationGracePeriodSeconds: 60
       # Node-critical: an observability agent evicted under node pressure goes
@@ -106,7 +106,7 @@ spec:
           # `Always` would either fail the pull or fetch a PUBLISHED :latest
           # over the build under test. Pin the tag to a release or an
           # `@sha256:` digest for a real deployment (the Helm chart's
-          # `image.tag`), and the pull policy stops mattering. See
+          # `image.tag` / `image.digest`), and the pull policy stops mattering. See
           # docs/CONFIGURATION.md, "Accepted security residuals".
           imagePullPolicy: IfNotPresent
           command: ["/kubescrape-agent"]
@@ -135,9 +135,9 @@ spec:
             #
             # Uncomment the flag, the mount and the volume below TOGETHER to
             # read them remotely with `Authorization: Bearer <token>` instead;
-            # the file is re-read about once a minute with the previous value
-            # accepted for a grace window, so rotating the Secret needs no
-            # restart:
+            # the file is re-read about once a second (a failed read backs off
+            # to a minute) with the previous value accepted for a 5-minute
+            # grace window, so rotating the Secret needs no restart:
             #   kubectl -n monitoring create secret generic kubescrape-debug \
             #     --from-literal=token="$(openssl rand -hex 24)"
             #- -debug-token-file=/etc/kubescrape/debug/token
@@ -191,11 +191,12 @@ spec:
             # the eighteen k8s.node.{filesystem,imagefs,containerfs}.* are
             # cadvisor's root-cgroup rows again, adding the
             # nodefs/imagefs/containerfs ROLE the eviction thresholds are
-            # written against; k8s.pod.process.count is the kubelet's sum of
-            # its containers' cadvisor process counts, which
-            # container_processes already carries; and on a PVC-backed volume
-            # the six k8s.volume.* restate kubelet_volume_stats_* from the
-            # -node-metrics scrape, which carry no pod label. CPU, memory,
+            # written against; and on a PVC-backed volume the six
+            # k8s.volume.* restate kubelet_volume_stats_* from the
+            # -node-metrics scrape, which carry no pod label. NOT a
+            # restatement, though it looks like one: k8s.pod.process.count is
+            # the kubelet's own per-pod figure, not a pre-summed
+            # container_processes (measured on a live node). CPU, memory,
             # network and swap are deliberately absent: cadvisor reports them
             # on the same resources, so collecting both would be the same
             # numbers twice under two names.
@@ -256,7 +257,7 @@ spec:
             # export rather than anything retained (~1.5 KiB per container),
             # and a floor: a 300s window reads +7.2 MiB.
             #
-            # Uncomment the flag AND the cgroup volume + mount below TOGETHER.
+            # Uncomment the flags AND the cgroup volume + mount below TOGETHER.
             # Without the host's /sys/fs/cgroup the agent sees only its OWN
             # cgroup, finds no pod cgroups and exports nothing — the same shape
             # as the journald trap above. It says so at startup (a WARNING
@@ -285,8 +286,29 @@ spec:
             # rule at any setting (at 5s, everything from 7s up). Lowering it
             # costs the METADATA SERVICE one lookup per unresolved cgroup a pass
             # (one per pod is permanent — the sandbox), not this node's CPU.
+            #
+            # -cgroup-stats-root names where the host hierarchy is mounted, and
+            # it is /host/sys/fs/cgroup rather than the default /sys/fs/cgroup
+            # on purpose: this container has its own cgroup namespace, its own
+            # /sys/fs/cgroup is where the binary reads its OWN memory limit for
+            # GOMEMLIMIT (see resources below), and the node's hierarchy mounted
+            # over it hides that limit — the agent then runs with no soft memory
+            # limit. A cgroup v1 node still only disables this pipeline at an
+            # explicit root; a root with nothing mounted is fatal.
             #- -cgroup-stats
+            #- -cgroup-stats-root=/host/sys/fs/cgroup
             #- -cgroup-stats-discover-interval=15s
+            # OTLP ingest: an UNAUTHENTICATED receiver for the LOGS and METRICS
+            # applications push to this node's agent (traces go to the trace
+            # tier, deploy/servicegraph.yaml), enriched with the pusher's
+            # Kubernetes metadata before forwarding. Uncomment the flag AND the
+            # otlp-grpc/otlp-http port entries below TOGETHER — it listens on
+            # :4317 and :4318 by default. Read the NetworkPolicy warning above
+            # first, and docs/CONFIGURATION.md, "How an application addresses the
+            # local agent", for how a sender reaches it: without a Service with
+            # internalTrafficPolicy: Local (that section carries the manifest) or
+            # a hostPort, the listeners are reachable at this pod's IP only.
+            #- -ingest
           env:
             - name: NODE_NAME
               valueFrom:
@@ -309,6 +331,19 @@ spec:
           ports:
             - name: http
               containerPort: 8081
+            # For -ingest above; uncomment with it. The hostPort lines are the
+            # FALLBACK addressing, for a sender that cannot use cluster DNS —
+            # leave them commented otherwise: a hostPort claims the port on
+            # EVERY node (a collector DaemonSet on 4317/4318 then cannot
+            # schedule), and on a CNI that implements it with the portmap
+            # plugin it masquerades a same-node sender, so that sender must
+            # carry k8s.pod.uid (or container.id) itself to be attributed.
+            #- name: otlp-grpc
+            #  containerPort: 4317
+            #  hostPort: 4317
+            #- name: otlp-http
+            #  containerPort: 4318
+            #  hostPort: 4318
           # Without these the agent's whole readiness machinery is inert on
           # this path: pods are Ready the moment the container starts, so a
           # rolling update marches across every node regardless of whether the
@@ -364,10 +399,11 @@ spec:
             #  readOnly: true
             # The host's cgroup hierarchy, for -cgroup-stats. Read-only: the
             # sampler only ever reads three files per container. Uncomment with
-            # the flag above; the chart mounts this whenever
-            # agent.cgroupStats.enabled is set.
+            # the flags above; the chart mounts this whenever
+            # agent.cgroupStats.enabled is set. BESIDE the container's own
+            # /sys/fs/cgroup, never over it, and at -cgroup-stats-root's path.
             #- name: cgroup
-            #  mountPath: /sys/fs/cgroup
+            #  mountPath: /host/sys/fs/cgroup
             #  readOnly: true
             # The -debug-token-file Secret. Uncomment with the flag above and
             # the volume below; the path must match the flag exactly, or the
@@ -416,7 +452,15 @@ spec:
         # Uncomment with -journald and its mount above. `File`, not
         # FileOrCreate: an EMPTY /etc/machine-id fails sd_id128_get_machine()
         # exactly as an absent one does, so creating one would hand the agent a
-        # mount that looks right and reads nothing.
+        # mount that looks right and reads nothing. The price, stated plainly:
+        # with this uncommented EVERY node the DaemonSet schedules on must have
+        # /etc/machine-id, or that node's WHOLE agent — logs, metrics, cadvisor,
+        # not just the journal — stays in ContainerCreating (a FailedMount
+        # event) and the rollout stalls there. Every systemd node has one; a
+        # non-systemd node (an OpenRC/Alpine edge node) has no journal either,
+        # so give it a machine id
+        # (`tr -d - < /proc/sys/kernel/random/uuid > /etc/machine-id`) or
+        # leave -journald off for the fleet.
         #- name: machineid
         #  hostPath:
         #    path: /etc/machine-id
@@ -433,3 +477,26 @@ spec:
         #- name: debug-token
         #  secret:
         #    secretName: kubescrape-debug
+
+# PRIORITY-CLASS QUOTA. Some clusters — GKE among them — configure the
+# ResourceQuota admission plugin to refuse a system-node-critical pod outside
+# kube-system unless a quota in its namespace covers that class. There the
+# agent DaemonSet creates NO pod, and the only symptom is a FailedCreate event
+# ("insufficient quota to match these scopes"). Uncomment this document on such
+# a cluster (the Helm chart renders it by default: priorityClassQuota). It
+# bounds only `pods`, far above any real count, so it restricts nothing where
+# that policy is absent.
+#---
+#apiVersion: v1
+#kind: ResourceQuota
+#metadata:
+#  name: kubescrape-agent-node-critical
+#  namespace: monitoring
+#spec:
+#  hard:
+#    pods: "100000"
+#  scopeSelector:
+#    matchExpressions:
+#      - scopeName: PriorityClass
+#        operator: In
+#        values: [system-node-critical]

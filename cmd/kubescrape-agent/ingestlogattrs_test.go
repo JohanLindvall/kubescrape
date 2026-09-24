@@ -26,8 +26,8 @@ func TestStartIngestLiftsLogAttributesFromPushedLines(t *testing.T) {
 	out := &capIngestOut{}
 	p.out = out
 	p.attrBuilders = &attrs.Builders{}
-	// The same compiled extractor the tailer and journald get (main.go builds
-	// it once and hands it to every producer).
+	// The same compiled extractor the tailer and journald get (compileConfig,
+	// config.go, builds it once and run() hands it to every producer).
 	ext, err := compileLogAttrs(&logattrs.Config{Rules: []logattrs.Rule{{Key: "user", Attribute: "app.user"}}})
 	if err != nil {
 		t.Fatal(err)

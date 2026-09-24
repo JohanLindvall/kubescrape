@@ -58,7 +58,7 @@ func tailChain(t *testing.T, proc *servicegraph.Processor) (*pipelines, serviceg
 // therefore the LAST thing above the exporter, and a span it drops has already
 // been counted by everything above it.
 func TestTailSamplingSitsBelowThePairTap(t *testing.T) {
-	proc := servicegraph.NewProcessor(servicegraph.Config{}, slog.New(slog.DiscardHandler))
+	proc := servicegraph.NewProcessor(servicegraph.Config{}, nil, slog.New(slog.DiscardHandler))
 	p, chain, out, stop := tailChain(t, proc)
 	defer stop()
 
@@ -88,7 +88,7 @@ func TestTailSamplingSitsBelowThePairTap(t *testing.T) {
 // stop lose nothing (see agent/tailbuffer's package doc on why a hard kill
 // does).
 func TestShutdownFlushExportsTheKeeps(t *testing.T) {
-	proc := servicegraph.NewProcessor(servicegraph.Config{}, slog.New(slog.DiscardHandler))
+	proc := servicegraph.NewProcessor(servicegraph.Config{}, nil, slog.New(slog.DiscardHandler))
 	p, chain, out, stop := tailChain(t, proc)
 	defer stop()
 
@@ -109,7 +109,7 @@ func TestShutdownFlushExportsTheKeeps(t *testing.T) {
 // Off unless configured: the tier must not start buffering traces because the
 // binary can.
 func TestTailSamplingIsOffWithoutPolicies(t *testing.T) {
-	proc := servicegraph.NewProcessor(servicegraph.Config{}, slog.New(slog.DiscardHandler))
+	proc := servicegraph.NewProcessor(servicegraph.Config{}, nil, slog.New(slog.DiscardHandler))
 	out := &chainOut{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

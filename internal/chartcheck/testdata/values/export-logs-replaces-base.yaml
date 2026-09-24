@@ -1,5 +1,5 @@
 # `export.logs.endpoint` REPLACES the flag base for the logs signal
-# (otlpexport.ExportOverride.merged), so the base is a metrics/traces-only
+# (otlpexport.ExportConfig.signalConfig), so the base is a metrics/traces-only
 # address here and its namespace must NOT be excluded: this flag governs which
 # namespaces are TAILED, and a destination that receives no logs has nothing to
 # feed itself with. The derived -logs-exclude-namespaces must therefore read

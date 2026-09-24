@@ -62,7 +62,7 @@ func fatPod() *corev1.Pod {
 			StartupProbe:   probe,
 			Lifecycle: &corev1.Lifecycle{
 				PreStop: &corev1.LifecycleHandler{Exec: &corev1.ExecAction{Command: []string{"sleep", "5"}}}},
-			SecurityContext: &corev1.SecurityContext{RunAsUser: ptr(int64(1000))},
+			SecurityContext: &corev1.SecurityContext{RunAsUser: new(int64(1000))},
 		}
 	}
 	return &corev1.Pod{
@@ -93,7 +93,7 @@ func fatPod() *corev1.Pod {
 				EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
 			Tolerations:               []corev1.Toleration{{Key: "node.kubernetes.io/unreachable"}},
 			NodeSelector:              map[string]string{"kubernetes.io/os": "linux"},
-			SecurityContext:           &corev1.PodSecurityContext{RunAsNonRoot: ptr(true)},
+			SecurityContext:           &corev1.PodSecurityContext{RunAsNonRoot: new(true)},
 			ImagePullSecrets:          []corev1.LocalObjectReference{{Name: "regcred"}},
 			TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{TopologyKey: "zone"}},
 			Affinity:                  &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{}},
@@ -133,7 +133,7 @@ func fatStatus() corev1.PodStatus {
 		// the field.
 		c.Image = "registry.example.com/" + c.Name + "@sha256:resolved"
 		c.ImageID = "registry.example.com/" + c.Name + "@sha256:deadbeef"
-		c.Started = ptr(true)
+		c.Started = new(true)
 		c.Resources = &corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
 			Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
@@ -143,7 +143,7 @@ func fatStatus() corev1.PodStatus {
 		c.VolumeMounts = []corev1.VolumeMountStatus{
 			{Name: "data", MountPath: "/data", RecursiveReadOnly: &rro}}
 		c.User = &corev1.ContainerUser{Linux: &corev1.LinuxContainerUser{UID: 1000, GID: 1000}}
-		c.StopSignal = ptr(corev1.SIGTERM)
+		c.StopSignal = new(corev1.SIGTERM)
 		return c
 	}
 	return corev1.PodStatus{
@@ -198,8 +198,6 @@ func fatStatus() corev1.PodStatus {
 			Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}},
 	}
 }
-
-func ptr[T any](v T) *T { return &v }
 
 // TestTrimPodPreservesEverythingFromPodReads is the guarantee that makes the
 // trim safe.

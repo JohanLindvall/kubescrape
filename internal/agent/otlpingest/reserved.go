@@ -96,12 +96,13 @@ func (r ReservedAttrs) empty() bool {
 // namespace, no k8s attributes, peer-IP fallback off) with no instance identity
 // at all.
 //
-// This list is shared with Enricher.resolvedWins, which is the whole point:
-// the exemption has to mean the same thing on the RESOLVED path, and the
-// far more common one. It briefly did not — the strip preserved the two keys
-// and the resolved-wins overwrite then destroyed them for every sender the
-// lookup succeeded on, excused here as "mergeAttrs corrects them anyway". There
-// is nothing to correct: neither key steers any kubescrape behaviour, which is
+// Enricher.resolvedWins reads this list, and the receipt strip
+// (SenderIdentityStrip) is derived FROM resolvedWins, which is the whole point:
+// the exemption has to mean the same thing on the RESOLVED path, and the far
+// more common one. It briefly did not — the strip preserved the two keys and
+// the resolved-wins overwrite then destroyed them for every sender the lookup
+// succeeded on, excused here as "mergeAttrs corrects them anyway". There is
+// nothing to correct: neither key steers any kubescrape behaviour, which is
 // this exemption's own premise.
 var senderControlledIdentity = []string{"service.namespace", "service.instance.id"}
 
@@ -117,58 +118,63 @@ var senderControlledIdentity = []string{"service.namespace", "service.instance.i
 // pod-annotation surface, which refuses it and counts a metric, reached here
 // through a listener with no credentials at all. The k8s.pod.*/k8s.node.name/
 // container.* siblings go with it because they are exactly the keys a resolved
-// lookup overwrites (mergeAttrs), so on a resolvable resource the strip changes
-// nothing, and on an unresolvable one a claim nobody can check would otherwise
-// name someone else's pod on every series and every log-derived metric bound to
-// the resource. Enrichment CANNOT stand in for this: a resource with no
+// lookup overwrites (mergeAttrs), so on a resource resolved at CONTAINER grain
+// the strip changes nothing — one resolved only at POD grain (a k8s.pod.uid
+// lookup) does lose the sender's container name, which a pod-level answer
+// cannot supply — and on an unresolvable one a claim nobody can check would
+// otherwise name someone else's pod on every series and every log-derived
+// metric bound to the resource. Enrichment CANNOT stand in for this: a resource with no
 // resolvable id — every sender that is not a pod on this node, and every push
 // with the peer-IP fallback off — has no correction available, and there the
 // sender's declaration was the only namespace there was.
 //
-// What is deliberately NOT stripped:
+// WHICH keys: attrs.ReservedIdentityKeys() filtered through resolvedWins — the
+// predicate the merge applies once a lookup has resolved — asked with BOTH
+// lookup kinds as the input, since at receipt nothing has resolved yet. The
+// strip and the merge are ONE decision about what a sender owns, and deriving
+// the one from the other is what keeps them from drifting apart again (the
+// exemption once held only on the strip, and the merge then destroyed it for
+// every sender the lookup succeeded on). resolvedWins carries the argument for
+// each exemption; in short, what survives the strip is:
 //
 //   - service.name, which attrs.ReservedIdentity leaves out on purpose: it is
-//     DESCRIPTIVE, and naming its own service is the whole point of a sender.
-//
-//   - service.namespace and service.instance.id, for the reason recorded at
-//     senderControlledIdentity: the same argument that exempts service.name.
-//     Enricher.resolvedWins exempts the same two, so a resolved sender keeps
-//     what an unresolved one keeps.
-//
+//     DESCRIPTIVE, and naming its own service is the whole point of a sender;
+//   - service.namespace and service.instance.id (senderControlledIdentity);
 //   - the LOOKUP KEYS (this enricher's -ingest-container-id-keys /
-//     -ingest-pod-uid-keys), because stripping them would disable attribution
-//     entirely: the strip runs BEFORE enrichment (sanitizeLogs -> EnrichLogs),
-//     so a receiver that removed them would resolve nothing at all. That is
-//     the trap in "just strip every identity key".
+//     -ingest-pod-uid-keys), both kinds: the strip runs BEFORE enrichment
+//     (sanitizeLogs -> EnrichLogs), so a receiver that removed them would
+//     resolve nothing at all — the trap in "just strip every identity key".
+//     Once one kind resolves, the merge corrects the OTHER like any resolved
+//     key.
 //
-//     THE RESIDUAL THIS LEAVES, stated as the trade it is rather than as a
-//     harmlessness claim: the exact tenancy crossing the strip exists to stop
-//     is still reachable through the lookup keys, one hop over. The metadata
-//     service's /v1/pods/{ns}/{name} is UNAUTHENTICATED by design and serves
-//     each container's id and the pod UID, and the store's container index is
-//     CLUSTER-wide rather than node-scoped. So a pod that can reach both
-//     services reads a victim's container.id, pushes it with no
-//     k8s.namespace.name of its own, and mergeAttrs writes the victim's
-//     namespace onto the resource — which route.match then keys tenancy on,
-//     sending the payload to that tenant's endpoint and X-Scope-OrgID. The
-//     strip removes nothing relevant on that path, because the forged value
-//     never appears on the wire: it is DERIVED, correctly, from a stolen id.
+// THE RESIDUAL the lookup-key exemption leaves, stated as the trade it is
+// rather than as a harmlessness claim: the exact tenancy crossing the strip
+// exists to stop is still reachable through the lookup keys, one hop over. The
+// metadata service's /v1/pods/{ns}/{name} is UNAUTHENTICATED by design and
+// serves each container's id and the pod UID, and the store's container index
+// is CLUSTER-wide rather than node-scoped. So a pod that can reach both
+// services reads a victim's container.id, pushes it with no k8s.namespace.name
+// of its own, and mergeAttrs writes the victim's namespace onto the resource —
+// which route.match then keys tenancy on, sending the payload to that tenant's
+// endpoint and X-Scope-OrgID. The strip removes nothing relevant on that path,
+// because the forged value never appears on the wire: it is DERIVED, correctly,
+// from a stolen id.
 //
-//     It is documented rather than closed because the obvious closure does
-//     not work. Refusing a resolved object on another NODE (Config.NodeInfo)
-//     would cost legitimate attribution — the datapoint/split path exists so
-//     a sender can describe objects across the cluster, the trace tier
-//     receives from every node by design, and a DaemonSet receiver fronted by
-//     a Service round-robins away from the sender's own node — and it would
-//     not even close the hole, since a co-located victim (the common case in
-//     a cluster that spreads namespaces across nodes) is still reachable.
-//     Narrowing the victim set while silently un-attributing honest senders is
-//     a worse bargain than the residual. What DOES close it is authenticating
-//     the listener or the metadata service, neither of which is on offer here.
+// It is documented rather than closed because the obvious closure does not
+// work. Refusing a resolved object on another NODE (Config.NodeInfo) would cost
+// legitimate attribution — the datapoint/split path exists so a sender can
+// describe objects across the cluster, the trace tier receives from every node
+// by design, and a DaemonSet receiver fronted by a Service round-robins away
+// from the sender's own node — and it would not even close the hole, since a
+// co-located victim (the common case in a cluster that spreads namespaces
+// across nodes) is still reachable. Narrowing the victim set while silently
+// un-attributing honest senders is a worse bargain than the residual. What DOES
+// close it is authenticating the listener or the metadata service, neither of
+// which is on offer here.
 //
-// It is derived from attrs.ReservedIdentityKeys() rather than spelled out, so a
-// key that becomes resolved identity there is covered here by default; the two
-// exclusion lists are what an exemption has to be argued into.
+// Being derived from attrs.ReservedIdentityKeys() rather than spelled out, a key
+// that becomes resolved identity there is covered here by default; an
+// exemption has to be argued into resolvedWins.
 //
 // The cost, stated so it is a decision and not a surprise: a sender that this
 // receiver cannot resolve LOSES its own honestly-declared k8s.pod.name and
@@ -176,18 +182,10 @@ var senderControlledIdentity = []string{"service.namespace", "service.instance.i
 // one. That is the trade the unauthenticated listener forces; the alternative
 // is a routing key any pod may choose.
 func (e *Enricher) SenderIdentityStrip() []string {
-	all := attrs.ReservedIdentityKeys()
-	out := make([]string, 0, len(all))
-	for _, k := range all {
-		if slices.Contains(e.containerIDKeys, k) || slices.Contains(e.podUIDKeys, k) {
-			continue
-		}
-		if slices.Contains(senderControlledIdentity, k) {
-			continue
-		}
-		out = append(out, k)
-	}
-	return out
+	lookup := slices.Concat(e.containerIDKeys, e.podUIDKeys)
+	return slices.DeleteFunc(attrs.ReservedIdentityKeys(), func(k string) bool {
+		return !e.resolvedWins(k, lookup)
+	})
 }
 
 // reservedWarnEvery is the per-key re-warn cadence: the condition is a state
@@ -208,15 +206,31 @@ const reservedWarnEvery = time.Minute
 // operator-intended transform drop. The counter and the warn still fired once,
 // so the strip looked successful.
 //
-// The loop is allocation-free and, on the overwhelmingly common clean map, is
-// exactly the one probe the single-shot form cost: the element walk runs per
-// record/point/span and must stay free. Remove swaps the last entry into the
-// hole, so repeated calls converge.
+// It is ONE pass, never a Remove loop. Remove rescans from index 0 on every
+// call (and swaps the last entry into the hole), so looping it until it
+// returns false costs (entries before the key) x (copies of the key): a
+// resource of 100k filler attributes followed by 20k copies of
+// k8s.namespace.name — a ~2 KiB gzipped push to an UNAUTHENTICATED listener,
+// and nothing ahead of the strip bounds attribute count — held a core, an
+// in-flight slot and its byte-budget charge for seconds, quadratically more
+// per doubling. RemoveIf compacts in place in one walk and, unlike Remove,
+// keeps the surviving attributes in their original order.
+//
+// On the overwhelmingly common clean map this is exactly the one probe the
+// single-shot form cost and it allocates nothing (the closure does not escape
+// RemoveIf): the element walk runs per record/point/span and must stay free.
 func removeAll(m pcommon.Map, k string) int {
-	n := 0
-	for m.Remove(k) {
-		n++
+	if _, ok := m.Get(k); !ok {
+		return 0
 	}
+	n := 0
+	m.RemoveIf(func(key string, _ pcommon.Value) bool {
+		if key != k {
+			return false
+		}
+		n++
+		return true
+	})
 	return n
 }
 
@@ -289,6 +303,18 @@ func (s *Server) stripIdentity(m pcommon.Map, keys []string) {
 
 // sanitizeLogs strips the reserved plumbing keys and the sender's identity
 // claim from a pushed logs payload.
+//
+// The identity strip is RESOURCE-only: identity is a resource concern (routing
+// keys tenancy on the resource's k8s.namespace.name, and a log-derived series'
+// identity is its bound resource), and a record's own attributes are the
+// sender's content. Rule and label resolution does not read a record-level
+// k8s.namespace.name as identity either: logchain.Resolver ranks the
+// attrs.ReservedIdentity keys resource-first, so a record's copy cannot satisfy
+// a namespace keep-allowlist or forge a label on a resource that resolved
+// (TestRecordNamespaceCannotSatisfyANamespaceAllowlist). Stripping it here could
+// not have closed that — a logAttributes `target: log` lift of the same key
+// runs after this — which is why the rule lives in the resolver every producer
+// shares.
 func (s *Server) sanitizeLogs(ld plog.Logs) {
 	ra := s.cfg.ReservedAttrs
 	if ra.empty() {
@@ -372,31 +398,7 @@ func (s *Server) sanitizeMetrics(md pmetric.Metrics) {
 // in both places (a marked metric prunes whole, a marked point alone).
 func (s *Server) sanitizeMetricElements(m pmetric.Metric, keys []string) {
 	s.stripReserved(m.Metadata(), keys)
-	switch m.Type() {
-	case pmetric.MetricTypeGauge:
-		dps := m.Gauge().DataPoints()
-		for i := 0; i < dps.Len(); i++ {
-			s.stripReserved(dps.At(i).Attributes(), keys)
-		}
-	case pmetric.MetricTypeSum:
-		dps := m.Sum().DataPoints()
-		for i := 0; i < dps.Len(); i++ {
-			s.stripReserved(dps.At(i).Attributes(), keys)
-		}
-	case pmetric.MetricTypeHistogram:
-		dps := m.Histogram().DataPoints()
-		for i := 0; i < dps.Len(); i++ {
-			s.stripReserved(dps.At(i).Attributes(), keys)
-		}
-	case pmetric.MetricTypeExponentialHistogram:
-		dps := m.ExponentialHistogram().DataPoints()
-		for i := 0; i < dps.Len(); i++ {
-			s.stripReserved(dps.At(i).Attributes(), keys)
-		}
-	case pmetric.MetricTypeSummary:
-		dps := m.Summary().DataPoints()
-		for i := 0; i < dps.Len(); i++ {
-			s.stripReserved(dps.At(i).Attributes(), keys)
-		}
+	for a := range dataPointAttrs(m) {
+		s.stripReserved(a, keys)
 	}
 }

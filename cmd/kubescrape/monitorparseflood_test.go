@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"log/slog"
 	"testing"
 	"time"
@@ -33,8 +32,8 @@ import (
 // the resyncs do not, and a fresh mistake does.
 func TestParseErrorsAreReportedPerChangeNotPerResync(t *testing.T) {
 	// client-go clamps a resync below one second to one second, so this is the
-	// shortest period that is actually the period (the sibling test says the
-	// same, for the same reason).
+	// shortest period that is actually the period; the deliveries are counted
+	// rather than slept through (the sibling test says why).
 	const resync = time.Second
 
 	gvr := servicemonitors.GVR
@@ -43,12 +42,12 @@ func TestParseErrorsAreReportedPerChangeNotPerResync(t *testing.T) {
 		map[schema.GroupVersionResource]string{gvr: "ServiceMonitorList"},
 		unparseableMonitor("1"))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	factory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(client, resync, "", nil)
 	index := servicemonitors.NewIndex()
+	upsert, deliveries := deliveryCounter(index.UpsertChanged)
 	synced, err := monitorInformer(factory, gvr, "servicemonitor", nil, slog.New(slog.DiscardHandler),
-		index.UpsertChanged, index.Delete, index.Endpoints)
+		upsert, index.Delete)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,13 +74,13 @@ func TestParseErrorsAreReportedPerChangeNotPerResync(t *testing.T) {
 	}
 	afterFirst := count()
 
-	// …and then several resync periods pass with the object untouched.
-	time.Sleep(3 * resync)
+	// …and then resyncs re-deliver the object untouched.
+	awaitResyncs(t, deliveries, 2)
 	if got := count(); got != afterFirst {
-		t.Errorf("kubescrape_monitor_parse_errors_total moved by %v across %d resync periods with nothing "+
+		t.Errorf("kubescrape_monitor_parse_errors_total moved by %v across resync deliveries with nothing "+
 			"edited: the counter climbs with the resync period instead of with events, so its rate is a "+
 			"standing alarm and the WARN beside it repeats forever for one broken monitor",
-			got-afterFirst, 3)
+			got-afterFirst)
 	}
 
 	// A NEW mistake still reports: the gate must not have silenced the signal.

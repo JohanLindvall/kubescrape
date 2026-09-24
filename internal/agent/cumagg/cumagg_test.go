@@ -2,6 +2,7 @@ package cumagg
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -139,6 +140,109 @@ func TestEvictionWaitsForDelivery(t *testing.T) {
 type errFail struct{}
 
 func (errFail) Error() string { return "collector down" }
+
+// observeDuringSend is the harness' exporter with one observation landing
+// DURING the send: after Render has marked the series Rendered and before the
+// delivery mark runs — the window an ingest goroutine hits on every export.
+type observeDuringSend struct {
+	h   *harness
+	key string
+}
+
+func (o *observeDuringSend) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
+	o.h.observe(o.key)
+	return o.h.ExportMetrics(ctx, md)
+}
+
+// The delivery mark promotes only what the delivered payload CARRIED. A series
+// observed while that payload was in flight is back in Observed, holds a value
+// no collector has seen, and must stay ineligible for eviction until a later
+// export delivers it — or an export interval longer than staleAfter, which is
+// legal, evicts the one increment nobody exported. Nothing else pins it: the
+// overlapping-exports test ends Rendered either way, and the eviction-gate test
+// covers only a FAILED send.
+func TestDeliveryMarkLeavesSeriesObservedDuringTheSendUndelivered(t *testing.T) {
+	h := newHarness(10, time.Minute)
+	h.observe("a")
+	if err := h.store.Export(context.Background(), &observeDuringSend{h: h, key: "a"}, pcommon.NewResource()); err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+
+	h.now = h.now.Add(2 * time.Minute) // past staleAfter, before any export carried the second call
+	h.export(t)
+	if h.evicted.n != 0 {
+		t.Fatalf("evicted = %d, want 0: the series held an observation no delivered export carried", h.evicted.n)
+	}
+	if len(h.exported) != 2 {
+		t.Fatalf("payloads = %d, want 2", len(h.exported))
+	}
+	got := h.exported[1].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0).IntValue()
+	if got != 2 {
+		t.Errorf("second payload calls = %d, want 2 (the call observed during the first send)", got)
+	}
+}
+
+// The delivery mark acts on what the delivered payload CARRIED and on nothing
+// else. A series ADMITTED while the payload was in flight was in no payload at
+// all, so its exemplar is evidence nobody has seen: clearing it with the rest
+// dropped it unseen. The mark used to take every live series' pointer in a
+// whole-map pass of its own, which is what reached it; it walks the render's own
+// list now.
+func TestDeliveryMarkLeavesSeriesAdmittedDuringTheSendAlone(t *testing.T) {
+	h := newHarness(10, time.Minute)
+	h.observe("a")
+	if err := h.store.Export(context.Background(), &observeDuringSend{h: h, key: "b"}, pcommon.NewResource()); err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	h.export(t)
+	if len(h.exported) != 2 {
+		t.Fatalf("payloads = %d, want 2", len(h.exported))
+	}
+	dps := h.exported[1].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints()
+	if dps.Len() != 2 {
+		t.Fatalf("second payload points = %d, want 2", dps.Len())
+	}
+	var exemplars []int
+	for i := 0; i < dps.Len(); i++ {
+		exemplars = append(exemplars, dps.At(i).Exemplars().Len())
+	}
+	// "a"'s exemplar was delivered by the first payload and cleared; "b"'s was
+	// recorded during that send and delivered by none, so it must still be here.
+	if exemplars[0]+exemplars[1] != 1 {
+		t.Fatalf("exemplars per point = %v, want exactly one (the series admitted during the first send kept its evidence)", exemplars)
+	}
+}
+
+// The list the delivery mark walks belongs to ONE export. Kept past it, it would
+// grow by a whole render per interval and pin series eviction had already
+// dropped — after a FAILED send too, which never reaches the mark at all.
+func TestRenderedListDoesNotOutliveItsExport(t *testing.T) {
+	h := newHarness(10, time.Minute)
+	listed := func() int {
+		h.store.Lock()
+		defer h.store.Unlock()
+		return len(h.store.rendered)
+	}
+	h.observe("a")
+	h.observe("b")
+	h.export(t)
+	if n := listed(); n != 0 {
+		t.Fatalf("after a delivered export the mark's list holds %d series, want 0", n)
+	}
+	h.failWith = errFail{}
+	h.export(t)
+	h.failWith = nil
+	if n := listed(); n != 0 {
+		t.Fatalf("after a failed export the mark's list holds %d series, want 0", n)
+	}
+	// A render outside Export (tests do it) must not leak into the next
+	// export's mark either.
+	h.store.Render(pcommon.NewResource(), h.now)
+	h.export(t)
+	if n := listed(); n != 0 {
+		t.Fatalf("after an out-of-band render and an export the list holds %d series, want 0", n)
+	}
+}
 
 // Zero staleAfter disables eviction outright: the branch a negative value used
 // to reach by being clamped (see ParseStaleAfter).
@@ -305,22 +409,114 @@ func TestParseStaleAfter(t *testing.T) {
 	}
 }
 
-func TestBuiltinsFilter(t *testing.T) {
+func TestBuiltinsConfigure(t *testing.T) {
 	b := NewBuiltins("service.name", "span.name")
-	got := b.Filter([]string{"http.route", "span.name", "http.route", "db.system"})
+	got := b.Configure("x", []string{"http.route", "span.name", "", "http.route", "db.system"}, nil)
 	want := []string{"http.route", "db.system"}
 	if len(got) != len(want) {
-		t.Fatalf("Filter = %v, want %v", got, want)
+		t.Fatalf("Configure = %v, want %v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("Filter = %v, want %v (order is the label order)", got, want)
+			t.Fatalf("Configure = %v, want %v (order is the label order)", got, want)
 		}
 	}
 	if !b.Has("span.name") || b.Has("http.route") {
 		t.Error("Has does not report the built-in set")
 	}
-	if b.Filter(nil) != nil {
-		t.Error("Filter(nil) should stay nil")
+	if b.Configure("x", nil, nil) != nil {
+		t.Error("Configure(nil) should stay nil")
 	}
+	// A nil set applies the empty and repeat rules alone (servicegraph's
+	// configured names, which are prefixed before they can meet a built-in).
+	var none Builtins
+	if got := none.Configure("x", []string{"a", "", "a", "b"}, nil); strings.Join(got, ",") != "a,b" {
+		t.Errorf("nil Builtins Configure = %q, want [a b]", got)
+	}
+}
+
+// A constructor's trace of what it dropped is exactly DimensionWarnings' list,
+// at Debug and never at Warn (configWarnings owns the Warn, or a start prints
+// each line twice) — and nothing at all when the logger is not at Debug.
+func TestConfigureTracesExactlyTheDimensionWarningsAtDebug(t *testing.T) {
+	b := NewBuiltins("span.name")
+	names := []string{"http.route", "", "span.name", "http.route"}
+	rec := &recordingHandler{level: slog.LevelDebug}
+	b.Configure("traceMetrics.dimensions", names, slog.New(rec))
+	want := b.DimensionWarnings("traceMetrics.dimensions", names)
+	if len(want) != 3 {
+		t.Fatalf("setup: DimensionWarnings = %q, want three drops", want)
+	}
+	if len(rec.msgs) != len(want) {
+		t.Fatalf("Configure traced %d lines, want one per drop (%d): %+v", len(rec.msgs), len(want), rec.msgs)
+	}
+	for i, r := range rec.msgs {
+		if r.level != slog.LevelDebug {
+			t.Errorf("line %d logged at %v; the Warn is configWarnings', a start would print it twice", i, r.level)
+		}
+		if r.msg != want[i] {
+			t.Errorf("line %d = %q, want DimensionWarnings' %q", i, r.msg, want[i])
+		}
+	}
+	quiet := &recordingHandler{level: slog.LevelInfo}
+	b.Configure("traceMetrics.dimensions", names, slog.New(quiet))
+	if len(quiet.msgs) != 0 {
+		t.Errorf("an Info-level logger received the Debug trace: %+v", quiet.msgs)
+	}
+}
+
+// recordingHandler keeps each record's level and message verbatim.
+type recordingHandler struct {
+	level slog.Level
+	msgs  []struct {
+		level slog.Level
+		msg   string
+	}
+}
+
+func (h *recordingHandler) Enabled(_ context.Context, l slog.Level) bool { return l >= h.level }
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.msgs = append(h.msgs, struct {
+		level slog.Level
+		msg   string
+	}{r.Level, r.Message})
+	return nil
+}
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
+
+// An empty configured name is a stray `- ` in a YAML list, and kept it renders
+// an attribute with an EMPTY KEY on every data point. servicegraph refused it
+// in a loop of its own while the shared rule kept it — the drift this package
+// exists to end — so the rule and its report are one walk, and they must agree.
+func TestDimensionWarningsReportExactlyWhatConfigureDrops(t *testing.T) {
+	b := NewBuiltins("service.name", "span.name")
+	names := []string{"http.route", "", "span.name", "http.route", "db.system", ""}
+	kept := b.Configure("traceMetrics.dimensions", names, nil)
+	warns := b.DimensionWarnings("traceMetrics.dimensions", names)
+	if len(kept)+len(warns) != len(names) {
+		t.Fatalf("kept %q and warned %q: every name is either kept or reported, exactly once", kept, warns)
+	}
+	for _, want := range []string{
+		`traceMetrics.dimensions[1] "" is ignored: it is empty`,
+		`traceMetrics.dimensions[2] "span.name" is ignored: it collides with a label every data point already carries (service.name,span.name)`,
+		`traceMetrics.dimensions[3] "http.route" is ignored: it repeats an earlier entry`,
+		`traceMetrics.dimensions[5] "" is ignored: it is empty`,
+	} {
+		if !containsPrefix(warns, want) {
+			t.Errorf("missing %q in %q", want, warns)
+		}
+	}
+	if w := b.DimensionWarnings("x", []string{"http.route", "db.system"}); w != nil {
+		t.Errorf("a clean list warned: %q", w)
+	}
+}
+
+func containsPrefix(ss []string, prefix string) bool {
+	for _, s := range ss {
+		if strings.HasPrefix(s, prefix) {
+			return true
+		}
+	}
+	return false
 }

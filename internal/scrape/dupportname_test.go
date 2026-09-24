@@ -71,9 +71,9 @@ func TestEveryPortPathAgreesOnADuplicateName(t *testing.T) {
 		{"pod annotation", targetPorts(PodTargets(pod))},
 		{"service annotation targetPort", targetPorts(ServiceTargets(pod, svc))},
 		{"servicemonitor endpoint port", targetPorts(MonitorTargets(pod, svc, "ns/sm", servicemonitors.Endpoint{Port: "metrics"}))},
-		{"servicemonitor endpoint targetPort", targetPorts(MonitorTargets(pod, svc, "ns/sm", servicemonitors.Endpoint{TargetPort: ptr(intstr.FromString("dup"))}))},
+		{"servicemonitor endpoint targetPort", targetPorts(MonitorTargets(pod, svc, "ns/sm", servicemonitors.Endpoint{TargetPort: new(intstr.FromString("dup"))}))},
 		{"podmonitor endpoint port", targetPorts(PodMonitorTargets(pod, "ns/pm", servicemonitors.Endpoint{Port: "dup"}))},
-		{"podmonitor endpoint targetPort", targetPorts(PodMonitorTargets(pod, "ns/pm", servicemonitors.Endpoint{TargetPort: ptr(intstr.FromString("dup"))}))},
+		{"podmonitor endpoint targetPort", targetPorts(PodMonitorTargets(pod, "ns/pm", servicemonitors.Endpoint{TargetPort: new(intstr.FromString("dup"))}))},
 	} {
 		if !slices.Equal(tc.ports, want) {
 			t.Errorf("%s resolved %v, want %v: one name on one pod must resolve the same however the target was discovered", tc.path, tc.ports, want)
@@ -163,5 +163,3 @@ func TestDuplicateNameDedupsAcrossServicePorts(t *testing.T) {
 		t.Errorf("second service port note = %q, want the already-claimed note", verdicts[1].Note)
 	}
 }
-
-func ptr[T any](v T) *T { return &v }

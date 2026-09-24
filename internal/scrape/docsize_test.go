@@ -100,11 +100,14 @@ func TestDocBytesIsNeverUnderTheMarshalledSize(t *testing.T) {
 			URL: "http://10.1.2.3:9090/metrics", Scheme: "http", Address: "10.1.2.3:9090",
 			Port: 9090, Path: "/metrics", Source: "servicemonitor",
 			Monitor: "default/web", Monitors: []string{"default/web", "default/platform"},
-			InsecureSkipVerify: true, AuthSecret: "default/tok/key",
-			BasicAuthUser: "default/ba/user", BasicAuthPass: "default/ba/pass",
-			AuthType: "Bearer", AuthCredentials: "default/auth/creds",
-			TLSCA: "default/tls/ca", TLSCert: "default/tls/crt", TLSKey: "default/tls/key",
-			TLSServerName: "web.default.svc", Interval: "30s", ScrapeTimeout: "10s",
+			ScrapeAuth: kubemeta.ScrapeAuth{
+				InsecureSkipVerify: true, AuthSecret: "default/tok/key",
+				BasicAuthUser: "default/ba/user", BasicAuthPass: "default/ba/pass",
+				AuthType: "Bearer", AuthCredentials: "default/auth/creds",
+				TLSCA: "default/tls/ca", TLSCert: "default/tls/crt", TLSKey: "default/tls/key",
+				TLSServerName: "web.default.svc",
+			},
+			Interval: "30s", ScrapeTimeout: "10s",
 			MetricRelabelings: []kubemeta.RelabelRule{
 				{Action: "keep", SourceLabels: []string{"__name__", "job"}, Regex: strings.Repeat("a|", 200) + "z"},
 			},
@@ -153,33 +156,35 @@ func TestDocBytesIsNotWildlyOverTheMarshalledSize(t *testing.T) {
 // then add it here.
 func TestDocSizeChargesEveryField(t *testing.T) {
 	charged := map[reflect.Type][]string{
-		reflect.TypeOf(kubemeta.Pod{}): {
+		reflect.TypeFor[kubemeta.Pod](): {
 			"Name", "Namespace", "UID", "NodeName", "PodIP", "PodIPs", "HostIP", "HostNetwork",
 			"Phase", "Ready", "Labels", "Annotations", "CreatedAt", "StartedAt",
 			"DeletionTimestamp", "DeletedAt", "NamespaceMetadata", "Owners", "OwnersOmitted", "Containers",
 		},
-		reflect.TypeOf(kubemeta.Container{}): {
+		reflect.TypeFor[kubemeta.Container](): {
 			"Name", "Type", "ID", "RuntimeID", "Image", "ImageID", "Ports", "RestartCount",
 			"Ready", "State", "WaitingReason", "StartedAt", "FinishedAt", "ExitCode",
 		},
-		reflect.TypeOf(kubemeta.ContainerPort{}): {"Name", "Port", "Protocol"},
-		reflect.TypeOf(kubemeta.Owner{}): {
+		reflect.TypeFor[kubemeta.ContainerPort](): {"Name", "Port", "Protocol"},
+		reflect.TypeFor[kubemeta.Owner](): {
 			"APIVersion", "Kind", "Name", "UID", "Controller", "Labels", "Annotations",
 		},
-		reflect.TypeOf(kubemeta.ObjectMeta{}):  {"UID", "Labels", "Annotations"},
-		reflect.TypeOf(kubemeta.Service{}):     {"Name", "Namespace", "UID", "Labels", "Annotations"},
-		reflect.TypeOf(kubemeta.RelabelRule{}): {"Action", "SourceLabels", "Regex"},
-		reflect.TypeOf(kubemeta.ScrapeTarget{}): {
+		reflect.TypeFor[kubemeta.ObjectMeta]():  {"UID", "Labels", "Annotations"},
+		reflect.TypeFor[kubemeta.Service]():     {"Name", "Namespace", "UID", "Labels", "Annotations"},
+		reflect.TypeFor[kubemeta.RelabelRule](): {"Action", "SourceLabels", "Regex"},
+		reflect.TypeFor[kubemeta.ScrapeTarget](): {
 			"URL", "Scheme", "Address", "Port", "Path", "Source", "Service", "Monitor", "Monitors",
+			"ScrapeAuth", "Interval", "ScrapeTimeout", "MetricRelabelings", "Pod",
+		},
+		reflect.TypeFor[kubemeta.ScrapeAuth](): {
 			"InsecureSkipVerify", "AuthSecret", "BasicAuthUser", "BasicAuthPass", "AuthType",
-			"AuthCredentials", "TLSCA", "TLSCert", "TLSKey", "TLSServerName", "Interval",
-			"ScrapeTimeout", "MetricRelabelings", "Pod",
+			"AuthCredentials", "TLSCA", "TLSCert", "TLSKey", "TLSServerName",
 		},
 	}
 	for typ, want := range charged {
 		var got []string
-		for i := range typ.NumField() {
-			got = append(got, typ.Field(i).Name)
+		for field := range typ.Fields() {
+			got = append(got, field.Name)
 		}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("%s has fields %v, but the size estimate accounts for %v — charge the new field in "+

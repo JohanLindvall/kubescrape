@@ -29,6 +29,14 @@ import (
 // budgetTestServer wires the HTTP handlers with a small buffer budget.
 func budgetTestServer(t *testing.T, limit int64) (*Server, *httptest.Server) {
 	t.Helper()
+	s, srv, _ := probedBudgetTestServer(t, limit)
+	return s, srv
+}
+
+// probedBudgetTestServer is budgetTestServer with its handler behind a
+// handlerProbe, for the tests that must know the server side has got somewhere.
+func probedBudgetTestServer(t *testing.T, limit int64) (*Server, *httptest.Server, *handlerProbe) {
+	t.Helper()
 	s := NewServer(ServerConfig{
 		Enricher: newEnricher(newMeta(), MetricsAuto),
 		Exporter: exporterFunc(func(plog.Logs) error { return nil }),
@@ -36,9 +44,54 @@ func budgetTestServer(t *testing.T, limit int64) (*Server, *httptest.Server) {
 	s.buffer.limit = limit
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/logs", s.handleHTTPLogs)
-	srv := httptest.NewServer(mux)
+	probe := &handlerProbe{next: mux}
+	srv := httptest.NewServer(probe)
 	t.Cleanup(srv.Close)
-	return s, srv
+	return s, srv, probe
+}
+
+// handlerProbe lets a raw-socket test WAIT for the server side of its request
+// instead of sleeping and hoping. A fixed sleep that ends before the handler
+// has run turns every assertion after it into a vacuous pass — a budget charged
+// 0 bytes, an exporter called 0 times — which no CI log would ever show.
+//
+// reading counts handlers that have entered their FIRST body Read: everything
+// the receiver does on the strength of the headers alone (a pre-sized
+// destination, a budget charge) has happened by then. returned counts handlers
+// that have finished.
+type handlerProbe struct {
+	next              http.Handler
+	reading, returned atomic.Int64
+}
+
+func (p *handlerProbe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	defer p.returned.Add(1)
+	r.Body = &firstReadBody{ReadCloser: r.Body, first: func() { p.reading.Add(1) }}
+	p.next.ServeHTTP(w, r)
+}
+
+// await blocks until n reaches want, failing the test after five seconds.
+func (p *handlerProbe) await(t *testing.T, what string, n *atomic.Int64, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for n.Load() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: %d of %d handlers got there within 5s; the assertions that follow would be vacuous",
+				what, n.Load(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+type firstReadBody struct {
+	io.ReadCloser
+	once  sync.Once
+	first func()
+}
+
+func (b *firstReadBody) Read(p []byte) (int, error) {
+	b.once.Do(b.first)
+	return b.ReadCloser.Read(p)
 }
 
 // The HTTP arm reads the whole body BEFORE taking an in-flight slot — it must,
@@ -63,9 +116,7 @@ func TestHTTPBufferBudgetBoundsResidentBytes(t *testing.T) {
 	)
 	release := make(chan struct{})
 	for range senders {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			conn, err := net.Dial("tcp", addr)
 			if err != nil {
 				return
@@ -97,7 +148,7 @@ func TestHTTPBufferBudgetBoundsResidentBytes(t *testing.T) {
 			if resp.StatusCode == http.StatusTooManyRequests {
 				refused.Add(1)
 			}
-		}()
+		})
 	}
 
 	// Give every sender time to either be parked mid-body or be refused.
@@ -235,7 +286,7 @@ func TestHTTPDeclaredLengthIsNotCredited(t *testing.T) {
 		limit   = 4 * maxIngestBody
 		sockets = 8
 	)
-	s, srv := budgetTestServer(t, limit)
+	s, srv, probe := probedBudgetTestServer(t, limit)
 	addr := srv.Listener.Addr().String()
 
 	runtime.GC()
@@ -255,8 +306,9 @@ func TestHTTPDeclaredLengthIsNotCredited(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Long enough for every handler to be parked inside its read.
-	time.Sleep(750 * time.Millisecond)
+	// Every handler parked inside its read: whatever the receiver does on the
+	// strength of the declaration alone has happened by its first Read.
+	probe.await(t, "handlers inside their body read", &probe.reading, sockets)
 
 	runtime.GC()
 	var after runtime.MemStats
@@ -512,8 +564,7 @@ func TestGRPCHeadersOnlyStreamsDoNotPinTheBudget(t *testing.T) {
 
 	// Exactly enough headers-only streams to exhaust the budget. They are never
 	// written to and never closed.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	streams := make([]grpc.ClientStream, 0, 4)
 	for i := range 4 {
 		st, err := conn.NewStream(ctx, &grpc.StreamDesc{ServerStreams: true, ClientStreams: true},
@@ -581,9 +632,7 @@ func TestGRPCReserveWindowRacesTheHandoverSafely(t *testing.T) {
 		s, client, _ := grpcTestServer(t, 64*maxIngestGRPCMessage, window)
 		var wg sync.WaitGroup
 		for range 8 {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				for range 25 {
 					if err := export(t, client); err != nil {
 						refused.Add(1) // a reclaimed reservation: legitimate here
@@ -591,7 +640,7 @@ func TestGRPCReserveWindowRacesTheHandoverSafely(t *testing.T) {
 						served.Add(1)
 					}
 				}
-			}()
+			})
 		}
 		wg.Wait()
 

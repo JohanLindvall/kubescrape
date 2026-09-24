@@ -1,10 +1,12 @@
 package transform
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,8 +14,15 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
+
+// compileStarlark is the tests' shorthand for one batch transform section:
+// src must define transform(batch), as Compile requires of logs/metrics/traces.
+func compileStarlark(signal, src string) (*starlarkProgram, error) {
+	return compileStarlarkFn(signal, src, "transform")
+}
 
 type capExp struct {
 	logs    []plog.Logs
@@ -552,4 +561,114 @@ func TestBrokenTransformsFileIsReportedOncePerDistinctEdit(t *testing.T) {
 	if got := failed.Value() - before; got != 1 {
 		t.Fatalf("a missing file read 50 times counted %v failures, want 1", got)
 	}
+}
+
+// A poll tick or a duplicate event re-reads an UNCHANGED file, which is the
+// active program's own source: it must not be compiled again. Compiling re-ran
+// every section's module top level — a module-level print() logged a line on
+// every node every poll period — and then threw the program away.
+func TestUnchangedTransformsFileDoesNotRerunModuleCode(t *testing.T) {
+	var logged bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transforms.yaml")
+	src := "logs: |\n  print(\"module ran\")\n  def transform(batch):\n      pass\n"
+	writeAtomic(t, path, src)
+	prog, err := CompileFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &reloader{w: Wrap(&capExp{}, nil, prog), path: path, log: testLogger(), currentHash: prog.Hash}
+	t.Cleanup(func() { r.setFailing(false) })
+	runs := func(applies int) int {
+		t.Helper()
+		logged.Reset()
+		for range applies {
+			// Open the 1/s script-log gate each time, so a suppressed line
+			// cannot pass for a module that did not run.
+			scriptLogGates.logs = logdedupe.Throttle{}
+			r.apply()
+		}
+		return strings.Count(logged.String(), "module ran")
+	}
+	if got := runs(3); got != 0 {
+		t.Fatalf("3 re-reads of an unchanged file ran its module code %d times, want 0", got)
+	}
+	// The probe does see a module run: an edit compiles, once.
+	writeAtomic(t, path, src+"metrics: |\n  def transform(batch):\n      pass\n")
+	if got := runs(3); got != 1 {
+		t.Fatalf("an edit read 3 times ran its module code %d times, want 1", got)
+	}
+	scriptLogGates.logs = logdedupe.Throttle{}
+}
+
+// The failed-reload COUNTER is deduped per distinct edit, so it cannot say the
+// file is STILL broken: an alert on its rate resolves one window after the
+// edit while every node keeps running the last good program — and a node
+// restarted in that state CrashLoops, because the startup compile is fatal.
+// kubescrape_transform_reload_failing is that state: it tracks the FILE, set
+// on every broken read and cleared by every compiling one, while the counter
+// keeps tracking the EVENT.
+func TestReloadFailingGaugeTracksTheFileNotTheEvent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transforms.yaml")
+	good := "logs: |\n  def transform(batch):\n      pass\n"
+	writeAtomic(t, path, good)
+	prog, err := CompileFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := &capExp{}
+	r := &reloader{w: Wrap(next, next, prog), path: path, log: testLogger(), currentHash: prog.Hash}
+	t.Cleanup(func() { r.setFailing(false) })
+
+	failed := obs.TransformReloads.WithLabelValues("failed")
+	base := reloadsFailing.Load()
+	step := func(content string, wantGauge int64, wantCounted float64) {
+		t.Helper()
+		if content == "" {
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			writeAtomic(t, path, content)
+		}
+		before := failed.Value()
+		for range 5 {
+			r.apply()
+		}
+		if got := reloadsFailing.Load() - base; got != wantGauge {
+			t.Fatalf("gauge = %d, want %d", got, wantGauge)
+		}
+		if got := failed.Value() - before; got != wantCounted {
+			t.Fatalf("failed counter moved by %v, want %v", got, wantCounted)
+		}
+	}
+
+	step(good, 0, 0)
+	step("logs: |\n  broken ===\n", 1, 1)
+	step("logs: |\n  broken ===\n", 1, 0)      // unchanged and still broken: state holds, no new event
+	step("logs: |\n  also broken ===\n", 1, 1) // a new broken edit: one event, still ONE broken file
+	step(good, 0, 0)                           // fixed (and unchanged from the active program)
+	step("", 1, 1)                             // an unreadable file is the same condition
+
+	t.Run("a stopped watcher stops vouching", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		stopped := make(chan struct{})
+		before := reloadsFailing.Load()
+		go func() {
+			defer close(stopped)
+			Reload(ctx, Wrap(next, next, prog), path, 5*time.Millisecond, testLogger())
+		}()
+		waitFor(t, "the running reloader to notice the missing file", func() bool {
+			return reloadsFailing.Load() == before+1
+		})
+		cancel()
+		<-stopped
+		if got := reloadsFailing.Load(); got != before {
+			t.Fatalf("gauge = %d after the reloader stopped, want %d", got, before)
+		}
+	})
 }

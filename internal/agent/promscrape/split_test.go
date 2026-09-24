@@ -170,7 +170,7 @@ func TestSplitChunkBytesRespectGRPCLimit(t *testing.T) {
 		var sb strings.Builder
 		for _, f := range fams {
 			fmt.Fprintf(&sb, "# TYPE %s gauge\n", f)
-			for i := 0; i < objects; i++ {
+			for i := range objects {
 				fmt.Fprintf(&sb, "%s{namespace=\"namespace-%d\",pod=\"workload-deployment-%d-abcde\",uid=\"%08x-1111-2222-3333-444455556666\",node=\"node9\",phase=\"Running\"} 1\n", f, i%50, i, i)
 			}
 		}
@@ -184,7 +184,7 @@ func TestSplitChunkBytesRespectGRPCLimit(t *testing.T) {
 		var sb strings.Builder
 		for _, f := range []string{"kube_pod_status_ready", "kube_pod_status_phase"} {
 			fmt.Fprintf(&sb, "# TYPE %s gauge\n", f)
-			for i := 0; i < objects; i++ {
+			for i := range objects {
 				fmt.Fprintf(&sb, "%s{pod=\"workload-deployment-%d-abcde\"} 1\n", f, i)
 			}
 		}
@@ -318,8 +318,8 @@ func demotingSplitters(t *testing.T) []*Splitter {
 // objectAttrSplitters demotes attributes that came from the rule's own
 // `attributes` fallbacks rather than from a groupBy label — the described
 // object's cluster/zone/node, which is exactly what datapointAttributes is
-// for. Nothing in the series over-charges for them, so if dpaBytes stops
-// counting them the estimate is simply missing them.
+// for. Nothing in the series over-charges for them, so if the per-point
+// splitDest.dp charge stops counting them the estimate is simply missing them.
 func objectAttrSplitters(t *testing.T) []*Splitter {
 	t.Helper()
 	demoted := []string{
@@ -1225,17 +1225,20 @@ func TestSplitBatcherRoutingIsAllocationFree(t *testing.T) {
 			{Name: "phase", Value: "Running"},
 		}
 	}
-	shape := func(m pmetric.Metric) { shapeNumber(m, false) }
+	// The shape is a closure CAPTURING monotonic and built per call, exactly as
+	// splitBatcher.addNumber (and cadvisorBatcher.addNumber) passes it: it is
+	// free only while metric() never retains shape, and this is what pins that.
+	monotonic := false
 	for i := range rows {
-		cb.metric("kube_pod_status_phase", metricMeta{}, rows[i], shape) // create both resources and metrics
+		cb.metric("kube_pod_status_phase", metricMeta{}, rows[i], func(m pmetric.Metric) { shapeNumber(m, monotonic) }) // create both resources and metrics
 	}
 	i := 0
 	allocs := testing.AllocsPerRun(200, func() {
-		cb.metric("kube_pod_status_phase", metricMeta{}, rows[i%2], shape)
+		cb.metric("kube_pod_status_phase", metricMeta{}, rows[i%2], func(m pmetric.Metric) { shapeNumber(m, monotonic) })
 		i++
 	})
 	if allocs != 0 {
-		t.Fatalf("routing an already-known object allocates %v times, want 0: the resource or metric key is being materialized per row", allocs)
+		t.Fatalf("routing an already-known object allocates %v times, want 0: the resource or metric key is being materialized per row, or metric() lets its per-point shape closure escape", allocs)
 	}
 }
 

@@ -10,11 +10,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
@@ -144,8 +147,9 @@ func TestExportRecoveryIsReported(t *testing.T) {
 	r := New(Config{MaxEntryBytes: 1 << 20, BatchSize: 10, MaxBatchBytes: 1 << 20})
 	logs := captureLog(r, slog.LevelInfo)
 
-	r.exportFailures = 4
-	r.exportFailingSince = time.Now().Add(-90 * time.Second)
+	for range 4 {
+		r.exportOutage.Fail(time.Now().Add(-90*time.Second), 0)
+	}
 	// flushRetry's success arm, reached with an empty batch (flush returns nil
 	// immediately), which is the settled state a recovered export leaves.
 	if err := r.flushRetry(t.Context()); err != nil {
@@ -155,8 +159,8 @@ func TestExportRecoveryIsReported(t *testing.T) {
 	if !strings.Contains(out, "journal export recovered") || !strings.Contains(out, "failures=4") {
 		t.Fatalf("recovery was not reported with its failure count; got:\n%s", out)
 	}
-	if r.exportFailures != 0 {
-		t.Fatalf("exportFailures = %d after recovery, want 0", r.exportFailures)
+	if n := r.exportOutage.Failures(); n != 0 {
+		t.Fatalf("exportOutage.Failures() = %d after recovery, want 0", n)
 	}
 	// Quiet in the steady state.
 	if err := r.flushRetry(t.Context()); err != nil {
@@ -228,7 +232,7 @@ func TestPerUnitDebugAnswersWhyAUnitIsNotShipping(t *testing.T) {
 		Exporter:      exp,
 		FlushInterval: 20 * time.Millisecond,
 		Units:         []string{"kubelet.service", "containerd.service"},
-		Rules:         rules,
+		Chain:         logchain.Config{Rules: rules},
 	})
 	logs := captureLog(r, slog.LevelDebug)
 	r.open = fakeOpener(entries, false)
@@ -287,5 +291,106 @@ func TestPerUnitDebugCostsNothingAtInfo(t *testing.T) {
 	}
 	if r.unitDebug.Len() != 0 {
 		t.Fatalf("the per-unit table holds %d keys after Info-level settles, want 0", r.unitDebug.Len())
+	}
+}
+
+// TestCursorWriteFailureWarnsOnceAndRecovers. The positions file is the SAME
+// store the tailer writes, and the tailer throttles its failure; the journal
+// cursor used to warn on every retry (every cursorPersistEvery, and on every
+// batch before the first cursor ever landed) with no end marker. A read-only
+// mount or a full disk persists, so the useful information is the first line,
+// a periodic reminder and the line that says it is over.
+func TestCursorWriteFailureWarnsOnceAndRecovers(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root writes into a read-only directory anyway")
+	}
+	dir := filepath.Join(t.TempDir(), "positions")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pos := mustOpenPositions(t, filepath.Join(dir, "positions.json"))
+	r := New(Config{Positions: pos, Exporter: &captureExporter{}})
+	r.cursorPersistEvery = 0 // every commit is a write attempt
+	now := time.Unix(1_700_000_000, 0)
+	r.now = func() time.Time { return now }
+	logs := captureLog(r, slog.LevelInfo)
+	ctx := context.Background()
+	n := 0
+	commit := func() {
+		t.Helper()
+		n++
+		c := fmt.Sprintf("c%03d", n)
+		r.ingest(mkEntry(c, "a.service", "m", "6"), "m", 0)
+		if err := r.flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(5 * time.Second)
+	}
+	readOnly := func(ro bool) {
+		t.Helper()
+		mode := os.FileMode(0o700)
+		if ro {
+			mode = 0o500
+		}
+		if err := os.Chmod(dir, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	const failed, recovered = "writing journal cursor to positions file", "journal cursor write recovered"
+	count := func(msg string, want int, when string) {
+		t.Helper()
+		if got := strings.Count(logs.String(), msg); got != want {
+			t.Fatalf("%s: %q logged %d times, want %d:\n%s", when, msg, got, want, logs.String())
+		}
+	}
+
+	readOnly(true)
+	for range 6 {
+		commit()
+	}
+	count(failed, 1, "six failed writes inside a minute")
+	now = now.Add(cursorWarnEvery)
+	commit()
+	count(failed, 2, "a failed write once the interval elapsed")
+	count(recovered, 0, "still failing")
+
+	readOnly(false)
+	commit()
+	commit()
+	count(recovered, 1, "the first write that lands, and one after it")
+	if got := pos.JournalCursor(); got != fmt.Sprintf("c%03d", n) {
+		t.Fatalf("stored cursor = %q, want the newest commit", got)
+	}
+
+	// A new outage speaks at once, inside the interval the last line claimed.
+	readOnly(true)
+	commit()
+	count(failed, 3, "the first failure of a new outage")
+}
+
+// TestPerUnitDebugNamesWhatTheResourceCarries. The per-unit line exists to be
+// matched against the exported resources, so it must group and name exactly as
+// convert does: an entry carrying neither a unit nor a syslog identifier is the
+// resource named "journald" (it used to be reported as unit=""), and a syslog
+// identifier that equals a real unit's name is a SEPARATE group — two resources,
+// so two lines, where the report used to fold them into one tally.
+func TestPerUnitDebugNamesWhatTheResourceCarries(t *testing.T) {
+	r := New(Config{MaxEntryBytes: 1 << 20, BatchSize: 100, MaxBatchBytes: 1 << 20})
+	logs := captureLog(r, slog.LevelDebug)
+	r.ingest(rawEntry{unit: "cron.service", priority: "6", realtime: time.Now()}, "a", 0)
+	r.ingest(rawEntry{ident: "cron.service", priority: "6", realtime: time.Now()}, "b", 0)
+	r.ingest(rawEntry{priority: "6", realtime: time.Now()}, "c", 0)
+	r.debugBatch(context.Background(), 3, 0)
+
+	out := logs.String()
+	if !strings.Contains(out, "units=3") {
+		t.Fatalf("the batch line does not count convert's three groups:\n%s", out)
+	}
+	if n := strings.Count(out, "journal unit active\" unit=cron.service entries=1"); n != 2 {
+		t.Fatalf("%d per-unit lines for cron.service, want 2 (the unit and the same-named syslog identifier are two resources):\n%s", n, out)
+	}
+	if !strings.Contains(out, "journal unit active\" unit=journald entries=1") {
+		t.Fatalf("an entry with neither a unit nor an identifier is not reported by the name its resource carries (journald):\n%s", out)
 	}
 }

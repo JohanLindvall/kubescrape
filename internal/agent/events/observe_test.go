@@ -3,18 +3,23 @@ package events
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -126,7 +131,7 @@ func TestEventsObserveOncePerDeliveryAcrossWatchRestarts(t *testing.T) {
 	// clock at all.
 	r := New(Config{
 		Client: client, Exporter: exp, BatchSize: 100,
-		LogMetrics: set, Rules: rules, Meta: fakeMeta{},
+		Chain: logchain.Config{LogMetrics: set, Rules: rules}, Meta: fakeMeta{},
 	})
 	// A committed position is the precondition: it is what makes the restart a
 	// REDELIVERING one (startResourceVersion), which is the path that drops the
@@ -138,7 +143,7 @@ func TestEventsObserveOncePerDeliveryAcrossWatchRestarts(t *testing.T) {
 	failures := obs.EventsExportFailures.Value()
 	ctx := context.Background()
 	const laps = 5
-	for i := 0; i < laps; i++ {
+	for i := range laps {
 		if err := r.stream(ctx); err == nil {
 			t.Fatalf("lap %d: the pre-stopped watch must end the stream", i)
 		}
@@ -206,6 +211,125 @@ func TestEventsObserveOncePerDeliveryAcrossWatchRestarts(t *testing.T) {
 	}
 }
 
+// Scrubbing is counted where it happens — at ingest, before the entry exists —
+// and a redelivering watch restart re-ingests every buffered event, so
+// kubescrape_log_scrubbed_total stepped once per restart over the whole
+// retained batch. An occurrence an earlier convert already ran the chain over
+// is redacted the same and not counted again; and a scrub-only config (no
+// metrics, no rules) must still keep the observed set that decides it.
+func TestEventsScrubCountsOncePerDeliveryAcrossWatchRestarts(t *testing.T) {
+	sc, err := logscrub.New(logscrub.Config{Rules: []logscrub.Rule{{Name: "events-rewind-probe", Regexp: `token=\w+`}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	client := newRedeliverClient(
+		event("pulled", "Pulled", "pulled with token=abc123", "Normal", "20", 1, now),
+		event("backoff", "BackOff", "back-off token=def456", "Warning", "21", 1, now),
+	)
+	exp := &captureExporter{failN: 1000, err: errors.New("collector down")}
+	r := New(Config{Client: client, Exporter: exp, BatchSize: 100, Chain: logchain.Config{Scrub: sc}, Meta: fakeMeta{}})
+	r.committed.ResourceVersion = "5" // a REDELIVERING restart (see above)
+
+	counter := obs.LogScrubbed.WithLabelValues("events-rewind-probe")
+	before := counter.Value()
+	ctx := context.Background()
+	const laps = 5
+	for i := range laps {
+		if err := r.stream(ctx); err == nil {
+			t.Fatalf("lap %d: the pre-stopped watch must end the stream", i)
+		}
+		r.tryFlush(ctx)
+	}
+	if client.watches != laps {
+		t.Fatalf("precondition: watches opened = %d, want %d", client.watches, laps)
+	}
+	if got := counter.Value() - before; got != 2 {
+		t.Errorf("kubescrape_log_scrubbed_total delta = %v after %d watch restarts over the same 2 events, want 2", got, laps)
+	}
+
+	exp.mu.Lock()
+	exp.failN = 0
+	exp.mu.Unlock()
+	if err := r.flush(ctx); err != nil {
+		t.Fatalf("flush after recovery: %v", err)
+	}
+	for _, rec := range exp.records() {
+		if body := rec.Body().Str(); strings.Contains(body, "abc123") || strings.Contains(body, "def456") {
+			t.Fatalf("a re-ingested event shipped unredacted: %q", body)
+		}
+	}
+	if got := len(exp.records()); got != 2 {
+		t.Fatalf("delivered %d records, want 2", got)
+	}
+}
+
+// Enrichment's counters are per RECORD too (logchain.Input.Observed gates them
+// through logenrich.ApplyUncounted), and -enrich is ON by default — so a
+// default config, with no log metrics and no rules, kept no observed set at all
+// and kubescrape_log_enriched_total stepped once per redelivering restart over
+// the whole retained batch: measured 10 for 2 events across 5 laps. It is read
+// as the decomposition of the delivered-record count by format, so a multiple
+// of it is a wrong answer, not a noisy one.
+func TestEventsEnrichCountsOncePerDeliveryAcrossWatchRestarts(t *testing.T) {
+	now := time.Now()
+	client := newRedeliverClient(
+		// level=error on a Normal event: enrichment's severity override is the
+		// visible proof the re-render was still ENRICHED, only not re-counted.
+		event("pulled", "Pulled", `{"level":"error","msg":"pulled image"}`, "Normal", "20", 1, now),
+		event("backoff", "BackOff", `{"level":"warn","msg":"back-off restarting"}`, "Warning", "21", 1, now),
+	)
+	exp := &captureExporter{failN: 1000, err: errors.New("collector down")}
+	r := New(Config{Client: client, Exporter: exp, BatchSize: 100, Chain: logchain.Config{Enrich: true}, Meta: fakeMeta{}})
+	r.committed.ResourceVersion = "5" // a REDELIVERING restart (see above)
+
+	enriched := func() float64 {
+		var n float64
+		for _, f := range []string{"json", "logfmt", "pattern", "none"} {
+			n += obs.LogEnriched.WithLabelValues(f).Value()
+		}
+		return n
+	}
+	before := enriched()
+	ctx := context.Background()
+	const laps = 5
+	for i := range laps {
+		if err := r.stream(ctx); err == nil {
+			t.Fatalf("lap %d: the pre-stopped watch must end the stream", i)
+		}
+		r.tryFlush(ctx)
+	}
+	if client.watches != laps || exp.attempts() != laps {
+		t.Fatalf("precondition: watches=%d attempts=%d, want %d of each", client.watches, exp.attempts(), laps)
+	}
+	if got := enriched() - before; got != 2 {
+		t.Errorf("kubescrape_log_enriched_total delta = %v after %d watch restarts over the same 2 events, want 2 — "+
+			"one per record per delivery, not per restart", got, laps)
+	}
+
+	// Suppressing the COUNT must not suppress the enrichment itself.
+	exp.mu.Lock()
+	exp.failN = 0
+	exp.mu.Unlock()
+	if err := r.flush(ctx); err != nil {
+		t.Fatalf("flush after recovery: %v", err)
+	}
+	recs := exp.records()
+	if len(recs) != 2 {
+		t.Fatalf("delivered %d records, want 2", len(recs))
+	}
+	for _, rec := range recs {
+		if name, _ := rec.Attributes().Get("k8s.event.name"); name.Str() == "pulled" &&
+			rec.SeverityNumber() != plog.SeverityNumberError {
+			t.Fatalf("a re-rendered event lost its enrichment: severity %v %q, want the body's level=error",
+				rec.SeverityNumber(), rec.SeverityText())
+		}
+	}
+	if got := enriched() - before; got != 2 {
+		t.Errorf("kubescrape_log_enriched_total delta = %v after the delivery, want 2", got)
+	}
+}
+
 // The suppression must key on the OCCURRENCE, not on the content and not on
 // the object: two distinct events carrying the same message are two
 // observations, and a REPEAT — which Kubernetes aggregates into one object
@@ -234,7 +358,7 @@ func TestObservationKeysOnTheOccurrence(t *testing.T) {
 	client := newRedeliverClient(a, b)
 	exp := &captureExporter{failN: 1000, err: errors.New("collector down")}
 	r := New(Config{
-		Client: client, Exporter: exp, BatchSize: 100, LogMetrics: set, Meta: fakeMeta{},
+		Client: client, Exporter: exp, BatchSize: 100, Chain: logchain.Config{LogMetrics: set}, Meta: fakeMeta{},
 	})
 	r.committed.ResourceVersion = "5" // a redelivering restart
 
@@ -274,7 +398,7 @@ func TestUnidentifiableEventIsNeverClaimedObserved(t *testing.T) {
 	}
 	// Marking it must not put anything in the set either — a second entry with
 	// the same empty key would otherwise be suppressed.
-	r.cfg.LogMetrics = &metrics.DynamicMetricSet{}
+	r.cfg.Chain.LogMetrics = &metrics.DynamicMetricSet{}
 	r.markObserved([]entry{{}, {}})
 	if len(r.observed) != 0 {
 		t.Fatalf("observed set holds %d keys for unidentifiable entries, want 0", len(r.observed))
@@ -289,6 +413,11 @@ func TestUnidentifiableEventIsNeverClaimedObserved(t *testing.T) {
 // resourceVersion, relist set, an hour-old watermark that filters nothing — and
 // the collector is down, so no lap ever commits and each one re-lists, re-
 // ingests and re-converts the same three events.
+//
+// What ends each lap is the backlog list's continue token aging out on the
+// second page: the walk no longer returns just because an export failed (it
+// holds for the collector — exportUntil), so a SNAPSHOT expiry is the ordinary
+// way a relist lap repeats during an outage.
 func TestRelistLapsObserveTheBacklogOnce(t *testing.T) {
 	set, err := metrics.NewDynamicMetricSet([]metrics.Dynamic{{
 		Name: "event_lines_total", Type: metrics.CounterType, Value: "1",
@@ -303,35 +432,48 @@ func TestRelistLapsObserveTheBacklogOnce(t *testing.T) {
 		*event("c", "Killing", "stopping container", "Normal", "22", 1, now),
 	}
 	client := fake.NewSimpleClientset()
+	lists := 0
 	client.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
+		lists++
+		if lists%2 == 0 {
+			return true, nil, apierrors.NewResourceExpired("continue token expired")
+		}
 		return true, &corev1.EventList{
-			ListMeta: metav1.ListMeta{ResourceVersion: "500"},
+			ListMeta: metav1.ListMeta{ResourceVersion: "500", Continue: "page-2"},
 			Items:    backlog,
 		}, nil
 	})
 	client.PrependWatchReactor("events", func(k8stesting.Action) (bool, watch.Interface, error) {
+		t.Error("a watch was opened: the lap should have ended at the expired continue token")
 		w := watch.NewFake()
 		w.Stop()
 		return true, w, nil
 	})
 
 	exp := &captureExporter{failN: 1000, err: errors.New("collector down")}
+	// BatchSize 3: the count trigger renders — and observes — the page's three
+	// events before the second page is asked for.
 	r := New(Config{
-		Client: client, Exporter: exp, BatchSize: 100,
-		FlushInterval: time.Millisecond, LogMetrics: set, Meta: fakeMeta{},
+		Client: client, Exporter: exp, BatchSize: 3,
+		FlushInterval: time.Millisecond, Chain: logchain.Config{LogMetrics: set}, Meta: fakeMeta{},
 	})
 	// Exactly what expire() leaves behind: no resume point, a relist armed, and
 	// a watermark old enough that wanted() filters nothing out of the backlog.
 	r.relist = true
 	r.committed.Watermark = now.Add(-time.Hour)
+	clock := now
+	r.now = func() time.Time { return clock }
 
 	ctx := context.Background()
 	const laps = 3
-	for i := 0; i < laps; i++ {
+	for i := range laps {
 		if err := r.stream(ctx); err == nil {
 			t.Fatalf("lap %d: the pre-stopped watch must end the stream", i)
 		}
-		time.Sleep(2 * time.Millisecond) // past FlushInterval, so the next lap's tail flush is due
+		clock = clock.Add(time.Millisecond) // past FlushInterval, so the next lap's count trigger is due
+	}
+	if exp.attempts() != laps {
+		t.Fatalf("export attempts = %d, want %d: each lap must render and try the batch once", exp.attempts(), laps)
 	}
 	if got := len(exp.records()); got != 0 {
 		t.Fatalf("delivered %d records, want 0: the collector is down for the whole test", got)

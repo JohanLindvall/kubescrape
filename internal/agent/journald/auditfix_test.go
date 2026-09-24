@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -27,7 +28,7 @@ func TestAuditFixTruncationCountedWhenTheRulesDropTheBatch(t *testing.T) {
 	before := obs.JournalTruncated.Value()
 
 	exp := &captureExporter{}
-	r := New(Config{Exporter: exp, Rules: rules, MaxEntryBytes: 20})
+	r := New(Config{Exporter: exp, Chain: logchain.Config{Rules: rules}, MaxEntryBytes: 20})
 	body, origLen := r.sanitize(strings.Repeat("x", 200), "unit.service")
 	if origLen == 0 {
 		t.Fatal("precondition: the message must be truncated")

@@ -33,10 +33,10 @@ func TestDumpCountsAndNamesAnUnparseableLabelSet(t *testing.T) {
 	c.WithLabelValues("ok").Inc()
 	corrupt(r.byName["kubescrape_test_counter"], "not-a-label-set", 7)
 
-	before := r.DumpLabelErrors()
+	before := r.SkippedPoints()
 	got := r.Dump()
-	if delta := r.DumpLabelErrors() - before; delta != 1 {
-		t.Fatalf("DumpLabelErrors moved by %d, want 1", delta)
+	if delta := r.SkippedPoints() - before; delta != 1 {
+		t.Fatalf("SkippedPoints moved by %d, want 1", delta)
 	}
 	// The good point still renders: one bad label string must not cost the
 	// whole series.
@@ -53,12 +53,12 @@ func TestDumpCountsAnUnparseableHistogramLabelSet(t *testing.T) {
 	h.WithLabelValues("ok").Observe(1)
 	corrupt(r.byName["kubescrape_test_hist"], "{bad", 1)
 
-	before := r.DumpLabelErrors()
+	before := r.SkippedPoints()
 	if got := r.Dump(); len(got) != 1 || len(got[0].Points) != 1 {
 		t.Fatalf("dump = %+v, want the one parseable point", got)
 	}
-	if delta := r.DumpLabelErrors() - before; delta != 1 {
-		t.Fatalf("DumpLabelErrors moved by %d, want 1", delta)
+	if delta := r.SkippedPoints() - before; delta != 1 {
+		t.Fatalf("SkippedPoints moved by %d, want 1", delta)
 	}
 }
 
@@ -79,8 +79,8 @@ func TestDumpLabelParseWarningNamesTheMetricAndIsThrottled(t *testing.T) {
 	for range 4 {
 		r.Dump()
 	}
-	if got := r.DumpLabelErrors(); got != 4 {
-		t.Fatalf("DumpLabelErrors = %d, want 4 (every skip counts)", got)
+	if got := r.SkippedPoints(); got != 4 {
+		t.Fatalf("SkippedPoints = %d, want 4 (every skip counts)", got)
 	}
 	out := buf.String()
 	if n := strings.Count(out, "a self-metric data point was skipped"); n != 1 {
@@ -144,12 +144,12 @@ func TestASkippedPointIsCountedWhereverTheExpositionRefusesIt(t *testing.T) {
 	defer slog.SetDefault(prev)
 
 	r := NewRegistry()
-	before := r.DumpLabelErrors()
+	before := r.SkippedPoints()
 	for range 3 {
 		r.NoteSkippedPoint("kubescrape_test_bridge", errors.New("label count mismatch"))
 	}
-	if delta := r.DumpLabelErrors() - before; delta != 3 {
-		t.Fatalf("DumpLabelErrors moved by %d, want 3 (every skip counts)", delta)
+	if delta := r.SkippedPoints() - before; delta != 3 {
+		t.Fatalf("SkippedPoints moved by %d, want 3 (every skip counts)", delta)
 	}
 	out := buf.String()
 	if n := strings.Count(out, "a self-metric data point was skipped"); n != 1 {

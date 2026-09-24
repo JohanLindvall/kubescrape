@@ -54,20 +54,20 @@ func textConvert(t *testing.T, body string) map[string]pmetric.Metric {
 // one until every bucket collapses into a single accumulator with malformed=0.
 func TestProtoRejectsDuplicateLabelNames(t *testing.T) {
 	dup := &dto.MetricFamily{
-		Name: ptr("dup_gauge"),
+		Name: new("dup_gauge"),
 		Type: dto.MetricType_GAUGE.Enum(),
 		Metric: []*dto.Metric{{
 			Label: []*dto.LabelPair{
-				{Name: ptr("a"), Value: ptr("keep")},
-				{Name: ptr("a"), Value: ptr("drop_me")},
+				{Name: new("a"), Value: new("keep")},
+				{Name: new("a"), Value: new("drop_me")},
 			},
-			Gauge: &dto.Gauge{Value: ptr(1.0)},
+			Gauge: &dto.Gauge{Value: new(1.0)},
 		}},
 	}
 	good := &dto.MetricFamily{
-		Name:   ptr("good_gauge"),
+		Name:   new("good_gauge"),
 		Type:   dto.MetricType_GAUGE.Enum(),
-		Metric: []*dto.Metric{{Gauge: &dto.Gauge{Value: ptr(3.0)}}},
+		Metric: []*dto.Metric{{Gauge: &dto.Gauge{Value: new(3.0)}}},
 	}
 	got, malformed := protoConvert(t, dup, good)
 	if _, ok := got["dup_gauge"]; ok {
@@ -114,28 +114,28 @@ func TestScopeVersionChargedToSizeEstimate(t *testing.T) {
 // single `le` collapses into one bound with the wrong counts, silently.
 func TestProtoRejectsSynthesizedLabelCollision(t *testing.T) {
 	hist := &dto.MetricFamily{
-		Name: ptr("rpc_seconds"),
+		Name: new("rpc_seconds"),
 		Type: dto.MetricType_HISTOGRAM.Enum(),
 		Metric: []*dto.Metric{{
-			Label: []*dto.LabelPair{{Name: ptr("le"), Value: ptr("0.1")}},
+			Label: []*dto.LabelPair{{Name: new("le"), Value: new("0.1")}},
 			Histogram: &dto.Histogram{
-				SampleCount: ptr(uint64(11)), SampleSum: ptr(1.5),
+				SampleCount: new(uint64(11)), SampleSum: new(1.5),
 				Bucket: []*dto.Bucket{
-					{UpperBound: ptr(1.0), CumulativeCount: ptr(uint64(5))},
-					{UpperBound: ptr(2.0), CumulativeCount: ptr(uint64(9))},
-					{UpperBound: ptr(math.Inf(1)), CumulativeCount: ptr(uint64(11))},
+					{UpperBound: new(1.0), CumulativeCount: new(uint64(5))},
+					{UpperBound: new(2.0), CumulativeCount: new(uint64(9))},
+					{UpperBound: new(math.Inf(1)), CumulativeCount: new(uint64(11))},
 				},
 			},
 		}},
 	}
 	summ := &dto.MetricFamily{
-		Name: ptr("rpc_summary"),
+		Name: new("rpc_summary"),
 		Type: dto.MetricType_SUMMARY.Enum(),
 		Metric: []*dto.Metric{{
-			Label: []*dto.LabelPair{{Name: ptr("quantile"), Value: ptr("0.5")}},
+			Label: []*dto.LabelPair{{Name: new("quantile"), Value: new("0.5")}},
 			Summary: &dto.Summary{
-				SampleCount: ptr(uint64(2)), SampleSum: ptr(1.0),
-				Quantile: []*dto.Quantile{{Quantile: ptr(0.99), Value: ptr(0.4)}},
+				SampleCount: new(uint64(2)), SampleSum: new(1.0),
+				Quantile: []*dto.Quantile{{Quantile: new(0.99), Value: new(0.4)}},
 			},
 		}},
 	}

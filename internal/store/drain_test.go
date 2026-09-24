@@ -53,7 +53,7 @@ func TestDrainReleasesParkedLookups(t *testing.T) {
 	if got := s.ShedLookups(); got != 0 {
 		t.Fatalf("ShedLookups = %d, want 0 (a drain is not a shed)", got)
 	}
-	if got := s.waiterCount(); got != 0 {
+	if got := s.BlockedLookups(); got != 0 {
 		t.Fatalf("waiter count after drain = %d, want 0", got)
 	}
 

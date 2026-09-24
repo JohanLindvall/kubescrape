@@ -52,8 +52,8 @@ func TestEmptyMetricsFlagsEveryTypeAndOnlyWhenEmpty(t *testing.T) {
 			if !strings.Contains(got[0], "m_"+tc.name) {
 				t.Errorf("entry %q does not name the metric", got[0])
 			}
-			if n := MetricPointCount(m); n != 0 {
-				t.Errorf("MetricPointCount = %d, want 0", n)
+			if n := metricPointCount(m); n != 0 {
+				t.Errorf("metricPointCount = %d, want 0", n)
 			}
 		})
 
@@ -70,8 +70,8 @@ func TestEmptyMetricsFlagsEveryTypeAndOnlyWhenEmpty(t *testing.T) {
 			if got := EmptyMetrics(md); len(got) != 0 {
 				t.Errorf("EmptyMetrics = %v, want none", got)
 			}
-			if n := MetricPointCount(m); n != 1 {
-				t.Errorf("MetricPointCount = %d, want 1", n)
+			if n := metricPointCount(m); n != 1 {
+				t.Errorf("metricPointCount = %d, want 1", n)
 			}
 		})
 	}

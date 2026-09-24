@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
+	"github.com/JohanLindvall/kubescrape/internal/scrape"
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/internal/store"
@@ -182,6 +183,80 @@ func TestExplainUnannotatedServiceGetsNothingOptsInHint(t *testing.T) {
 	}
 }
 
+// A door that is not opted in yields nothing, and its port entries must say so.
+// PodTargets and ServiceTargets refuse a door without prometheus.io/scrape=
+// "true" before they resolve a single port, while the explain mirrors resolve
+// every entry — so an unannotated pod behind a monitor-selected Service read
+// "declared container port (... every declared port is a target)" and the
+// Service's ports read as resolving, beside `targets: []`, and the hint sent the
+// reader to exactly those verdicts. The entries stay listed (what they WOULD
+// resolve to is the diagnosis for a forgotten scrape annotation); they must just
+// stop claiming ports.
+func TestExplainDoesNotClaimPortsThroughADoorThatIsNotOptedIn(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		monitorPort string
+		wantTargets int
+	}{
+		// The monitor is the only opt-in and resolves to nothing: the hint
+		// case, where the reader is sent to the verdicts.
+		{"monitor resolves nothing", "nosuch", 0},
+		// The monitor resolves: the doors still yield nothing of their own.
+		{"monitor resolves", "http", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := store.New(time.Minute)
+			st.UpsertPod(&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "web-1", Namespace: "default", UID: types.UID("web-uid"), ResourceVersion: "1",
+					Labels: map[string]string{"app": "web"},
+				},
+				Spec: corev1.PodSpec{NodeName: "node1", Containers: []corev1.Container{{
+					Name:  "c",
+					Ports: []corev1.ContainerPort{{Name: "metrics", ContainerPort: 8080}},
+				}}},
+				Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.9"},
+			})
+			svcs := services.NewIndex()
+			svcs.Upsert(monitorSelectedService())
+			idx := newMonitorIndex(t, "sm-web", []any{map[string]any{"port": tc.monitorPort}})
+
+			var doc explainDoc
+			raw := fetchExplain(t, st, svcs, idx, "default", "web-1")
+			if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+				t.Fatal(err)
+			}
+			if !doc.Scrapeable || doc.PodAnnotated || len(doc.Targets) != tc.wantTargets {
+				t.Fatalf("setup: scrapeable=%v podAnnotated=%v targets=%+v", doc.Scrapeable, doc.PodAnnotated, doc.Targets)
+			}
+			if len(doc.Services) != 1 || doc.Services[0].Annotated {
+				t.Fatalf("setup: services = %+v", doc.Services)
+			}
+			type doorEntries struct {
+				door string
+				v    []scrape.PortVerdict
+			}
+			for _, d := range []doorEntries{{"the pod", doc.PortEntries}, {"this Service", doc.Services[0].PortEntries}} {
+				if len(d.v) == 0 {
+					t.Fatalf("%s: no port entries listed; they are the diagnosis for a forgotten scrape annotation", d.door)
+				}
+				for _, v := range d.v {
+					if len(v.Ports) != 0 {
+						t.Errorf("%s: entry %q lists ports %v through a door that is not opted in (targets=%d)",
+							d.door, v.Entry, v.Ports, len(doc.Targets))
+					}
+					if !strings.Contains(v.Note, "carries no prometheus.io/scrape") || !strings.Contains(v.Note, d.door) {
+						t.Errorf("%s: entry %q does not say its door is not opted in: %q", d.door, v.Entry, v.Note)
+					}
+				}
+			}
+			if tc.wantTargets == 0 && !strings.Contains(doc.Hint, "serviceMonitors[].note") {
+				t.Errorf("the hint does not point at the monitor endpoint, the only opt-in here: %q", doc.Hint)
+			}
+		})
+	}
+}
+
 // The per-entry verdicts must not contradict the head of their own document.
 //
 // Scrapeable is a THIRD short-circuit — monitorEndpoint checks it beside the
@@ -223,8 +298,25 @@ func TestExplainOfANotScrapeablePodDoesNotBlameItsPorts(t *testing.T) {
 	if err := idx.Upsert(&unstructured.Unstructured{Object: map[string]any{
 		"metadata": map[string]any{"name": "sm-web", "namespace": "prod"},
 		"spec": map[string]any{
-			"selector":  map[string]any{"matchLabels": map[string]any{"team": "obs"}},
-			"endpoints": []any{map[string]any{"port": "http"}},
+			"selector": map[string]any{"matchLabels": map[string]any{"team": "obs"}},
+			// One endpoint that resolves and one that names a port the Service
+			// does not have: only the first may be blamed on the pod.
+			"endpoints": []any{map[string]any{"port": "http"}, map[string]any{"port": "nosuchport"}},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// And the PodMonitor door, which has the same short-circuit in front of the
+	// port and used to answer the same way for an endpoint naming no container
+	// port at all.
+	if err := idx.UpsertPodMonitor(&unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "pm-web", "namespace": "prod"},
+		"spec": map[string]any{
+			"selector": map[string]any{"matchLabels": map[string]any{"app": "web"}},
+			"podMetricsEndpoints": []any{
+				map[string]any{"port": "metrics"},
+				map[string]any{"port": "nosuchcontainerport"},
+			},
 		},
 	}}); err != nil {
 		t.Fatal(err)
@@ -250,7 +342,7 @@ func TestExplainOfANotScrapeablePodDoesNotBlameItsPorts(t *testing.T) {
 		t.Errorf("a port entry of a pod that yields no target still lists ports %v, which reads as "+
 			"'this port is scraped'", doc.PortEntries[0].Ports)
 	}
-	if len(doc.Services) != 1 || len(doc.Services[0].Monitors) != 1 {
+	if len(doc.Services) != 1 || len(doc.Services[0].Monitors) != 2 {
 		t.Fatalf("services = %+v", doc.Services)
 	}
 	if note := doc.Services[0].Monitors[0].Note; !strings.Contains(note, "excluded from scraping") {
@@ -260,6 +352,24 @@ func TestExplainOfANotScrapeablePodDoesNotBlameItsPorts(t *testing.T) {
 	if note := doc.Services[0].PortEntries[0].Note; !strings.Contains(note, "excluded from scraping") {
 		t.Errorf("the Service port entry does not name the pod's exclusion: %q", note)
 	}
+	// The converse, which is what the pod-level wording must never swallow:
+	// an endpoint that resolves to nothing on ANY pod is the port's fault, here
+	// as much as on a scrapeable pod — "this endpoint resolves" about it is
+	// false. The pod's own reason is still pointed at, beside the port.
+	brokenNote := func(door, note string) {
+		t.Helper()
+		if strings.Contains(note, "this endpoint resolves") || !strings.Contains(note, "resolves to no pod port") {
+			t.Errorf("%s: an endpoint naming a port that does not exist is explained as %q", door, note)
+		}
+	}
+	brokenNote("ServiceMonitor", doc.Services[0].Monitors[1].Note)
+	if len(doc.PodMonitors) != 2 {
+		t.Fatalf("podMonitors = %+v", doc.PodMonitors)
+	}
+	if note := doc.PodMonitors[0].Note; !strings.Contains(note, "excluded from scraping") {
+		t.Errorf("the resolving PodMonitor endpoint is explained as %q; the POD is what is excluded", note)
+	}
+	brokenNote("PodMonitor", doc.PodMonitors[1].Note)
 }
 
 // The "nothing opts this pod in" hint must be derived from the DERIVATION, not

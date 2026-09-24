@@ -8,11 +8,16 @@ package services
 // agent poll.
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 func svcRV(uid types.UID, name, rv string, labels map[string]string) *corev1.Service {
@@ -45,9 +50,62 @@ func TestGenerationIgnoresAReDeliveryThatChangesNothing(t *testing.T) {
 	if got := ix.Generation(); got == after {
 		t.Fatal("the change token did not move for a genuine update")
 	}
-	matched := ix.Matching("ns", map[string]string{"app": "web"})
+	matched := matching(ix, "ns", map[string]string{"app": "web"})
 	if len(matched) != 1 || matched[0].Labels["team"] != "platform" {
 		t.Fatalf("the update was not applied: %+v", matched)
+	}
+}
+
+// The re-delivery is ignored BEFORE the conversion, not merely before the index
+// write: the conversion is where the annotation budget's refusal is counted,
+// and kubescrape_metadata_annotations_omitted_total is meant to move once per
+// informer EVENT. A relist or `-resync` re-delivers every Service
+// byte-identical, so converting first re-counted every over-budget Service once
+// per re-delivery — a counter that climbs on a timer with nothing changing.
+func TestAReDeliveryDoesNotRecountOmittedAnnotations(t *testing.T) {
+	omitted := obs.MetadataAnnotationsOmitted.WithLabelValues("Service")
+	fat := func(rv string) *corev1.Service {
+		svc := svcRV("uid-fat", "fat", rv, nil)
+		svc.Annotations = map[string]string{"blob": strings.Repeat("x", kubemeta.MaxAnnotationValueBytes+1)}
+		return svc
+	}
+	ix := NewIndex()
+	before := omitted.Value()
+	ix.Upsert(fat("7"))
+	if got := omitted.Value() - before; got != 1 {
+		t.Fatalf("fixture: the first delivery counted %v refusals, want 1", got)
+	}
+	gen := ix.Generation()
+
+	ix.Upsert(fat("7"))
+	ix.Upsert(fat("7"))
+	if got := omitted.Value() - before; got != 1 {
+		t.Errorf("two re-deliveries of the same object moved the refusal counter to %v, want 1: "+
+			"it counts deliveries instead of events", got)
+	}
+	if got := ix.Generation(); got != gen {
+		t.Errorf("the change token moved (%d -> %d) for a re-delivery", gen, got)
+	}
+
+	// A genuine update is still an event, and is still counted.
+	ix.Upsert(fat("8"))
+	if got := omitted.Value() - before; got != 2 {
+		t.Errorf("a genuine update moved the refusal counter to %v, want 2", got)
+	}
+}
+
+// Zero allocations is the only number that says the conversion did not run for
+// a re-delivery: CopyMeta, the selector clone and the ports are its whole cost.
+func TestUnchangedReDeliveryIsAllocationFree(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	ix := NewIndex()
+	svc := svcRV("uid-a", "web", "7", map[string]string{"team": "obs"})
+	ix.Upsert(svc)
+	if got := testing.AllocsPerRun(100, func() { ix.Upsert(svc) }); got != 0 {
+		t.Errorf("a re-delivery of an unchanged Service allocates %v times, want 0: "+
+			"the conversion runs before the short-circuit", got)
 	}
 }
 
@@ -65,7 +123,7 @@ func TestVersionlessServicesAreAlwaysApplied(t *testing.T) {
 	if got := ix.Generation(); got == after {
 		t.Error("a versionless re-upsert must count as a change")
 	}
-	matched := ix.Matching("ns", map[string]string{"app": "web"})
+	matched := matching(ix, "ns", map[string]string{"app": "web"})
 	if len(matched) != 1 || matched[0].Labels["team"] != "platform" {
 		t.Fatalf("a versionless update was dropped: %+v", matched)
 	}
@@ -102,7 +160,7 @@ func TestGenerationIgnoresADeleteOfSomethingNeverIndexed(t *testing.T) {
 	if got := ix.Generation(); got != after {
 		t.Errorf("the change token moved (%d -> %d) for the late Delete of a predecessor Upsert had already replaced", after, got)
 	}
-	if matched := ix.Matching("ns", map[string]string{"app": "web"}); len(matched) != 1 || matched[0].UID != "uid-b" {
+	if matched := matching(ix, "ns", map[string]string{"app": "web"}); len(matched) != 1 || matched[0].UID != "uid-b" {
 		t.Fatalf("the late Delete disturbed the live successor: %+v", matched)
 	}
 
@@ -111,7 +169,7 @@ func TestGenerationIgnoresADeleteOfSomethingNeverIndexed(t *testing.T) {
 	if got := ix.Generation(); got == after {
 		t.Error("the change token did not move for a delete that removed a Service")
 	}
-	if matched := ix.Matching("ns", map[string]string{"app": "web"}); len(matched) != 0 {
+	if matched := matching(ix, "ns", map[string]string{"app": "web"}); len(matched) != 0 {
 		t.Fatalf("the Service survived its delete: %+v", matched)
 	}
 }

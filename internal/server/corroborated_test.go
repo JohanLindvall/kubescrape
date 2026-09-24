@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -121,14 +122,12 @@ var parkableHead = "GET /v1/containers/" + strings.Repeat("ab", 32) + "?wait=600
 func runRecorded(fn func(measureT)) string {
 	rec := &recordingT{}
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		fn(rec)
-	}()
+	})
 	wg.Wait()
-	for i := len(rec.cleanups) - 1; i >= 0; i-- {
-		rec.cleanups[i]()
+	for _, v := range slices.Backward(rec.cleanups) {
+		v()
 	}
 	return rec.failure
 }

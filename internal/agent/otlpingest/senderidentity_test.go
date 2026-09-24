@@ -16,10 +16,12 @@ import (
 // the builder — so the strip matters exactly for keys the described object
 // LACKS, and any builder-emittable key missing from the list survives from the
 // EXPORTER onto the object it describes. The list is derived from
-// attrs.IdentityKeys() precisely so it cannot drift again (a hand-copied list
-// already had: attrs.Service's k8s.service.name/uid were absent, so a sender's
-// service identity leaked onto every split-described object); this asserts the
-// derivation stays a superset through the exported surface.
+// attrs.SenderIdentityKeys() (split.go) precisely so it cannot drift again (a
+// hand-copied list already had: attrs.Service's k8s.service.name/uid were
+// absent, so a sender's service identity leaked onto every split-described
+// object); this asserts, against attrs.IdentityKeys() — the builder's emission
+// set, an oracle independent of the list under test — that the derivation
+// stays a superset through the exported surface.
 func TestSenderIdentityAttrsCoverEveryBuilderIdentityKey(t *testing.T) {
 	for _, k := range attrs.IdentityKeys() {
 		if !slices.Contains(senderIdentityAttrs, k) {

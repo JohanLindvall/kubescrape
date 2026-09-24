@@ -2,14 +2,18 @@
 # Shared helpers for the chaos scenarios in this directory.
 #
 # Every scenario runs against the SHIPPED deployment that hack/e2e.sh creates
-# (deploy/*.yaml + hack/otel-collector.yaml) — no bespoke overlay — so what they
-# prove is what an operator actually gets.
+# (deploy/kubernetes.yaml + deploy/agent.yaml + hack/otel-collector.yaml; the
+# events singleton and the trace tier are not deployed) — no bespoke overlay —
+# so what they prove is what an operator actually gets.
 #
-# The invariant they all check is the same one, and it is the universal one:
-# NO GAP. A writer emits densely numbered lines; at-least-once delivery means
-# duplicates are ALLOWED and expected, but a sequence number the writer produced
-# and no pass ever delivered is data loss. Counting deliveries cannot show that;
-# only the numbering can.
+# The three DATA-PATH scenarios (collector-outage, agent-kill, log-rotation)
+# all check the same invariant, and it is the universal one: NO GAP. A writer
+# emits densely numbered lines; at-least-once delivery means duplicates are
+# ALLOWED and expected, but a sequence number the writer produced and no pass
+# ever delivered is data loss. Counting deliveries cannot show that; only the
+# numbering can. apiserver-blackhole.sh moves no data, so it runs no writer and
+# asserts something else: that /readyz LATCHES at 200 through the outage, that
+# kubescrape_apiserver_probe_failures_total moves, and that nothing restarts.
 set -uo pipefail
 
 CLUSTER_NAME="${CLUSTER_NAME:-kubescrape}"
@@ -68,9 +72,12 @@ recycle_collector() {
   "${KCTL[@]}" -n "$NS" rollout status deploy/otel-collector --timeout=180s >/dev/null 2>&1
 }
 
-# writer_pod <name> <node> <mark> <count> <sleep> — a densely numbered log writer.
+# writer_pod <name> <node> <mark> <count> <sleep> [pad] — a densely numbered
+# log writer: <count> lines "<mark> seq=<i>", one per <sleep> seconds, each
+# followed by a space and <pad> bytes of padding when pad > 0 (log-rotation.sh
+# uses that to cross the kubelet's rotation threshold).
 writer_pod() {
-  local name="$1" node="$2" mark="$3" count="$4" nap="$5"
+  local name="$1" node="$2" mark="$3" count="$4" nap="$5" pad="${6:-0}"
   "${KCTL[@]}" -n default delete pod "$name" --ignore-not-found --grace-period=0 --force >/dev/null 2>&1
   cat <<EOF | "${KCTL[@]}" apply -f - >/dev/null
 apiVersion: v1
@@ -86,7 +93,19 @@ spec:
     - name: w
       image: busybox:1.36
       imagePullPolicy: IfNotPresent
-      command: ["/bin/sh","-c","i=0; while [ \$i -lt $count ]; do i=\$((i+1)); echo \"$mark seq=\$i\"; sleep $nap; done; sleep 3600"]
+      command:
+        - /bin/sh
+        - -c
+        - |
+          padding=""
+          [ $pad -gt 0 ] && padding=" \$(head -c $pad /dev/zero | tr '\\0' 'x')"
+          i=0
+          while [ \$i -lt $count ]; do
+            i=\$((i+1))
+            echo "$mark seq=\$i\$padding"
+            sleep $nap
+          done
+          sleep 3600
 EOF
   "${KCTL[@]}" -n default wait --for=condition=Ready "pod/$name" --timeout=120s >/dev/null
 }
@@ -112,101 +131,137 @@ raise SystemExit(1 if missing else 0)
 PY
 }
 
-# counters <substring> — latest value of each matching kubescrape_* self-metric.
+# The captured self-metrics are read by ONE walk, hack/chaos/otlpcap.py. The
+# two helpers below used to carry their own copies of it, which had already
+# drifted (a missing value read as None in one and 0 in the other); see that
+# file for what a SERIES is and why an agent is keyed by service.instance.id.
+OTLPCAP=(python3 "$CHAOS_DIR/otlpcap.py")
+
+# metrics_capture [capture] — the path of the metrics capture to read: the one
+# given (an earlier `metrics_capture` result, when a scenario asks several
+# questions of ONE moment), else a fresh `grab metrics`. Every grab re-reads
+# every rotated capture through `kubectl exec` — hundreds of megabytes on a
+# cluster that has been up a while — so two questions in a row should not pay
+# for two.
+metrics_capture() {
+  if [ -n "${1:-}" ]; then echo "$1"; return 0; fi
+  grab metrics || return 1
+  echo "$CAP_DIR/metrics.json"
+}
+
+# counters <substring> [capture] — latest value of each matching kubescrape_*
+# self-metric.
 #
 # It PROPAGATES a failed capture. It used to `return 0`, so a scenario whose
 # collector could not be read printed nothing and read as "the counter did not
 # move" — indistinguishable from the counter genuinely staying flat, on the
 # scripts whose whole job is to notice a signal.
 counters() {
-  grab metrics || return 1
-  python3 - "${1:-}" "$CAP_DIR/metrics.json" <<'PY'
-import json, sys
-pat, path = sys.argv[1], sys.argv[2]
-seen = {}
-for line in open(path, errors="replace"):
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        d = json.loads(line)
-    except Exception:
-        continue
-    for rm in d.get("resourceMetrics", []):
-        ra = {a["key"]: list(a["value"].values())[0] for a in rm["resource"].get("attributes", [])}
-        pod = ra.get("k8s.pod.name", ra.get("service.instance.id", "?"))
-        for sm in rm.get("scopeMetrics", []):
-            for m in sm.get("metrics", []):
-                n = m["name"]
-                if not n.startswith("kubescrape_") or pat not in n:
-                    continue
-                for t in ("gauge", "sum"):
-                    if t in m:
-                        for dp in m[t].get("dataPoints", []):
-                            at = ",".join(f'{a["key"]}={list(a["value"].values())[0]}'
-                                          for a in dp.get("attributes", []))
-                            seen[(pod, n, at)] = dp.get("asInt", dp.get("asDouble"))
-for (pod, n, at), v in sorted(seen.items()):
-    print(f"    {pod} {n}{{{at}}} = {v}")
-PY
+  local cap
+  cap=$(metrics_capture "${2:-}") || return 1
+  "${OTLPCAP[@]}" print "$cap" "${1:-}"
 }
 
-# counter_total <metric-name> — the SUM of that metric's latest data points
-# across every reporting pod, as a bare integer. Prints nothing and returns
-# non-zero when the collector capture cannot be read, so a caller can tell "no
-# capture" from "zero", which the human-readable `counters` cannot.
+# counter_total <metric-name> [capture] — the SUM of that metric's latest data
+# points across every reporting process, as a bare integer. Prints nothing and
+# returns non-zero when the collector capture cannot be read, so a caller can
+# tell "no capture" from "zero", which the human-readable `counters` cannot.
 #
 # The collector's file exporter holds every push, so the LAST value of a series
 # is its current one; a counter that has never been incremented was never
 # exported at all and reads as absent, which for a total is 0.
 counter_total() {
-  grab metrics || return 1
-  python3 - "$1" "$CAP_DIR/metrics.json" <<'PY'
-import json, sys
-name, path = sys.argv[1], sys.argv[2]
-seen = {}
-for line in open(path, errors="replace"):
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        d = json.loads(line)
-    except Exception:
-        continue
-    for rm in d.get("resourceMetrics", []):
-        ra = {a["key"]: list(a["value"].values())[0] for a in rm["resource"].get("attributes", [])}
-        pod = ra.get("k8s.pod.name", ra.get("service.instance.id", "?"))
-        for sm in rm.get("scopeMetrics", []):
-            for m in sm.get("metrics", []):
-                if m["name"] != name:
-                    continue
-                for t in ("gauge", "sum"):
-                    for dp in m.get(t, {}).get("dataPoints", []):
-                        at = ",".join(f'{a["key"]}={list(a["value"].values())[0]}'
-                                      for a in dp.get("attributes", []))
-                        seen[(pod, at)] = dp.get("asInt", dp.get("asDouble", 0))
-print(int(sum(float(v) for v in seen.values())))
-PY
+  local cap
+  cap=$(metrics_capture "${2:-}") || return 1
+  "${OTLPCAP[@]}" total "$cap" "$1"
 }
 
-# assert_no_restarts <label> — every pod matching the label selector must have
-# a restartCount of 0. A crash-and-restart can hide a scenario's whole point:
-# the process comes back, resumes, and the invariant under test passes for the
-# wrong reason.
-assert_no_restarts() {
-  local sel="$1" out
+# loss_baseline <file> <metric>... — record the named counters' current values,
+# per series, BEFORE a fault. assert_losses_flat compares against it.
+#
+# A BASELINE and not "must be zero": the counters are cumulative over each
+# agent's lifetime, and `make chaos` runs its scenarios back to back, so an
+# absolute check fails every later run for something an earlier one did —
+# apiserver-blackhole.sh's reason for asserting that its counter MOVED rather
+# than that it is non-zero, applied the other way round.
+loss_baseline() {
+  local out="$1"; shift
+  grab metrics || return 1
+  "${OTLPCAP[@]}" snapshot "$CAP_DIR/metrics.json" "$@" > "$out"
+}
+
+# assert_losses_flat <baseline> <metric>... — fail when any series of the named
+# loss counters rose since loss_baseline recorded <baseline>. The counters are
+# the agent's OWN admission of loss, so one moving is a failure even when the
+# gap check passed: the numbered lines are one writer's, and the counters see
+# every file on every node the fault touched. It also refuses to pass
+# VACUOUSLY: a capture holding no agent self-metric pushed after the baseline
+# cannot say whether a counter moved (otlpcap.py exits 2 for that), and that
+# fails too.
+assert_losses_flat() {
+  local base="$1" rc; shift
+  grab metrics || fail "could not read the collector's metrics capture after the run — the loss counters cannot be compared"
+  "${OTLPCAP[@]}" grew "$base" "$CAP_DIR/metrics.json" "$@"
+  rc=$?
+  case $rc in
+    0) ;;
+    1) fail "an agent counted a loss during the run (the series marked MOVED above)" ;;
+    2) fail "no agent self-metrics reached the collector after the baseline, so the loss counters were not observed" ;;
+    *) fail "could not compare the loss counters against $base (otlpcap.py exited $rc)" ;;
+  esac
+}
+
+# restart_snapshot <label> — one sorted "name restarts" line per pod matching
+# the label selector, restarts summed across the pod's containers. Take it
+# BEFORE the fault and hand it to assert_no_restarts afterwards.
+#
+# A BASELINE and not an absolute check: the lifetime restartCount of a pod says
+# nothing about THIS run. An absolute "every count is 0" false-failed on any
+# cluster whose pods ever restarted (a kind node restart is enough) and could
+# never be applied to the agents at all once agent-kill.sh — which raises their
+# count on purpose — had run earlier in `make chaos`; it also passed vacuously
+# for a pod REPLACED during the run, whose fresh count starts at 0. Comparing
+# the whole snapshot catches all three: a count that moved, and a name set that
+# changed.
+#
+# Returns non-zero (message on stderr) when nothing matches or a pod has no
+# container status yet, because a baseline over a pod that is not running
+# cannot say whether it restarted.
+restart_snapshot() {
+  local sel="$1" out snap
   out=$("${KCTL[@]}" -n "$NS" get pods -l "$sel" -o \
-    jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.containerStatuses[0].restartCount}{"\n"}{end}' \
-    2>/dev/null) || fail "could not read restart counts for '$sel'"
-  [ -n "$out" ] || fail "no pods matched '$sel' — the scenario cannot have observed what it claims"
-  echo "$out" | sed 's/^/    /;s/ / restarts=/'
-  # Two awk traps, both of which made an earlier spelling of this line answer
-  # "no restarts" or "restarted" for every input: `exit 0` in the main block
-  # still runs END, and an exit THERE wins (hence the flag); and `$2 != 0` on a
-  # pod with no containerStatuses compares "" against the string "0" and is
-  # TRUE, so a Pending pod read as a restart (hence the explicit numeric test).
-  if echo "$out" | awk '$2 ~ /^[0-9]+$/ && $2 + 0 > 0 { bad = 1 } END { exit !bad }'; then
-    fail "a pod matching '$sel' restarted during the run — the invariant under test was not exercised by a running process"
+    jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.containerStatuses[*]}{.restartCount}{" "}{end}{"\n"}{end}' \
+    2>/dev/null) || { echo "could not read restart counts for '$sel'" >&2; return 1; }
+  # A pod with no containerStatuses renders as its bare name, and an empty
+  # field compared as a number reads as 0 — so the non-numeric case is spelled
+  # out rather than left to awk's coercion (the trap an earlier absolute check
+  # here fell into, where a Pending pod read as a restart).
+  snap=$(printf '%s\n' "$out" | awk 'NF {
+      ok = NF > 1; n = 0
+      for (i = 2; i <= NF; i++) { if ($i !~ /^[0-9]+$/) ok = 0; n += $i }
+      print $1, (ok ? n : "?")
+    }' | sort)
+  [ -n "$snap" ] || { echo "no pods matched '$sel' — the scenario cannot have observed what it claims" >&2; return 1; }
+  if printf '%s\n' "$snap" | grep -q ' ?$'; then
+    echo "a pod matching '$sel' has no container status yet:" >&2
+    printf '%s\n' "$snap" | grep ' ?$' | sed 's/^/    /' >&2
+    return 1
+  fi
+  printf '%s\n' "$snap"
+}
+
+# assert_no_restarts <label> <snapshot> — the pods matching the label must be
+# EXACTLY the ones restart_snapshot recorded, each with the same restart count.
+# A crash-and-restart can hide a scenario's whole point: the process comes back,
+# resumes, and the invariant under test passes for the wrong reason.
+assert_no_restarts() {
+  local sel="$1" before="$2" after
+  after=$(restart_snapshot "$sel") || fail "could not re-read the restart counts for '$sel' after the run"
+  printf '%s\n' "$after" | sed 's/ / restarts=/;s/^/    /'
+  if [ "$before" != "$after" ]; then
+    info "before -> after:"
+    diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") | grep '^[<>]' | sed 's/^/    /'
+    fail "the pods matching '$sel' changed during the run (a restart, or a pod replaced) — the invariant under test was not exercised by one continuously running process"
   fi
 }
 

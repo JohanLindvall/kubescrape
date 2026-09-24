@@ -58,7 +58,7 @@ func FuzzFeedLine(f *testing.F) {
 			}
 		}
 
-		for _, line := range bytes.Split(data, []byte{'\n'}) {
+		for line := range bytes.SplitSeq(data, []byte{'\n'}) {
 			start := total
 			total += int64(len(line)) + 1
 			if len(line) == 0 {
@@ -89,6 +89,144 @@ func FuzzFeedLine(f *testing.F) {
 					i, e.stream, clip(e.body), e.end.off, prev)
 			}
 			lastOffset[e.stream] = e.end.off
+		}
+	})
+}
+
+// FuzzIngestChunk drives consume — the physical-line splitter from untrusted,
+// tenant-written bytes at arbitrary read-chunk boundaries to the offsets
+// checkpoints are built from — through ingestChunk exactly as every read loop
+// does. FuzzFeedLine does its own '\n' split and never reaches it, so the
+// interacting lineStart/pending/skipEnd/discarding/limited state went unfuzzed.
+//
+// Rate limiting runs off, in DROP mode and in PAUSE mode (readFile's retry is
+// modelled: refill the bucket and consume again before the next read), with a
+// small entry cap so the oversized-line discard window is reachable — the carry
+// cap is MaxEntryBytes+oversizeSlack, so a seed carries a newline-free run past
+// it. Invariants, after every chunk and every pause retry:
+//
+//   - lineStart + len(pending) == readPos (file's state invariant, file.go);
+//   - skipEnd <= lineStart, and skipEnd is 0 or follows a '\n' in the data;
+//   - committed <= lineStart and on a line boundary;
+//   - the watermark sits at or below lineStart;
+//   - limited implies pending begins with a whole, non-blank line: a pause
+//     holds a LINE, never a blank line or a discarded tail, which are handled
+//     ahead of the limiter precisely so they cannot defer the file's reading.
+//
+// After stopPipeline every batched entry's range lies on line boundaries within
+// [0, lineStart]. And with rate limiting off and no oversized line in either
+// run, the entries do not depend on the chunking. (An oversized line is the
+// deliberate exception: consume discards a line longer than the carry cap when
+// it arrives in pieces but feeds it, truncated, when one read holds it whole.)
+func FuzzIngestChunk(f *testing.F) {
+	ts := timeNowCRI()
+	long := strings.Repeat("x", 4096+200) // past a 96-byte cap's MaxEntryBytes+oversizeSlack
+	seeds := []string{
+		ts + " stdout F hello\n" + ts + " stderr F world\n",
+		ts + " stdout P frag1\n" + ts + " stdout P frag2\n" + ts + " stdout F end\n" + ts + " stdout P dangling",
+		ts + " stderr F panic: boom\n" + ts + " stderr F \tat main.go:1\n\n\n" + ts + " stdout F after-blanks\n",
+		"not a cri line\n\x00\x01\n\xff\xfe bad utf8\n\n",
+		ts + " stdout F " + long + "\n" + ts + " stdout F next\n",
+		long + long + "\n" + ts + " stdout F after-discard\n\n" + ts + " stdout F tail",
+	}
+	cutSets := [][]byte{nil, {0}, {6, 40, 255}, {199, 255, 7}}
+	for _, s := range seeds {
+		for i, cuts := range cutSets {
+			f.Add([]byte(s), cuts, byte(i%3), i%2 == 0)
+		}
+	}
+	f.Fuzz(func(t *testing.T, data []byte, cuts []byte, mode byte, multiline bool) {
+		cfg := Config{Multiline: multiline, MaxEntryBytes: 96}
+		switch mode % 3 {
+		case 1:
+			cfg.RateLimit, cfg.RateBurst, cfg.RateDrop = 1, 2, true
+		case 2:
+			cfg.RateLimit, cfg.RateBurst = 1, 2
+		}
+		ctx := context.Background()
+		boundary := func(off int64) bool {
+			return off == 0 || (off <= int64(len(data)) && data[off-1] == '\n')
+		}
+
+		run := func(chunked bool) (*Tailer, *file) {
+			tl, fl := benchTailer(t, cfg)
+			check := func(when string) {
+				t.Helper()
+				if fl.lineStart+int64(len(fl.pending)) != fl.readPos {
+					t.Fatalf("%s: lineStart %d + pending %d != readPos %d", when, fl.lineStart, len(fl.pending), fl.readPos)
+				}
+				if fl.skipEnd > fl.lineStart || !boundary(fl.skipEnd) {
+					t.Fatalf("%s: skipEnd %d (lineStart %d) is not a line boundary at or below lineStart", when, fl.skipEnd, fl.lineStart)
+				}
+				if fl.committed > fl.lineStart || !boundary(fl.committed) {
+					t.Fatalf("%s: committed %d (lineStart %d) is not a line boundary at or below lineStart", when, fl.committed, fl.lineStart)
+				}
+				if wm, ok := fl.watermark(); ok && wm.off > fl.lineStart {
+					t.Fatalf("%s: watermark %d above lineStart %d", when, wm.off, fl.lineStart)
+				}
+				if fl.limited {
+					if i := bytes.IndexByte(fl.pending, '\n'); i <= 0 || fl.discarding {
+						t.Fatalf("%s: paused on %q (discarding=%v), want a whole non-blank line at the head of pending",
+							when, clip(string(fl.pending)), fl.discarding)
+					}
+				}
+			}
+			// readFile stops reading a paused file and retries once tokens
+			// refill: model exactly that before every read.
+			unpause := func() {
+				for n := 0; fl.limited; n++ {
+					if n > len(data)+2 {
+						t.Fatal("a paused file never resumed across bucket refills")
+					}
+					fl.tokens = cfg.RateBurst
+					if tl.consume(ctx, fl, false) {
+						t.Fatal("consume reported a rewind with a null exporter")
+					}
+					check("after a pause retry")
+				}
+			}
+			rest := data
+			for i := 0; len(rest) > 0; i++ {
+				n := len(rest)
+				if chunked && len(cuts) > 0 {
+					n = min(n, int(cuts[i%len(cuts)])+1)
+				}
+				unpause()
+				if tl.ingestChunk(ctx, fl, rest[:n], false) {
+					t.Fatal("ingestChunk reported a rewind with a null exporter")
+				}
+				rest = rest[n:]
+				check("after a chunk")
+			}
+			unpause()
+			tl.stopPipeline(ctx, fl)
+			for i, e := range tl.batch {
+				if e.start.off < 0 || e.start.off > e.end.off || e.end.off > fl.lineStart ||
+					!boundary(e.start.off) || !boundary(e.end.off) {
+					t.Fatalf("entry %d (body %q): range [%d, %d) is not line boundaries within [0, %d]",
+						i, clip(e.body), e.start.off, e.end.off, fl.lineStart)
+				}
+			}
+			return tl, fl
+		}
+
+		tlA, fA := run(true)
+		if mode%3 != 0 {
+			return
+		}
+		tlB, fB := run(false)
+		if fA.oversized != 0 || fB.oversized != 0 {
+			return // the documented exception: see above
+		}
+		if len(tlA.batch) != len(tlB.batch) {
+			t.Fatalf("chunking changed the entry count: %d chunked vs %d whole", len(tlA.batch), len(tlB.batch))
+		}
+		for i := range tlA.batch {
+			a, b := tlA.batch[i], tlB.batch[i]
+			if a.body != b.body || a.start != b.start || a.end != b.end {
+				t.Fatalf("entry %d depends on the chunking: %q [%d,%d) chunked vs %q [%d,%d) whole",
+					i, clip(a.body), a.start.off, a.end.off, clip(b.body), b.start.off, b.end.off)
+			}
 		}
 	})
 }

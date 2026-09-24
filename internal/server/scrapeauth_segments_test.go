@@ -73,14 +73,14 @@ func TestScrapeAuthRefusesReCutPathSegments(t *testing.T) {
 
 	secrets := &recordingSecrets{}
 	srv := httptest.NewServer(New(Config{
-		Store:           store.New(time.Minute),
-		Services:        services.NewIndex(),
-		Monitors:        monitors,
-		Resolver:        stubResolver{},
-		MaxWait:         500 * time.Millisecond,
-		Ready:           closedChan(),
-		Secrets:         secrets,
-		ScrapeAuthToken: testScrapeToken,
+		Store:            store.New(time.Minute),
+		Services:         services.NewIndex(),
+		Monitors:         monitors,
+		Resolver:         stubResolver{},
+		MaxWait:          500 * time.Millisecond,
+		Ready:            closedChan(),
+		Secrets:          secrets,
+		ScrapeAuthTokens: staticTokens(testScrapeToken),
 	}).Handler())
 	t.Cleanup(srv.Close)
 

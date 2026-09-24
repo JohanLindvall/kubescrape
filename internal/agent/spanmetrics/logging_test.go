@@ -18,31 +18,60 @@ func capturedLog() (*slog.Logger, func() string) {
 }
 
 // A dimension colliding with a built-in is DROPPED (it would blank the real
-// label and render two series identically — cumagg.Builtins). Right, but the
-// operator gets no error and finds the label missing from every series.
+// label and render two series identically — cumagg.Builtins), and so are an
+// empty entry (an attribute with an empty KEY on every point) and a repeat.
+// Right, but the operator gets no error and finds the label missing from every
+// series — so each drop is one sentence from DimensionWarnings, the PURE
+// function configWarnings emits from -check-config and a real start alike (New
+// logging it was invisible to the dry run).
 func TestDroppedDimensionsAreWarnedAbout(t *testing.T) {
-	log, dump := capturedLog()
-	g := New(Config{Dimensions: []string{"http.method", "span.name", "http.method"}, Logger: log})
-
-	out := dump()
-	if n := strings.Count(out, "ignoring a"); n != 2 {
-		t.Errorf("want a line per dropped dimension (the built-in collision and the repeat), got %d:\n%s", n, out)
+	cfg := Config{Dimensions: []string{"http.method", "span.name", "http.method", "", "le"}}
+	warns := cfg.DimensionWarnings()
+	if len(warns) != 4 {
+		t.Fatalf("want a sentence per dropped dimension (built-in, repeat, empty, le), got %d: %q", len(warns), warns)
 	}
-	if !strings.Contains(out, "key=span.name") {
-		t.Errorf("the warning does not name the dimension:\n%s", out)
+	all := strings.Join(warns, "\n")
+	for _, want := range []string{
+		`traceMetrics.dimensions[1] "span.name"`,
+		`traceMetrics.dimensions[2] "http.method" is ignored: it repeats an earlier entry`,
+		`traceMetrics.dimensions[3] "" is ignored: it is empty`,
+		`traceMetrics.dimensions[4] "le"`,
+	} {
+		if !strings.Contains(all, want) {
+			t.Errorf("the warnings do not name %s:\n%s", want, all)
+		}
 	}
-	// And the surviving dimension is still there: the report must not change
-	// what is kept.
+	// And the generator drops exactly those: the report must describe what New
+	// keeps, which is why both come from one walk.
+	g := New(cfg)
 	if len(g.extra) != 1 || g.extra[0] != "http.method" {
-		t.Errorf("extra dimensions = %v, want [http.method]", g.extra)
+		t.Errorf("extra dimensions = %q, want [http.method]", g.extra)
+	}
+}
+
+// New does not WARN about them itself: configWarnings does, on every start, so
+// a Warn here would print each line twice. It keeps a Debug trace.
+func TestNewLogsDroppedDimensionsOnlyAtDebug(t *testing.T) {
+	log, dump := capturedLog()
+	New(Config{Dimensions: []string{"span.name", ""}, Logger: log})
+	out := dump()
+	if strings.Contains(out, "level=WARN") {
+		t.Errorf("New warned about a dropped dimension; configWarnings owns that line:\n%s", out)
+	}
+	if strings.Count(out, "level=DEBUG") != 2 {
+		t.Errorf("want one Debug line per dropped dimension:\n%s", out)
 	}
 }
 
 func TestAcceptedDimensionsAreSilent(t *testing.T) {
 	log, dump := capturedLog()
-	New(Config{Dimensions: []string{"http.method", "http.route"}, Logger: log})
+	cfg := Config{Dimensions: []string{"http.method", "http.route"}, Logger: log}
+	New(cfg)
 	if out := dump(); out != "" {
 		t.Errorf("an ordinary dimension list logged:\n%s", out)
+	}
+	if w := cfg.DimensionWarnings(); len(w) != 0 {
+		t.Errorf("an ordinary dimension list warned: %q", w)
 	}
 }
 
@@ -53,7 +82,7 @@ func TestUnparseableStaleAfterIsWarnedAbout(t *testing.T) {
 	log, dump := capturedLog()
 	New(Config{StaleAfter: "fifteen minutes", Logger: log})
 	out := dump()
-	if !strings.Contains(out, "staleAfter is unparseable") {
+	if !strings.Contains(out, "staleAfter is invalid") {
 		t.Errorf("the fallback is silent:\n%s", out)
 	}
 	if !strings.Contains(out, "staleAfter=15m0s") {

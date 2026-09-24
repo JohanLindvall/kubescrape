@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -107,7 +109,7 @@ func TestScrapeChunking(t *testing.T) {
 	// 25 samples with a 10-point batch limit -> 3 exports.
 	var body strings.Builder
 	body.WriteString("# TYPE things counter\n")
-	for i := 0; i < 25; i++ {
+	for i := range 25 {
 		fmt.Fprintf(&body, "things_total{i=\"%d\"} %d\n", i, i)
 	}
 	srv := serveBody(t, body.String())
@@ -199,9 +201,109 @@ func TestScrapeHealthMetrics(t *testing.T) {
 	}
 }
 
+// hangingExporter blocks every export until its context is done — a
+// blackholed collector behind an unbuffered chain — and records whether the
+// context it was handed carried a deadline at all.
+type hangingExporter struct{ unbounded atomic.Int64 }
+
+func (h *hangingExporter) ExportMetrics(ctx context.Context, _ pmetric.Metrics) error {
+	if _, ok := ctx.Deadline(); !ok {
+		h.unbounded.Add(1)
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// The health export runs after wg.Wait on Run's own context, so it was the one
+// export of the cycle no scrape budget bounded: against a destination that
+// hangs, cycle() — and with it the node's whole scrape loop, since Run cannot
+// tick while it runs — waited out the exporter's retry budget (~48s at the
+// defaults) every cycle. It is bounded by the cycle's clamp now, and the
+// expiry is still warned about.
+func TestHealthExportIsBoundedByTheCycleBudget(t *testing.T) {
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError) // fails before any export
+	}))
+	t.Cleanup(bad.Close)
+
+	const budget = 200 * time.Millisecond
+	exp := &hangingExporter{}
+	var buf strings.Builder // slog's handler serialises its own writes
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: budget,
+		Targets: staticTargets{testTarget(bad.URL)}, Exporter: exp, StartTime: time.Now(),
+		HealthMetrics: true,
+	})
+	s.log = slog.New(slog.NewTextHandler(&buf, nil))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	s.cycle(ctx)
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("cycle took %v against a %v budget: the health export waited on the hung destination for as long as the caller's context allowed", took, budget)
+	}
+	if n := exp.unbounded.Load(); n != 0 {
+		t.Errorf("%d exports ran on a context with no deadline", n)
+	}
+	// cycle() joined every goroutine that logs before it returned.
+	if out := buf.String(); !strings.Contains(out, "exporting scrape health metrics") {
+		t.Errorf("the health export's own deadline expiring must still be warned about (only a shutdown is silent):\n%s", out)
+	}
+}
+
+// A failing health export is a persisting condition — the collector is down,
+// and otlpexport already narrates that with a transition, a re-warn and a
+// recovery — while exportHealth runs once per cycle on every node. Its own line
+// is throttled, or the outage is repeated at scrape cadence across the fleet.
+func TestHealthExportFailureIsThrottled(t *testing.T) {
+	srv := serveBody(t, "m 1\n")
+	var buf strings.Builder // slog's handler serialises its own writes
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{testTarget(srv.URL)}, Exporter: rejectingExporter{}, StartTime: time.Now(),
+		HealthMetrics: true,
+	})
+	s.log = slog.New(slog.NewTextHandler(&buf, nil))
+	for range 3 {
+		expireSchedule(s)
+		s.cycle(context.Background())
+	}
+	if n := strings.Count(buf.String(), "exporting scrape health metrics"); n != 1 {
+		t.Errorf("%d health-export warnings over 3 failing cycles, want 1:\n%s", n, buf.String())
+	}
+}
+
+// The partial-scrape salvage's export failure is throttled per target the same
+// way: an aborting target in front of a failing collector otherwise logged one
+// Warn per target per cycle on every node.
+func TestPartialScrapeExportFailureIsThrottled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		for i := range 100 {
+			_, _ = fmt.Fprintf(w, "m%d 1\n", i)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	var buf strings.Builder
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		MaxSamples: 10, BatchPoints: 1000,
+		Targets: staticTargets{testTarget(srv.URL)}, Exporter: rejectingExporter{},
+	})
+	s.log = slog.New(slog.NewTextHandler(&buf, nil))
+	for range 3 {
+		if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL), s.cfg.Timeout); !errors.Is(err, ErrTooManySamples) {
+			t.Fatalf("err = %v, want ErrTooManySamples (the abort salvage runs on)", err)
+		}
+	}
+	if n := strings.Count(buf.String(), "exporting partial scrape"); n != 1 {
+		t.Errorf("%d partial-scrape export warnings over 3 aborted scrapes, want 1:\n%s", n, buf.String())
+	}
+}
+
 func TestScrapeSampleLimit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		for i := 0; i < 100; i++ {
+		for i := range 100 {
 			_, _ = fmt.Fprintf(w, "m%d 1\n", i)
 		}
 	}))
@@ -305,7 +407,7 @@ rpc_count 2000
 `
 	bt := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
 	conv := newConverter(bt, nil)
-	p := newParser(promparse.Options{MaxLineBytes: 1 << 20})
+	p := promparse.New(promparse.Options{MaxLineBytes: 1 << 20})
 	malformed, err := p.Parse(strings.NewReader(body), func(s Sample) error {
 		_ = conv.add(s)
 		return nil
@@ -416,6 +518,47 @@ func TestScrapeExemplarsDisabled(t *testing.T) {
 	}
 }
 
+// The Accept header is the one part of a scrape a TARGET negotiates on, so the
+// exact bytes are wire-visible: the offers are composed from one const block
+// (a fallback spelled once, protoContentType shared with the response check),
+// and this pins that the composition renders what each mode always sent.
+func TestScrapeTargetOffersTheAcceptHeaderOfItsMode(t *testing.T) {
+	var gotAccept atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAccept.Store(r.Header.Get("Accept"))
+		_, _ = w.Write([]byte("m 1\n"))
+	}))
+	defer srv.Close()
+
+	for _, c := range []struct {
+		name              string
+		exemplars, native bool
+		want              string
+	}{
+		{"text", false, false, "text/plain;version=0.0.4"},
+		{"exemplars", true, false, "application/openmetrics-text;version=1.0.0;q=1,text/plain;version=0.0.4;q=0.5"},
+		{"native histograms", true, true, "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=1," +
+			"application/openmetrics-text;version=1.0.0;q=0.8,text/plain;version=0.0.4;q=0.5"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := New(Config{
+				Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+				Exemplars: c.exemplars, NativeHistograms: c.native,
+				Exporter: &captureExporter{}, StartTime: time.Now(),
+			})
+			if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL), s.cfg.Timeout); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := gotAccept.Load().(string); got != c.want {
+				t.Errorf("Accept = %q, want %q", got, c.want)
+			}
+		})
+	}
+	if acceptJSON != "application/json" {
+		t.Errorf("acceptJSON = %q", acceptJSON)
+	}
+}
+
 func TestScrapeAttrFilter(t *testing.T) {
 	srv := serveBody(t, "m 1\n")
 
@@ -501,7 +644,7 @@ a_count{s="2"} 7
 `
 	bt := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
 	conv := newConverter(bt, nil)
-	p := newParser(promparse.Options{MaxLineBytes: 1 << 20})
+	p := promparse.New(promparse.Options{MaxLineBytes: 1 << 20})
 	if _, err := p.Parse(strings.NewReader(exposition), func(s Sample) error {
 		_ = conv.add(s)
 		return nil
@@ -594,9 +737,231 @@ func TestKubeletScheduleSurvivesTargetFetchFailure(t *testing.T) {
 	}
 }
 
+// The kubelet scrapes do not depend on the target list, so a slow or
+// blackholed metadata service must not hold them back. The fetch is bounded
+// only by the metadata client's own timeout (15s at the defaults), and spawning
+// the kubelet scrapes after it delayed every kubelet pipeline by that much each
+// cycle — /metrics included, which resolves nothing. The fetch here answers
+// only once the kubelet has been asked, so the test waits on no clock unless
+// the order is wrong.
+func TestKubeletScrapesDoNotWaitForTheTargetFetch(t *testing.T) {
+	asked := make(chan struct{})
+	var once sync.Once
+	kubelet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		once.Do(func() { close(asked) })
+		_, _ = w.Write([]byte("# TYPE up gauge\nup 1\n"))
+	}))
+	t.Cleanup(kubelet.Close)
+	src := &gatedTargets{gate: asked, giveUp: 3 * time.Second}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 10 * time.Second,
+		Targets: src, Exporter: &captureExporter{}, StartTime: time.Now(),
+		Kubelet: KubeletConfig{Endpoint: kubelet.URL, NodeMetrics: true},
+	})
+	s.cycle(context.Background())
+	if !src.opened.Load() {
+		t.Fatal("the kubelet was not asked until the target fetch had given up: a hung metadata service delays a pipeline that never uses it")
+	}
+	if _, ok := s.dueAt(dueKeyNode); !ok {
+		t.Error("the /metrics scrape was not scheduled")
+	}
+}
+
+// gatedTargets answers once gate closes, or fails after giveUp, as a metadata
+// service that is not answering does.
+type gatedTargets struct {
+	gate   <-chan struct{}
+	giveUp time.Duration
+	opened atomic.Bool
+}
+
+func (g *gatedTargets) NodeTargets(ctx context.Context, _ string) ([]kubemeta.ScrapeTarget, error) {
+	select {
+	case <-g.gate:
+		g.opened.Store(true)
+		return nil, nil
+	case <-time.After(g.giveUp):
+		return nil, errors.New("metadata service did not answer")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // failingTargets always fails, as a metadata service being rolled does.
 type failingTargets struct{}
 
 func (failingTargets) NodeTargets(context.Context, string) ([]kubemeta.ScrapeTarget, error) {
 	return nil, errors.New("metadata service unavailable")
+}
+
+// flakyTargets serves its list until fail is set, then fails as a metadata
+// service being rolled does.
+type flakyTargets struct {
+	list []kubemeta.ScrapeTarget
+	fail atomic.Bool
+}
+
+func (f *flakyTargets) NodeTargets(context.Context, string) ([]kubemeta.ScrapeTarget, error) {
+	if f.fail.Load() {
+		return nil, errors.New("metadata service unavailable")
+	}
+	return f.list, nil
+}
+
+// expireSchedule makes every scheduled key due at the next cycle: the passage
+// of the interval, without sleeping through it.
+func expireSchedule(s *Scraper) {
+	s.dueMu.Lock()
+	defer s.dueMu.Unlock()
+	for k := range s.due {
+		s.due[k] = time.Time{}
+	}
+}
+
+// countingTarget serves one sample and counts the scrapes it received.
+func countingTarget(t *testing.T) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte("m 1\n"))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &hits
+}
+
+// The metadata service is a singleton, so a node drain or a rollout fails
+// every agent's target fetch for as long as its replacement takes to become
+// ready. Scraping NOTHING for that long was a hole in every discovered
+// target's data while the targets themselves were healthy — and
+// /debug/targets kept showing them up, from the previous snapshot.
+func TestFailedTargetFetchScrapesTheLastKnownTargets(t *testing.T) {
+	srv, hits := countingTarget(t)
+	src := &flakyTargets{list: []kubemeta.ScrapeTarget{testTarget(srv.URL)}}
+	var buf strings.Builder
+	exp := &captureExporter{}
+	s := debugScraper(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: src, Exporter: exp, StartTime: time.Now(),
+	}, &buf)
+
+	s.cycle(context.Background())
+	if hits.Load() != 1 {
+		t.Fatalf("hits = %d after the first cycle, want 1", hits.Load())
+	}
+	src.fail.Store(true)
+	for range 3 {
+		expireSchedule(s)
+		s.cycle(context.Background())
+	}
+	if got := hits.Load(); got != 4 {
+		t.Fatalf("hits = %d after three cycles whose fetch failed, want 4: the last known list must keep being scraped", got)
+	}
+	st := s.Status()
+	if len(st.Targets) != 1 || !st.Targets[0].Up || st.Targets[0].Pending {
+		t.Errorf("status = %+v, want the one target, scraped and up", st.Targets)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "scraping the last known target list") {
+		t.Errorf("the reuse was not announced:\n%s", out)
+	}
+
+	src.fail.Store(false)
+	s.cycle(context.Background())
+	if !strings.Contains(buf.String(), "fetching scrape targets recovered") {
+		t.Errorf("the recovery was not reported:\n%s", buf.String())
+	}
+}
+
+// The reuse is BOUNDED: a list is a snapshot of pod IPs, pod CIDRs are per
+// node, and an address freed by a pod deleted during the outage is likely to
+// be recycled on this very node — scraped under the dead pod's identity for as
+// long as the stale list is honoured.
+func TestStaleTargetListExpires(t *testing.T) {
+	srv, hits := countingTarget(t)
+	src := &flakyTargets{list: []kubemeta.ScrapeTarget{testTarget(srv.URL)}}
+	var buf strings.Builder
+	s := debugScraper(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: src, Exporter: &captureExporter{}, StartTime: time.Now(),
+	}, &buf)
+	s.cycle(context.Background())
+	src.fail.Store(true)
+	expireSchedule(s)
+	s.cycle(context.Background()) // inside the bound: reused
+	if hits.Load() != 2 {
+		t.Fatalf("hits = %d, want 2 (the reuse inside the bound)", hits.Load())
+	}
+
+	s.lastGoodAt = time.Now().Add(-maxStaleTargetList - time.Second)
+	for range 2 {
+		expireSchedule(s)
+		s.cycle(context.Background())
+	}
+	if got := hits.Load(); got != 2 {
+		t.Errorf("hits = %d, want 2: a list older than %v must not be scraped", got, maxStaleTargetList)
+	}
+	if n := strings.Count(buf.String(), "too old to reuse"); n != 1 {
+		t.Errorf("the expiry was reported %d times, want once (it is a transition):\n%s", n, buf.String())
+	}
+}
+
+// A failing fetch is a persisting condition, noticed every cycle on every node
+// at a tick that can be as short as 1s. It says so on the transition and then
+// at most once per window — the tailer's and the export reporter's shape.
+func TestTargetFetchFailureIsNarratedNotRepeated(t *testing.T) {
+	var buf strings.Builder
+	s := debugScraper(Config{
+		Node: "node1", Interval: time.Hour, Exporter: &captureExporter{},
+		Targets: failingTargets{},
+	}, &buf)
+	for range 5 {
+		s.cycle(context.Background())
+	}
+	out := buf.String()
+	if n := strings.Count(out, "fetching scrape targets"); n != 1 {
+		t.Fatalf("logged %d lines for one ongoing failure, want 1 (the transition):\n%s", n, out)
+	}
+	if !strings.Contains(out, "no discovered target is scraped") {
+		t.Errorf("with no last known list the line must say nothing is scraped:\n%s", out)
+	}
+	if s.fetchFail.failures != 5 {
+		t.Errorf("failures = %d, want 5 (the repeat line carries the count)", s.fetchFail.failures)
+	}
+}
+
+// salvage cannot send on an expired context, so a body that stalls past the
+// scrape budget exports only the chunks already flushed — never the converted
+// remainder. Pinned so the documentation cannot claim otherwise again.
+func TestReadTimeoutMidBodyExportsOnlyFlushedChunks(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("a 1\nb 2\nc 3\n"))
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 300 * time.Millisecond, BatchPoints: 2,
+		Targets: staticTargets{}, Exporter: exp, StartTime: time.Now(),
+	})
+	samples, err := s.scrapeTarget(context.Background(), testTarget(srv.URL), 300*time.Millisecond)
+	if err == nil {
+		t.Fatal("a body stalling past the budget reported success")
+	}
+	if got := failureReason(err); got != reasonTimeout {
+		t.Errorf("reason = %q (%v), want %q", got, err, reasonTimeout)
+	}
+	if samples != 3 {
+		t.Errorf("samples = %d, want 3 (all three lines arrived before the stall)", samples)
+	}
+	if got := exp.points(); got != 2 {
+		t.Errorf("exported %d points, want 2: exactly the chunk flushed before the stall", got)
+	}
 }

@@ -2,13 +2,14 @@ package otlpingest
 
 import (
 	"context"
-	"strings"
+	"iter"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/pkg/otlpsplit"
 )
 
 // splitAndEnrich regroups every data point by the object ID on its own
@@ -18,6 +19,12 @@ import (
 // preserved. The cache is the request's: lookups are memoized once per
 // distinct ID across the whole batch, and the split budgets it carries span
 // every input ResourceMetrics of the push.
+//
+// md is CONSUMED: every data point is moved into the output (route), leaving
+// the input's points empty. Its one production caller exports only the
+// returned value, and a failed push is re-decoded from the sender's
+// retransmitted bytes; the input was never read-only anyway (the reserved
+// strip, admission and the empty-metric prune all edit it in place).
 func (e *Enricher) splitAndEnrich(ctx context.Context, cache *reqCache, md pmetric.Metrics) pmetric.Metrics {
 	out := pmetric.NewMetrics()
 	rms := md.ResourceMetrics()
@@ -81,13 +88,25 @@ type metricGrouper struct {
 	smByID      map[idScope]pmetric.ScopeMetrics
 	metByID     map[idMetric]pmetric.Metric
 	refused     map[string]struct{} // IDs already counted split_capped (lazily allocated)
+	// alias maps a point-level id that names the SENDER's own object to
+	// resToken, so its points join the sender's group (canonical). Lazily
+	// allocated; only folding ids are entered.
+	alias map[string]string
 }
 
 // route moves every data point of m into the output metric for its ID. The
-// per-type loops copy directly (no per-point closures — this is the ingest
+// per-type loops move directly (no per-point closures — this is the ingest
 // hot path).
+//
+// MOVE, not copy: metricFor has already read the point's attributes (the token
+// is built by concatenation, so nothing aliases them), and nothing reads the
+// input after the split — so a copy was a second, uncharged instance of every
+// point, attributes and exemplars included, alive beside the decoded input
+// until the handler returned (maxSplitCopyBytes charges only the resource,
+// scope and descriptor copies the splitter MINTS). The input is left with
+// emptied points; splitAndEnrich says so.
 func (g *metricGrouper) route(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.Metric, metricIdx int) {
-	if metricPointCount(m) == 0 {
+	if otlpsplit.DataPointCount(m) == 0 {
 		// No data points to route (an empty metric, or MetricTypeEmpty): the
 		// per-type loops below would create no shell and the descriptor would be
 		// dropped. Resource mode returns the metric in place, so preserve it here
@@ -101,57 +120,89 @@ func (g *metricGrouper) route(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.M
 		for i := 0; i < dps.Len(); i++ {
 			dp := dps.At(i)
 			dst := g.metricFor(sm, scopeIdx, m, metricIdx, dp.Attributes())
-			dp.CopyTo(dst.Gauge().DataPoints().AppendEmpty())
+			dp.MoveTo(dst.Gauge().DataPoints().AppendEmpty())
 		}
 	case pmetric.MetricTypeSum:
 		dps := m.Sum().DataPoints()
 		for i := 0; i < dps.Len(); i++ {
 			dp := dps.At(i)
 			dst := g.metricFor(sm, scopeIdx, m, metricIdx, dp.Attributes())
-			dp.CopyTo(dst.Sum().DataPoints().AppendEmpty())
+			dp.MoveTo(dst.Sum().DataPoints().AppendEmpty())
 		}
 	case pmetric.MetricTypeHistogram:
 		dps := m.Histogram().DataPoints()
 		for i := 0; i < dps.Len(); i++ {
 			dp := dps.At(i)
 			dst := g.metricFor(sm, scopeIdx, m, metricIdx, dp.Attributes())
-			dp.CopyTo(dst.Histogram().DataPoints().AppendEmpty())
+			dp.MoveTo(dst.Histogram().DataPoints().AppendEmpty())
 		}
 	case pmetric.MetricTypeExponentialHistogram:
 		dps := m.ExponentialHistogram().DataPoints()
 		for i := 0; i < dps.Len(); i++ {
 			dp := dps.At(i)
 			dst := g.metricFor(sm, scopeIdx, m, metricIdx, dp.Attributes())
-			dp.CopyTo(dst.ExponentialHistogram().DataPoints().AppendEmpty())
+			dp.MoveTo(dst.ExponentialHistogram().DataPoints().AppendEmpty())
 		}
 	case pmetric.MetricTypeSummary:
 		dps := m.Summary().DataPoints()
 		for i := 0; i < dps.Len(); i++ {
 			dp := dps.At(i)
 			dst := g.metricFor(sm, scopeIdx, m, metricIdx, dp.Attributes())
-			dp.CopyTo(dst.Summary().DataPoints().AppendEmpty())
+			dp.MoveTo(dst.Summary().DataPoints().AppendEmpty())
 		}
 	}
 }
 
-// metricPointCount is the number of data points on m, across its type (0 for
-// MetricTypeEmpty), without touching them. The regrouper, the empty-metric
-// prune and the decoded-size estimate all count through it; the estimate used
-// to keep an identical copy under another name.
-func metricPointCount(m pmetric.Metric) int {
-	switch m.Type() {
-	case pmetric.MetricTypeGauge:
-		return m.Gauge().DataPoints().Len()
-	case pmetric.MetricTypeSum:
-		return m.Sum().DataPoints().Len()
-	case pmetric.MetricTypeHistogram:
-		return m.Histogram().DataPoints().Len()
-	case pmetric.MetricTypeExponentialHistogram:
-		return m.ExponentialHistogram().DataPoints().Len()
-	case pmetric.MetricTypeSummary:
-		return m.Summary().DataPoints().Len()
+// dataPointAttrs yields the attributes of each of m's data points, across all
+// five metric types (none for MetricTypeEmpty), stopping when the loop breaks.
+// It is the one per-point attribute walk: the auto-mode decision's two
+// presence/foreign walks and the reserved strip each spelled the same five
+// loops, differing only in the body. A caller that needs the TYPED point (the
+// regrouper's route, which moves it) keeps its own switch.
+//
+// Allocation-free: the function is inlined, so neither the iterator nor the
+// loop body escapes (TestAutoDecisionWalkAllocationBudget and the reserved
+// strip's clean-path budget run through it).
+func dataPointAttrs(m pmetric.Metric) iter.Seq[pcommon.Map] {
+	return func(yield func(pcommon.Map) bool) {
+		switch m.Type() {
+		case pmetric.MetricTypeGauge:
+			dps := m.Gauge().DataPoints()
+			for i := 0; i < dps.Len(); i++ {
+				if !yield(dps.At(i).Attributes()) {
+					return
+				}
+			}
+		case pmetric.MetricTypeSum:
+			dps := m.Sum().DataPoints()
+			for i := 0; i < dps.Len(); i++ {
+				if !yield(dps.At(i).Attributes()) {
+					return
+				}
+			}
+		case pmetric.MetricTypeHistogram:
+			dps := m.Histogram().DataPoints()
+			for i := 0; i < dps.Len(); i++ {
+				if !yield(dps.At(i).Attributes()) {
+					return
+				}
+			}
+		case pmetric.MetricTypeExponentialHistogram:
+			dps := m.ExponentialHistogram().DataPoints()
+			for i := 0; i < dps.Len(); i++ {
+				if !yield(dps.At(i).Attributes()) {
+					return
+				}
+			}
+		case pmetric.MetricTypeSummary:
+			dps := m.Summary().DataPoints()
+			for i := 0; i < dps.Len(); i++ {
+				if !yield(dps.At(i).Attributes()) {
+					return
+				}
+			}
+		}
 	}
-	return 0
 }
 
 // metricFor resolves one data point's ID (falling back to the resource-level
@@ -160,6 +211,10 @@ func (g *metricGrouper) metricFor(sm pmetric.ScopeMetrics, scopeIdx int, m pmetr
 	token := g.enricher.resolvableToken(g.ctx, g.cache, dpAttrs)
 	if token == "" {
 		token = g.resToken
+	} else if a, ok := g.alias[token]; ok {
+		// Decided once, at the id's first point (canonical); every later point
+		// pays this one probe.
+		token = a
 	}
 	return g.metric(sm, scopeIdx, m, metricIdx, token)
 }
@@ -181,6 +236,9 @@ func (g *metricGrouper) metric(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.
 	// the agent with a >maxSplitGroups-object push.
 	if !isFallbackID(id) && !g.admit(id) {
 		return g.metric(sm, scopeIdx, m, metricIdx, g.foldTarget(id))
+	}
+	if canon := g.canonical(id); canon != id {
+		return g.metric(sm, scopeIdx, m, metricIdx, canon)
 	}
 	scope := g.scope(sm, scopeIdx, id)
 	dst := scope.Metrics().AppendEmpty()
@@ -240,6 +298,49 @@ func (g *metricGrouper) foldTarget(id string) string {
 		return ""
 	}
 	return overflowID
+}
+
+// canonical is the group an ADMITTED point-level id's points belong to: the
+// sender's own (resToken) when the id names the sender's object at the same or
+// a coarser grain, the id's own group otherwise.
+//
+// Without it, datapoint mode split ONE object across two resources whenever a
+// sender named itself two ways — its resource carrying container.id, some
+// points carrying its k8s.pod.uid, the rest nothing: the id-less points went to
+// the container-grain group and the pod-uid points to a second, pod-grain one
+// (resource()'s merge arm resolves them as the same object but keys a SEPARATE
+// group by the point token), with a different service.instance.id and no
+// container name. Auto mode attributed the same payload to one resource — the
+// mode-dependent attribution sameObject exists to prevent.
+//
+// Only a point at the SAME or a COARSER grain folds (its resolved container is
+// the resource's, or none): a point naming one CONTAINER of the pod a
+// pod-grain resource describes keeps its own group, because that is the
+// container grain datapoint mode exists to give. Only ADMITTED ids get here
+// (metric() gates on admit first), so no lookup is spent on an id the budgets
+// refuse (foldTarget's argument), and the lookups spent are exactly the ones
+// resource()'s merge arm would have spent on the same id. The object is then
+// counted enriched once, through the sender's own group.
+func (g *metricGrouper) canonical(id string) string {
+	if isFallbackID(id) || g.resToken == "" || id == g.resToken {
+		return id
+	}
+	if a, ok := g.alias[id]; ok {
+		return a
+	}
+	if _, grouped := g.rmByID[id]; grouped {
+		return id
+	}
+	pt := g.enricher.attrsFor(g.ctx, g.cache, id)
+	res := g.enricher.attrsFor(g.ctx, g.cache, g.resToken)
+	if !sameResolved(pt, res) || (pt.container != "" && pt.container != res.container) {
+		return id
+	}
+	if g.alias == nil {
+		g.alias = map[string]string{}
+	}
+	g.alias[id] = g.resToken
+	return g.resToken
 }
 
 // admit reports whether copies keyed by id may still be minted, against the
@@ -346,9 +447,11 @@ func stripSenderIdentity(a pcommon.Map) {
 // request's cache rather than the grouper. Each group is a full copy of the
 // sender's resource, so the bound is on MEMORY, which the ingest byte budget
 // cannot express — it counts the payload's raw bytes, and a small payload can
-// name a great many distinct objects. Past the cap the remaining objects share
-// the source resource — unenriched, but forwarded and counted, which is
-// strictly better than an OOM the process cannot defend against on an
+// name a great many distinct objects. Past the cap the remaining objects' points
+// fold into the overflow group (overflowID: a copy of the source resource
+// stripped of the sender's identity, unenriched), or — for the sender's OWN id
+// — into its own "" group (foldTarget); forwarded and counted either way, which
+// is strictly better than an OOM the process cannot defend against on an
 // unauthenticated listener.
 const maxSplitGroups = 2048
 
@@ -361,8 +464,9 @@ const maxSplitGroups = 2048
 // by the disk buffer's enqueue, or re-sent as a thousand otlpsplit parts
 // without one. 16 MiB is far above what real described-object pushes mint
 // (thousands of groups times KiB-scale resources) and a handful of otlpexport
-// part-splits; past it, creations fold into the "" fallback exactly as the
-// group cap's overflow does, counted under the same outcome.
+// part-splits; past it, creations fold exactly as the group cap's refusals do
+// (foldTarget: the stripped overflow group, or the sender's own "" group for
+// its own id), counted under the same outcome.
 const maxSplitCopyBytes = 16 << 20
 
 func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
@@ -425,7 +529,17 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 			g.rmByID[id] = rm
 			return rm
 		}
-		g.enricher.mergeAttrs(g.enricher.builtAttrs(g.ctx, g.cache, id).built, rm.Resource().Attributes())
+		// The lookup input exempt from the resolved-wins overwrite is the key
+		// set of the kind that resolved — but only when that input is ON this
+		// resource copy, i.e. the group is the sender's own token. A group
+		// keyed by a POINT's id (same object, finer grain) was resolved by the
+		// point's attribute; the copied resource's own id keys were not its
+		// input, so they are corrected like any other resolved key.
+		var by []string
+		if id == g.resToken {
+			by = g.enricher.lookupKeysOf(id)
+		}
+		g.enricher.mergeAttrs(g.enricher.builtAttrs(g.ctx, g.cache, id).built, rm.Resource().Attributes(), by)
 	case g.resToken == "":
 		// No ID anywhere for these points: the opt-in peer-IP fallback still
 		// attributes them to the pushing pod (resolved once per request). The
@@ -439,7 +553,7 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 		// fold in here) tallied an unresolved sender for a push whose resource
 		// had resolved perfectly.
 		if built, resolved := g.enricher.peerFallback(g.ctx, g.cache); resolved {
-			g.enricher.mergeAttrs(built, rm.Resource().Attributes())
+			g.enricher.mergeAttrs(built, rm.Resource().Attributes(), nil)
 		}
 	}
 	g.rmByID[id] = rm
@@ -450,15 +564,12 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 // (first-configured) attribute key, so unresolved split points remain
 // re-attributable downstream.
 func (g *metricGrouper) putIDAttr(a pcommon.Map, token string) {
-	if len(token) <= len(tokContainer) {
+	_, id, ok := splitToken(token)
+	if !ok || id == "" {
 		return
 	}
-	keys := g.enricher.containerIDKeys
-	if strings.HasPrefix(token, tokPodUID) {
-		keys = g.enricher.podUIDKeys
-	}
-	if len(keys) > 0 {
-		a.PutStr(keys[0], token[len(tokContainer):])
+	if keys := g.enricher.lookupKeysOf(token); len(keys) > 0 {
+		a.PutStr(keys[0], id)
 	}
 }
 
@@ -536,4 +647,33 @@ func valueSize(v pcommon.Value) int {
 	default:
 		return 8
 	}
+}
+
+// noteSplitCapped reports the point-split degradation: past either bound the
+// remaining objects' points fold into ONE overflow resource per input resource
+// (overflowID) — a copy of the sender's with its Kubernetes identity stripped,
+// UNENRICHED — so their series keep flowing, still carrying their own id
+// attributes, but attributed to no object: many objects' series under one
+// identity-less resource, the failure mode a counter alone reads as a small
+// number next to a large one. (A refused id that is the sender's OWN folds into
+// the sender's resource instead, which is correct for it.)
+//
+// grouped distinguishes the two shapes worth telling apart: an object that
+// never got a resource of its own (the group cap) from one that has a resource
+// and is being refused further descriptor copies (the byte cap), which is the
+// mid-push bind an operator has no other way to see.
+func (e *Enricher) noteSplitCapped(grouped bool, cache *reqCache) {
+	reason := "groups"
+	if grouped || cache.splitCopied >= maxSplitCopyBytes {
+		reason = "copied_bytes"
+	}
+	if allow, _ := e.splitCapWarnGate.Allow(reason); !allow {
+		return
+	}
+	e.log.Warn("ingest: a push describes more objects than one payload may split into, so the remainder's points "+
+		"are forwarded without Kubernetes attribution, on one overflow resource stripped of the sender's identity "+
+		"(each point keeps its own id attributes, so a downstream consumer can still re-resolve it). Have the "+
+		"sender batch fewer objects per push",
+		"reason", reason, "objects", cache.splitGroups, "maxObjects", maxSplitGroups,
+		"bytes", cache.splitCopied, "maxBytes", maxSplitCopyBytes)
 }

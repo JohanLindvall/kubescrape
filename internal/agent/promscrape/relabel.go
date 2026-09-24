@@ -9,7 +9,9 @@ package promscrape
 //
 // Compiled filters are cached by their rule fingerprint — targets are
 // re-fetched every cycle but their rules rarely change. Only targets that
-// carry rules pay the per-sample join (one reused buffer per scrape).
+// carry rules pay the per-sample join (one reused buffer per scrape), and a
+// rule whose join repeats on consecutive samples pays a memcmp instead of its
+// regex (relabelFilter.last).
 
 import (
 	"fmt"
@@ -31,7 +33,28 @@ type compiledRelabel struct {
 type relabelFilter struct {
 	rules []compiledRelabel
 	buf   []byte
+	// last is one last-seen memo per rule: the join the rule last evaluated
+	// and its verdict. An exposition is family-ordered, so a rule on __name__
+	// or on a low-cardinality label sees the same join on consecutive samples,
+	// and the memo turns that anchored-regex run into a memcmp — the parser's
+	// lastMetric/lastKV pattern, and the reason it is last-seen rather than a
+	// map: a rule on a high-cardinality label (pod, id) misses every time, and a
+	// map memo there measured thousands of allocations per scrape for no gain
+	// where this costs a compare. Allocated once per session.
+	last []relabelLast
 }
+
+// relabelLast is one rule's last-seen join and verdict.
+type relabelLast struct {
+	val     []byte
+	ok      bool // val holds a join this rule evaluated
+	matched bool
+}
+
+// maxRelabelMemoBytes bounds the join a rule's memo remembers. A longer one is
+// simply re-evaluated each time: a join that long is a label value that rarely
+// repeats, and the memo must not pin a target's longest value per rule.
+const maxRelabelMemoBytes = 256
 
 // relabelCache caches compiled chains by fingerprint. It is process-global (one
 // per Scraper), shared across the concurrent scrape goroutines, and keyed by the
@@ -65,22 +88,7 @@ func (c *relabelCache) session(rules []kubemeta.RelabelRule) (f *relabelFilter, 
 	if len(rules) == 0 {
 		return nil, false, nil
 	}
-	// Length-prefixed via appendLP (the package's one injective-join rule): a
-	// regex or source label may contain any delimiter byte, and two rule chains
-	// fingerprinting to one key would hand one endpoint the other's compiled
-	// filter. The source-label COUNT is part of the encoding — the parts are
-	// self-delimiting, but rule boundaries are not without it.
-	fp := make([]byte, 0, 128)
-	for _, r := range rules {
-		fp = appendLP(fp, r.Action)
-		fp = strconv.AppendInt(fp, int64(len(r.SourceLabels)), 10)
-		fp = append(fp, ';')
-		for _, src := range r.SourceLabels {
-			fp = appendLP(fp, src)
-		}
-		fp = appendLP(fp, r.Regex)
-	}
-	key := string(fp)
+	key := relabelFingerprint(rules)
 	c.mu.Lock()
 	compiled, ok := c.m[key]
 	c.mu.Unlock()
@@ -89,11 +97,11 @@ func (c *relabelCache) session(rules []kubemeta.RelabelRule) (f *relabelFilter, 
 			if r.Action != "keep" && r.Action != "drop" {
 				continue // parse already restricted to keep/drop; belt and braces
 			}
-			rx := r.Regex
-			if rx == "" {
-				rx = "(.*)" // Prometheus default
-			}
-			re, err := regexp.Compile("^(?:" + rx + ")$")
+			// The ONE spelling of the anchored wrap and the empty-regex
+			// default, shared with the metadata service's parse door
+			// (internal/servicemonitors), which refuses an endpoint whose
+			// regex this would fail on — so the two cannot disagree.
+			re, err := kubemeta.CompileRelabelRegex(r.Regex)
 			if err != nil {
 				return nil, false, fmt.Errorf("metricRelabelings regex %q: %w", r.Regex, err)
 			}
@@ -114,7 +122,29 @@ func (c *relabelCache) session(rules []kubemeta.RelabelRule) (f *relabelFilter, 
 		c.m[key] = compiled
 		c.mu.Unlock()
 	}
-	return &relabelFilter{rules: compiled}, evicted, nil
+	return &relabelFilter{rules: compiled, last: make([]relabelLast, len(compiled))}, evicted, nil
+}
+
+// relabelFingerprint is a rule chain's cache key, and its INJECTIVITY is
+// load-bearing: the cache is process-global, so two chains fingerprinting to
+// one key would hand one endpoint the other's compiled filter and export
+// series its own rule asked to drop. Length-prefixed via appendLP (the
+// package's one injective-join rule), because a regex or source label may
+// contain any delimiter byte. The source-label COUNT is part of the encoding —
+// the parts are self-delimiting, but rule boundaries are not without it.
+// TestRelabelFingerprintIsInjective pins it.
+func relabelFingerprint(rules []kubemeta.RelabelRule) string {
+	fp := make([]byte, 0, 128)
+	for _, r := range rules {
+		fp = appendLP(fp, r.Action)
+		fp = strconv.AppendInt(fp, int64(len(r.SourceLabels)), 10)
+		fp = append(fp, ';')
+		for _, src := range r.SourceLabels {
+			fp = appendLP(fp, src)
+		}
+		fp = appendLP(fp, r.Regex)
+	}
+	return string(fp)
 }
 
 // Keep reports whether a sample survives the chain.
@@ -128,7 +158,18 @@ func (f *relabelFilter) Keep(name string, labels []Label) bool {
 			}
 			f.buf = append(f.buf, labelOrName(name, labels, src)...)
 		}
-		matched := r.re.Match(f.buf)
+		var matched bool
+		if l := &f.last[i]; l.ok && string(l.val) == string(f.buf) {
+			matched = l.matched
+		} else {
+			matched = r.re.Match(f.buf)
+			if len(f.buf) <= maxRelabelMemoBytes {
+				l.val = append(l.val[:0], f.buf...)
+				l.ok, l.matched = true, matched
+			} else {
+				l.ok = false
+			}
+		}
 		if r.keep && !matched {
 			return false
 		}
@@ -137,11 +178,4 @@ func (f *relabelFilter) Keep(name string, labels []Label) bool {
 		}
 	}
 	return true
-}
-
-func labelOrName(name string, labels []Label, key string) string {
-	if key == "__name__" {
-		return name
-	}
-	return labelValue(labels, key)
 }

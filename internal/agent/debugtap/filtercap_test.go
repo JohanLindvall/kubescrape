@@ -31,7 +31,7 @@ func TestAttrFilterCountIsBounded(t *testing.T) {
 	// The attacker's query: thousands of filters that all match, so every one
 	// of them is evaluated against every attribute of every resource.
 	q := make(url.Values)
-	for i := 0; i < 5000; i++ {
+	for range 5000 {
 		q.Add("attr", "*/*=*")
 	}
 	resp, err := http.Get(srv.URL + "?signal=logs&" + q.Encode())
@@ -67,7 +67,7 @@ func TestAttrFilterCapBoundaries(t *testing.T) {
 		t.Helper()
 		q := make(url.Values)
 		q.Set("signal", "logs")
-		for i := 0; i < filters; i++ {
+		for i := range filters {
 			q.Add("attr", fmt.Sprintf("k8s.namespace.name=team-%d*", i))
 		}
 		req, err := http.NewRequest("GET", srv.URL+"?"+q.Encode(), nil)
@@ -101,8 +101,8 @@ func TestAttrFilterCapBoundaries(t *testing.T) {
 // The SIZE half of the same ceiling. maxAttrFilters bounds how many globs an
 // export is walked against; without a bound on their LENGTH the only ceiling
 // on one glob was net/http's 1 MiB request line, and the cost of a glob is
-// linear in its length (path.Match is O(pattern x name), and globMatch copies
-// a pattern containing '/' once per comparison) — paid per resource attribute,
+// linear in its length (path.Match is O(pattern x name), and a `*` glob's
+// substring scans are linear in the pattern) — paid per resource attribute,
 // per resource, per export, on the exporting goroutine, which for logs is the
 // tailer's single sweep goroutine serving every log file on the node. So the
 // count bound could be respected exactly and the multiplier kept: a handful of

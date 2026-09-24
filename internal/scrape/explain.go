@@ -4,7 +4,7 @@ package scrape
 // GET /v1/explain/{ns}/{pod} endpoint. Each function here mirrors one of the
 // target-derivation functions in targets.go and MUST give the same verdict —
 // they live in this package precisely so the explanation and the derivation
-// read the same parsers (parsePort, containerPortByName, TargetPodPort) and
+// read the same parsers (parsePort, containerPortByName, targetPodPort) and
 // cannot drift into explaining a decision the server does not make.
 
 import (
@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/JohanLindvall/kubescrape/internal/cli"
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -85,12 +86,12 @@ func MergedContributorCeilingNote() string {
 		"scrape is unaffected)", MaxContributorsPerTarget)
 }
 
-// PathRefusedNote is the ONE wording for a door whose prometheus.io/path is
+// pathRefusedNote is the ONE wording for a door whose prometheus.io/path is
 // over MaxTargetPathBytes. It is a whole-door verdict rather than a per-entry
 // one — the path is not per port, so every entry of that door resolves to
 // nothing — and it exists because the refusal is otherwise invisible: the pod
 // is annotated, its ports are declared, and no target appears.
-func PathRefusedNote(n int) string {
+func pathRefusedNote(n int) string {
 	return fmt.Sprintf("the %s annotation is %d bytes, over the ceiling of %d, so NO target is served from this door — "+
 		"a scrape path is copied into the URL of every target the door produces and into the node-targets document on "+
 		"every agent poll. It is refused rather than truncated or defaulted: both of those would silently scrape a "+
@@ -113,80 +114,209 @@ func refusedPath(annotations map[string]string) (int, bool) {
 // nothing is decided in this package, and a note spelled over there could name
 // only the ones the handler happened to know about — which it did, twice.
 //
-// The reasons are monitorEndpoint's own, in monitorEndpoint's order:
-// servicemonitors' size refusal it honours, then the POD being excluded, then
-// the port. The middle one was missing, so a terminating pod behind a perfectly
-// good ServiceMonitor was explained as "endpoint resolves to no pod port" —
-// sending an operator to fix a port name that is fine, while the head of the
-// same document said the pod is not scrapeable.
-func MonitorEndpointNote(pod kubemeta.Pod, ep servicemonitors.Endpoint) string {
-	if note := refusedEndpointNote(ep); note != "" {
-		return note
+// The reasons are monitorEndpoint's own: servicemonitors' size refusal it
+// honours, the POD being excluded, the port. The pod-level one was missing, so
+// a terminating pod behind a perfectly good ServiceMonitor was explained as
+// "endpoint resolves to no pod port" — sending an operator to fix a port name
+// that is fine, while the head of the same document said the pod is not
+// scrapeable.
+//
+// The pod-level reason is claimed only for an endpoint that WOULD resolve.
+// monitorEndpoint short-circuits on Scrapeable before it looks at the port, so
+// reaching this note on an excluded pod says nothing about the port — and
+// answering "this endpoint resolves" there described an endpoint naming a port
+// that does not exist as working, the inversion retractPorts already
+// refuses for the annotation doors (an entry that already resolves to nothing
+// keeps its own note). So the port is asked here, through the derivation's own
+// resolver, and a broken endpoint keeps the port wording on any pod.
+func MonitorEndpointNote(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.Endpoint) string {
+	portOK := false
+	if svc != nil {
+		_, portOK = monitorPodPort(pod, svc, ep)
 	}
-	if !Scrapeable(pod) {
-		return NotScrapeableNote("this endpoint")
-	}
-	return "endpoint resolves to no pod port (port must name a Service port, targetPort a number or declared container-port name; an endpoint naming neither resolves to nothing)"
+	return endpointNote(pod, ep, portOK,
+		"endpoint resolves to no pod port (port must name a Service port, targetPort a number or declared container-port name; an endpoint naming neither resolves to nothing)")
 }
 
 // PodMonitorEndpointNote is MonitorEndpointNote's PodMonitor half: same
 // reasons in the same order (podMonitorEndpoint mirrors monitorEndpoint),
 // different port semantics (a PodMonitor's port names a CONTAINER port).
 func PodMonitorEndpointNote(pod kubemeta.Pod, ep servicemonitors.Endpoint) string {
+	_, portOK := podMonitorPodPort(pod, ep)
+	return endpointNote(pod, ep, portOK,
+		"endpoint resolves to no pod port (port must name a declared container port; targetPort a number or declared name)")
+}
+
+// endpointNote is the two monitor notes' shared decision: the size refusal
+// first (it is what an operator must fix, and it blanks everything after it),
+// then whatever keeps the endpoint from resolving on ANY pod — the port, then
+// the path ceiling defaultSchemePath applies — and only for an endpoint that
+// would resolve, the pod being excluded.
+func endpointNote(pod kubemeta.Pod, ep servicemonitors.Endpoint, portOK bool, portWording string) string {
 	if note := refusedEndpointNote(ep); note != "" {
 		return note
 	}
-	if !Scrapeable(pod) {
-		return NotScrapeableNote("this endpoint")
+	var why string
+	switch {
+	case !portOK:
+		why = portWording
+	case len(ep.Path) > MaxTargetPathBytes:
+		// servicemonitors refuses a longer path at parse time, so this is
+		// belt and braces; it mirrors defaultSchemePath's own refusal.
+		why = fmt.Sprintf("endpoint path is %d bytes, over the ceiling of %d, so it yields NO target", len(ep.Path), MaxTargetPathBytes)
 	}
-	return "endpoint resolves to no pod port (port must name a declared container port; targetPort a number or declared name)"
+	if Scrapeable(pod) {
+		if why == "" {
+			why = portWording // unreachable from a caller that asked because the endpoint did not resolve
+		}
+		return why
+	}
+	if why == "" {
+		return notScrapeableNote("this endpoint")
+	}
+	return why + "; the pod is also excluded from scraping (see notScrapeableWhy)"
 }
 
-// NotScrapeableNote is the ONE wording for an entry or endpoint that resolves
+// notOptedInNote is the ONE wording for an entry that resolves perfectly well
+// through a door that is NOT opted in: the pod or the Service carries no
+// prometheus.io/scrape="true", and PodTargets/ServiceTargets refuse that door
+// before they resolve a single port. door names which one ("the pod", "this
+// Service").
+//
+// The explain mirrors resolve ports as the door would if it were opted in —
+// the one whole-door gate they leave to their caller (NoteNotOptedIn) — so
+// without it an unannotated pod's declared ports read "every declared port is
+// a target" beside `targets: []`. The entries are still worth listing (a user
+// who set prometheus.io/port and forgot prometheus.io/scrape needs to see what
+// it WOULD resolve to); they must just stop claiming a target.
+func notOptedInNote(subject, door string) string {
+	return fmt.Sprintf("%s would resolve, but %s carries no %s=\"true\" annotation, so this door yields NO target; "+
+		"a ServiceMonitor or PodMonitor selecting the pod is the other way in", subject, door, AnnotationScrape)
+}
+
+// repeatNote is the suffix a folded REPEATED annotation entry adds to its first
+// verdict. The derivation resolves a repeat to nothing new — the port it names
+// was claimed by its first occurrence — so explain lists one verdict per
+// DISTINCT entry and counts the rest here, rather than materialising one
+// verdict (and one formatted note) per repeat of a tenant-authored list of up
+// to ~4,000 entries on an unauthenticated route.
+func repeatNote(note string, repeats int) string {
+	suffix := fmt.Sprintf("the entry is repeated %d more time(s) in the annotation; a repeat adds no target", repeats)
+	if note == "" {
+		return suffix
+	}
+	return note + "; " + suffix
+}
+
+// notScrapeableNote is the ONE wording for an entry or endpoint that resolves
 // perfectly well and yields no target anyway, because the POD is excluded.
 //
 // Scrapeable is a short-circuit the diagnostic mirrors kept missing: it sits
 // inside monitorEndpoint and podMonitorEndpoint beside the port resolution, and
 // PodTargets/ServiceTargets never run at all for such a pod — while
-// ExplainPodPorts and ExplainServicePorts, which mirror only the port
+// ExplainPodPorts and ExplainServicePorts, which mirrored only the port
 // arithmetic, went on reporting every entry as resolving. The head of the
 // document was right (scrapeable / notScrapeableWhy) and the per-entry verdicts
 // contradicted it, which is the shape an operator reads PAST the head to reach.
 //
 // It names notScrapeableWhy rather than repeating the reasons: those are
 // ScrapeableReasons' and they are already at the head, per pod, once.
-func NotScrapeableNote(subject string) string {
+func notScrapeableNote(subject string) string {
 	return fmt.Sprintf("%s resolves, but the pod itself is excluded from scraping, so it yields NO target; "+
 		"see notScrapeableWhy", subject)
 }
 
-// refusedEndpointNote explains a size-refused endpoint, naming the fields that
-// were over their ceilings — never their VALUES, which are the tenant's
-// megabyte and, for the credential refs, secret-bearing names.
+// retractIfNotScrapeable is the port mirrors' copy of the derivation's
+// pod-level gate: PodTargets and ServiceTargets return nil for a pod that is
+// not Scrapeable, so every entry that would resolve loses its `ports` and says
+// why. It is applied HERE, beside the path-ceiling gate the mirrors already
+// share with the derivation, rather than by the caller — the monitor notes'
+// pod-level reason lives in this package too (endpointNote), and a gate the
+// mirror leaves to its caller is one a second caller can forget.
+func retractIfNotScrapeable(pod kubemeta.Pod, verdicts []PortVerdict) {
+	if !Scrapeable(pod) {
+		retractPorts(verdicts, notScrapeableNote)
+	}
+}
+
+// NoteNotOptedIn rewrites the verdicts of a door that does NOT opt in — the
+// pod, or a Service, carrying no prometheus.io/scrape="true" — which
+// PodTargets and ServiceTargets refuse before they resolve anything. door
+// names which one ("the pod", "this Service").
+//
+// It is the caller's to apply, unlike the Scrapeable gate, because the opt-in
+// is the one whole-door gate the mirrors deliberately leave out: they resolve
+// a door as it WOULD resolve opted in (the contract
+// explain_parity_random_test.go pins), and the caller holds the document head
+// that reports the gate. The entries stay listed; a resolving one loses its
+// `ports`, and one that already resolves to nothing keeps its own, sharper
+// note. On a pod that is not scrapeable the mirror has already retracted every
+// port, so the pod-level reason wins when both apply.
+func NoteNotOptedIn(verdicts []PortVerdict, door string) {
+	retractPorts(verdicts, func(subject string) string { return notOptedInNote(subject, door) })
+}
+
+// retractPorts is what both whole-door gates do to a door's verdicts: every
+// RESOLVING entry loses its `ports` (listing them is what reads as "this port
+// is scraped", exactly as for a ceiling-refused entry) and says why through
+// note, and an entry resolving to nothing is left alone — its own note is
+// still true and is the sharper answer.
+func retractPorts(verdicts []PortVerdict, note func(subject string) string) {
+	for i := range verdicts {
+		v := &verdicts[i]
+		if len(v.Ports) == 0 {
+			continue
+		}
+		ports := make([]string, 0, len(v.Ports))
+		for _, p := range v.Ports {
+			ports = append(ports, strconv.Itoa(int(p)))
+		}
+		v.Ports = nil // omitempty: an empty array reads as "resolves, to nothing"
+		v.Note = note("port " + strings.Join(ports, ", "))
+	}
+}
+
+// refusedEndpointNote explains a refused endpoint, naming the fields and WHY
+// each refused it (servicemonitors.Endpoint.RefusalReasons: a size ceiling, an
+// uncompilable relabel regex, or a keep/drop depending on an unapplied mutating
+// rule) — never their VALUES, which are the tenant's megabyte and, for the
+// credential refs, secret-bearing names.
 func refusedEndpointNote(ep servicemonitors.Endpoint) string {
 	if ep.Refused == "" {
 		return ""
 	}
-	return fmt.Sprintf("endpoint field(s) %s are over the per-endpoint size ceiling, so this endpoint is REFUSED and "+
-		"yields NO target: those strings are copied into every target the endpoint resolves to. It is refused rather "+
-		"than truncated — a shortened path, serverName or credential reference would scrape a different URL, verify a "+
-		"different name or present a different credential than the monitor declares", ep.Refused)
+	why := strings.Join(ep.RefusalReasons(), ", ")
+	if why == "" {
+		why = ep.Refused
+	}
+	return fmt.Sprintf("endpoint field(s) %s cannot be served as the monitor declares them, so this endpoint is "+
+		"REFUSED and yields NO target: an oversize string would be copied into every target the endpoint resolves "+
+		"to, and a metricRelabelings chain with an invalid regex or a filter that depends on a rule kubescrape does "+
+		"not apply would filter differently than it says. It is refused rather than truncated or approximated — a "+
+		"shortened path, serverName or credential reference would scrape a different URL, verify a different name or "+
+		"present a different credential than the monitor declares", why)
 }
 
 // ScrapeableReasons returns why a pod cannot yield scrape targets — one
-// reason per failed condition of Scrapeable, empty when it is scrapeable.
+// reason per failed condition of Scrapeable, empty when it is scrapeable. It
+// renders unscrapeableReasons, the one definition of those conditions, so it
+// cannot disagree with Scrapeable.
 func ScrapeableReasons(pod kubemeta.Pod) []string {
+	u := unscrapeableReasons(&pod)
+	if u == 0 {
+		return nil
+	}
 	var reasons []string
-	if pod.PodIP == "" {
+	if u&unscrapeableNoIP != 0 {
 		reasons = append(reasons, "pod has no IP (not scheduled/started yet, or hostNetwork without a reported address)")
 	}
-	if pod.DeletedAt != nil {
+	if u&unscrapeableDeleted != 0 {
 		reasons = append(reasons, "pod is deleted (resolvable via its tombstone, but never a target)")
 	}
-	if pod.DeletionTimestamp != nil {
+	if u&unscrapeableTerminating != 0 {
 		reasons = append(reasons, "pod is terminating (deletionTimestamp set; it stays phase Running for its whole grace period, but scraping it is up=0 churn)")
 	}
-	if kubemeta.FinishedPhase(pod.Phase) {
+	if u&unscrapeableFinished != 0 {
 		reasons = append(reasons, fmt.Sprintf("pod phase %s is finished", pod.Phase))
 	}
 	return reasons
@@ -266,19 +396,31 @@ func (f *portFilter) keep(ports []int32) (kept []int32, note string) {
 // ExplainPodPorts explains what podPorts does with this pod: one verdict per
 // annotation entry, or — with no (non-blank) annotation — one per declared
 // container port. annotated reports which of the two shapes applied.
+//
+// It applies PodTargets' whole-door gates but one: the path ceiling and the
+// pod-level exclusion (Scrapeable). The prometheus.io/scrape opt-in is left to
+// the caller (NoteNotOptedIn), which holds the document head that reports it.
 func ExplainPodPorts(pod kubemeta.Pod) (verdicts []PortVerdict, annotated bool) {
 	// PodTargets refuses the whole door before it resolves a single port, so
 	// the mirror has to as well: reporting the ports as resolving would invert
 	// the one question this endpoint answers.
 	if n, refused := refusedPath(pod.Annotations); refused {
-		return []PortVerdict{{Entry: AnnotationPath, Note: PathRefusedNote(n)}}, true
+		return []PortVerdict{{Entry: AnnotationPath, Note: pathRefusedNote(n)}}, true
 	}
+	verdicts, annotated = explainPodPortEntries(pod)
+	retractIfNotScrapeable(pod, verdicts)
+	return verdicts, annotated
+}
+
+// explainPodPortEntries is ExplainPodPorts' per-entry resolution: podPorts'
+// arithmetic with its verdicts spelled out, before any whole-door gate.
+func explainPodPortEntries(pod kubemeta.Pod) (verdicts []PortVerdict, annotated bool) {
 	filter := &portFilter{}
-	// The fallback predicate must be EXACTLY podPorts': absent or all-blank
+	// podPorts' own fallback predicate (portAnnotation): absent or all-blank
 	// falls back to declared ports; a present annotation never does, even one
 	// whose entries all split away (","), which selects nothing.
-	ann, ok := pod.Annotations[AnnotationPort]
-	if !ok || strings.TrimSpace(ann) == "" {
+	ann, explicit := portAnnotation(pod.Annotations)
+	if !explicit {
 		for _, dp := range DeclaredPorts(pod) {
 			entry := strconv.Itoa(int(dp.Port))
 			if dp.Name != "" {
@@ -292,17 +434,56 @@ func ExplainPodPorts(pod kubemeta.Pod) (verdicts []PortVerdict, annotated bool) 
 		}
 		return verdicts, false
 	}
-	entries := splitList(ann)
+	entries := cli.SplitList(ann)
 	if len(entries) == 0 {
 		return []PortVerdict{{
 			Entry: ann,
 			Note:  "annotation is present but contains no entries (commas and whitespace only); a present annotation never falls back to the declared container ports, so it resolves to nothing",
 		}}, true
 	}
+	// One verdict per DISTINCT entry; a repeat is folded into its first
+	// occurrence (see repeatNote). Skipping it is exactly what podPorts does
+	// with it: the port it names is already in `seen`.
+	var fold entryFold
 	for _, entry := range entries {
+		if fold.repeat(entry, len(verdicts)) {
+			continue
+		}
 		verdicts = append(verdicts, explainPodPortEntry(pod, entry, filter))
 	}
+	fold.apply(verdicts)
 	return verdicts, true
+}
+
+// entryFold folds repeated annotation entries into their first verdict.
+type entryFold struct {
+	first   map[string]int // entry → index of its first verdict
+	repeats map[int]int    // verdict index → how many repeats folded into it
+}
+
+// repeat reports whether entry was seen before, counting it against its first
+// verdict if so; otherwise it records that entry's first verdict is next, at
+// index at.
+func (f *entryFold) repeat(entry string, at int) bool {
+	if i, dup := f.first[entry]; dup {
+		if f.repeats == nil {
+			f.repeats = map[int]int{}
+		}
+		f.repeats[i]++
+		return true
+	}
+	if f.first == nil {
+		f.first = map[string]int{}
+	}
+	f.first[entry] = at
+	return false
+}
+
+// apply writes the repeat counts onto the verdicts they were folded into.
+func (f *entryFold) apply(verdicts []PortVerdict) {
+	for i, n := range f.repeats {
+		verdicts[i].Note = repeatNote(verdicts[i].Note, n)
+	}
 }
 
 // explainPodPortEntry is podPorts' per-entry logic with its verdict spelled
@@ -337,40 +518,69 @@ func explainPodPortEntry(pod kubemeta.Pod, entry string, filter *portFilter) Por
 // ExplainServicePorts explains what ServiceTargets does with this pod behind
 // this service: which service ports its annotation selects and what pod port
 // each translates to. annotated reports whether a port annotation narrowed
-// the selection.
+// the selection. Its whole-door gates are ExplainPodPorts': the path ceiling
+// and Scrapeable here, the Service's opt-in left to the caller.
 func ExplainServicePorts(pod kubemeta.Pod, svc *services.Service) (verdicts []PortVerdict, annotated bool) {
 	// ServiceTargets refuses the whole door first; see ExplainPodPorts.
 	if n, refused := refusedPath(svc.Annotations); refused {
-		return []PortVerdict{{Entry: AnnotationPath, Note: PathRefusedNote(n)}}, true
+		return []PortVerdict{{Entry: AnnotationPath, Note: pathRefusedNote(n)}}, true
 	}
+	verdicts, annotated = explainServicePortEntries(pod, svc)
+	retractIfNotScrapeable(pod, verdicts)
+	return verdicts, annotated
+}
+
+// explainServicePortEntries is ExplainServicePorts' per-entry resolution,
+// before any whole-door gate.
+func explainServicePortEntries(pod kubemeta.Pod, svc *services.Service) (verdicts []PortVerdict, annotated bool) {
 	filter := &servicePortFilter{}
-	// The predicate must be EXACTLY selectServicePorts': absent or all-blank
+	// selectServicePorts' own predicate (portAnnotation): absent or all-blank
 	// selects every service port; a present annotation never falls back, even
 	// one whose entries all split away (","), which selects nothing.
-	ann, hasAnn := svc.Annotations[AnnotationPort]
-	annotated = hasAnn && strings.TrimSpace(ann) != ""
+	ann, annotated := portAnnotation(svc.Annotations)
 	if annotated {
-		entries := splitList(ann)
+		entries := cli.SplitList(ann)
 		if len(entries) == 0 {
 			return []PortVerdict{{
 				Entry: ann,
 				Note:  "annotation is present but contains no entries (commas and whitespace only); a present annotation never falls back to the declared service ports, so it selects nothing",
 			}}, true
 		}
-		// Per annotation entry: does it name a service port at all?
+		// Per DISTINCT annotation entry (repeats fold into the first, see
+		// repeatNote): which service ports does it name? Through the SAME index
+		// selectServicePorts asks, so the two agree on what an entry selects,
+		// and at the same O(entries + ports) cost.
+		ix := newServicePortIndex(svc.Ports)
+		// selected mirrors selectServicePorts' own dedup: a service port is
+		// selected once, by the first entry naming it, so a LATER distinct entry
+		// naming the same port ("http, 80") is not a second selection at all —
+		// which the derivation now never offers to ServiceTargets' loop.
+		selected := make([]bool, len(svc.Ports))
+		var fold entryFold
+		var buf [8]int32
 		for _, entry := range entries {
-			n, numeric := parsePort(entry)
-			matched := false
-			for _, sp := range svc.Ports {
-				if sp.Name == entry || (numeric && sp.Port == n) {
-					matched = true
-					verdicts = append(verdicts, servicePortVerdict(pod, entry, sp, filter))
-				}
+			if fold.repeat(entry, len(verdicts)) {
+				continue
 			}
-			if !matched {
+			matches := ix.appendMatches(buf[:0], entry)
+			if len(matches) == 0 {
 				verdicts = append(verdicts, PortVerdict{Entry: entry, Note: "no service port has this name or number; the entry resolves to nothing"})
+				continue
+			}
+			for _, i := range matches {
+				sp := svc.Ports[i]
+				if selected[i] {
+					verdicts = append(verdicts, PortVerdict{
+						Entry: entry,
+						Note:  fmt.Sprintf("names service port %d, already selected by an earlier entry; this entry adds no target", sp.Port),
+					})
+					continue
+				}
+				selected[i] = true
+				verdicts = append(verdicts, servicePortVerdict(pod, entry, sp, filter))
 			}
 		}
+		fold.apply(verdicts)
 		return verdicts, true
 	}
 	for _, sp := range svc.Ports {
@@ -420,7 +630,7 @@ func (f *servicePortFilter) claim(podPort, svcPort int32) (note string, dup bool
 }
 
 // servicePortVerdict explains one selected service port's translation to a
-// pod port (ServiceTargets' ceiling break, then TargetPodPort's decision, then
+// pod port (ServiceTargets' ceiling break, then targetPodPort's decision, then
 // its seen-port dedup) — in the derivation's order, which is load-bearing:
 // ServiceTargets BREAKS before it resolves anything, so once this Service has
 // produced MaxPortsPerPod targets every remaining entry yields nothing
@@ -430,7 +640,7 @@ func servicePortVerdict(pod kubemeta.Pod, entry string, sp services.Port, filter
 	if filter.kept >= MaxPortsPerPod {
 		return PortVerdict{Entry: entry, Note: CeilingNote("this entry")}
 	}
-	port, ok := TargetPodPort(pod, sp)
+	port, ok := targetPodPort(pod, sp)
 	if !ok {
 		return PortVerdict{
 			Entry: entry,

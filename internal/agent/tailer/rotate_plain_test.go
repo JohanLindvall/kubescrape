@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -31,12 +32,7 @@ func drivePlainTailer(dir string, exp *fakeExporter) *Tailer {
 }
 
 func hasRecord(got []string, s string) bool {
-	for _, r := range got {
-		if r == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(got, s)
 }
 
 // TestPlainRotationExportFailureNoLoss guards the plain-path (non-containerd)

@@ -1,5 +1,5 @@
 // Tests for the commit frontier over bytes the read CONSUMED but never FED
-// (ledger.go: file.skipEnd / absorbSkipped) — rate-DROPPED lines, blank lines
+// (file.skipEnd in file.go, absorbSkipped in ledger.go) — rate-DROPPED lines, blank lines
 // and fully discarded oversized ones. `committed` only ever advances to an
 // EXPORTED entry's end, so without this accounting a TRAILING run of them is
 // permanently uncommittable.
@@ -376,7 +376,7 @@ func TestArchiveFailedMidReadFlushDoesNotReadAClosedReader(t *testing.T) {
 
 	const lines = 2000
 	body := make([]string, 0, lines)
-	for i := 0; i < lines; i++ {
+	for i := range lines {
 		body = append(body, "archived line "+strconv.Itoa(i)+" "+strings.Repeat("x", 80))
 	}
 	writeGzip(t, filepath.Join(dir, "app.log.gz"), body...)

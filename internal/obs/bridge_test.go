@@ -3,12 +3,20 @@
 package obs
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/JohanLindvall/kubescrape/internal/metrics"
 )
 
 func scrapeBody(t *testing.T, internal bool) string {
@@ -66,7 +74,7 @@ func TestBridgeHistogramExposition(t *testing.T) {
 	}
 	body := scrapeBody(t, true)
 	var got []string
-	for _, ln := range strings.Split(body, "\n") {
+	for ln := range strings.SplitSeq(body, "\n") {
 		if strings.Contains(ln, `pipeline="`+pipeline+`"`) {
 			got = append(got, strings.TrimSpace(ln))
 		}
@@ -75,8 +83,8 @@ func TestBridgeHistogramExposition(t *testing.T) {
 		t.Fatalf("no bridged histogram series:\n%.600s", body)
 	}
 	joined := strings.Join(got, "\n")
-	// Default buckets are prometheus.DefBuckets: 0.005 catches the first
-	// observation, 0.025 the first two, +Inf all three.
+	// durationBuckets: 0.005 catches the first observation, 0.025 the first
+	// two, +Inf all three.
 	for _, want := range []string{
 		fmt.Sprintf(`kubescrape_scrape_duration_seconds_bucket{pipeline=%q,le="0.005"} 1`, pipeline),
 		fmt.Sprintf(`kubescrape_scrape_duration_seconds_bucket{pipeline=%q,le="0.025"} 2`, pipeline),
@@ -88,4 +96,100 @@ func TestBridgeHistogramExposition(t *testing.T) {
 			t.Errorf("missing %q in:\n%s", want, joined)
 		}
 	}
+}
+
+// The scrape and export durations are bounded by -scrape-timeout and
+// -otlp-timeout, 15s by default. On the default buckets, whose top finite bound
+// is 10s, every attempt between 10s and the timeout — and every timed-out one —
+// landed in +Inf, where histogram_quantile answers with the highest finite
+// bound: the documented "p90 approaching -otlp-timeout" alert flatlined at 10
+// and could never cross a threshold near 15. A 12s attempt must land in a
+// finite bucket at or below the timeout.
+func TestDurationHistogramsResolvePastTheDefaultTimeouts(t *testing.T) {
+	label := fmt.Sprintf("duration-test-%d", bridgeSeq.Add(1))
+	ScrapeDuration.WithLabelValues(label).Observe(12)
+	ExportDuration.WithLabelValues(label).Observe(12)
+	body := scrapeBody(t, true)
+	for _, want := range []string{
+		fmt.Sprintf(`kubescrape_scrape_duration_seconds_bucket{pipeline=%q,le="10"} 0`, label),
+		fmt.Sprintf(`kubescrape_scrape_duration_seconds_bucket{pipeline=%q,le="15"} 1`, label),
+		fmt.Sprintf(`kubescrape_export_duration_seconds_bucket{signal=%q,le="10"} 0`, label),
+		fmt.Sprintf(`kubescrape_export_duration_seconds_bucket{signal=%q,le="15"} 1`, label),
+		fmt.Sprintf(`kubescrape_export_duration_seconds_bucket{signal=%q,le="60"} 1`, label),
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q: a duration under the default timeout must resolve to a finite bucket", want)
+		}
+	}
+}
+
+// The bridge's refusal arm is the only thing between a point client_golang
+// will not build and a series silently ABSENT from /metrics — which with
+// -self-metrics-interval=0 is the ONLY delivery path for kubescrape_*. Both
+// refusals it can meet are driven here on a private registry: a label NAME
+// the exposition reserves, and a label VALUE that is not valid UTF-8 (the
+// reachable one — client_golang validates values, internal/metrics does not).
+// The good series must still be served, each bad one counted, and one WARN
+// must name the metric.
+func TestBridgeRefusalIsCountedAndNamed(t *testing.T) {
+	r := metrics.NewRegistry()
+	r.Counter("kubescrape_bridge_good_total", "good").Inc()
+	r.CounterVec("kubescrape_bridge_badvalue_total", "bad value", "gate").WithLabelValues("\xff").Inc()
+	r.CounterVec("kubescrape_bridge_badname_total", "bad name", "__reserved").WithLabelValues("x").Inc()
+
+	buf := &lockedBuf{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
+	defer slog.SetDefault(prev)
+
+	preg := prometheus.NewRegistry()
+	preg.MustRegister(registryCollector{reg: r})
+	srv := httptest.NewServer(promhttp.HandlerFor(preg, promhttp.HandlerOpts{}))
+	defer srv.Close()
+	resp, err := srv.Client().Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200: one refused point must not fail the whole scrape\n%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "kubescrape_bridge_good_total 1") {
+		t.Errorf("the valid series is missing:\n%s", body)
+	}
+	for _, bad := range []string{"kubescrape_bridge_badvalue_total", "kubescrape_bridge_badname_total"} {
+		if strings.Contains(string(body), bad+"{") {
+			t.Errorf("%s was served; client_golang should have refused it:\n%s", bad, body)
+		}
+	}
+	if got := r.SkippedPoints(); got != 2 {
+		t.Errorf("SkippedPoints = %d, want 2: a refused point must be counted, not silently absent", got)
+	}
+	if out := buf.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "metric=kubescrape_bridge_bad") {
+		t.Errorf("want a WARN naming the refused metric, got:\n%s", out)
+	}
+}
+
+// lockedBuf is a log sink safe to read after a handler goroutine wrote to it:
+// the write happens on the server's goroutine and nothing the race detector
+// can see orders it before the test's read.
+type lockedBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuf) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuf) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
 }

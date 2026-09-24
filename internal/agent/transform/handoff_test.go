@@ -40,6 +40,32 @@ func TestHandoffSurvivesWithoutCancel(t *testing.T) {
 	}
 }
 
+// Consumed is a Handoff with a second promise, never a replacement for it: a
+// consumed payload is transformed in place like any handed-off one, the mark
+// survives the same seams, and a plain Handoff does not read as consumed —
+// that is the difference the drop counter keys on.
+func TestConsumedImpliesHandoffButNotTheReverse(t *testing.T) {
+	ctx := Consumed(context.Background())
+	if !IsConsumed(ctx) || !HandedOff(ctx) {
+		t.Fatalf("Consumed marked consumed=%v handedOff=%v, want both", IsConsumed(ctx), HandedOff(ctx))
+	}
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
+	if !IsConsumed(dctx) {
+		t.Fatal("consumed marker lost across WithoutCancel + WithTimeout")
+	}
+	if IsConsumed(Handoff(context.Background())) {
+		t.Fatal("a plain Handoff reads as consumed")
+	}
+	var nilCtx context.Context
+	if IsConsumed(nilCtx) {
+		t.Fatal("nil context reads as consumed")
+	}
+	if Consumed(ctx) != ctx {
+		t.Fatal("re-marking an already-consumed context must be a no-op")
+	}
+}
+
 // A marked logs payload is transformed in place: the caller's object carries
 // the script's mutations after the export — the copy is gone.
 func TestHandoffTransformsLogsInPlace(t *testing.T) {
@@ -175,7 +201,7 @@ func TestUnmarkedRetryStillGetsTheCopy(t *testing.T) {
 	ld := logsPayload("hello")
 
 	var expErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := range 3 {
 		if expErr = w.ExportLogs(context.Background(), ld); expErr == nil {
 			break
 		}

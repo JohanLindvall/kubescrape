@@ -24,12 +24,14 @@ package promscrape
 // The rest of what this pipeline emits DOES overlap, and is written down here
 // rather than left to be rediscovered as a bug: the three node filesystem
 // families restate cadvisor's root-cgroup (id="/") rows — available and
-// inodes.used as a subtraction — and add only the role above;
-// k8s.pod.process.count is the kubelet's sum of its containers' cadvisor
-// process counts, which container_processes already carries per container (and
-// still carries under -cadvisor-rollups=false); and on a PVC-backed volume
-// the six k8s.volume.* restate the six kubelet_volume_stats_* that the -node-
-// metrics scrape already collects, adding the pod attribution those lack.
+// inodes.used as a subtraction — and add only the role above; and on a
+// PVC-backed volume the six k8s.volume.* restate the six
+// kubelet_volume_stats_* that the -node-metrics scrape already collects,
+// adding the pod attribution those lack. Two that LOOK like overlaps are not,
+// measured on a live node (docs/CONFIGURATION.md, "What overlaps"):
+// k8s.pod.process.count is the kubelet's own per-pod figure, not a pre-summed
+// container_processes, and the per-container rootfs ephemeral usage has no
+// per-container cadvisor row to restate on a modern node.
 // Everything the two endpoints BOTH cover outright (cpu, memory, network, swap)
 // is deliberately not exported here; see summarybatch.go.
 //
@@ -69,9 +71,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net/http"
-	"strconv"
-	"strings"
 	"time"
 
 	ljson "github.com/JohanLindvall/lightning/pkg/json"
@@ -79,9 +78,6 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 )
-
-// summaryPath is the kubelet's stats endpoint, relative to Kubelet.Endpoint.
-const summaryPath = "/stats/summary"
 
 // maxSummaryBytes bounds the body read into memory. lightning is slice-based,
 // so the whole document is resident during the walk; a kubelet is the node's
@@ -114,76 +110,40 @@ func (s *Scraper) scrapeSummary(ctx context.Context) (int, error) {
 	ctx, cancel := s.scrapeContext(ctx, s.kubeletTimeout(), pipelineSummary)
 	defer cancel()
 
-	url := strings.TrimRight(s.cfg.Kubelet.Endpoint, "/") + summaryPath
+	url := s.kubeletURLs.summary
 	resp, err := s.kubeletGet(ctx, url, acceptJSON)
 	if err != nil {
-		s.reportSummaryRefusal(url, err)
+		s.reportKubeletRefusal(pipelineSummary, url, err)
 		return 0, err
 	}
 	defer drainClose(resp.Body)
 
+	// Unclassified here: readCapped tags only the cap refusal as `body`, and a
+	// read that FAILED mid-body — the scrape budget expiring, a reset — is left
+	// to failureReason's inference (timeout, connect), exactly as on the
+	// exposition pipelines. Wrapping it here labelled every such failure
+	// "a response body over this pipeline's cap", which it was not.
 	body, err := readCapped(resp.Body, maxSummaryBytes)
 	if err != nil {
-		return 0, classify(reasonBody, err)
+		return 0, err
 	}
 	return s.convertSummary(ctx, url, body, time.Now())
-}
-
-// reportSummaryRefusal names the RBAC rule behind a 403.
-//
-// The kubelet authorizes each endpoint against its own subresource: /metrics
-// and /metrics/cadvisor against nodes/metrics, which is all the agent's
-// ClusterRole has historically held, and /stats/* against nodes/stats. So the
-// first-contact failure of this pipeline is a 403 on every node in the fleet
-// while the other two kubelet scrapes keep working — and "status 403" against a
-// kubelet is indistinguishable from an expired token, a bad audience or a
-// webhook authorizer outage. Once per process, keyed on the endpoint like every
-// other per-target complaint (there is nothing new to say until someone edits
-// the ClusterRole).
-func (s *Scraper) reportSummaryRefusal(url string, err error) {
-	var se *statusError
-	if !errors.As(err, &se) || se.code != http.StatusForbidden {
-		return
-	}
-	s.warnOnce("summaryrbac:"+s.cfg.Kubelet.Endpoint,
-		`the kubelet refused /stats/summary: it authorizes that endpoint against the nodes/stats subresource, not the nodes/metrics the cadvisor and node scrapes use — add {apiGroups: [""], resources: ["nodes/stats"], verbs: ["get"]} to the agent ClusterRole`,
-		"url", url)
-}
-
-// reportKubeletRefusal is the same idea for the two nodes/metrics endpoints,
-// which had no equivalent: a 401 or 403 on /metrics/cadvisor is the ONE
-// first-contact failure that takes down both kubelet pipelines on every node at
-// once, and "status 403" alone does not distinguish a missing ClusterRole rule
-// from a token the kubelet would not accept — which is the whole diagnosis.
-//
-// Keyed on the endpoint and the code, so a 401 arriving after a 403 has been
-// reported still says so; once per process, like every other complaint about
-// something an operator has to go and edit.
-func (s *Scraper) reportKubeletRefusal(pipeline, url string, err error) {
-	var se *statusError
-	if !errors.As(err, &se) || (se.code != http.StatusForbidden && se.code != http.StatusUnauthorized) {
-		return
-	}
-	note := `the agent ClusterRole needs {apiGroups: [""], resources: ["nodes/metrics"], verbs: ["get"]}, bound to this agent's ServiceAccount`
-	if se.code == http.StatusUnauthorized {
-		note = "the kubelet did not accept the token at -kubelet-token-file at all: check that the ServiceAccount token is projected and that the kubelet runs with --authentication-token-webhook"
-	}
-	s.warnOnce("kubeletauth:"+s.cfg.Kubelet.Endpoint+":"+pipeline+":"+strconv.Itoa(se.code),
-		"the kubelet refused the scrape",
-		"pipeline", pipeline, "url", url, "status", se.code, "tokenFile", s.cfg.Kubelet.TokenFile, "note", note)
 }
 
 // readCapped reads r whole, refusing a body over limit. The limit+1 read is
 // what tells "exactly at the limit" from "over it": a LimitReader stopping at
 // the limit yields a truncated document that would decode as a document-level
 // error and blame the kubelet for a bound of ours.
+//
+// Only the cap refusal is classified (reason=body); a read error is returned
+// as it came, for failureReason to infer from its type.
 func readCapped(r io.Reader, limit int) ([]byte, error) {
 	b, err := io.ReadAll(io.LimitReader(r, int64(limit)+1))
 	if err != nil {
 		return nil, err
 	}
 	if len(b) > limit {
-		return nil, fmt.Errorf("body over the %d-byte maxSummaryBytes cap", limit)
+		return nil, classify(reasonBody, fmt.Errorf("body over the %d-byte maxSummaryBytes cap", limit))
 	}
 	return b, nil
 }
@@ -203,8 +163,9 @@ func (s *Scraper) convertSummary(ctx context.Context, url string, body []byte, s
 	// Handoff to the transform seam, exactly as newScrapeSession marks it: every
 	// chunk is take()n out of the batcher and never re-sent — a failure fails the
 	// scrape and the next cycle re-fetches from the kubelet — so the transform
-	// wrapper may run its script in place instead of deep-copying the payload.
-	ctx = transform.Handoff(ctx)
+	// wrapper may run its script in place instead of deep-copying the payload
+	// (Consumed: no retry brings these points back to the script).
+	ctx = transform.Consumed(ctx)
 	sb := newSummaryBatcher(ctx, s, url, scrape)
 	defer sb.report()
 
@@ -357,6 +318,9 @@ func (sb *summaryBatcher) addContainer(ident cadvisorIdentity, c []byte) bool {
 	// two resources byte-identical and the series joinable.
 	ident.container = name
 	t := summaryTarget{ident: ident, level: levelContainer}
+	if ms := statTime(slots[pCtrStartTime]); ms != 0 {
+		t.created = time.UnixMilli(ms)
+	}
 
 	// rootfs and logs are the two halves of ONE additive whole (a container's
 	// ephemeral storage), which is why they are an attribute on one metric name
@@ -479,8 +443,14 @@ var podPaths = [][]string{
 // requested: ContainerStats.Rootfs and .Logs carry the imagefs/nodefs
 // available/capacity/inodes numbers verbatim, so asking for them would be an
 // invitation to export the node's numbers once per container.
+//
+// startTime is not exported: it is the container's CREATION time (the runtime's
+// CreatedAt, or cadvisor's Spec.CreationTime), read only so a by-name match
+// against a pod document can tell whether that document is new enough to
+// describe this incarnation (see Scraper.containerIncarnation).
 const (
 	pCtrName = iota
+	pCtrStartTime
 	pCtrRootfsUsed
 	pCtrRootfsInodesUsed
 	pCtrRootfsTime
@@ -491,6 +461,7 @@ const (
 
 var containerPaths = [][]string{
 	pCtrName:             {"name"},
+	pCtrStartTime:        {"startTime"},
 	pCtrRootfsUsed:       {"rootfs", "usedBytes"},
 	pCtrRootfsInodesUsed: {"rootfs", "inodesUsed"},
 	pCtrRootfsTime:       {"rootfs", "time"},

@@ -9,16 +9,26 @@
 // edit keeps the last good program running, counted and warned), so
 // transformation logic changes without a pod restart.
 //
-// Cost model: one Starlark invocation per exported BATCH per signal, PLUS —
-// for a payload NOT marked with Handoff — one deep copy of that batch, and
-// the copy, not the script, is what the copying path costs. Measured on a
-// 1024-record log batch with a `def transform(batch): return` script: ~249µs
-// total, of which ld.CopyTo is ~226µs (91%) and the whole Starlark call is
-// 245ns; a 10,000-point metrics payload (one promscrape chunk) is ~2.05ms and
-// 2.3 MB for the same no-op. A payload marked Handoff(ctx) — the producer's
-// promise that it rebuilds from source on failure rather than re-offering the
-// object (see handoff.go for the roster) — runs the script IN PLACE and pays
-// only the invocation; the copy remains the CORRECTNESS requirement for every
+// Cost model: one Starlark invocation per exported BATCH per signal, PLUS a
+// post-script prune sweep, PLUS — for a payload NOT marked with Handoff — one
+// deep copy of that batch, and the copy, not the script, is what the copying
+// path costs. Measured on a 1024-record log batch with a
+// `def transform(batch): return` script: ~249µs total, of which ld.CopyTo is
+// ~226µs (91%) and the whole Starlark call is 245ns; a 10,000-point metrics
+// payload (one promscrape chunk) is ~2.05ms and 2.3 MB for the same no-op. A
+// payload marked Handoff(ctx) — the producer's promise that it rebuilds from
+// source on failure rather than re-offering the object (see handoff.go for the
+// roster) — runs the script IN PLACE and skips the copy, but NOT the prune:
+// that sweep visits every record, span or data point and looks the drop
+// marker up in its attributes whether or not the script called drop(), so it
+// costs O(elements x attributes) and, on the in-place path, dwarfs the
+// invocation (a 10k-point, 8-attribute chunk: 0.2-0.38 ms of prune against
+// ~0.4µs of call, some 5-8% of that chunk's proto marshal). It cannot be
+// skipped when no drop() ran: the prune is PRESENCE-based, and a marker that
+// reached the payload through a door other than drop() (a logAttributes lift,
+// for one) must be pruned all the same — gating the sweep would make that
+// record's fate depend on whether another record in the batch was dropped.
+// The copy remains the CORRECTNESS requirement for every
 // unmarked producer, which re-exports the SAME object on retry (see the
 // comment above ExportLogs). The tailer takes a third shape: it transforms
 // its just-built batch once via TransformLogs and retries through Inner(),
@@ -95,35 +105,25 @@ func Compile(raw []byte) (*Program, error) {
 		return nil, fmt.Errorf("transforms file: %w", err)
 	}
 	p := &Program{Hash: contentHash(raw)}
-	var err error
-	if cfg.Logs != "" {
-		if p.logs, err = compileStarlark("logs", cfg.Logs); err != nil {
-			return nil, err
-		}
-	}
-	if cfg.Metrics != "" {
-		if p.metrics, err = compileStarlark("metrics", cfg.Metrics); err != nil {
-			return nil, err
-		}
-	}
-	if cfg.Traces != "" {
-		if p.traces, err = compileStarlark("traces", cfg.Traces); err != nil {
-			return nil, err
-		}
-	}
-	for _, h := range []struct {
+	// One row per section: the batch transforms all define transform(batch),
+	// the hooks each their own function (hooks.go).
+	for _, sec := range []struct {
 		src, signal, fn string
 		dst             **starlarkProgram
 	}{
+		{cfg.Logs, "logs", "transform", &p.logs},
+		{cfg.Metrics, "metrics", "transform", &p.metrics},
+		{cfg.Traces, "traces", "transform", &p.traces},
 		{cfg.Ingest, "ingest", "admit", &p.ingest},
 		{cfg.Targets, "targets", "target", &p.targets},
 		{cfg.Sample, "sample", "decide", &p.sample},
 		{cfg.Parse, "parse", "parse", &p.parse},
 	} {
-		if h.src == "" {
+		if sec.src == "" {
 			continue
 		}
-		if *h.dst, err = compileStarlarkFn(h.signal, h.src, h.fn); err != nil {
+		var err error
+		if *sec.dst, err = compileStarlarkFn(sec.signal, sec.src, sec.fn); err != nil {
 			return nil, err
 		}
 	}
@@ -137,12 +137,6 @@ func CompileFile(path string) (*Program, error) {
 		return nil, err
 	}
 	return Compile(data)
-}
-
-// Empty reports a program with no transforms at all.
-func (p *Program) Empty() bool {
-	return p == nil || (p.logs == nil && p.metrics == nil && p.traces == nil &&
-		p.ingest == nil && p.targets == nil && p.sample == nil && p.parse == nil)
 }
 
 // Exporter is the downstream the wrapper forwards to (otlpexport.Client and
@@ -226,30 +220,29 @@ func (w *Wrapper) metricEmitter() MetricEmitter {
 }
 
 // TransformLogs runs the active logs program on ld IN PLACE (drop marks
-// swept, empty groups pruned) and reports the script's error; no program means
-// no-op. It is the tailer's seam: the tailer's retry loop re-sends the SAME
-// batch, so it can neither mark Handoff (the contract forbids the re-send)
-// nor export through the wrapper (every attempt would re-copy and re-run the
-// script) — instead it transforms the batch it just built exactly once, here,
-// and retries through Inner(). The caller decides what an emptied payload
-// means (the tailer commits its offsets without a send) and treats an error
-// like a failed export, so a re-read re-runs the — possibly hot-reloaded —
-// program.
-func (w *Wrapper) TransformLogs(ld plog.Logs) error {
+// swept, empty groups pruned) and reports how many records the script dropped,
+// or its error; no program means no-op. It is the tailer's seam: the tailer's
+// retry loop re-sends the SAME batch, so it can neither mark Handoff (the
+// contract forbids the re-send) nor export through the wrapper (every attempt
+// would re-copy and re-run the script) — instead it transforms the batch it
+// just built exactly once, here, and retries through Inner(). The caller
+// decides what an emptied payload means (the tailer commits its offsets
+// without a send) and treats an error like a failed export, so a re-read
+// re-runs the — possibly hot-reloaded — program.
+//
+// The drops are REPORTED, not counted: the caller counts them into
+// kubescrape_transform_dropped_total{signal="logs"} once the batch's records
+// are settled (its offsets commit, or it is dropped as permanently rejected).
+// Counting here counted every rewind: a failed flush rewinds the files, the
+// next sweep rebuilds the batch from the same bytes and the script drops the
+// same records again, so one intended drop read as one per failed flush of
+// the outage.
+func (w *Wrapper) TransformLogs(ld plog.Logs) (dropped int, err error) {
 	p := w.program.Load()
 	if p == nil || p.logs == nil {
-		return nil
+		return 0, nil
 	}
-	// Counted at transform time: this seam runs ONCE per built batch (the
-	// tailer's retry loop re-sends the same already-transformed object), so
-	// there is no per-attempt re-run to over-count. A sweep-level rewind
-	// rebuilds the batch from source, which is a fresh transform by design.
-	dropped, err := p.logs.runLogs(ld, w.metricEmitter())
-	if err != nil {
-		return err
-	}
-	p.logs.countDropped(dropped)
-	return nil
+	return p.logs.runLogs(ld, w.metricEmitter())
 }
 
 // Inner is the exporter below the transform layer, for a producer that
@@ -263,6 +256,31 @@ func (w *Wrapper) Swap(p *Program) { w.program.Store(p) }
 
 // Active returns the current program (for /debug/transforms).
 func (w *Wrapper) Active() *Program { return w.program.Load() }
+
+// settle counts what the script dropped from a batch once the batch's records
+// are SETTLED, and passes the forward's err through. err == nil covers both
+// acks: a delivered forward, and a payload the script emptied, which is acked
+// without a send.
+//
+// A FAILED forward counts only when the failure is final for these RECORDS
+// (Consumed, handoff.go). A copy-path producer re-offers the same object and
+// the retry re-runs the script over a fresh copy; an ingest sender retransmits
+// the same records, which a plain Handoff still describes; the log-metrics set
+// re-renders a failed chunk's samples as the same points. Counting any of
+// those here multiplied one batch's drops by the length of an outage (see
+// run*'s doc). A CONSUMED payload's records never come back — promscrape
+// take()s its chunk and latches exportFailed, cgroupstats renders from a
+// snapshot() that reset each window, and the cumulative renders' next export
+// is a new point — so not counting them here counted them nowhere,
+// under-reporting drop volume during exactly the collector outage in which an
+// operator reads this counter to tell an intentional script drop from a
+// delivery failure.
+func (p *starlarkProgram) settle(ctx context.Context, dropped int, err error) error {
+	if err == nil || IsConsumed(ctx) {
+		p.countDropped(dropped)
+	}
+	return err
+}
 
 // An UNMARKED payload is transformed on a COPY, never the caller's object: the
 // scripts mutate pdata in place (lazy host objects alias it), while unmarked
@@ -289,31 +307,9 @@ func (w *Wrapper) ExportLogs(ctx context.Context, ld plog.Logs) error {
 			return err
 		}
 		if out.ResourceLogs().Len() == 0 {
-			p.logs.countDropped(dropped)
-			return nil // everything dropped: acked, nothing to send
+			return p.logs.settle(ctx, dropped, nil) // everything dropped: acked, nothing to send
 		}
-		if err := w.next.ExportLogs(ctx, out); err != nil {
-			// On a FAILED export the two producer classes part company, and
-			// this used to apply the copy path's reasoning to both. A
-			// COPY-PATH producer re-offers the same object and the retry
-			// re-runs the script over a fresh copy, so counting here would
-			// multiply one batch's drops by the length of an outage (see
-			// run*'s doc). A HANDED-OFF producer never re-offers it — its
-			// contract is that it rebuilds from source, and for two roster
-			// members the source is already gone by now: promscrape take()s
-			// its chunk and then latches exportFailed, and cgroupstats renders
-			// from a snapshot() that RESET each window as it read it. Their
-			// drops were counted nowhere, ever, so the counter under-reported
-			// drop volume during exactly the collector outage in which an
-			// operator reads it to tell an intentional script drop from a
-			// delivery failure.
-			if HandedOff(ctx) {
-				p.logs.countDropped(dropped)
-			}
-			return err
-		}
-		p.logs.countDropped(dropped)
-		return nil
+		return p.logs.settle(ctx, dropped, w.next.ExportLogs(ctx, out))
 	}
 	return w.next.ExportLogs(ctx, ld)
 }
@@ -331,17 +327,9 @@ func (w *Wrapper) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 			return err
 		}
 		if out.ResourceMetrics().Len() == 0 {
-			p.metrics.countDropped(dropped)
-			return nil
+			return p.metrics.settle(ctx, dropped, nil)
 		}
-		if err := w.next.ExportMetrics(ctx, out); err != nil {
-			if HandedOff(ctx) { // counted here only for the class that will not re-run the script; see ExportLogs
-				p.metrics.countDropped(dropped)
-			}
-			return err
-		}
-		p.metrics.countDropped(dropped)
-		return nil
+		return p.metrics.settle(ctx, dropped, w.next.ExportMetrics(ctx, out))
 	}
 	return w.next.ExportMetrics(ctx, md)
 }
@@ -362,17 +350,9 @@ func (w *Wrapper) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 			return err
 		}
 		if out.ResourceSpans().Len() == 0 {
-			p.traces.countDropped(dropped)
-			return nil
+			return p.traces.settle(ctx, dropped, nil)
 		}
-		if err := w.nextTraces.ExportTraces(ctx, out); err != nil {
-			if HandedOff(ctx) { // counted here only for the class that will not re-run the script; see ExportLogs
-				p.traces.countDropped(dropped)
-			}
-			return err
-		}
-		p.traces.countDropped(dropped)
-		return nil
+		return p.traces.settle(ctx, dropped, w.nextTraces.ExportTraces(ctx, out))
 	}
 	// No traces script: pass through. Require traces capability only when a
 	// script actually exists, so a logs-only transforms file never forces the
@@ -386,3 +366,8 @@ func (w *Wrapper) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 // HasSample reports whether the program carries a sample: section (the
 // `type: script` tail-sampling body); config validation cross-checks it.
 func (p *Program) HasSample() bool { return p != nil && p.sample != nil }
+
+// HasParse reports whether the program carries a parse: section (the hook a
+// plain log source opts into with parseScript); config validation reports a
+// source that opts in with no hook to run.
+func (p *Program) HasParse() bool { return p != nil && p.parse != nil }

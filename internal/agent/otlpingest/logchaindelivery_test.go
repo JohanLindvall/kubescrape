@@ -46,7 +46,7 @@ func TestRuleDropsOfANACKedPushAreNotCounted(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := obs.LogRulesDropped.Value()
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		req := plogotlp.NewExportRequest()
 		if err := req.UnmarshalProto(raw); err != nil {
 			t.Fatal(err)
@@ -145,7 +145,7 @@ func TestPushedLineSelectsLikeATailedOneAfterALiftedRename(t *testing.T) {
 
 	// The producers' own chain, over the same body, as the oracle.
 	chain := logchain.NewChain[string](logchain.Config{LogAttrs: renameExtractor(t), Rules: rules}, false)
-	body, lifted := chain.Line(renamedLine)
+	body, lifted := chain.Line(renamedLine, false)
 	dest := plog.NewLogs().ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
 	kept := chain.Emit(&testProducer{dest: dest.LogRecords(), body: body},
 		logchain.Input[string]{Body: body, Lifted: lifted, Resource: dest.Scope().Attributes(), BoundKey: "k"})

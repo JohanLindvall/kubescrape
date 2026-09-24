@@ -5,18 +5,24 @@ package tailbuffer
 // Every bound here trades trace COMPLETENESS for a smaller buffer, and an early
 // decision is judged on the spans present — so a sustained rate means the
 // sampling an operator configured is not the sampling they are getting. The
-// decision path is allocation-budgeted and runs under the buffer mutex, so it
-// may only bump a counter; the line is the sweep's.
+// decision path is allocation-budgeted (TestDropDecisionAllocationBudget,
+// TestKeepDecisionAllocationBudget) and runs under the buffer mutex, so it may
+// only bump a counter; the line is the sweep's.
 
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/ptrace"
+
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 func capturedLog() (*slog.Logger, func() string) {
@@ -209,6 +215,37 @@ func TestEarlyReportNamesShutdownDecisions(t *testing.T) {
 	}
 }
 
+// Every early-decision reason's tally must reach the line.
+//
+// The per-reason tables are arrays, but reportEarly names its reasons one by
+// one, so a reason added to the const block (and given a label and a counter)
+// but left off the line would be counted, would make any() write the line, and
+// would then be missing from it: the operator reading the line for "which
+// bound?" would find every by* key it does carry at zero. Distinct values per
+// reason, so no reason's tally can stand in for another's.
+func TestEveryEarlyReasonIsReportedOnTheLine(t *testing.T) {
+	b, _, dump := newLoggingBuffer(t, Config{Config: alwaysCfg()})
+	tally := func(r earlyReason) int { return 1000 + int(r) }
+
+	b.mu.Lock()
+	for r := reasonNone + 1; r < numEarlyReasons; r++ {
+		b.earlyPending[r] = tally(r)
+	}
+	early, ok := b.takeEarlyLocked()
+	b.mu.Unlock()
+	if !ok {
+		t.Fatal("no line to write with every early reason pending")
+	}
+	b.reportEarly(early)
+
+	out := dump()
+	for r := reasonNone + 1; r < numEarlyReasons; r++ {
+		if !regexp.MustCompile(fmt.Sprintf(`\bby[A-Za-z]+=%d\b`, tally(r))).MatchString(out) {
+			t.Errorf("early reason %q is counted but its tally (%d) is not on the line:\n%s", r, tally(r), out)
+		}
+	}
+}
+
 // The two failed-export lines hold SEPARATE throttles.
 //
 // They describe one downstream condition and therefore co-occur, but only one
@@ -265,5 +302,174 @@ func TestLossReportIsNotStarvedByTheNackReport(t *testing.T) {
 
 	if !strings.Contains(dump(), "their senders were acked at buffering time") {
 		t.Errorf("the data-loss line was starved by the harmless NACK line — an operator reads a log saying the senders have it covered while buffered spans are destroyed:\n%s", dump())
+	}
+}
+
+// The receive path has BOTH events too, and they must not share a gate.
+//
+// A push that carries only the sender's own spans (late spans) and fails is a
+// NACK — nothing lost. A push that also carries keeps a BOUND forced out of the
+// buffer early and fails destroys those keeps: their senders were acked at
+// buffering time and the retransmission re-presents only the pusher's own
+// spans. The second used to be reported through the NACK line's gate, so the
+// frequent harmless line suppressed the only report of the loss — the exact
+// starvation the gate split exists to prevent — and the harmless line in turn
+// claimed "counted lost" for a push that lost nothing.
+func TestReceivePathLossIsNotStarvedByTheNackReport(t *testing.T) {
+	cap := &capture{}
+	log, dump := capturedLog()
+	b, err := New(Config{Config: alwaysCfg(), DecisionWait: "1s", MaxTraces: 1}, cap, log)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	clk := newClock()
+	b.now = clk.now
+	ctx := context.Background()
+
+	// Trace 1's keep is cached while the collector is healthy.
+	if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 1, span: 1, end: 5})); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(2 * time.Second)
+	b.Sweep(ctx)
+
+	// A permanent rejection: no retry sleeps, every send fails on attempt one.
+	cap.fail(&otlpexport.HTTPStatusError{Code: 400, Body: "bad batch"})
+
+	// The harmless one first: a late span of trace 1, NACKed back to its
+	// sender. It takes its gate's slot, and it must not claim a loss.
+	if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 1, span: 2, end: 5})); err == nil {
+		t.Fatal("a failing collector must fail the push")
+	}
+	if out := dump(); strings.Count(out, "the push is NACKed") != 1 {
+		t.Fatalf("want exactly one NACK line:\n%s", out)
+	} else if strings.Contains(out, "counted lost") {
+		t.Errorf("a push that carried only its sender's spans claimed a loss:\n%s", out)
+	}
+
+	// Now a real loss on the receive path: trace 2 is buffered (acked), and
+	// trace 3's push makes maxTraces bind, forcing trace 2 out inside it.
+	if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 2, span: 1, end: 5})); err != nil {
+		t.Fatal(err)
+	}
+	lost0 := counter(obs.TailSampleSpans.WithLabelValues("lost"))
+	if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 3, span: 1, end: 5})); err == nil {
+		t.Fatal("the failed forward of an early-decided keep must still NACK the push")
+	}
+	if lost := counter(obs.TailSampleSpans.WithLabelValues("lost")) - lost0; lost != 1 {
+		t.Fatalf("lost spans counted %v, want 1", lost)
+	}
+	out := dump()
+	if !strings.Contains(out, "their senders were acked at buffering time") || !strings.Contains(out, "buffered=1") {
+		t.Errorf("the receive-path loss was not reported — the NACK line starved it:\n%s", out)
+	}
+}
+
+// slowExport is a downstream whose every export takes d on the buffer's clock.
+type slowExport struct {
+	capture
+	clk *clock
+	d   time.Duration
+}
+
+func (s *slowExport) ExportTraces(ctx context.Context, td ptrace.Traces) error {
+	s.clk.advance(s.d)
+	return s.capture.ExportTraces(ctx, td)
+}
+
+// The decision loop decides nothing while its own send is in flight, so a slow
+// collector fills the buffer and makes maxSpans (or maxTraces) bind — early
+// decisions caused by EXPORT LATENCY, which a line naming only the bounds reads
+// as a bound sized below the shard's span rate. The line therefore carries the
+// slowest decision-loop export of its window.
+func TestEarlyReportNamesTheSlowestDecisionExport(t *testing.T) {
+	log, dump := capturedLog()
+	next := &slowExport{d: 3 * time.Second}
+	b, err := New(Config{Config: alwaysCfg(), DecisionWait: "1s", MaxTraces: 1}, next, log)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	clk := newClock()
+	b.now = clk.now
+	next.clk = clk
+	ctx := context.Background()
+
+	// A sweep whose export takes 3s — three windows during which nothing is
+	// decided on time.
+	if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: 1, span: 1, end: 5})); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(2 * time.Second)
+	b.Sweep(ctx)
+
+	// A bound binds; the next sweep reports it.
+	for i := uint64(2); i <= 3; i++ {
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: i, span: 1, end: 5})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b.Sweep(ctx)
+
+	out := dump()
+	if !strings.Contains(out, "byMaxTraces=1") {
+		t.Fatalf("the bound did not bind as the fixture intends:\n%s", out)
+	}
+	if !strings.Contains(out, "slowestDecisionExport=3s") {
+		t.Errorf("the early-decision line does not name the slow export that stalled the decision loop:\n%s", out)
+	}
+}
+
+// ...and ONLY a slow export of the window it reports. A drain that emits
+// nothing must not leave the slowest export standing: kept until the next line,
+// a stall that ended long before an unrelated bind — hours of healthy sweeps
+// earlier — rides that line and points the operator at export latency for a
+// bound that is simply sized below the shard's span rate.
+func TestEarlyReportForgetsASlowExportFromBeforeTheBind(t *testing.T) {
+	log, dump := capturedLog()
+	next := &slowExport{d: 30 * time.Second}
+	b, err := New(Config{Config: alwaysCfg(), DecisionWait: "1s", MaxTraces: 1}, next, log)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	clk := newClock()
+	b.now = clk.now
+	next.clk = clk
+	ctx := context.Background()
+
+	push := func(id uint64) {
+		t.Helper()
+		if err := b.ExportTraces(ctx, payload("checkout", spanSpec{trace: id, span: 1, end: 5})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	decideOnTime := func(id uint64) {
+		t.Helper()
+		push(id)
+		clk.advance(2 * time.Second)
+		b.Sweep(ctx)
+	}
+
+	// One stall that no bound bound during...
+	decideOnTime(1)
+	// ...then healthy sweeps whose exports are fast.
+	next.d = 10 * time.Millisecond
+	for id := uint64(2); id <= 4; id++ {
+		decideOnTime(id)
+	}
+
+	// Now a bound binds, for reasons of its own, and the next sweep reports it.
+	push(5)
+	push(6)
+	b.Sweep(ctx)
+
+	out := dump()
+	if !strings.Contains(out, "byMaxTraces=1") {
+		t.Fatalf("the bound did not bind as the fixture intends:\n%s", out)
+	}
+	if strings.Contains(out, "slowestDecisionExport=30s") {
+		t.Errorf("the line blames a stall that ended three healthy sweeps before the bind:\n%s", out)
+	}
+	if !strings.Contains(out, "slowestDecisionExport=10ms") {
+		t.Errorf("the line does not carry the slowest export of its own window (10ms):\n%s", out)
 	}
 }

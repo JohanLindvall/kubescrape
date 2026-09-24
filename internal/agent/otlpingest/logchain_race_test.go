@@ -32,9 +32,7 @@ func TestLogChainExportVsInPlaceTransformIsRaceFree(t *testing.T) {
 	stop := make(chan struct{})
 	var exporter sync.WaitGroup
 	// Exporter goroutine: renders the set continuously while pushers run.
-	exporter.Add(1)
-	go func() {
-		defer exporter.Done()
+	exporter.Go(func() {
 		for {
 			select {
 			case <-stop:
@@ -43,14 +41,12 @@ func TestLogChainExportVsInPlaceTransformIsRaceFree(t *testing.T) {
 				_ = set.Export(context.Background(), &copyMetricsExporter{}, 0)
 			}
 		}
-	}()
+	})
 	// Pusher goroutines: push, then mutate the payload's resource in place —
 	// what an in-place transform does during ExportLogs.
-	for g := 0; g < 4; g++ {
-		pushers.Add(1)
-		go func() {
-			defer pushers.Done()
-			for i := 0; i < 200; i++ {
+	for range 4 {
+		pushers.Go(func() {
+			for range 200 {
 				ld := pushLogs(map[string][]string{"web": {"x one", "x two"}})
 				if _, forward := s.applyLogChain(ld); !forward {
 					t.Error("payload unexpectedly emptied")
@@ -61,7 +57,7 @@ func TestLogChainExportVsInPlaceTransformIsRaceFree(t *testing.T) {
 				rl.Resource().Attributes().PutStr("service.name", "transformed")
 				rl.Resource().Attributes().PutStr("extra", "attr")
 			}
-		}()
+		})
 	}
 	pushers.Wait()
 	close(stop)

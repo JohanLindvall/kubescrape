@@ -116,9 +116,11 @@ func TestTracesRouting(t *testing.T) {
 	}
 }
 
-// The router must NOT mutate its input: the ingest batcher retries the same
-// payload object in place, and the spanmetrics tap Consumes it after the
-// forward — an in-place split loses the retried batch and blinds the tap.
+// The router must NOT mutate its input: the tailer retries its batch in place
+// (reaching the router through transform.Wrapper.Inner, below the per-attempt
+// copy), the tail sampler's drain re-offers its payload, and the spanmetrics
+// tap Consumes it after the forward — an in-place split loses the retried
+// batch and blinds the tap.
 func TestRouterDoesNotMutateInput(t *testing.T) {
 	t.Parallel()
 	def, teamA := &capDest{}, &capDest{}
@@ -131,7 +133,7 @@ func TestRouterDoesNotMutateInput(t *testing.T) {
 	if ld.ResourceLogs().Len() != 2 {
 		t.Fatalf("input emptied: %d resources left of 2", ld.ResourceLogs().Len())
 	}
-	// A second export of the SAME object (the batcher's in-place retry) must
+	// A second export of the SAME object (a producer's in-place retry) must
 	// re-split identically, not forward an emptied payload.
 	def2, teamA2 := &capDest{}, &capDest{}
 	r2 := New(def2, []Destination{{Name: "team-a", Namespaces: []string{"team-a-*"}, Exporter: teamA2}})
@@ -263,8 +265,7 @@ func TestAllPermanentFlattensAndStaysPermanent(t *testing.T) {
 	if strings.ContainsAny(err.Error(), "\n") {
 		t.Fatalf("all-permanent error message contains a newline: %q", err.Error())
 	}
-	var hse *otlpexport.HTTPStatusError
-	if !errors.As(err, &hse) {
+	if _, ok := errors.AsType[*otlpexport.HTTPStatusError](err); !ok {
 		t.Fatal("errors.As must still reach an HTTPStatusError leaf")
 	}
 }

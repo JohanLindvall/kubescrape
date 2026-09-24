@@ -24,7 +24,7 @@ func TestBankedRecoveryDeliveriesDoNotDropGoodBatch(t *testing.T) {
 	data := []byte("a perfectly good log batch")
 
 	// Outage: the batch circles the queue, failing every cycle. delivered frozen.
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if s.stuckTooLong(data) {
 			t.Fatalf("dropped during the outage at cycle %d", i+1)
 		}
@@ -111,7 +111,7 @@ func TestStuckEntryForgottenOnPermanentRejection(t *testing.T) {
 func TestStuckMapAtCapStillTracksNewPoison(t *testing.T) {
 	s := &sink[plog.Logs]{kind: "logs", stuckResponded: true}
 	// Fill the map with leaked entries (payloads never seen again).
-	for i := 0; i < maxStuckTracked; i++ {
+	for i := range maxStuckTracked {
 		s.stuckTooLong([]byte{byte(i), byte(i >> 8), byte(i >> 16)})
 	}
 	if n := len(s.stuck); n != maxStuckTracked {
@@ -142,13 +142,13 @@ func TestBlipDeliveryThenOutageDoesNotDrop(t *testing.T) {
 	s := &sink[plog.Logs]{kind: "logs"} // stuckResponded=false: transport failures
 	data := []byte("a good batch")
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if s.stuckTooLong(data) {
 			t.Fatalf("dropped during the initial outage at lap %d", i+1)
 		}
 	}
 	s.delivered++ // a blip: one other batch gets through
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if s.stuckTooLong(data) {
 			t.Fatalf("ZERO-LOSS BREACH: dropped during the resumed outage at lap %d after a single blip delivery", i+1)
 		}
@@ -197,7 +197,7 @@ func TestPoisonBudgetNotSpentWithoutConcurrentProgress(t *testing.T) {
 	}
 	// From here nothing else gets through. However many laps this takes, the
 	// batch must survive: there is no evidence the collector would accept it.
-	for lap := 0; lap < 10*maxDrainCycles; lap++ {
+	for lap := range 10 * maxDrainCycles {
 		if s.stuckTooLong(data) {
 			t.Fatalf("dropped on lap %d with no concurrent delivery: that is a back-pressure outage, not poison", lap)
 		}

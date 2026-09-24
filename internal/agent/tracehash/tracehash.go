@@ -20,10 +20,10 @@
 // This package replaced two copies of the arithmetic that were held equal only
 // by cross-package tests (tailsample.TestProbabilisticNestsWithTheHeadSampler,
 // tailbuffer.TestNestsWithTheHeadSampler) and had ALREADY micro-drifted: the
-// threshold==MaxUint64 keep-all guard in Keep existed on the tracesample side
-// only, so a tailsample policy at samplingPercentage: 100 dropped the one
-// trace in 2^64 whose hash is exactly MaxUint64. Sharing the function is what
-// keeps the next drift from being a bigger one.
+// threshold==MaxUint64 keep-all guard (keepHash's, now) existed on the
+// tracesample side only, so a tailsample policy at samplingPercentage: 100
+// dropped the one trace in 2^64 whose hash is exactly MaxUint64. Sharing the
+// function is what keeps the next drift from being a bigger one.
 //
 // # Changing the hash re-rolls the sampled set
 //
@@ -36,7 +36,9 @@
 // split. The window is the rollout, it is self-healing, and the alternative
 // (never changing the function) is what this package exists to make a
 // deliberate decision rather than an accident. This hash moved from xxhash to
-// rapidhash once, knowingly, for the ~5x it buys on a per-span path.
+// rapidhash once, knowingly, for the ~2.3x it buys on a per-span path (~12.9ns
+// -> ~5.6ns on the real Keep with varying ids; see Keep for the measurement and
+// for why the ~5x first quoted for it was an artefact).
 //
 // NOT in scope: agent/servicegraph's ring.TokenFor, which is Tempo's FNV-1
 // 32-bit hash ON PURPOSE — the ring must place spans where Tempo's would, and
@@ -68,10 +70,8 @@ func Threshold(fraction float64) uint64 {
 	return uint64(fraction * float64(math.MaxUint64))
 }
 
-// Keep reports the sampling decision for a trace id against a Threshold. A
-// threshold of MaxUint64 keeps ALL traces — without the fast path, the one
-// hash in 2^64 equal to MaxUint64 would fail the strict comparison and a
-// sampler configured to keep everything would not.
+// Keep reports the sampling decision for a trace id against a Threshold: the
+// id's hash, decided by keepHash (which owns the keep-all rule).
 //
 // Hashing the id (rather than reading its low bits, as a W3C-random id would
 // permit) keeps the distribution uniform even for senders whose ids are not
@@ -90,9 +90,26 @@ func Threshold(fraction float64) uint64 {
 // worth the two loads.
 func Keep(id pcommon.TraceID, threshold uint64) bool {
 	if threshold == math.MaxUint64 {
+		// Skips the hash where keepHash's answer does not depend on it. An
+		// optimization only — keepHash repeats the rule, so deleting this
+		// early return changes no decision; it spares a sampler configured to
+		// keep everything a per-span hash whose result it would discard.
 		return true
 	}
 	lo := binary.LittleEndian.Uint64(id[0:8])
 	hi := binary.LittleEndian.Uint64(id[8:16])
-	return rapidhash.Sum64Uint128(lo, hi) < threshold
+	return keepHash(rapidhash.Sum64Uint128(lo, hi), threshold)
+}
+
+// keepHash is the decision itself, on an already-computed hash: keep when the
+// hash is below the threshold, and keep EVERYTHING at a threshold of MaxUint64.
+// The second half is the keep-all guard this package exists to hold in one
+// place — without it the one hash in 2^64 equal to MaxUint64 fails the strict
+// comparison, and a sampler configured to keep everything drops that trace
+// (the drift the package doc records). It is a function of its own because the
+// guard is only observable on that one hash, which no test can find by
+// hashing ids: TestKeepHashKeepsEveryHashAtTheKeepAllThreshold hands it the
+// hash directly.
+func keepHash(h, threshold uint64) bool {
+	return threshold == math.MaxUint64 || h < threshold
 }

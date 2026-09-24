@@ -51,6 +51,12 @@ func (p *pipelines) startEvents(ctx context.Context) error {
 	if ns == "" {
 		return errors.New("events: no namespace for the lease and position ConfigMap; set -events-lease-namespace or $POD_NAMESPACE (downward API)")
 	}
+	// ONE renew deadline for the election AND the reader's stop budget: the
+	// reader's final flush and position write must finish inside the window
+	// the election gives leader work to stop in (events.Config.StopBudget), so
+	// the budget is derived from the deadline rather than left to a second
+	// default that merely agrees with it today.
+	renew := leader.DefaultRenewDeadline
 	reader := events.New(events.Config{
 		Client:          client,
 		Positions:       &events.ConfigMapStore{Client: client, Namespace: ns, Name: *eventsConfigMap},
@@ -59,24 +65,28 @@ func (p *pipelines) startEvents(ctx context.Context) error {
 		BatchSize:       *eventsBatch,
 		FlushInterval:   *eventsFlush,
 		PersistInterval: *eventsPersist,
+		StopBudget:      renew / 2,
 		Meta:            p.meta,
-		Enrich:          *enrichOn,
-		Scrub:           p.scrub,
-		LogAttrs:        p.logAttrs,
-		Rules:           p.journalRules, // the same logs.rules chain
-		LogMetrics:      p.logMetrics,
-		Attrs:           p.attrBuilders.Ingest,
-		Exporter:        p.out,
-		Logger:          p.log,
+		Chain:           p.logChain(),
+		// The INGEST attribute pipeline (there is no events-specific one),
+		// like -azure-diagnostics. So resourceAttributes.pipelines.ingest
+		// governs every event resource, and a pipelines.logs override (of
+		// service.name, say) does NOT reach the events about that pod, whose
+		// logs it does govern — with the default builders the two agree, so
+		// it only matters once an operator sets per-pipeline overrides.
+		Attrs:    p.attrBuilders.Ingest,
+		Exporter: p.out,
+		Logger:   p.log,
 	})
 	p.spawn(func() {
 		// The election goroutine must be inside the WaitGroup: ReleaseOnCancel
 		// only hands the lease back if Run returns before the process exits.
 		err := leader.Run(ctx, leader.Config{
-			Client:    client,
-			Namespace: ns,
-			Name:      *eventsLease,
-			OnStarted: reader.Run,
+			Client:        client,
+			Namespace:     ns,
+			Name:          *eventsLease,
+			RenewDeadline: renew,
+			OnStarted:     reader.Run,
 			OnLeading: func(leading bool) {
 				if leading {
 					obs.Leader.Set(1)

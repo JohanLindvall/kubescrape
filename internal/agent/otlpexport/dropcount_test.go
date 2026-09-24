@@ -53,8 +53,8 @@ func TestCorruptBatchDropIsCounted(t *testing.T) {
 	}
 
 	before := obs.BufferDroppedBatches.WithLabelValues("metrics").Value()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel() // stop Run BEFORE the queue Closes deferred above; t.Context() alone ends after them
 	go b.Run(ctx)
 
 	// The good batch behind it still gets through (the queue must not wedge).
@@ -68,7 +68,7 @@ func TestCorruptBatchDropIsCounted(t *testing.T) {
 func logsWithN(body string, n int) plog.Logs {
 	ld := plog.NewLogs()
 	sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
-	for i := 0; i < n; i++ {
+	for range n {
 		sl.LogRecords().AppendEmpty().Body().SetStr(body)
 	}
 	return ld
@@ -96,8 +96,8 @@ func TestPermanentRejectionCountsRecords(t *testing.T) {
 	beforeBatches := obs.BufferDroppedBatches.WithLabelValues("logs").Value()
 	beforeRecords := obs.BufferDroppedRecords.WithLabelValues("logs").Value()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel() // stop Run BEFORE the queue Closes deferred above; t.Context() alone ends after them
 	go b.Run(ctx)
 
 	if err := b.ExportLogs(ctx, logsWithN("poison", 7)); err != nil {
@@ -140,13 +140,13 @@ func TestPermanentRejectionCountsMetricDataPoints(t *testing.T) {
 	cpu := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
 	cpu.SetName("cpu")
 	cpuPoints := cpu.SetEmptyGauge().DataPoints()
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		cpuPoints.AppendEmpty()
 	}
 	mem := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
 	mem.SetName("mem")
 	memPoints := mem.SetEmptyGauge().DataPoints()
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		memPoints.AppendEmpty()
 	}
 	const want = 5.0
@@ -155,8 +155,8 @@ func TestPermanentRejectionCountsMetricDataPoints(t *testing.T) {
 	}
 
 	beforeRecords := obs.BufferDroppedRecords.WithLabelValues("metrics").Value()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel() // stop Run BEFORE the queue Closes deferred above; t.Context() alone ends after them
 	go b.Run(ctx)
 
 	if err := b.ExportMetrics(ctx, md); err != nil {

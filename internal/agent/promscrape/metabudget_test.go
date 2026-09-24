@@ -238,10 +238,17 @@ func TestScrapeStillResolvesWithTheAllowanceInPlace(t *testing.T) {
 // The allowance is spent by MEASURED ELAPSED TIME, and once it is gone no
 // further lookup is issued: another parked round trip can only take time from
 // the export, and the object it would attribute is exported either way.
+//
+// Nothing here races the wall clock. The charge is asserted as a LOWER bound
+// (a stall can only raise it), and the allowance is then spent by adding to
+// the charge directly, against a scrape budget no stall can exhaust — the
+// earlier version parked a lookup until a 100ms deadline and then required a
+// 200ms scrape context to still be live, which a loaded -race run broke.
 func TestMetaLookupStopsIssuingOnceTheAllowanceIsSpent(t *testing.T) {
 	s := New(Config{Node: "node1", Targets: staticTargets{}, Exporter: &captureExporter{}})
-	ctx, cancel := s.scrapeContext(context.Background(), 200*time.Millisecond, pipelineSummary)
+	ctx, cancel := s.scrapeContext(context.Background(), 10*time.Second, pipelineSummary)
 	defer cancel()
+	b := metaBudgetFrom(ctx)
 
 	lctx, spent, may := s.metaLookup(ctx, nil)
 	if !may {
@@ -251,13 +258,18 @@ func TestMetaLookupStopsIssuingOnceTheAllowanceIsSpent(t *testing.T) {
 	if !ok {
 		t.Fatal("a bounded lookup has no deadline")
 	}
-	if left := time.Until(dl); left > 100*time.Millisecond {
-		t.Errorf("the first lookup may run for %v, past the 100ms allowance of a 200ms scrape", left)
+	if left := time.Until(dl); left > b.limit {
+		t.Errorf("the first lookup may run for %v, past the %v allowance of a 10s scrape", left, b.limit)
 	}
-	// Park exactly as a blackholed lookup does: until the derived deadline.
-	<-lctx.Done()
+	const held = 20 * time.Millisecond
+	time.Sleep(held)
 	spent()
+	if got := time.Duration(b.spent.Load()); got < held {
+		t.Errorf("a lookup held for %v was charged %v: the allowance must be spent by measured elapsed time", held, got)
+	}
 
+	// Spend the rest as a blackholed lookup would, without waiting for it.
+	b.spent.Add(int64(b.limit))
 	if _, _, may := s.metaLookup(ctx, nil); may {
 		t.Error("a lookup was issued after the allowance was spent")
 	}
@@ -270,27 +282,27 @@ func TestMetaLookupStopsIssuingOnceTheAllowanceIsSpent(t *testing.T) {
 
 // No single lookup may take more than what is LEFT: the allowance is a budget
 // for the scrape, not a per-lookup timeout that N lookups can each claim.
+//
+// The earlier spending is charged directly rather than slept through, and the
+// assertion is an UPPER bound on the second lookup's deadline, which a stall
+// cannot break: what is left does not shrink while nothing is being charged.
 func TestMetaLookupClampsToTheRemainingAllowance(t *testing.T) {
 	s := New(Config{Node: "node1", Targets: staticTargets{}, Exporter: &captureExporter{}})
-	ctx, cancel := s.scrapeContext(context.Background(), time.Second, pipelineSummary)
+	ctx, cancel := s.scrapeContext(context.Background(), 10*time.Second, pipelineSummary)
 	defer cancel()
+	b := metaBudgetFrom(ctx)
 
-	first, spent, may := s.metaLookup(ctx, nil)
-	if !may {
-		t.Fatal("the first lookup of a scrape was refused")
-	}
-	<-time.After(300 * time.Millisecond)
-	spent()
-	_ = first
+	const left = 200 * time.Millisecond
+	b.spent.Add(int64(b.limit - left)) // earlier lookups took all but 200ms
 
-	second, spent2, may := s.metaLookup(ctx, nil)
+	second, spent, may := s.metaLookup(ctx, nil)
 	if !may {
-		t.Fatal("the second lookup was refused while the allowance still had time in it")
+		t.Fatal("a lookup was refused while the allowance still had time in it")
 	}
-	defer spent2()
+	defer spent()
 	dl, _ := second.Deadline()
-	if left := time.Until(dl); left > 250*time.Millisecond {
-		t.Errorf("the second lookup may run for %v; only ~200ms of the 500ms allowance was left", left)
+	if got := time.Until(dl); got > left {
+		t.Errorf("the lookup may run for %v; only %v of the %v allowance was left", got, left, b.limit)
 	}
 }
 
@@ -326,21 +338,21 @@ func TestASpentAllowanceIsNotNegativeCached(t *testing.T) {
 	ctx, cancel := s.scrapeContext(context.Background(), 200*time.Millisecond, pipelineSummary)
 	defer cancel()
 
-	if p, answered := s.podMeta(ctx, "ns1", "pod1", nil); p != nil || answered {
+	if p, answered := s.podMeta(ctx, "ns1", "pod1", "", nil); p != nil || answered {
 		t.Fatalf("a hung lookup reported (%v, answered=%v), want (nil, false)", p, answered)
 	}
-	if _, ok := s.cacheGet("n\x00ns1/pod1"); ok {
+	if _, ok := s.cacheGet(podCacheKey("ns1", "pod1", "")); ok {
 		t.Error("a hung lookup was cached")
 	}
 	// The allowance is now spent, so the next call must not even ask.
 	before := meta.calls.Load()
-	if p, answered := s.podMeta(ctx, "ns2", "pod2", nil); p != nil || answered {
+	if p, answered := s.podMeta(ctx, "ns2", "pod2", "", nil); p != nil || answered {
 		t.Errorf("a lookup past the allowance reported (%v, answered=%v), want (nil, false)", p, answered)
 	}
 	if got := meta.calls.Load(); got != before {
 		t.Errorf("%d lookups were issued past the allowance, want none", got-before)
 	}
-	if _, ok := s.cacheGet("n\x00ns2/pod2"); ok {
+	if _, ok := s.cacheGet(podCacheKey("ns2", "pod2", "")); ok {
 		t.Error("an unissued lookup was cached")
 	}
 }

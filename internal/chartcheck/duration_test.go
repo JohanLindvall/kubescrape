@@ -5,16 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/docscheck"
 	"github.com/JohanLindvall/kubescrape/internal/manifestcheck"
 )
 
@@ -81,6 +80,12 @@ var featureFlags = []string{
 	"--set", "serviceGraph.tokenSecret.name=kubescrape-service-graph",
 }
 
+// renderFeatures renders the chart with featureFlags appended, so one render
+// holds every workload whose duration and byte-size flags sit behind an `if`.
+func renderFeatures(helm string, args ...string) ([]byte, error) {
+	return helmTemplate(helm, "monitoring", slices.Concat(args, featureFlags)...)
+}
+
 // TestDurationValuesAreSchemaGuarded is the DRIFT guard: it derives, from the
 // chart templates plus the generated flag docs, which values reach a
 // flag.Duration, and fails unless each one $refs the shared duration grammar
@@ -101,8 +106,8 @@ func TestDurationValuesAreSchemaGuarded(t *testing.T) {
 			continue
 		}
 		for _, p := range paths {
-			if strings.HasPrefix(p, unresolved) {
-				t.Errorf("-%s takes a duration from an expression this scan cannot read (%s); teach chartValuePaths about it rather than leaving the value unguarded", flag, strings.TrimPrefix(p, unresolved))
+			if after, ok := strings.CutPrefix(p, unresolved); ok {
+				t.Errorf("-%s takes a duration from an expression this scan cannot read (%s); teach chartValuePaths about it rather than leaving the value unguarded", flag, after)
 				continue
 			}
 			derived[p] = flag
@@ -169,13 +174,6 @@ func TestDurationValuesAreSchemaGuarded(t *testing.T) {
 // missing name rather than a passing render.
 func TestDurationValuesRejectWhatTheFlagCannotParse(t *testing.T) {
 	helm := helmBin(t)
-	template := func(args ...string) ([]byte, error) {
-		full := append([]string{"template", "kubescrape", "../../charts/kubescrape",
-			"--namespace", "monitoring"}, args...)
-		full = append(full, featureFlags...)
-		out, err := exec.Command(helm, full...).CombinedOutput()
-		return out, err
-	}
 
 	// Accepted: every path takes a DISTINCT duration in one render, so each
 	// one's flag can be checked individually — two paths share -otlp-timeout,
@@ -186,7 +184,7 @@ func TestDurationValuesRejectWhatTheFlagCannotParse(t *testing.T) {
 		set[v.path] = fmt.Sprintf("%dh30m", i+1)
 		args = append(args, "--set-string", v.path+"="+set[v.path])
 	}
-	out, err := template(args...)
+	out, err := renderFeatures(helm, args...)
 	if err != nil {
 		t.Fatalf("plain durations were refused: %v\n%s", err, out)
 	}
@@ -203,7 +201,7 @@ func TestDurationValuesRejectWhatTheFlagCannotParse(t *testing.T) {
 		for _, v := range durationValues {
 			a = append(a, "--set-string", v.path+"="+ok)
 		}
-		if out, err := template(a...); err != nil {
+		if out, err := renderFeatures(helm, a...); err != nil {
 			t.Errorf("--set-string <every duration>=%s was refused; it is a valid Go duration: %s", ok, out)
 		}
 	}
@@ -230,7 +228,7 @@ func TestDurationValuesRejectWhatTheFlagCannotParse(t *testing.T) {
 			a = append(a, bad.setFlag, v.path+"="+bad.value)
 			paths = append(paths, v.path)
 		}
-		out, err := template(a...)
+		out, err := renderFeatures(helm, a...)
 		if err == nil {
 			t.Errorf("%s <every duration>=%q rendered fine; the binary's duration parse would reject it at startup:\n%s", bad.setFlag, bad.value, out)
 			continue
@@ -252,7 +250,7 @@ func TestDurationValuesRejectWhatTheFlagCannotParse(t *testing.T) {
 		emptyArgs = append(emptyArgs, "--set-string", v.path+"=")
 		emptyPaths = append(emptyPaths, v.path)
 	}
-	out, err = template(emptyArgs...)
+	out, err = renderFeatures(helm, emptyArgs...)
 	if err == nil {
 		t.Errorf("an empty value rendered fine for every path; `-flag=` is `invalid duration \"\"`:\n%s", out)
 	} else {
@@ -266,7 +264,7 @@ func TestDurationValuesRejectWhatTheFlagCannotParse(t *testing.T) {
 		if !v.empty {
 			continue
 		}
-		out, err := template("--set-string", v.path+"=")
+		out, err := renderFeatures(helm, "--set-string", v.path+"=")
 		if err != nil {
 			t.Errorf("%s is `with`-guarded, so \"\" must stay legal: %v\n%s", v.path, err, out)
 		} else if bytes.Contains(out, []byte("- -"+v.flag+"=")) {
@@ -284,28 +282,22 @@ func TestDurationValuesRejectWhatTheFlagCannotParse(t *testing.T) {
 // the special-cased 0 parses without a unit.
 func TestDocumentedZeroRendersTheSameFlagEitherWay(t *testing.T) {
 	helm := helmBin(t)
-	template := func(args ...string) ([]byte, error) {
-		full := append([]string{"template", "kubescrape", "../../charts/kubescrape",
-			"--namespace", "monitoring"}, args...)
-		full = append(full, featureFlags...)
-		return exec.Command(helm, full...).CombinedOutput()
-	}
 	for _, v := range durationValues {
 		t.Run(v.path, func(t *testing.T) {
 			if !v.zeroNum {
 				// Not documented as zeroable: the number branch stays closed,
 				// so the refusal is a helm error and never a rendered pod.
-				out, err := template("--set", v.path+"=0")
+				out, err := renderFeatures(helm, "--set", v.path+"=0")
 				if err == nil {
 					t.Errorf("--set %s=0 rendered fine, but the schema types it as a duration string; either the row needs zeroNum or the schema drifted:\n%s", v.path, out)
 				}
 				return
 			}
-			num, err := template("--set", v.path+"=0")
+			num, err := renderFeatures(helm, "--set", v.path+"=0")
 			if err != nil {
 				t.Fatalf("--set %s=0 was refused, and values.yaml documents 0: %v\n%s", v.path, err, num)
 			}
-			str, err := template("--set-string", v.path+"=0")
+			str, err := renderFeatures(helm, "--set-string", v.path+"=0")
 			if err != nil {
 				t.Fatalf("--set-string %s=0 was refused: %v\n%s", v.path, err, str)
 			}
@@ -317,7 +309,7 @@ func TestDocumentedZeroRendersTheSameFlagEitherWay(t *testing.T) {
 				t.Errorf("--set %s=0 rendered no -%s=0 flag", v.path, v.flag)
 			}
 			// A bare non-zero number is not a duration in any spelling.
-			if out, err := template("--set", v.path+"=30"); err == nil {
+			if out, err := renderFeatures(helm, "--set", v.path+"=30"); err == nil {
 				t.Errorf("--set %s=30 rendered fine; -%s=30 is `invalid duration`:\n%s", v.path, v.flag, out)
 			}
 		})
@@ -371,19 +363,13 @@ func TestByteSizeValuesAreIntegerTyped(t *testing.T) {
 func TestByteSizeValuesRejectHumanFormats(t *testing.T) {
 	helm := helmBin(t)
 	paths := byteSizeValuePaths(t)
-	template := func(args ...string) ([]byte, error) {
-		full := append([]string{"template", "kubescrape", "../../charts/kubescrape",
-			"--namespace", "monitoring"}, args...)
-		full = append(full, featureFlags...)
-		return exec.Command(helm, full...).CombinedOutput()
-	}
 	for _, bad := range []string{"1GiB", "40Mi", "3MB"} {
 		for _, setFlag := range []string{"--set", "--set-string"} {
 			var a []string
 			for _, p := range paths {
 				a = append(a, setFlag, p+"="+bad)
 			}
-			out, err := template(a...)
+			out, err := renderFeatures(helm, a...)
 			if err == nil {
 				t.Errorf("%s <every byte size>=%s rendered fine; helm's int64 turns it into 0:\n%s", setFlag, bad, out)
 				continue
@@ -405,7 +391,7 @@ func TestByteSizeValuesRejectHumanFormats(t *testing.T) {
 	if err := os.WriteFile(file, []byte(values), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	out, err := template("-f", file)
+	out, err := renderFeatures(helm, "-f", file)
 	if err != nil {
 		t.Fatalf("byte sizes from a values file were refused: %v\n%s", err, out)
 	}
@@ -440,8 +426,8 @@ func byteSizeValuePaths(t *testing.T) []string {
 			continue
 		}
 		for _, p := range paths {
-			if strings.HasPrefix(p, unresolved) {
-				t.Errorf("-%s takes a byte size from an expression this scan cannot read (%s); teach chartValuePaths about it rather than leaving the value unguarded", flag, strings.TrimPrefix(p, unresolved))
+			if after, ok := strings.CutPrefix(p, unresolved); ok {
+				t.Errorf("-%s takes a byte size from an expression this scan cannot read (%s); teach chartValuePaths about it rather than leaving the value unguarded", flag, after)
 				continue
 			}
 			if !slices.Contains(out, p) {
@@ -469,26 +455,21 @@ func jsonPointer(path string) string {
 	return "/" + strings.ReplaceAll(path, ".", "/")
 }
 
-var docRow = regexp.MustCompile("^\\|\\s*`-([a-zA-Z0-9-]+)`\\s*\\|\\s*(?:`([^`]*)`|—)\\s*\\|")
-
 // durationFlagsFromDocs reads docs/FLAGS.md — GENERATED from each binary's
-// registered flag set, so its default column cannot drift from the code — and
-// returns the flags whose default is a Go duration. time.Duration.String()
+// registered flag set, so its default column cannot drift from the code, and
+// read back through docscheck.ParseFlagTable, the inverse of the renderer that
+// wrote it — and returns the flags whose default is a Go duration. time.Duration.String()
 // always emits a unit ("0s", never "0"), which is what separates a
 // flag.Duration from a flag.Int whose default happens to be 0.
 func durationFlagsFromDocs(t *testing.T) map[string]bool {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join("..", "..", "docs", "FLAGS.md"))
+	b, err := os.ReadFile(flagsDocPath)
 	if err != nil {
 		t.Fatalf("reading the generated flag docs: %v", err)
 	}
 	out := map[string]bool{}
-	for _, line := range strings.Split(string(b), "\n") {
-		m := docRow.FindStringSubmatch(line)
-		if m == nil {
-			continue
-		}
-		def := m[2]
+	for _, row := range docscheck.ParseFlagTable(string(b)) {
+		def := row.Default
 		if def == "" {
 			continue
 		}
@@ -498,12 +479,47 @@ func durationFlagsFromDocs(t *testing.T) map[string]bool {
 		if _, err := time.ParseDuration(def); err != nil {
 			continue
 		}
-		out[m[1]] = true
+		out[row.Name] = true
 	}
 	if len(out) == 0 {
 		t.Fatal("docs/FLAGS.md yielded no duration flags; the table format changed and this parse needs updating")
 	}
 	return out
+}
+
+// flagsDocPath is the generated flag reference both readers below parse.
+var flagsDocPath = filepath.Join("..", "..", "docs", "FLAGS.md")
+
+// flagDefaultFromDocs returns a flag's default as docs/FLAGS.md states it —
+// GENERATED from the registered flag sets and held current by each binary's
+// TestFlagsDocIsCurrent, so a changed default in main.go reaches every guard
+// reading it here, where a hand-copied literal would go on asserting the old
+// one. It fails the test when the flag has no row or no default, or when the
+// two binaries document the same flag with different defaults (the question
+// "what is its default" then has no single answer).
+func flagDefaultFromDocs(t *testing.T, flag string) string {
+	t.Helper()
+	b, err := os.ReadFile(flagsDocPath)
+	if err != nil {
+		t.Fatalf("reading the generated flag docs: %v", err)
+	}
+	def, found := "", false
+	for _, row := range docscheck.ParseFlagTable(string(b)) {
+		if row.Name != flag {
+			continue
+		}
+		if found && row.Default != def {
+			t.Fatalf("docs/FLAGS.md documents -%s twice with different defaults (%q and %q)", flag, def, row.Default)
+		}
+		def, found = row.Default, true
+	}
+	if !found {
+		t.Fatalf("docs/FLAGS.md has no row for -%s; the flag was renamed or removed, or the table format changed", flag)
+	}
+	if def == "" {
+		t.Fatalf("docs/FLAGS.md documents -%s with no default", flag)
+	}
+	return def
 }
 
 // unresolved prefixes a "path" the template scan could not read back to a
@@ -513,7 +529,6 @@ const unresolved = "?"
 var (
 	tplAction       = regexp.MustCompile(`\{\{-?\s*(.*?)\s*-?\}\}`)
 	tplAssign       = regexp.MustCompile(`^\$(\w+)\s*:=\s*(\S+)$`)
-	tplArg          = regexp.MustCompile(`^\s*- -([a-z0-9-]+)=(.*)$`)
 	tplCommentStart = regexp.MustCompile(`\{\{-?\s*/\*`)
 	tplCommentEnd   = regexp.MustCompile(`\*/\s*-?\}\}`)
 )
@@ -525,14 +540,43 @@ var (
 // template shape it cannot follow fails the caller instead of silently
 // yielding a smaller set (a guard that quietly degrades to "pass" is worse
 // than no guard: the green check is read as coverage).
+//
+// That contract covers the ARGUMENT's shape as well as the expression's. An
+// argument is read in either dash spelling and quoted or not (`- -a=…`,
+// `- --a=…`, `- "-a=…"`: YAML strips the quotes and Go's flag package takes
+// both dashes, so each passes the flag) — through manifestcheck.ArgEntry, the
+// grammar internal/manifestcheck reads the same templates with, so the two
+// scans cannot disagree about which lines pass a flag. A value that is exactly ONE template
+// action is resolved; a value that CONTAINS a template action but is not one —
+// `-a={{ .Values.a }}s`, `-a="{{ .Values.a }}"` (quotes inside the value reach
+// the flag verbatim) — is recorded as unresolved rather than skipped, and the
+// guards decide whether that flag was one they had to see. A literal value
+// with no action feeds from no values path and records nothing.
 func chartValuePaths(t *testing.T) map[string][]string {
+	t.Helper()
+	return chartValuePathsIn(t, filepath.Join(chartDir, "templates"))
+}
+
+// chartValuePathsIn is chartValuePaths over an arbitrary templates directory,
+// which is what lets its test feed it the shapes the shipped chart does not
+// (yet) contain.
+func chartValuePathsIn(t *testing.T, dir string) map[string][]string {
 	t.Helper()
 	// Walked, not globbed — see manifestcheck.ManifestFiles: helm renders a
 	// template in a subdirectory like a flat one, and a value path this guard
 	// never reads is a value path nothing checks.
-	files, err := manifestcheck.ManifestFiles(filepath.Join("..", "..", "charts", "kubescrape", "templates"))
+	files, err := manifestcheck.ManifestFiles(dir)
 	if err != nil || len(files) == 0 {
 		t.Fatalf("no chart templates found (err=%v)", err)
+	}
+	// A block of flags a template takes from a _helpers.tpl define is read
+	// where it is included, through the same expansion manifestcheck's flag
+	// check reads it with: the three agent-binary workloads' -otlp-* block
+	// lives there, and a scan of the bare template would see an include line
+	// and derive nothing.
+	helpers, err := manifestcheck.Helpers(dir)
+	if err != nil {
+		t.Fatal(err)
 	}
 	out := map[string][]string{}
 	for _, f := range files {
@@ -540,10 +584,15 @@ func chartValuePaths(t *testing.T) map[string][]string {
 		if err != nil {
 			t.Fatal(err)
 		}
+		lines, err := manifestcheck.ExpandIncludes(f, string(b), helpers)
+		if err != nil {
+			t.Fatal(err)
+		}
 		aliases := map[string]string{}
 		var withStack []string // "" for if/range, the resolved path for with
 		inComment := false
-		for n, line := range strings.Split(string(b), "\n") {
+		for _, ln := range lines {
+			line := ln.Text
 			if inComment {
 				if tplCommentEnd.MatchString(line) {
 					inComment = false
@@ -557,9 +606,22 @@ func chartValuePaths(t *testing.T) map[string][]string {
 				inComment = true
 				continue
 			}
-			if m := tplArg.FindStringSubmatch(line); m != nil {
-				flag, expr := m[1], strings.TrimSpace(m[2])
-				if inner := tplAction.FindStringSubmatch(expr); inner != nil && inner[0] == expr {
+			// A live entry only: a commented-out one passes nothing. ArgEntry
+			// has already dropped a quoted list item's closing quote, which is
+			// YAML's, not the value's.
+			if flag, expr, commented, ok := manifestcheck.ArgEntry(line); ok && !commented {
+				unreadable := func() {
+					path := unresolved + ln.Where
+					if !slices.Contains(out[flag], path) {
+						out[flag] = append(out[flag], path)
+					}
+				}
+				if inner := tplAction.FindStringSubmatch(expr); inner != nil && inner[0] != expr {
+					// A value BUILT from an action — a suffix, a prefix, quotes
+					// that reach the flag, two actions — is not a values path
+					// this scan can name. Recorded, not skipped: see below.
+					unreadable()
+				} else if inner != nil {
 					// The VALUE is the action's last argument: `.Values.a.b`,
 					// `int64 $.Values.a.b`, `$sg.b`, or the `.` of the
 					// enclosing `with` (`int64 .`, `include "…" .`).
@@ -567,9 +629,9 @@ func chartValuePaths(t *testing.T) map[string][]string {
 					last := strings.TrimRight(fields[len(fields)-1], ")")
 					path, ok := "", false
 					if last == "." {
-						for i := len(withStack) - 1; i >= 0; i-- {
-							if withStack[i] != "" {
-								path, ok = withStack[i], true
+						for _, w := range slices.Backward(withStack) {
+							if w != "" {
+								path, ok = w, true
 								break
 							}
 						}
@@ -581,9 +643,8 @@ func chartValuePaths(t *testing.T) map[string][]string {
 						// this flag was one it had to see. Silently skipping
 						// what the scan cannot read is how a green check comes
 						// to mean nothing.
-						path = unresolved + filepath.Base(f) + ":" + strconv.Itoa(n+1)
-					}
-					if !slices.Contains(out[flag], path) {
+						unreadable()
+					} else if !slices.Contains(out[flag], path) {
 						out[flag] = append(out[flag], path)
 					}
 				}
@@ -593,7 +654,7 @@ func chartValuePaths(t *testing.T) map[string][]string {
 				switch {
 				case body == "end":
 					if len(withStack) == 0 {
-						t.Fatalf("%s:%d: unbalanced {{ end }}; this scan no longer understands the templates", f, n+1)
+						t.Fatalf("%s: unbalanced {{ end }}; this scan no longer understands the templates", ln.Where)
 					}
 					withStack = withStack[:len(withStack)-1]
 				case strings.HasPrefix(body, "with "):
@@ -614,6 +675,79 @@ func chartValuePaths(t *testing.T) map[string][]string {
 		}
 	}
 	return out
+}
+
+// chartValuePaths must hand its guards every argument that takes its value from
+// the chart, in every shape the argument can be written — or say it could not
+// read one. Only the bare `- -a={{ one action }}` shape was recognised: a GNU
+// spelling or a quoted list item yielded no entry at all, and a value BUILT
+// from an action (a unit suffix, quotes that reach the flag) was skipped
+// without a record, so a duration or byte-size value written that way would
+// have left both guards green while never reading it. None of the shipped
+// templates carries such a duration or byte value today; this is what keeps
+// the first one from being invisible.
+func TestChartValuePathsReadsEveryArgumentShape(t *testing.T) {
+	dir := t.TempDir()
+	const tpl = `spec:
+  containers:
+    - args:
+        - -plain={{ .Values.a.plain }}
+        - --gnu={{ .Values.a.gnu }}
+        - "-dquoted={{ .Values.a.dquoted }}"
+        - '--squoted={{ .Values.a.squoted }}'
+        - -suffixed={{ .Values.a.suffixed }}s
+        - -quoted-value="{{ .Values.a.quotedValue }}"
+        - -literal=30s
+        #- -commented={{ .Values.a.commented }}
+        - -bare-flag
+        {{- include "t.args" . }}
+`
+	// A block of args a template takes from a helper is read where it is
+	// included, and an unreadable value in it is reported at the HELPER's
+	// line, which is the text to edit.
+	const helpers = `{{- define "t.args" }}
+        - -helped={{ .Values.a.helped }}
+        {{- with .Values.a.withHelped }}
+        - -with-helped={{ int64 . }}
+        {{- end }}
+        - -helped-built={{ .Values.a.built }}s
+{{- end }}
+`
+	for name, text := range map[string]string{"a.yaml": tpl, "_helpers.tpl": helpers} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := chartValuePathsIn(t, dir)
+	want := map[string][]string{
+		"plain":   {"a.plain"},
+		"gnu":     {"a.gnu"},
+		"dquoted": {"a.dquoted"},
+		"squoted": {"a.squoted"},
+		// Line numbers are 1-based, counted in the fixtures above.
+		"suffixed":     {unresolved + "a.yaml:8"},
+		"quoted-value": {unresolved + "a.yaml:9"},
+		"helped":       {"a.helped"},
+		"with-helped":  {"a.withHelped"},
+		"helped-built": {unresolved + "_helpers.tpl:6"},
+	}
+	for flag, paths := range want {
+		if !slices.Equal(got[flag], paths) {
+			t.Errorf("-%s: chartValuePaths = %q, want %q", flag, got[flag], paths)
+		}
+	}
+	if p, ok := got["literal"]; ok {
+		t.Errorf("-literal carries no template action, so no values path feeds it; got %q", p)
+	}
+	// A commented-out entry passes nothing, and a bare flag has no value.
+	for _, flag := range []string{"commented", "bare-flag"} {
+		if p, ok := got[flag]; ok {
+			t.Errorf("-%s passes no value from the chart; got %q", flag, p)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("chartValuePaths = %v, want exactly the flags %v", got, want)
+	}
 }
 
 // resolveValuePath turns a template expression into a dotted values path.
@@ -640,7 +774,7 @@ func resolveValuePath(expr string, aliases map[string]string) (string, bool) {
 
 func readSchema(t *testing.T) map[string]any {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join("..", "..", "charts", "kubescrape", "values.schema.json"))
+	b, err := os.ReadFile(filepath.Join(chartDir, "values.schema.json"))
 	if err != nil {
 		t.Fatalf("reading values.schema.json: %v", err)
 	}
@@ -655,7 +789,7 @@ func readSchema(t *testing.T) map[string]any {
 func schemaNode(t *testing.T, schema map[string]any, path string) map[string]any {
 	t.Helper()
 	node := schema
-	for _, part := range strings.Split(path, ".") {
+	for part := range strings.SplitSeq(path, ".") {
 		props, _ := node["properties"].(map[string]any)
 		next, ok := props[part].(map[string]any)
 		if !ok {

@@ -111,12 +111,12 @@ spec:
   ports:
     {{- with $sg.ingest.grpcEndpoint }}
     - name: otlp-grpc
-      port: {{ int (split ":" .)._1 }}
+      port: {{ include "kubescrape.port" . | int }}
       targetPort: otlp-grpc
     {{- end }}
     {{- with $sg.ingest.httpEndpoint }}
     - name: otlp-http
-      port: {{ int (split ":" .)._1 }}
+      port: {{ include "kubescrape.port" . | int }}
       targetPort: otlp-http
     {{- end }}
 {{- end }}
@@ -133,12 +133,16 @@ spec:
   # The governing headless Service above. Without it the pods get no stable
   # DNS names and the ring addresses nothing.
   serviceName: {{ .Release.Name }}-servicegraph
-  # This number IS part of the ring definition: the agents are told the same
-  # count (-service-graph-shards) and derive shard names from it. Scaling the
-  # tier means a `helm upgrade`, not a `kubectl scale` — an agent addressing
-  # the old width keeps working (it simply never uses the new shards), but a
-  # count LARGER than the StatefulSet's addresses pods that do not exist and
-  # their traces are never paired.
+  # This number IS part of the ring definition: every SHARD is passed the same
+  # count (-service-graph-shards, rendered below from this one value) and
+  # derives the shard names from it; the DaemonSet agents take no part in the
+  # ring. Scaling the tier means a `helm upgrade`, never a `kubectl scale`: a
+  # shard added by hand still takes pushes as an entry shard but no ring names
+  # it, so it never owns a trace; and a ring naming a pod that does not exist
+  # (a scale-down by hand) FAILS every push whose trace hashes there — the
+  # entry shard holds the only copy of those spans, so the sender is told to
+  # retry rather than that they landed, and the retry hashes to the same
+  # missing owner.
   replicas: {{ int64 $sg.replicas }}
   # Shards are independent — nothing about pairing is ordered — and ordered
   # startup would delay the last shard's traces for no benefit.
@@ -156,7 +160,7 @@ spec:
         {{- end }}
         {{- if and .Values.metrics.enabled .Values.metrics.scrapeAnnotations }}
         prometheus.io/scrape: "true"
-        prometheus.io/port: {{ (split ":" .Values.metrics.listen)._1 | quote }}
+        prometheus.io/port: {{ include "kubescrape.port" .Values.metrics.listen | quote }}
         prometheus.io/path: /metrics
         {{- end }}
     spec:
@@ -181,20 +185,9 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- /* Pod-level seccomp. Kubernetes' own default is Unconfined, which is
-             LOOSER than what a plain `docker run` gets, and PodSecurity's
-             `restricted` profile rejects a pod without RuntimeDefault outright
-             — so on a namespace labelled restricted these pods used to fail
-             ADMISSION, which on a first install looks like the chart being
-             broken. Set `seccompProfile: null` to omit the field entirely —
-             NOT `{}`, which cannot work: helm COALESCES a user map onto the
-             chart's default map, so an empty one arrives here as the default
-             `{type: RuntimeDefault}` and renders. Only an explicit null
-             removes the key. */}}
-      {{- with .Values.seccompProfile }}
-      securityContext:
-        seccompProfile:
-          {{- toYaml . | nindent 10 }}
+      {{- /* Pod-level seccomp: see kubescrape.podSecurityContext. */}}
+      {{- if .Values.seccompProfile }}
+      {{- include "kubescrape.podSecurityContext" . | nindent 6 }}
       {{- end }}
       containers:
         - name: servicegraph
@@ -224,14 +217,14 @@ spec:
             - -self-metrics-interval={{ .Values.agent.selfMetricsInterval }}
             - -service-graph
             - -service-graph-listen=:{{ $port }}
-            {{- if $sg.tokenSecret.name }}
+            {{- /* Unconditional: the fail() at the top refuses to render
+                   without serviceGraph.tokenSecret.name. */}}
             # The INTERNAL receiver is reachable from every pod in the cluster,
             # and what it accepts is treated as final — already enriched,
             # already routed — so the hop is authenticated. Re-read
             # periodically, so rotating the Secret needs no restart. Without it
             # the binary refuses to open the listener.
             - -service-graph-token-file={{ $tokenPath }}
-            {{- end }}
             {{- if $sg.ingest.enabled }}
             # The APPLICATION-facing listeners, behind the ClusterIP Service
             # above. Unauthenticated by design; scope them with the
@@ -240,17 +233,10 @@ spec:
             - -service-graph-ingest-grpc={{ $sg.ingest.grpcEndpoint }}
             - -service-graph-ingest-http={{ $sg.ingest.httpEndpoint }}
             - -ingest-peer-ip-fallback={{ $sg.ingest.peerIpFallback }}
-            {{- with .Values.agent.ingest.containerIdKeys }}
-            - -ingest-container-id-keys={{ join "," . }}
-            {{- end }}
-            {{- with .Values.agent.ingest.podUidKeys }}
-            - -ingest-pod-uid-keys={{ join "," . }}
-            {{- end }}
-            {{- with .Values.agent.ingest.grpcMaxRecvBytes }}
-            {{- /* Trace pushes are the largest payloads a fleet sends, so a
-                   raised message cap matters on these ports first. */}}
-            - -ingest-grpc-max-recv-bytes={{ int64 . }}
-            {{- end }}
+            {{- /* The lookup keys and the message cap come from agent.ingest,
+                   as on the DaemonSet. Trace pushes are the largest payloads a
+                   fleet sends, so a raised cap matters on these ports first. */}}
+            {{- include "kubescrape.ingestKeyArgs" . }}
             {{- else }}
             - -service-graph-ingest=false
             {{- end }}
@@ -269,29 +255,9 @@ spec:
             - -ingest-span-metrics
             - -ingest-span-metrics-interval={{ $sg.spanMetricsInterval }}
             {{- end }}
-            - -otlp-endpoint={{ .Values.agent.otlp.endpoint }}
-            - -otlp-protocol={{ .Values.agent.otlp.protocol }}
-            - -otlp-compression={{ .Values.agent.otlp.compression }}
-            - -otlp-compression-level={{ int64 .Values.agent.otlp.compressionLevel }}
-            - -otlp-insecure={{ .Values.agent.otlp.insecure }}
-            - -otlp-tls-insecure-skip-verify={{ .Values.agent.otlp.tlsInsecureSkipVerify }}
-            {{- with .Values.agent.otlp.caFile }}
-            - -otlp-tls-ca-file={{ . }}
-            {{- end }}
-            - -otlp-timeout={{ .Values.agent.otlp.timeout }}
-            {{- /* Rendered here too: all three workloads take their exporter
-                   from the single agent.otlp block, and these were on the
-                   DaemonSet alone. maxSendBytes matters most on this one — the
-                   tier exports span metrics and service-graph edges, whose
-                   payloads grow with cardinality. */}}
-            - -otlp-retry-attempts={{ .Values.agent.otlp.retryAttempts }}
-            - -otlp-retry-backoff={{ .Values.agent.otlp.retryBackoff }}
-            {{- with .Values.agent.otlp.maxSendBytes }}
-            - -otlp-max-send-bytes={{ int64 . }}
-            {{- end }}
-            {{- if .Values.agent.otlp.bearerTokenSecret.name }}
-            - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.agent.otlp.bearerTokenSecret.key }}
-            {{- end }}
+            {{- /* The whole agent.otlp block, as on the other two agent-binary
+                   workloads (see the argument-block helpers). */}}
+            {{- include "kubescrape.agentOtlpArgs" . }}
             {{- if $cfg }}
             # The same rendered agent config as the DaemonSet. Its
             # `serviceGraph` (wait / maxItems / maxCardinality / staleAfter /
@@ -328,38 +294,32 @@ spec:
             - name: POD_NAME
               valueFrom:
                 fieldRef: {fieldPath: metadata.name}
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65532
-            capabilities:
-              drop: ["ALL"]
+          {{- include "kubescrape.nonRootSecurityContext" . | nindent 10 }}
           ports:
             - name: http
-              containerPort: {{ (split ":" .Values.agent.listen)._1 | int }}
+              containerPort: {{ include "kubescrape.port" .Values.agent.listen | int }}
             {{- if .Values.metrics.enabled }}
             - name: metrics
-              containerPort: {{ (split ":" .Values.metrics.listen)._1 | int }}
+              containerPort: {{ include "kubescrape.port" .Values.metrics.listen | int }}
             {{- end }}
             - name: service-graph
               containerPort: {{ $port }}
             {{- if $sg.ingest.enabled }}
             {{- with $sg.ingest.grpcEndpoint }}
             - name: otlp-grpc
-              containerPort: {{ int (split ":" .)._1 }}
+              containerPort: {{ include "kubescrape.port" . | int }}
             {{- end }}
             {{- with $sg.ingest.httpEndpoint }}
             - name: otlp-http
-              containerPort: {{ int (split ":" .)._1 }}
+              containerPort: {{ include "kubescrape.port" . | int }}
             {{- end }}
             {{- end }}
           readinessProbe:
             httpGet: {path: /readyz, port: http}
           livenessProbe:
             httpGet: {path: /healthz, port: http}
-          {{- $anyVolume := or $cfg .Values.agent.otlp.bearerTokenSecret.name $sg.tokenSecret.name $sg.extraVolumes .Values.agent.debug.tokenSecret.name }}
-          {{- if $anyVolume }}
+          {{- /* Never empty: the token mount is unconditional (the fail() at
+                 the top makes serviceGraph.tokenSecret.name mandatory). */}}
           volumeMounts:
             {{- if $cfg }}
             - name: config
@@ -371,11 +331,9 @@ spec:
               mountPath: /etc/kubescrape/otlp-token
               readOnly: true
             {{- end }}
-            {{- if $sg.tokenSecret.name }}
             - name: service-graph-token
               mountPath: /etc/kubescrape/service-graph
               readOnly: true
-            {{- end }}
             {{- if .Values.agent.debug.tokenSecret.name }}
             - name: debug-token
               mountPath: /etc/kubescrape/debug
@@ -384,9 +342,7 @@ spec:
             {{- with $sg.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- end }}
           resources: {{ toYaml $sg.resources | nindent 12 }}
-      {{- if $anyVolume }}
       volumes:
         {{- if $cfg }}
         - name: config
@@ -398,11 +354,9 @@ spec:
           secret:
             secretName: {{ .Values.agent.otlp.bearerTokenSecret.name }}
         {{- end }}
-        {{- if $sg.tokenSecret.name }}
         - name: service-graph-token
           secret:
             secretName: {{ $sg.tokenSecret.name }}
-        {{- end }}
         {{- if .Values.agent.debug.tokenSecret.name }}
         - name: debug-token
           secret:
@@ -411,7 +365,6 @@ spec:
         {{- with $sg.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- end }}
 {{- if $sg.podDisruptionBudget.enabled }}
 ---
 # The tier is a hard cluster-wide dependency for traces: there is no per-node
@@ -468,7 +421,7 @@ spec:
     #    token, everything else refused and counted. agent.debug.allowFrom
     #    narrows the port; read its comment first, since the probes share it.
     - ports:
-        - port: {{ (split ":" .Values.agent.listen)._1 | int }}
+        - port: {{ include "kubescrape.port" .Values.agent.listen | int }}
       {{- with .Values.agent.debug.allowFrom }}
       from:
         {{- toYaml . | nindent 8 }}
@@ -479,7 +432,7 @@ spec:
     #    shard's own counters, not span contents. Undeclared ports (pprof, which
     #    exposes goroutine stacks and heap contents) stay closed on every rule.
     - ports:
-        - port: {{ (split ":" .Values.metrics.listen)._1 | int }}
+        - port: {{ include "kubescrape.port" .Values.metrics.listen | int }}
     {{- end }}
     # 3. The INTERNAL receiver. Its only legitimate clients are the sibling
     #    shards, so it is scoped to this tier's own pods REGARDLESS of
@@ -500,19 +453,28 @@ spec:
     #
     # WHAT THEY EXPOSE, stated plainly: any pod that can reach them can push
     # arbitrary OTLP spans into this cluster's traces, with no credential.
-    # Enrichment stamps the SENDER's Kubernetes identity where it can resolve
-    # one, so a forged span is attributable to the pod that sent it rather than
-    # to whatever it claims — but a sender can still emit spans naming any
-    # service.name it likes, and the cost of the volume it pushes is the tier's
-    # and the collector's. That is the same bargain every unauthenticated OTLP
-    # collector in a cluster makes; narrow it with allowFrom if the pod network
-    # is not trusted. EMPTY MEANS ANY POD MAY PUSH TRACES.
+    # Enrichment resolves the container.id / k8s.pod.uid the SENDER supplies
+    # (agent.ingest.containerIdKeys / podUidKeys, which this tier shares) and
+    # stamps whatever pod that id names; nothing on an unauthenticated port can
+    # check that the id is the sender's own. So a pod presenting ANOTHER pod's
+    # id — which the metadata service's /v1/pods route hands to any caller —
+    # has its spans attributed as that pod, and with `routing` configured
+    # delivered to that pod's tenant endpoint and X-Scope-OrgID
+    # (docs/CONFIGURATION.md, "Accepted security residuals" #1). The
+    # source-address fallback (serviceGraph.ingest.peerIpFallback) is off by
+    # default and only ever applies to a resource carrying no id. A sender can
+    # also name any service.name it likes, and the cost of the volume it pushes
+    # is the tier's and the collector's. That is the same bargain every
+    # unauthenticated OTLP collector in a cluster makes; narrow it with
+    # allowFrom if the pod network is not trusted, and treat it as the lever
+    # that bounds tenant crossings wherever `routing` separates tenants.
+    # EMPTY MEANS ANY POD MAY PUSH TRACES.
     - ports:
         {{- with $sg.ingest.grpcEndpoint }}
-        - port: {{ int (split ":" .)._1 }}
+        - port: {{ include "kubescrape.port" . | int }}
         {{- end }}
         {{- with $sg.ingest.httpEndpoint }}
-        - port: {{ int (split ":" .)._1 }}
+        - port: {{ include "kubescrape.port" . | int }}
         {{- end }}
       {{- with $sg.ingest.allowFrom }}
       from:

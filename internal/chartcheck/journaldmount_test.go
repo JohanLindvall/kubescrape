@@ -1,7 +1,6 @@
 package chartcheck
 
 import (
-	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
@@ -32,8 +31,7 @@ var machineIDHostPath = regexp.MustCompile(`(?m)^\s*path: /etc/machine-id\n\s*ty
 func TestJournaldMountsCoverBothJournalLayouts(t *testing.T) {
 	helm := helmBin(t)
 
-	off, err := exec.Command(helm, "template", "kubescrape", "../../charts/kubescrape",
-		"--namespace", "monitoring").CombinedOutput()
+	off, err := helmTemplate(helm, "monitoring")
 	if err != nil {
 		t.Fatalf("helm template failed: %v\n%s", err, off)
 	}
@@ -41,8 +39,7 @@ func TestJournaldMountsCoverBothJournalLayouts(t *testing.T) {
 		t.Error("the machine-id mount renders with agent.journald.enabled unset; it exists for the journal reader and nothing else")
 	}
 
-	on, err := exec.Command(helm, "template", "kubescrape", "../../charts/kubescrape",
-		"--namespace", "monitoring", "--set", "agent.journald.enabled=true").CombinedOutput()
+	on, err := helmTemplate(helm, "monitoring", "--set", "agent.journald.enabled=true")
 	if err != nil {
 		t.Fatalf("helm template with journald failed: %v\n%s", err, on)
 	}

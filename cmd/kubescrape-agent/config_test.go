@@ -65,7 +65,7 @@ func TestSummaryPrintsEveryDeclaredSection(t *testing.T) {
 
 	var buf bytes.Buffer
 	printConfigSummary(cfg, slog.New(slog.NewTextHandler(&buf, nil)))
-	for _, name := range strings.Split(configSections(), ", ") {
+	for name := range strings.SplitSeq(configSections(), ", ") {
 		if !strings.Contains(buf.String(), name) {
 			t.Errorf("section %q is declared but missing from the -check-config summary:\n%s", name, buf.String())
 		}

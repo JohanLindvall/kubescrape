@@ -1,16 +1,85 @@
-// Tests for file identity (ledger.go): fingerprints and checkpoint
-// identity guards.
+// Tests for file identity (fingerprint.go, ledger.go): fingerprints and
+// checkpoint identity guards.
 package tailer
 
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
+
+// computeFingerprint hashes through a fixed stack buffer in pieces. FNV-1a
+// streams, so the result must be bit-identical to hashing the whole head at
+// once — a persisted fingerprint from before the change (or a head longer than
+// one chunk) must still match, or every restart would read every file as
+// replaced.
+func TestFingerprintIsTheWholeHeadHashAcrossChunks(t *testing.T) {
+	content := make([]byte, 3*fingerprintChunk+123)
+	for i := range content {
+		content[i] = byte(i*7 + i/251)
+	}
+	path := filepath.Join(t.TempDir(), "head")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fh, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = fh.Close() }()
+	for _, n := range []int64{1, 1024, fingerprintChunk - 1, fingerprintChunk, fingerprintChunk + 1,
+		2*fingerprintChunk + 17, int64(len(content)), int64(len(content)) + 5000} {
+		fp, err := computeFingerprint(fh, n)
+		if err != nil {
+			t.Fatalf("n=%d: %v", n, err)
+		}
+		head := content[:min(n, int64(len(content)))]
+		h := fnv.New64a()
+		_, _ = h.Write(head)
+		if want := (fingerprint{Len: int64(len(head)), Hash: h.Sum64()}); fp != want {
+			t.Errorf("n=%d: fingerprint = %+v, want the whole-head hash %+v", n, fp, want)
+		}
+		if !fp.matches(fh) {
+			t.Errorf("n=%d: a fingerprint does not match the file it was taken from", n)
+		}
+	}
+}
+
+// The copytruncate re-verify calls fp.matches on every read of every active
+// file (readFile's pre-read check, whenever the mtime moved). It used to
+// allocate its whole -logs-fingerprint-bytes buffer per call.
+func TestFingerprintMatchesIsAllocationFree(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	path := filepath.Join(t.TempDir(), "head")
+	if err := os.WriteFile(path, make([]byte, 8192), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fh, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = fh.Close() }()
+	fp, err := computeFingerprint(fh, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		if !fp.matches(fh) {
+			t.Fatal("fingerprint does not match its own file")
+		}
+	}); allocs != 0 {
+		t.Fatalf("fp.matches allocates %v times per call, want 0", allocs)
+	}
+}
 
 func TestFingerprintGuardsCheckpointResume(t *testing.T) {
 	dir := t.TempDir()
@@ -124,7 +193,7 @@ func TestCheckpointFingerprintKeepsCopyTruncateGuard(t *testing.T) {
 	// A checkpoint lands before the next sweep (housekeeping's own ticker).
 	tl.saveCheckpoints()
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
 	}
@@ -364,7 +433,7 @@ func TestCarriedFragmentSurvivesARewindAfterRotation(t *testing.T) {
 	exp.fail = 3
 	tl.flush(ctx)
 
-	for i := 0; i < 6; i++ {
+	for range 6 {
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
 	}

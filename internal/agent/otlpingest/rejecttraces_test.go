@@ -155,7 +155,7 @@ func TestRejectTracesRefusesBeforeEnrichmentGRPC(t *testing.T) {
 	send := func(t *testing.T, td ptrace.Traces) error {
 		t.Helper()
 		var lastErr error
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			_, lastErr = client.Export(context.Background(), ptraceotlp.NewExportRequestFromTraces(td))
 			if status.Code(lastErr) != codes.Unavailable {
 				return lastErr // the listener is up; this is the server's answer

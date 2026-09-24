@@ -12,10 +12,10 @@ import (
 // GET /debug/targets for "which targets exist and which are failing, why" —
 // the human-readable counterpart of the health metrics.
 type TargetStatus struct {
-	Pipeline  string `json:"pipeline"` // targets | cadvisor | node
+	Pipeline  string `json:"pipeline"` // targets | cadvisor | node | summary (the pipeline* consts)
 	URL       string `json:"url"`
-	Source    string `json:"source,omitempty"`  // pod | service | servicemonitor (annotation targets)
-	Monitor   string `json:"monitor,omitempty"` // ns/name of the ServiceMonitor
+	Source    string `json:"source,omitempty"`  // pod | service | servicemonitor | podmonitor (discovered targets)
+	Monitor   string `json:"monitor,omitempty"` // ns/name of the ServiceMonitor or PodMonitor
 	Namespace string `json:"namespace,omitempty"`
 	Pod       string `json:"pod,omitempty"`
 	Up        bool   `json:"up"`
@@ -95,7 +95,7 @@ func (s *Scraper) publishStatus(outcomes []scrapeOutcome, targets []kubemeta.Scr
 	// Current-but-not-scraped-this-cycle targets: last outcome, or Pending.
 	for i := range targets {
 		t := &targets[i]
-		k := key("targets", scheduleKey(*t))
+		k := key(pipelineTargets, scheduleKey(*t))
 		if seen[k] {
 			continue
 		}
@@ -105,7 +105,7 @@ func (s *Scraper) publishStatus(outcomes []scrapeOutcome, targets []kubemeta.Scr
 			continue
 		}
 		st.Targets = append(st.Targets, TargetStatus{
-			Pipeline:  "targets",
+			Pipeline:  pipelineTargets,
 			URL:       t.URL,
 			Source:    t.Source,
 			Monitor:   t.Monitor,
@@ -124,7 +124,7 @@ func (s *Scraper) publishStatus(outcomes []scrapeOutcome, targets []kubemeta.Scr
 		if seen[k] {
 			continue
 		}
-		if ts.Pipeline != "targets" || !targetsOK {
+		if ts.Pipeline != pipelineTargets || !targetsOK {
 			st.Targets = append(st.Targets, ts)
 		}
 	}

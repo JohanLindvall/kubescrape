@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -72,6 +73,64 @@ func TestGoneFileMidDrainExportFailureDoesNotSettle(t *testing.T) {
 		if k := fmt.Sprintf("%04d", i); !seen[k] {
 			t.Fatalf("line %s of %d was never exported: the gone drain settled after a mid-drain export failure "+
 				"with bytes still behind its fd", k, lines)
+		}
+	}
+}
+
+// K pods deleted during a collector outage must not cost K export cycles per
+// sweep. The gone branch used to flush once PER FILE, so each vanished file
+// paid a whole exportWithRetry budget (three attempts plus backoff, or three
+// export timeouts against a blackholed collector) on the single sweep
+// goroutine, every sweep — each failure rewinds the gone fd and the next sweep
+// re-drains and re-fails — with no other file read and no rotation observed
+// for the duration.
+func TestGoneFilesShareOneFlushPerSweep(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	const pods = 5
+	ts := timeNowCRI()
+	paths := make([]string, pods)
+	for i := range paths {
+		paths[i] = filepath.Join(dir, fmt.Sprintf("pod%d_ns1_app-%016x.log", i, i+1))
+		writeLines(t, paths[i], ts+" stdout F first")
+	}
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true) // every fd is held from here on
+	tl.flush(ctx)
+	if len(tl.files) != pods {
+		t.Fatalf("setup: %d files tracked, want %d", len(tl.files), pods)
+	}
+	for i, p := range paths {
+		writeLines(t, p, fmt.Sprintf("%s stdout F last-%d", ts, i))
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tl.scanDir(nil, false) // proves absence: every file is gone
+
+	exp.mu.Lock()
+	exp.fail = 1 << 20 // the collector is down for the whole sweep
+	before := exp.attempts
+	exp.mu.Unlock()
+	tl.sweep(ctx, true)
+	exp.mu.Lock()
+	attempts := exp.attempts - before
+	exp.fail = 0
+	exp.mu.Unlock()
+	if attempts > 3 {
+		t.Fatalf("one sweep over %d gone files made %d export attempts, want at most one retry budget (3)",
+			pods, attempts)
+	}
+
+	driveUntil(t, ctx, tl, func() bool { return len(tl.files) == 0 }, "every gone file to settle and release")
+	got := exp.get()
+	for i := range pods {
+		if want := fmt.Sprintf("last-%d", i); !slices.Contains(got, want) {
+			t.Fatalf("%s never exported: %v", want, got)
 		}
 	}
 }

@@ -63,7 +63,7 @@ import (
 // into the very build the tag exists to slim.
 //
 // THE FLAGS DO NOT DISAPPEAR. `-journald`, `-azure-diagnostics` and `-events`
-// are defined in main.go, untagged, in every build: internal/manifestcheck
+// are defined in flags.go, untagged, in every build: internal/manifestcheck
 // asserts that every flag the shipped manifests pass actually exists, and the
 // chart passes all three — dropping a flag would break that guard for exactly the deployments
 // most likely to run these pipelines, and would turn a clear refusal into

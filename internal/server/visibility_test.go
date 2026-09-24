@@ -41,15 +41,15 @@ func authFixture(t *testing.T, sec SecretReader, monitors *servicemonitors.Index
 	t.Helper()
 	h := &recordingHandler{}
 	s := New(Config{
-		Store:           store.New(time.Minute),
-		Services:        services.NewIndex(),
-		Monitors:        monitors,
-		Resolver:        stubResolver{},
-		MaxWait:         500 * time.Millisecond,
-		Ready:           closedChan(),
-		Secrets:         sec,
-		ScrapeAuthToken: testScrapeToken,
-		Log:             slog.New(h),
+		Store:            store.New(time.Minute),
+		Services:         services.NewIndex(),
+		Monitors:         monitors,
+		Resolver:         stubResolver{},
+		MaxWait:          500 * time.Millisecond,
+		Ready:            closedChan(),
+		Secrets:          sec,
+		ScrapeAuthTokens: staticTokens(testScrapeToken),
+		Log:              slog.New(h),
 	})
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
@@ -539,7 +539,7 @@ func TestEncodeFailureIsReportedOnce(t *testing.T) {
 	h := &recordingHandler{}
 	s := New(Config{Log: slog.New(h)})
 	for range 5 {
-		s.reportEncodeFailure("metadata response", errors.New("json: unsupported type: chan int"))
+		s.reportEncodeFailure("metadata response", encodeAnswered500, errors.New("json: unsupported type: chan int"))
 	}
 	lines := h.matching("encoding a response failed")
 	if len(lines) != 1 {
@@ -547,6 +547,34 @@ func TestEncodeFailureIsReportedOnce(t *testing.T) {
 	}
 	if !strings.Contains(lines[0], "what=metadata response") {
 		t.Errorf("the report does not say which response: %s", lines[0])
+	}
+	if !strings.Contains(lines[0], "answers 500") {
+		t.Errorf("the report does not say the route answers 500: %s", lines[0])
+	}
+}
+
+// writeJSON streams, so an unencodable value is discovered only after the 200
+// has gone out. That report is the SERVER's — through its own logger and its
+// own throttle — and says the client got a truncated body rather than a 500.
+// writeJSON used to be a package function with a second, package-level
+// reporter logging through slog.Default, which a Server built with Config.Log
+// never saw and which shared one throttle across every Server in the process.
+func TestStreamedEncodeFailureIsReportedThroughTheServer(t *testing.T) {
+	h := &recordingHandler{}
+	s := New(Config{Log: slog.New(h)})
+	for range 3 {
+		rec := httptest.NewRecorder()
+		s.writeJSON(rec, http.StatusOK, failingMarshaler{})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d; the status line is written before the body is encoded", rec.Code)
+		}
+	}
+	lines := h.matching("encoding a response failed")
+	if len(lines) != 1 {
+		t.Fatalf("want exactly one throttled report through the Server's logger, got %d: %v", len(lines), h.lines)
+	}
+	if !strings.Contains(lines[0], "truncated body") {
+		t.Errorf("the report does not say the client got a truncated body: %s", lines[0])
 	}
 }
 

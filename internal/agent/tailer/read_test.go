@@ -1,5 +1,5 @@
-// Tests for reading and metadata resolution (read.go): readFile truncation
-// decisions, copytruncate guards and resolve backoff.
+// Tests for reading and metadata resolution (read.go, resolve.go): readFile
+// truncation decisions, copytruncate guards and resolve backoff.
 package tailer
 
 import (
@@ -19,6 +19,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
 	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
 )
 
 func TestAttrFilter(t *testing.T) {
@@ -112,12 +113,7 @@ func TestCopyTruncateWithBufferedGroupCommitsNewOffsets(t *testing.T) {
 	}
 	writeLog(t, dir, timeNowCRI()+" stdout F after-truncate")
 	waitFor(t, func() bool {
-		for _, r := range exp.get() {
-			if r == "after-truncate" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(exp.get(), "after-truncate")
 	}, "post-truncate line exported")
 
 	// The committed offset must stay within the new content's size.
@@ -202,7 +198,7 @@ func TestCopyTruncateRefillPastOffsetKeepsPrefix(t *testing.T) {
 		t.Fatalf("setup: refilled size must exceed the committed offset (%d)", f.committed)
 	}
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		tl.scanDir(nil, false)
 		tl.sweep(ctx, true)
 		tl.flush(ctx)
@@ -413,7 +409,7 @@ func TestCheckpointBeyondSizeWithMatchingHeadRestarts(t *testing.T) {
 func TestMetadataBackoffGrows(t *testing.T) {
 	var d time.Duration
 	seen := []time.Duration{}
-	for i := 0; i < 8; i++ {
+	for range 8 {
 		d = nextMetaBackoff(d)
 		seen = append(seen, d)
 	}
@@ -567,7 +563,7 @@ func TestSweepResolveBudgetBoundsLookups(t *testing.T) {
 		tl := driveTailer(dir, &fakeExporter{})
 		tl.cfg.Metadata = meta
 		tl.resolveBudget = budget
-		for i := 0; i < files; i++ {
+		for i := range files {
 			name := fmt.Sprintf("pod%d_ns1_app-0123456789abcde%d.log", i, i)
 			writeLines(t, filepath.Join(dir, name), "2026-07-05T10:00:00Z stdout F hello")
 		}
@@ -723,5 +719,135 @@ func TestAnInPlaceTruncationFoundAtOpenStartsANewIncarnation(t *testing.T) {
 	if got := obs.LogRotations.Value() - rotations; got != 1 {
 		t.Fatalf("kubescrape_log_rotations_total moved by %v, want 1: handleRotation's truncated arm counts the "+
 			"same physical event, and this door left it invisible", got)
+	}
+}
+
+// rewriteOnFailure lets `ok` exports through, then fails the next `fail` —
+// rewriting the tailed file IN PLACE (same inode) on the first failing call, so
+// the rewrite lands inside the very export whose failure then rewinds the file.
+type rewriteOnFailure struct {
+	fakeExporter
+	ok, fail int
+	rewrite  func()
+}
+
+func (r *rewriteOnFailure) ExportLogs(ctx context.Context, ld plog.Logs) error {
+	if r.ok > 0 {
+		r.ok--
+		return r.fakeExporter.ExportLogs(ctx, ld)
+	}
+	if r.fail > 0 {
+		r.fail--
+		if r.rewrite != nil {
+			r.rewrite()
+			r.rewrite = nil
+		}
+		return errors.New("collector down")
+	}
+	return r.fakeExporter.ExportLogs(ctx, ld)
+}
+
+// A mid-read flush failure rewinds readPos to `committed` BEFORE readFile's
+// post-read rotation check runs. An in-place rewrite that landed inside that
+// failing export, sized between `committed` and how far the pass had read, was
+// then invisible: the truncated arm compared against the rewound readPos, the
+// copytruncate arm needs a zero-byte read, and stamping lastMod consumed the
+// mtime change the next sweep's fingerprint re-verify is gated on. The tailer
+// resumed at `committed` mid-way into the replacement — its prefix lost with no
+// counter moving, and a torn record exported because the line lengths differ.
+func TestMidReadRewindDoesNotHideAnInPlaceRewrite(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	path := filepath.Join(dir, logName)
+	orig := make([]string, 6)
+	repl := make([]string, 6)
+	var replBody strings.Builder
+	for i := range orig {
+		orig[i] = fmt.Sprintf("2026-07-05T10:00:0%dZ stdout F orig-%d", i, i)
+		// Shorter lines, so a resume at the old `committed` lands mid-line.
+		repl[i] = fmt.Sprintf("2026-07-05T10:00:0%dZ stdout F r-%d", i, i)
+		replBody.WriteString(repl[i] + "\n")
+	}
+	exp := &rewriteOnFailure{ok: 1, fail: 3, rewrite: func() {
+		if err := os.WriteFile(path, []byte(replBody.String()), 0o644); err != nil {
+			t.Error(err)
+		}
+	}}
+	tl := driveTailer(dir, exp)
+	tl.cfg.BatchSize = 3 // the first flush succeeds mid-read, the second fails and rewinds
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLines(t, path, orig...)
+	tl.scanDir(nil, false)
+
+	// Precondition: the replacement is shorter than what the pass read and
+	// longer than what committed — the window neither old guard could see.
+	committed := int64(3 * (len(orig[0]) + 1))
+	if n := int64(replBody.Len()); n < committed || n >= int64(6*(len(orig[0])+1)) {
+		t.Fatalf("setup: replacement size %d outside [%d, %d)", n, committed, 6*(len(orig[0])+1))
+	}
+
+	driveUntil(t, ctx, tl, func() bool {
+		got := exp.get()
+		for i := range repl {
+			if !slices.Contains(got, fmt.Sprintf("r-%d", i)) {
+				return false
+			}
+		}
+		return true
+	}, "every line of the in-place replacement exported")
+
+	valid := map[string]bool{}
+	for i := range orig {
+		valid[fmt.Sprintf("orig-%d", i)] = true
+		valid[fmt.Sprintf("r-%d", i)] = true
+	}
+	for _, r := range exp.get() {
+		if !valid[r] {
+			t.Fatalf("torn record %q exported: the tailer resumed mid-line in the replacement (all: %v)", r, exp.get())
+		}
+	}
+}
+
+// Every truncation arm must open the truncated file's new content at once, as
+// the rename arm does. reopen clears f.f/f.inode/f.fp, and identityChanged needs
+// a recorded inode: a RENAME rotation landing before the next readFile found
+// nothing to drain and recorded no segment, so everything the truncated inode
+// held since — B1 and B2 here — was lost with no counter and no log line.
+func TestTruncationArmReopensImmediately(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	path := filepath.Join(dir, logName)
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLines(t, path,
+		"2026-07-05T10:00:00Z stdout F A1 "+strings.Repeat("a", 64),
+		"2026-07-05T10:00:01Z stdout F A2 "+strings.Repeat("a", 64))
+	tl.scanDir(nil, false)
+	driveUntil(t, ctx, tl, func() bool { return len(exp.get()) == 2 }, "A1 and A2 exported")
+
+	// Truncated in place and rewritten SHORTER than what was read: the
+	// truncated arm fires on this sweep.
+	if err := os.WriteFile(path, []byte("2026-07-05T10:00:02Z stdout F B1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rotations := obs.LogRotations.Value()
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+
+	// Before the next sweep reads it: B2 lands, then the file is rename-rotated.
+	writeLines(t, path, "2026-07-05T10:00:03Z stdout F B2")
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	writeLines(t, path, "2026-07-05T10:00:04Z stdout F C1")
+
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "C1") }, "C1 exported")
+	driveUntil(t, ctx, tl, func() bool {
+		got := exp.get()
+		return slices.Contains(got, "B1") && slices.Contains(got, "B2")
+	}, "the truncated inode's content exported across the rename")
+	if got := obs.LogRotations.Value() - rotations; got != 2 {
+		t.Fatalf("kubescrape_log_rotations_total moved by %v, want 2 (the truncation and the rename)", got)
 	}
 }

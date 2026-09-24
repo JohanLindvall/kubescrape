@@ -32,7 +32,8 @@ import (
 // directly and leave TLSConfig/Mechanism nil for a plaintext broker.
 type KafkaConfig struct {
 	// Namespace is the Event Hubs namespace host
-	// (myns.servicebus.windows.net[:9093]).
+	// (myns.servicebus.windows.net[:9093]); the portal's Endpoint form
+	// (sb://myns.servicebus.windows.net/) is accepted too (normalizeNamespace).
 	Namespace string
 	// Topics are the hubs to consume; empty consumes every hub matching
 	// ^insights- — the names diagnostic settings create by default.
@@ -75,7 +76,7 @@ func (k *KafkaConfig) Resolve(log *slog.Logger) error {
 	if log == nil {
 		log = slog.Default()
 	}
-	host := strings.TrimSpace(k.Namespace)
+	host := normalizeNamespace(k.Namespace)
 	if k.ConnectionStringFile != "" {
 		// Read once here — the SASL path re-reads per session, but neither the
 		// HOST nor the ENTITY of a rotated key changes.
@@ -95,7 +96,7 @@ func (k *KafkaConfig) Resolve(log *slog.Logger) error {
 		if host == "" {
 			return errors.New("azure event hubs: set -azure-eventhub-namespace or -azure-eventhub-connection-string-file")
 		}
-		ts := managedIdentitySource(strings.TrimSuffix(hostOnly(host), ":9093"), k.ClientID, k.TenantID, nil, log)
+		ts := managedIdentitySource(hostOnly(host), k.ClientID, k.TenantID, nil, log)
 		k.Mechanism, k.Invalidate = ts.mechanism(), ts.invalidate
 	}
 	if !strings.Contains(host, ":") {
@@ -152,8 +153,8 @@ func (k *KafkaConfig) applyEntityPath(entity string, log *slog.Logger) {
 }
 
 func hostOnly(h string) string {
-	if i := strings.IndexByte(h, ':'); i >= 0 {
-		return h[:i]
+	if before, _, ok := strings.Cut(h, ":"); ok {
+		return before
 	}
 	return h
 }
@@ -165,6 +166,12 @@ func readTrimmed(path string) (string, error) {
 	}
 	return strings.TrimSpace(string(b)), nil
 }
+
+// defaultTopicPattern is what a consumer with no explicit topics subscribes to:
+// the hubs diagnostic settings create by default. Spelled once, because three
+// places must agree on it — the kgo subscription, the log line naming it, and
+// ResolveSources' check for a consumer it would duplicate (defaultTopicRE).
+const defaultTopicPattern = "^insights-.*"
 
 // kafkaSource wraps a kgo client as a source.
 type kafkaSource struct {
@@ -236,7 +243,7 @@ func newKafkaSource(cfg *Config) (source, error) {
 	if len(k.Topics) > 0 {
 		opts = append(opts, kgo.ConsumeTopics(k.Topics...))
 	} else {
-		opts = append(opts, kgo.ConsumeTopics("^insights-.*"), kgo.ConsumeRegex())
+		opts = append(opts, kgo.ConsumeTopics(defaultTopicPattern), kgo.ConsumeRegex())
 	}
 	if k.Start == StartBeginning {
 		opts = append(opts, kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))
@@ -252,7 +259,7 @@ func newKafkaSource(cfg *Config) (source, error) {
 	// kgo retries connection/TLS/SASL failures internally and forever, so
 	// without a logger a wrong credential is a consumer that blocks in silence
 	// (see kgolog.go).
-	opts = append(opts, kgo.WithLogger(kgoLoggerFor(cfg.Logger)))
+	opts = append(opts, kgo.WithLogger(kgoLoggerFor(log)))
 	// The assignment callbacks feed kubescrape_azure_partitions_assigned and
 	// narrate each change at Info: a consumer that joined its group and owns
 	// NOTHING (a topic pattern matching no hub, an entity-scoped credential in
@@ -285,9 +292,6 @@ func newKafkaSource(cfg *Config) (source, error) {
 	if err != nil {
 		return nil, fmt.Errorf("building the kafka client: %w", err)
 	}
-	if log == nil {
-		log = slog.Default()
-	}
 	// One line per opened consumer: what it will talk to and how. The topic
 	// selection in particular is derived (an EntityPath, or the ^insights-.*
 	// pattern), so "which hubs am I actually consuming" is otherwise only
@@ -296,7 +300,7 @@ func newKafkaSource(cfg *Config) (source, error) {
 	log.Info("event hubs consumer opened", "brokers", strings.Join(k.Brokers, ","),
 		"topics", topicSelection(k), "group", k.Group, "mechanism", describeMechanism(k),
 		"startMode", startOrDefault(k.Start))
-	return &kafkaSource{cl: cl, log: cfg.Logger, fetchWarn: logdedupe.New(fetchWarnKeys, fetchWarnEvery)}, nil
+	return &kafkaSource{cl: cl, log: log, fetchWarn: logdedupe.New(fetchWarnKeys, fetchWarnEvery)}, nil
 }
 
 // poll blocks for the next fetch and returns the message values.
@@ -327,7 +331,9 @@ func (s *kafkaSource) poll(ctx context.Context) ([][]byte, bool, error) {
 //
 // So an error naming a TOPIC never fails the poll: it is scoped to that topic,
 // kgo retries it, and the rest of the namespace keeps streaming. Only a
-// condition no further fetch can clear does (see fatalFetchErr).
+// condition no further fetch can clear does (see fatalFetchErr) — a closed
+// client, or the group/cluster authorization refusal kgo reports inside an
+// ErrGroupSession.
 //
 // healthy is false whenever a fetch carried errors and NO records. By the
 // records alone such a fetch is indistinguishable from a clean empty poll, so
@@ -392,14 +398,24 @@ func warnAllow(t *logdedupe.Table, fe kgo.FetchError) (allow, saturated bool) {
 //
 // An error naming a topic is scoped to that topic (a metadata load failure, a
 // non-retryable offset-fetch error, an injected *ErrDataLoss), so it says
-// nothing about the other hubs and kgo retries it on its own. An unscoped
-// ErrGroupSession is self-healing too — kgo rejoins the group, and a rebuild
-// would only add a LeaveGroup to a rebalance already under way. What remains
-// is the closed client (which errors.Is tests exactly as Fetches.IsClientClosed
+// nothing about the other hubs and kgo retries it on its own. What remains is
+// the closed client (which errors.Is tests exactly as Fetches.IsClientClosed
 // does, but per error, so a fetch mixing it with records is still counted and
-// logged) and an unscoped NON-RETRIABLE broker error — a cluster-wide
-// authorization or SASL failure, the one shape where every hub is unreachable
-// and a fresh client with freshly read credentials is the only recovery.
+// logged) and a CREDENTIAL refusal covering the whole namespace
+// (credentialRefusal).
+//
+// That second arm arrives in ONE shape: kgo reports every group-management
+// failure unscoped, as *kgo.ErrGroupSession wrapping the broker's error
+// (consumer_group.go's manageFailWait), and nothing else reaches PollFetches
+// unscoped. This function used to exempt ErrGroupSession wholesale and look
+// for a RAW non-retriable kerr instead — a shape kgo never produces — so a
+// group authorization refusal was logged as "kgo retries it and the rest of the
+// namespace keeps streaming" while nothing streamed, and the rebuild with fresh
+// credentials never happened. The session is unwrapped now, and matched
+// against an ALLOW-list rather than !Retriable: RebalanceInProgress,
+// IllegalGeneration and UnknownMemberID are Retriable=false too, and kgo heals
+// each of them by rejoining — a rebuild there only adds a LeaveGroup to a
+// rebalance already under way.
 func fatalFetchErr(fe kgo.FetchError) bool {
 	if errors.Is(fe.Err, kgo.ErrClientClosed) {
 		return true
@@ -407,11 +423,21 @@ func fatalFetchErr(fe kgo.FetchError) bool {
 	if fe.Topic != "" {
 		return false
 	}
-	if gs := (*kgo.ErrGroupSession)(nil); errors.As(fe.Err, &gs) {
-		return false
-	}
-	ke := (*kerr.Error)(nil)
-	return errors.As(fe.Err, &ke) && !ke.Retriable
+	return credentialRefusal(fe.Err)
+}
+
+// credentialRefusal reports a broker error that refuses this client's
+// credential for the whole namespace: a group or cluster authorization failure,
+// or a rejected SASL session. The last is listed for completeness rather than
+// because it arrives here — kgo (checked on v1.22.0, the go.mod pin) retries a
+// failed SASL handshake once on a new connection and otherwise fails only the
+// request that dialled it, never a fetch: a kfake cluster refusing the
+// credential leaves PollFetches returning no error at all. It is visible only
+// through kgo's own log (kgolog.go).
+func credentialRefusal(err error) bool {
+	return errors.Is(err, kerr.GroupAuthorizationFailed) ||
+		errors.Is(err, kerr.ClusterAuthorizationFailed) ||
+		errors.Is(err, kerr.SaslAuthenticationFailed)
 }
 
 // topicSelection renders what this client subscribes to: the explicit list, or
@@ -420,7 +446,7 @@ func topicSelection(k *KafkaConfig) string {
 	if len(k.Topics) > 0 {
 		return strings.Join(k.Topics, ",")
 	}
-	return "^insights-.* (regex)"
+	return defaultTopicPattern + " (regex)"
 }
 
 // startOrDefault names where a group with no committed offsets begins.

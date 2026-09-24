@@ -195,9 +195,7 @@ func TestInNamespacesMemoUnderConcurrentChange(t *testing.T) {
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
 	for range 4 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				select {
 				case <-stop:
@@ -213,7 +211,7 @@ func TestInNamespacesMemoUnderConcurrentChange(t *testing.T) {
 					last = svc.Name
 				}
 			}
-		}()
+		})
 	}
 	for i := range 500 {
 		ix.Upsert(memoService("prod", fmt.Sprintf("svc-%02d", i%20), fmt.Sprintf("uid-%d", i%20),

@@ -39,19 +39,17 @@ func TestRedirectDoesNotDoubleReleaseTheGzipBody(t *testing.T) {
 	// response is processed.
 	ld := plog.NewLogs()
 	lrs := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords()
-	for i := 0; i < 20000; i++ {
+	for range 20000 {
 		lrs.AppendEmpty().Body().SetStr("a moderately long log line to make the payload big enough to stream")
 	}
 
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 8 {
+		wg.Go(func() {
 			// The 302 must surface as an error, never as a false ack.
 			if err := c.ExportLogs(context.Background(), ld); err == nil {
 				t.Error("a redirect was reported as a successful export; offsets would commit for records the collector never saw")
 			}
-		}()
+		})
 	}
 	wg.Wait()
 

@@ -2,7 +2,6 @@ package chartcheck
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"testing"
@@ -11,9 +10,9 @@ import (
 // The feedback-loop guard derives -logs-exclude-namespaces from the ONE
 // in-cluster LOGS destination: agent.config.export.logs.endpoint when it names
 // one, the -otlp-endpoint flag base otherwise. That mirrors
-// otlpexport.ExportOverride.merged, where a non-empty per-signal endpoint
-// REPLACES the base rather than adding to it, and both halves of the rule are
-// load-bearing in opposite directions:
+// otlpexport.ExportConfig.signalConfig (destinationConfig), where a non-empty
+// per-signal endpoint REPLACES the base rather than adding to it, and both
+// halves of the rule are load-bearing in opposite directions:
 //
 //   - miss the override and the collectorless arrangement tails the very
 //     gateway it ships to, which amplifies exactly when that gateway is slow;
@@ -81,6 +80,34 @@ func TestLogsExcludeNamespacesFollowsTheOneLogsDestination(t *testing.T) {
 			want: "obs,observability",
 			why:  "a metrics override says nothing about where logs go; the base still carries them",
 		},
+		// gRPC endpoints go to grpc.NewClient verbatim, so a URL-scheme target
+		// is a legal spelling of the same destination — and stripping only
+		// http(s):// left `dns:` as the "host", derived no namespace and tailed
+		// the collector's own namespace, the loop this guard exists to close.
+		{
+			name:   "grpc-dns-target",
+			values: "agent:\n  otlp:\n    endpoint: dns:///" + base + "\n",
+			want:   "obs,observability",
+			why:    "dns:/// is a gRPC target scheme for the same Service; its namespace must still be derived",
+		},
+		{
+			name:   "grpc-dns-target-with-a-resolver-authority",
+			values: "agent:\n  otlp:\n    endpoint: dns://10.96.0.10/" + base + "\n",
+			want:   "obs,observability",
+			why:    "the authority of a dns:// target names the DNS SERVER, not the destination",
+		},
+		{
+			name:   "grpc-passthrough-target",
+			values: "agent:\n  otlp:\n    endpoint: passthrough:///" + base + "\n",
+			want:   "obs,observability",
+			why:    "passthrough:/// is a gRPC target scheme for the same Service",
+		},
+		{
+			name:   "external-grpc-target-still-adds-nothing",
+			values: "agent:\n  otlp:\n    endpoint: dns:///otel.grafana.net:443\n",
+			want:   "obs",
+			why:    "stripping the scheme must not make an external host's second label a namespace",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -90,8 +117,7 @@ func TestLogsExcludeNamespacesFollowsTheOneLogsDestination(t *testing.T) {
 			}
 			// The release namespace is `obs`, never the base endpoint's, so the
 			// release term and the endpoint term cannot mask one another.
-			out, err := exec.Command(helm, "template", "kubescrape", "../../charts/kubescrape",
-				"--namespace", "obs", "-f", vals, "--show-only", "templates/agent.yaml").CombinedOutput()
+			out, err := helmTemplate(helm, "obs", "-f", vals, "--show-only", "templates/agent.yaml")
 			if err != nil {
 				t.Fatalf("helm template failed: %v\n%s", err, out)
 			}

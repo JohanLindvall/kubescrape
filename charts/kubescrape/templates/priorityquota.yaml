@@ -1,0 +1,50 @@
+{{- /*
+A ResourceQuota covering the system-* priority classes this release's workloads
+schedule at. Some clusters (GKE among them) configure the ResourceQuota
+admission plugin with `limitedResources` on the PriorityClass scope, which
+refuses a pod of `system-node-critical` or `system-cluster-critical` outside
+kube-system unless a quota in its namespace covers that class — so without this
+a default install creates no agent and no metadata-service pods at all, and the
+only symptom is a FailedCreate event on the DaemonSet and the Deployment.
+
+The class list is DERIVED from the priorityClassName values of the workloads
+that are actually rendered, never hard-coded beside them: an operator who sets
+a class to "" gets no quota entry for it (and none at all when nothing is left),
+and a custom class is left out because the admission policy this answers
+applies to the system-* classes. It bounds only `pods`, far above any fleet, so
+on a cluster without that policy it restricts nothing.
+*/}}
+{{- if .Values.priorityClassQuota.enabled }}
+{{- $classes := list .Values.service.priorityClassName .Values.agent.priorityClassName }}
+{{- if or .Values.events.enabled .Values.azure.enabled }}
+{{-   $classes = append $classes .Values.events.priorityClassName }}
+{{- end }}
+{{- if .Values.serviceGraph.enabled }}
+{{-   $classes = append $classes .Values.serviceGraph.priorityClassName }}
+{{- end }}
+{{- $system := list }}
+{{- range $classes }}
+{{-   if and . (hasPrefix "system-" .) }}
+{{-     $system = append $system . }}
+{{-   end }}
+{{- end }}
+{{- $system = $system | uniq | sortAlpha }}
+{{- if $system }}
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ .Release.Name }}-priority-classes
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubescrape.labels" . | nindent 4 }}
+spec:
+  hard:
+    pods: {{ .Values.priorityClassQuota.pods | quote }}
+  scopeSelector:
+    matchExpressions:
+      - scopeName: PriorityClass
+        operator: In
+        values:
+          {{- toYaml $system | nindent 10 }}
+{{- end }}
+{{- end }}

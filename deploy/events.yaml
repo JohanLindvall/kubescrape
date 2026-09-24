@@ -147,12 +147,15 @@ spec:
           # a manual rollout restart then reuses the `latest` layer every node
           # already cached — a successful-looking upgrade running the old
           # binary, with the startup line's `version=` as the only evidence.
-          # It stays because hack/e2e.sh applies these files against an image
-          # `kind load`ed from the working tree, which exists in no registry:
+          # It stays so all four deploy/ manifests share ONE pull policy:
+          # applied to a kind cluster after `make image` + `kind load`, any of
+          # them runs the working-tree image, which exists in no registry —
           # `Always` would either fail the pull or fetch a PUBLISHED :latest
-          # over the build under test. Pin the tag to a release or an
+          # over the build under test. (hack/e2e.sh does exactly that for
+          # deploy/kubernetes.yaml and deploy/agent.yaml; it does not apply
+          # this file.) Pin the tag to a release or an
           # `@sha256:` digest for a real deployment (the Helm chart's
-          # `image.tag`), and the pull policy stops mattering. See
+          # `image.tag` / `image.digest`), and the pull policy stops mattering. See
           # docs/CONFIGURATION.md, "Accepted security residuals".
           imagePullPolicy: IfNotPresent
           command: ["/kubescrape-agent"]
@@ -175,8 +178,9 @@ spec:
             # everything else, counting kubescrape_debug_refused_total{reason}.
             # That default is the one to keep; uncomment the flag, the mount and
             # the volume below TOGETHER to read them remotely with a bearer
-            # token instead (re-read about once a minute, previous value
-            # accepted for a grace window, so rotation needs no restart):
+            # token instead (re-read about once a second — a failed read backs
+            # off to a minute — previous value accepted for a 5-minute grace
+            # window, so rotation needs no restart):
             #   kubectl -n monitoring create secret generic kubescrape-debug \
             #     --from-literal=token="$(openssl rand -hex 24)"
             #- -debug-token-file=/etc/kubescrape/debug/token

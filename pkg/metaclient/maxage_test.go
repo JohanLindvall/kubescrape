@@ -50,13 +50,43 @@ func TestMaxAgeIsClamped(t *testing.T) {
 	}
 }
 
+// Directive names are case-insensitive (RFC 9111 §5.2) and a repeated
+// Cache-Control header is one list (RFC 9110 §5.3). The doc's promise — no-store
+// or no-cache ALWAYS beats a max-age — held only for the lowercase, single-line
+// spelling kubescrape's own server writes, and this package is public: a
+// foreign or proxied Config.Base was cached in the unsafe direction.
+//
+// Reverse-patch check: the old first-line, exact-compare loop fails every row
+// but the last.
+func TestMaxAgeDirectivesAreCaseInsensitiveAndMultiLine(t *testing.T) {
+	for _, tc := range []struct {
+		lines []string
+		want  time.Duration
+	}{
+		{[]string{"No-Store, max-age=60"}, 0},
+		{[]string{"Max-Age=60"}, time.Minute},
+		{[]string{"max-age=60", "no-store"}, 0},
+		{[]string{"NO-CACHE, max-age=60"}, 0},
+		{[]string{"public", "MAX-AGE=120"}, 2 * time.Minute},
+		{[]string{"max-age="}, 0},
+	} {
+		resp := &http.Response{Header: http.Header{}}
+		for _, l := range tc.lines {
+			resp.Header.Add("Cache-Control", l)
+		}
+		if got := maxAge(resp); got != tc.want {
+			t.Errorf("maxAge(%q) = %v, want %v", tc.lines, got, tc.want)
+		}
+	}
+}
+
 // The clamp seen from the outside: an entry stored under a wrapped-positive
 // max-age is never revalidated again, because it is fresh for ~49 years and the
 // idle sweep cannot reclaim an entry that is being read.
 func TestOverflowingMaxAgeDoesNotPinAnEntryForever(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		n := atomic.AddInt32(&hits, 1)
+		n := hits.Add(1)
 		w.Header().Set("Cache-Control", "max-age=20000000000")
 		w.Header().Set("ETag", `"v`+strconv.Itoa(int(n))+`"`)
 		w.Header().Set("Content-Type", "application/json")
@@ -74,7 +104,7 @@ func TestOverflowingMaxAgeDoesNotPinAnEntryForever(t *testing.T) {
 	if _, err := c.PodByUID(ctx, "u1"); err != nil {
 		t.Fatal(err)
 	}
-	if n := atomic.LoadInt32(&hits); n != 1 {
+	if n := hits.Load(); n != 1 {
 		t.Fatalf("hits = %d, want 1: the entry is cached for the clamped lifetime", n)
 	}
 	// A day and an hour later the entry must be revalidated. Unclamped it is
@@ -83,7 +113,7 @@ func TestOverflowingMaxAgeDoesNotPinAnEntryForever(t *testing.T) {
 	if _, err := c.PodByUID(ctx, "u1"); err != nil {
 		t.Fatal(err)
 	}
-	if n := atomic.LoadInt32(&hits); n != 2 {
+	if n := hits.Load(); n != 2 {
 		t.Fatalf("hits = %d after %v; a max-age that overflows time.Duration must not pin the "+
 			"entry past maxCacheTTL", n, maxCacheTTL+time.Hour)
 	}
@@ -92,9 +122,9 @@ func TestOverflowingMaxAgeDoesNotPinAnEntryForever(t *testing.T) {
 // The mirror case: a max-age that wraps NEGATIVE disabled caching entirely, so
 // every lookup went to the wire — the opposite of what the header asked for.
 func TestNegativelyOverflowingMaxAgeStillCaches(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		atomic.AddInt32(&hits, 1)
+		hits.Add(1)
 		w.Header().Set("Cache-Control", "max-age=9300000000")
 		w.Header().Set("ETag", `"v1"`)
 		w.Header().Set("Content-Type", "application/json")
@@ -109,7 +139,7 @@ func TestNegativelyOverflowingMaxAgeStillCaches(t *testing.T) {
 			t.Fatalf("lookup %d: %v", i, err)
 		}
 	}
-	if n := atomic.LoadInt32(&hits); n != 1 {
+	if n := hits.Load(); n != 1 {
 		t.Fatalf("hits = %d, want 1: a max-age too large to represent must clamp, not disable caching", n)
 	}
 }

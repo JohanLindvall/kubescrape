@@ -21,7 +21,7 @@ package otlpexport
 // Both transports can still be referencing a request body after a FAILED
 // attempt returns (net/http's writeLoop, grpc's loopyWriter), and the drain's
 // very next queue operation reuses that buffer — Requeue clobbers it. The
-// caller therefore copies once per batch (buffered.go), which is one
+// caller therefore copies once per batch (sink.go's drainLoop), which is one
 // allocation against the ~10,000 the decode cost.
 
 import (
@@ -69,9 +69,11 @@ type rawCodec struct {
 }
 
 func (c *rawCodec) Marshal(any) (mem.BufferSlice, error) {
-	// mem.SliceBuffer's Free is a no-op, so grpc never pools or mutates the
-	// caller's bytes; the send completes inside Invoke, before the drain
-	// touches the queue again.
+	// mem.SliceBuffer's Free is a no-op, so grpc never pools or mutates these
+	// bytes. It does NOT make them safe to reuse once Invoke returns: after a
+	// FAILED attempt grpc's loopyWriter can still hold a reference (see
+	// OWNERSHIP above), and what makes that lingering reference harmless is
+	// the caller's per-batch copy, never the timing of Invoke.
 	return mem.BufferSlice{mem.SliceBuffer(c.payload)}, nil
 }
 

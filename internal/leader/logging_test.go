@@ -75,7 +75,7 @@ func TestGracefulStopReportsAReleaseNotALoss(t *testing.T) {
 		t.Errorf("the acquisition is not reported:\n%s", out)
 	}
 	// A release is lifecycle, not a problem.
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		if strings.Contains(line, "released leadership") && !strings.Contains(line, "level=INFO") {
 			t.Errorf("the release line is not Info: %s", line)
 		}

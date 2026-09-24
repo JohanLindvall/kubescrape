@@ -71,7 +71,9 @@ func readMachineID() string {
 	if err != nil {
 		return ""
 	}
-	id := strings.TrimSpace(string(b))
+	// sd_id128_get_machine() parses the file with sd_id128_from_string, which
+	// takes either case; compare in the lowercase form journalSubdirID returns.
+	id := strings.ToLower(strings.TrimSpace(string(b)))
 	if len(id) != 32 {
 		return ""
 	}
@@ -81,6 +83,56 @@ func readMachineID() string {
 		}
 	}
 	return id
+}
+
+// journalSubdirID reports whether sd_journal descends into a subdirectory of a
+// root named `name`, and the 128-bit id it names, normalised (lowercase, no
+// dashes). It mirrors the two sd-journal rules that apply before any machine
+// id is consulted, in EVERY root and with an explicit -journald-dir alike:
+//
+//   - directory_enumerate descends only into dirent_is_journal_subdir names: a
+//     128-bit id (id128_is_valid — 32 hex digits in either case, or the
+//     36-character dashed UUID form), optionally followed by `.<namespace>`.
+//     `remote/` (systemd-journal-remote) and every other name is never opened.
+//   - add_directory then drops a `.<namespace>` directory unless a namespace
+//     was requested, and this reader requests none (go-systemd passes no
+//     namespace to either open call).
+//
+// So only a BARE id is ever read, and ok is false for everything else: neither
+// found nor refused, because no machine id — mounted or not — makes libsystemd
+// open it, and counting it toward the machine-id remedy sends the operator to
+// fix a mount that is already right.
+func journalSubdirID(name string) (id string, ok bool) {
+	switch len(name) {
+	case 32:
+		for i := 0; i < len(name); i++ {
+			if !isHex(name[i]) {
+				return "", false
+			}
+		}
+		return strings.ToLower(name), true
+	case 36:
+		for i := 0; i < len(name); i++ {
+			switch i {
+			case 8, 13, 18, 23:
+				if name[i] != '-' {
+					return "", false
+				}
+			default:
+				if !isHex(name[i]) {
+					return "", false
+				}
+			}
+		}
+		return strings.ToLower(strings.ReplaceAll(name, "-", "")), true
+	}
+	// Any other length, a `.<namespace>` suffix included (the suffix makes the
+	// name longer than either id form).
+	return "", false
+}
+
+func isHex(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
 // machineGate is libsystemd's LOCAL_ONLY rule for a root's SUBDIRECTORIES, and
@@ -97,7 +149,9 @@ func readMachineID() string {
 // open is what let this probe stay quiet through precisely that failure.
 //
 // An explicit -journald-dir does NOT take the gate: sd_journal_open_directory
-// is called with no flags, so it reads every subdirectory whatever it is named.
+// is called with no flags, so it reads every id-named subdirectory whatever id
+// it names. The subdirectory-NAME rules come before this gate and apply to
+// every root (journalSubdirID).
 type machineGate struct {
 	on bool   // SD_JOURNAL_LOCAL_ONLY applies (i.e. no explicit Dir)
 	id string // this container's machine id; "" when none is readable
@@ -105,24 +159,46 @@ type machineGate struct {
 
 // allows reports whether sd_journal will open root/name.
 func (g machineGate) allows(root, name string) bool {
-	if !g.on || root == "/run" || strings.HasPrefix(root, "/run/") {
+	id, ok := journalSubdirID(name)
+	if !ok {
+		return false
+	}
+	if !g.on || underRun(root) {
 		return true
 	}
-	return g.id != "" && name == g.id
+	return g.id != "" && id == g.id
+}
+
+// underRun reports a root LOCAL_ONLY exempts (sd-journal's path_has_prefix
+// "/run" check).
+func underRun(root string) bool {
+	return root == "/run" || strings.HasPrefix(root, "/run/")
 }
 
 // countJournalFiles counts the journal files under root — in root itself and
-// one level down, the <machine-id>[.<namespace>] layout systemd writes and
-// sd_journal searches. A subdirectory that cannot be listed contributes
-// nothing: what this process cannot read, the libsystemd inside it cannot read
-// either. `refused` counts the files in subdirectories the gate above rules
-// out, which are NOT part of `found`: they exist, and the reader will never see
-// one, which is a different remedy from a missing mount and has to be said so.
+// one level down, in the <machine-id> directories sd_journal searches (a
+// subdirectory it never opens, journalSubdirID, is skipped outright). A
+// subdirectory that cannot be listed contributes nothing: what this process
+// cannot read, the libsystemd inside it cannot read either.
+//
+// `refused` counts the files in id-named subdirectories the gate rules out,
+// which are NOT part of `found`: they exist, and the reader will never see one,
+// which is a different remedy from a missing mount and has to be said so — but
+// only when the machine id is the reason. Once the node's OWN id directory is
+// present — by NAME, whether or not it can be listed — every other id beside it
+// is a FOREIGN journal (a machine id regenerated on a node cloned from a
+// template leaves the template's directory behind): LOCAL_ONLY skips it by
+// design, no mount changes that, and the -journald-dir fallback the remedy
+// offers would read another machine's journal as this node's. Those are counted
+// as neither — even when the own directory is unlistable, since counting them
+// `refused` would name the machine-id remedy for ids that already match.
 func countJournalFiles(root string, gate machineGate) (found, refused int, err error) {
 	ents, err := os.ReadDir(root)
 	if err != nil {
 		return 0, 0, err
 	}
+	var dirs []string
+	ownPresent := false
 	for _, e := range ents {
 		if !e.IsDir() {
 			if isJournalFile(e.Name()) {
@@ -130,7 +206,17 @@ func countJournalFiles(root string, gate machineGate) (found, refused int, err e
 			}
 			continue
 		}
-		sub, err := os.ReadDir(filepath.Join(root, e.Name()))
+		id, ok := journalSubdirID(e.Name())
+		if !ok {
+			continue
+		}
+		if gate.id != "" && id == gate.id {
+			ownPresent = true
+		}
+		dirs = append(dirs, e.Name())
+	}
+	for _, name := range dirs {
+		sub, err := os.ReadDir(filepath.Join(root, name))
 		if err != nil {
 			continue
 		}
@@ -140,9 +226,12 @@ func countJournalFiles(root string, gate machineGate) (found, refused int, err e
 				n++
 			}
 		}
-		if gate.allows(root, e.Name()) {
+		switch {
+		case gate.allows(root, name):
 			found += n
-		} else {
+		case ownPresent:
+			// A foreign machine's journal beside this node's own: see above.
+		default:
 			refused += n
 		}
 	}

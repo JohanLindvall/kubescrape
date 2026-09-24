@@ -117,7 +117,7 @@ func TestExportFailureTransitionsAndRecovers(t *testing.T) {
 	if n := strings.Count(out, "level=WARN"); n != 1 {
 		t.Errorf("WARN lines = %d, want 1 (the repeats are Debug until the re-warn interval):\n%s", n, out)
 	}
-	if !strings.Contains(out, "attempts=3") {
+	if !strings.Contains(out, "failures=3") {
 		t.Errorf("the repeats must carry the cost so far:\n%s", out)
 	}
 
@@ -127,7 +127,7 @@ func TestExportFailureTransitionsAndRecovers(t *testing.T) {
 	if !strings.Contains(out, "level=INFO") || !strings.Contains(out, "succeeded again") {
 		t.Errorf("want a recovery line naming the outage:\n%s", out)
 	}
-	if !strings.Contains(out, "attempts=3") {
+	if !strings.Contains(out, "failures=3") {
 		t.Errorf("the recovery must say what the outage cost:\n%s", out)
 	}
 }
@@ -157,8 +157,8 @@ func TestZeroExportIntervalSaysSo(t *testing.T) {
 }
 
 // The re-offer buffer filling is REAL LOSS — the retention is what makes a
-// failed export at-least-once, so an evicted resource is observations no export
-// will ever carry. It was counted and never described, and the two bounds
+// failed export at-least-once, so an evicted generation is observations no
+// export will ever carry. It was counted and never described, and the two bounds
 // (resources, samples) bind for different reasons and are tuned separately, so
 // the line has to say which one bound.
 func TestRetentionEvictionIsDescribed(t *testing.T) {
@@ -166,12 +166,9 @@ func TestRetentionEvictionIsDescribed(t *testing.T) {
 	set := &DynamicMetricSet{log: log}
 
 	t1 := time.Now().Add(-time.Minute)
-	gen := func(ts time.Time, n int) seriesSamples {
-		return seriesSamples{samples: make([]sample, n), ts: ts}
-	}
 	set.retain(map[string][]seriesSamples{
-		"live":  {gen(t1.Add(30*time.Second), 15_000)},
-		"quiet": {gen(t1, 40_000)},
+		"live":  {finalGen(t1.Add(30*time.Second), 15_000)},
+		"quiet": {finalGen(t1, 40_000)},
 	}, []string{"live", "quiet"})
 
 	if set.DroppedUndelivered() == 0 {

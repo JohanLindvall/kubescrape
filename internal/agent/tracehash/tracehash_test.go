@@ -49,17 +49,53 @@ func TestThresholdSaturates(t *testing.T) {
 	}
 }
 
-// The keep-all fast path is the micro-drift this package closed: without it a
-// trace whose hash is exactly MaxUint64 fails the strict comparison and a
-// sampler configured to keep everything drops one trace in 2^64.
-func TestKeepAllFastPath(t *testing.T) {
-	var id pcommon.TraceID
-	copy(id[:], "any id at all..")
-	if !Keep(id, math.MaxUint64) {
-		t.Fatal("Keep(id, MaxUint64) = false; the keep-all fast path is gone")
+// The keep-all guard is the micro-drift this package closed: without it a trace
+// whose hash is exactly MaxUint64 fails the strict comparison and a sampler
+// configured to keep everything drops one trace in 2^64. That hash is the ONLY
+// input on which the guard is observable, and no id a test can write is known
+// to produce it — a Keep-level test with an arbitrary id passes with the guard
+// deleted, which is what this one used to be. So the guard lives in keepHash,
+// and this hands keepHash the hash itself.
+func TestKeepHashKeepsEveryHashAtTheKeepAllThreshold(t *testing.T) {
+	for _, h := range []uint64{0, 1, 1 << 63, math.MaxUint64 - 1, math.MaxUint64} {
+		if !keepHash(h, math.MaxUint64) {
+			t.Errorf("keepHash(%#x, MaxUint64) = false: the keep-all threshold dropped a trace", h)
+		}
 	}
-	if Keep(id, 0) {
-		t.Fatal("Keep(id, 0) = true; a zero threshold must keep nothing")
+	// Below the keep-all threshold it is the strict comparison — including at
+	// MaxUint64-1, the largest threshold Threshold can return short of
+	// saturating.
+	for _, tc := range []struct {
+		h, threshold uint64
+		want         bool
+	}{
+		{0, 0, false}, // a zero threshold keeps nothing
+		{math.MaxUint64, 0, false},
+		{41, 42, true},
+		{42, 42, false},
+		{math.MaxUint64 - 2, math.MaxUint64 - 1, true},
+		{math.MaxUint64 - 1, math.MaxUint64 - 1, false},
+		{math.MaxUint64, math.MaxUint64 - 1, false},
+	} {
+		if got := keepHash(tc.h, tc.threshold); got != tc.want {
+			t.Errorf("keepHash(%#x, %#x) = %v, want %v", tc.h, tc.threshold, got, tc.want)
+		}
+	}
+}
+
+// Keep at the two extreme thresholds. This CANNOT see the keep-all guard (see
+// TestKeepHashKeepsEveryHashAtTheKeepAllThreshold); it pins Keep's own early
+// return and the zero threshold, over ids spread across the hash space.
+func TestKeepAtTheExtremeThresholds(t *testing.T) {
+	for i := range 256 {
+		var id pcommon.TraceID
+		id[0], id[7], id[15] = byte(i), byte(i*13), byte(i^0xa5)
+		if !Keep(id, math.MaxUint64) {
+			t.Fatalf("Keep(%v, MaxUint64) = false; a keep-all threshold must keep every trace", id)
+		}
+		if Keep(id, 0) {
+			t.Fatalf("Keep(%v, 0) = true; a zero threshold must keep nothing", id)
+		}
 	}
 }
 
@@ -67,7 +103,7 @@ func TestKeepAllFastPath(t *testing.T) {
 // other half of what both adopters spelled out.
 func TestKeepIsTheHashComparison(t *testing.T) {
 	thr := Threshold(0.5)
-	for i := byte(0); i < 200; i++ {
+	for i := range byte(200) {
 		var id pcommon.TraceID
 		id[0], id[15] = i, i^0x5a
 		if got, want := Keep(id, thr), rapidhash.Sum64(id[:]) < thr; got != want {
@@ -77,13 +113,13 @@ func TestKeepIsTheHashComparison(t *testing.T) {
 }
 
 // Keep feeds the trace id to rapidhash as its two little-endian halves rather
-// than as a slice, because that form takes them in registers and is ~2.6x
-// faster on a path that runs once per span in BOTH samplers. It is only a
-// legitimate substitution because it hashes exactly the same bytes — this pins
-// that, so the fast form can never quietly drift from the definition it
-// shortcuts.
+// than as a slice, because that form takes them in registers on a path that
+// runs once per span in BOTH samplers (Keep's doc carries the measurement). It
+// is only a legitimate substitution because it hashes exactly the same bytes —
+// this pins that, so the fast form can never quietly drift from the definition
+// it shortcuts.
 func TestUint128FormEqualsRawBytes(t *testing.T) {
-	for i := 0; i < 5000; i++ {
+	for i := range 5000 {
 		var id pcommon.TraceID
 		for j := range id {
 			id[j] = byte(i*7 + j*31)

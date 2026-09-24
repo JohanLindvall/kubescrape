@@ -3,8 +3,11 @@ package promscrape
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -46,12 +49,127 @@ func TestRelabelKeepDrop(t *testing.T) {
 	}
 }
 
+// The per-rule last-seen memo must never change a verdict: a session reused
+// across a whole scrape answers every sample exactly as a FRESH session (no memo
+// state at all) answers it — through runs of one join, alternations, a join
+// longer than the memo keeps, and a rule whose join repeats while another's
+// changes.
+func TestRelabelMemoAgreesWithTheRegex(t *testing.T) {
+	rules := []kubemeta.RelabelRule{
+		{Action: "drop", SourceLabels: []string{"__name__"}, Regex: "go_.*"},
+		{Action: "keep", SourceLabels: []string{"job", "pod"}, Regex: "api;(p1|x+)"},
+	}
+	var c relabelCache
+	reused, _, err := c.session(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	long := strings.Repeat("x", maxRelabelMemoBytes+10) // matches x+, never memoised
+	type sample struct {
+		name string
+		pod  string
+	}
+	seq := []sample{
+		{"go_gc", "p1"}, {"go_gc", "p1"}, // dropped by rule 0, twice
+		{"http_total", "p1"}, {"http_total", "p1"}, // kept
+		{"http_total", "p2"}, {"http_total", "p2"}, // rule 1's join changes: dropped
+		{"http_total", "p1"},                       // and back
+		{"http_total", long}, {"http_total", long}, // long join: kept, re-evaluated
+		{"http_total", long + "y"}, // long and NOT matching: dropped
+		{"go_gc", long}, {"http_total", "p1"},
+	}
+	for i, smp := range seq {
+		labels := []Label{{Name: "job", Value: "api"}, {Name: "pod", Value: smp.pod}}
+		fresh, _, err := c.session(rules)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := reused.Keep(smp.name, labels), fresh.Keep(smp.name, labels); got != want {
+			t.Fatalf("sample %d (%s, pod of %d bytes): the memoised session says keep=%v, a fresh one %v",
+				i, smp.name, len(smp.pod), got, want)
+		}
+	}
+	for i := range reused.last {
+		if l := reused.last[i]; len(l.val) > maxRelabelMemoBytes {
+			t.Errorf("rule %d's memo holds a %d-byte join, over the %d-byte bound", i, len(l.val), maxRelabelMemoBytes)
+		}
+	}
+}
+
 // The compiled-chain cache is bounded: a controller minting monitors with
 // distinct (templated/hashed) regexes must not leak a compiled chain per
 // fingerprint for the process' life. Evict-one at the cap keeps it hot.
+// The compiled-chain cache is process-global and keyed by relabelFingerprint,
+// so a collision is not a cache miss but a WRONG ANSWER: one endpoint gets
+// another's keep/drop chain and exports series its own rule asked to drop.
+// Every pair below aliases under a naive join of the rule text; the random
+// half then throws delimiter-heavy chains at it and requires that two keys
+// agree only when the chains do.
+func TestRelabelFingerprintIsInjective(t *testing.T) {
+	type chain = []kubemeta.RelabelRule
+	pairs := []struct {
+		name string
+		a, b chain
+	}{
+		{"split vs joined sources",
+			chain{{Action: "keep", SourceLabels: []string{"a", "b"}, Regex: "x"}},
+			chain{{Action: "keep", SourceLabels: []string{"a;b"}, Regex: "x"}}},
+		{"source/regex boundary shift",
+			chain{{Action: "keep", SourceLabels: []string{"a"}, Regex: "bc"}},
+			chain{{Action: "keep", SourceLabels: []string{"ab"}, Regex: "c"}}},
+		{"one rule vs two with the same concatenation",
+			chain{{Action: "keep", SourceLabels: []string{"a"}, Regex: "x"}, {Action: "drop", SourceLabels: []string{"b"}, Regex: "y"}},
+			chain{{Action: "keep", SourceLabels: []string{"a"}, Regex: "xdropby"}}},
+		{"regex forging the next rule's encoding",
+			chain{{Action: "keep", SourceLabels: []string{"a"}, Regex: "x"}, {Action: "drop", SourceLabels: []string{"b"}, Regex: "y"}},
+			chain{{Action: "keep", SourceLabels: []string{"a"}, Regex: "1:x4:drop1;1:b1:y"}}},
+		{"no source vs one empty source",
+			chain{{Action: "keep", Regex: ""}},
+			chain{{Action: "keep", SourceLabels: []string{""}, Regex: ""}}},
+		{"empty regex vs a trailing empty rule",
+			chain{{Action: "keep", SourceLabels: []string{"a"}}},
+			chain{{Action: "keep", SourceLabels: []string{"a"}}, {Action: "", SourceLabels: nil, Regex: ""}}},
+		{"source/action boundary shift",
+			chain{{Action: "keep", SourceLabels: []string{"a"}, Regex: ""}, {Action: "drop"}},
+			chain{{Action: "keep", SourceLabels: []string{"a", "drop"}, Regex: ""}}},
+	}
+	for _, p := range pairs {
+		if relabelFingerprint(p.a) == relabelFingerprint(p.b) {
+			t.Errorf("%s: %+v and %+v share the fingerprint %q", p.name, p.a, p.b, relabelFingerprint(p.a))
+		}
+	}
+
+	// Random chains over an alphabet made of the encoding's own delimiters.
+	alphabet := []string{"", "a", "1", "2", ":", ";", "1:", "0:", "keep", "drop", "1;"}
+	rnd := rand.New(rand.NewPCG(1, 2))
+	pick := func() string { return alphabet[rnd.IntN(len(alphabet))] }
+	seen := map[string]chain{}
+	for range 50_000 {
+		c := make(chain, rnd.IntN(3))
+		for i := range c {
+			c[i].Action = pick()
+			for range rnd.IntN(3) {
+				c[i].SourceLabels = append(c[i].SourceLabels, pick())
+			}
+			c[i].Regex = pick() + pick()
+		}
+		key := relabelFingerprint(c)
+		prev, ok := seen[key]
+		if !ok {
+			seen[key] = c
+			continue
+		}
+		if !slices.EqualFunc(prev, c, func(x, y kubemeta.RelabelRule) bool {
+			return x.Action == y.Action && x.Regex == y.Regex && slices.Equal(x.SourceLabels, y.SourceLabels)
+		}) {
+			t.Fatalf("%+v and %+v share the fingerprint %q", prev, c, key)
+		}
+	}
+}
+
 func TestRelabelCacheBounded(t *testing.T) {
 	var c relabelCache
-	for i := 0; i < maxRelabelChains*3; i++ {
+	for i := range maxRelabelChains * 3 {
 		f, _, err := c.session([]kubemeta.RelabelRule{
 			{Action: "drop", SourceLabels: []string{"__name__"}, Regex: fmt.Sprintf("metric_%d_.*", i)},
 		})
@@ -136,5 +254,32 @@ func TestScrapeTargetMetricRelabelings(t *testing.T) {
 	s.cycle(context.Background())
 	if exp.points() != 1 {
 		t.Fatalf("points = %d, want the go_ series dropped", exp.points())
+	}
+}
+
+// A chain that will not compile fails the scrape whatever the target answers,
+// so the target must not be fetched at all. Compiled after the request, a
+// broken monitor cost a full HTTP scrape of every matched target every cycle —
+// and a fresh handshake whenever the body outran drainClose's bound — only for
+// the response to be thrown away.
+func TestUncompilableRelabelChainFailsBeforeTheTargetIsFetched(t *testing.T) {
+	srv, hits := countingTarget(t)
+	tgt := testTarget(srv.URL)
+	tgt.Source, tgt.Monitor = "servicemonitor", "ns/broken"
+	tgt.MetricRelabelings = []kubemeta.RelabelRule{{Action: "drop", SourceLabels: []string{"__name__"}, Regex: "("}}
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "n1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{tgt}, Exporter: exp, StartTime: time.Now(),
+	})
+	_, err := s.scrapeTarget(context.Background(), tgt, 5*time.Second)
+	if got := failureReason(err); got != reasonRelabel {
+		t.Fatalf("reason = %q (%v), want %q", got, err, reasonRelabel)
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("the target was fetched %d time(s) for a scrape its relabel chain had already failed", n)
+	}
+	if exp.points() != 0 {
+		t.Errorf("points = %d, want 0", exp.points())
 	}
 }

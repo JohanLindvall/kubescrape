@@ -199,6 +199,39 @@ func TestBudgetCutReplayDefersTailRead(t *testing.T) {
 // pass advances past what it discarded and the segment finishes and retires
 // normally.
 func TestReplayOversizedLineDoesNotWedgeSegment(t *testing.T) {
+	_, exp := replayOversizedSegment(t)
+	for _, r := range exp.get() {
+		if strings.Contains(r, "xxxx") {
+			t.Fatalf("a fragment of the discarded oversized line was exported: %.80q", r)
+		}
+	}
+}
+
+// TestReplayedOversizedLineIsNamedPerFile: a line the segment REPLAY discards
+// for size is the same loss the live path discards, and the file's own
+// Oversized tally (/debug/tailer, the status summary's sum) is the only report
+// that names WHICH file — kubescrape_log_oversized_dropped_total cannot. The
+// replay's copy of the discard used to bump the aggregate alone, so the counter
+// moved while the file reported Oversized 0; both paths now go through
+// noteOversized.
+func TestReplayedOversizedLineIsNamedPerFile(t *testing.T) {
+	before := obs.LogOversizedDropped.Value()
+	f, _ := replayOversizedSegment(t)
+	if got := obs.LogOversizedDropped.Value() - before; got != 1 {
+		t.Fatalf("kubescrape_log_oversized_dropped_total moved by %v, want 1 (once per LINE)", got)
+	}
+	if f.oversized != 1 {
+		t.Fatalf("file.oversized = %d after the replay dropped one oversized line, want 1", f.oversized)
+	}
+}
+
+// replayOversizedSegment is the shared setup of the two tests above: a
+// checkpointed segment holding one line far past the discard escape's cap,
+// replayed under caps small enough that no single pass reaches its newline. It
+// drives the tailer until the segment has replayed past the discard, the
+// remainder and the live tail are delivered and the segment has retired.
+func replayOversizedSegment(t *testing.T) (*file, *fakeExporter) {
+	t.Helper()
 	dir := t.TempDir()
 	ctx := context.Background()
 	pos := mustOpenPositions(t, filepath.Join(t.TempDir(), "pos.json"))
@@ -241,11 +274,7 @@ func TestReplayOversizedLineDoesNotWedgeSegment(t *testing.T) {
 		return strings.Contains(all, "seg-tail") && strings.Contains(all, "live-tail") &&
 			len(f.segments) == 0
 	}, "oversized-line segment replayed past the discard, remainder delivered, segment retired")
-	for _, r := range exp.get() {
-		if strings.Contains(r, "xxxx") {
-			t.Fatalf("a fragment of the discarded oversized line was exported: %.80q", r)
-		}
-	}
+	return f, exp
 }
 
 // A file that VANISHES while a rotated segment's replay is unfinished must not
@@ -420,5 +449,28 @@ func TestFailedExportsDoNotSpendTheSegmentStallBudget(t *testing.T) {
 	}, "the segment and the tail delivered once the collector recovered")
 	if got := obs.LogPrefixLost.Value(); got != prefixBefore {
 		t.Fatalf("LogPrefixLost = %v, want %v: nothing was lost", got, prefixBefore)
+	}
+}
+
+// TestStallClockIsOneStateMachine pins stallSpent, the clock both stall budgets
+// run on — a segment replay's (chargeStall) and a gone file's drain
+// (chargeGoneStall), whose doc promises "the same budget applies". A resetting
+// pass zeroes it, the first charging pass only arms it, and a charging pass
+// finding it at least segmentStallLimit old reports it spent.
+func TestStallClockIsOneStateMachine(t *testing.T) {
+	tl := &Tailer{segmentStallLimit: time.Minute}
+	var since time.Time
+	if _, spent := tl.stallSpent(&since, false); spent || since.IsZero() {
+		t.Fatalf("first charging pass: spent=%v armed=%v, want armed and not spent", spent, !since.IsZero())
+	}
+	if _, spent := tl.stallSpent(&since, false); spent {
+		t.Fatal("the clock reported spent inside the limit")
+	}
+	since = time.Now().Add(-2 * time.Minute)
+	if stalled, spent := tl.stallSpent(&since, false); !spent || stalled < 2*time.Minute {
+		t.Fatalf("a clock 2m old against a 1m limit: stalled=%v spent=%v, want >=2m and spent", stalled, spent)
+	}
+	if _, spent := tl.stallSpent(&since, true); spent || !since.IsZero() {
+		t.Fatalf("a resetting pass: spent=%v cleared=%v, want not spent and cleared", spent, since.IsZero())
 	}
 }

@@ -91,13 +91,6 @@ const debugAuthRealm = `Bearer realm="kubescrape debug"`
 // useful information in it is one line.
 const debugWarnEvery = 15 * time.Minute
 
-// debugForwardedHeaders are the headers a hop sets when it re-originates a
-// request. Their presence is the hop saying, in its own words, that the
-// connection is not the caller's — which is exactly the claim the local
-// exemption rests on, so a local connection carrying one is refused. The same
-// evidence /v1/self refuses on, for the same reason.
-var debugForwardedHeaders = []string{"Forwarded", "X-Forwarded-For", "X-Real-Ip"}
-
 // debugGuard decides who may read the data-bearing debug surfaces.
 type debugGuard struct {
 	// tokens is the accepted set (more than one only during a rotation grace
@@ -138,12 +131,16 @@ func newDebugGuard(ctx context.Context, path string, log *slog.Logger) (*debugGu
 // surfaces: the startup summary and -check-config print it, so an operator can
 // see it without diffing flags. Read from the FLAG rather than from a built
 // guard because -check-config builds nothing.
+//
+// An empty -listen is checked FIRST: then no debug server exists and the token
+// file is never read (run() calls newDebugGuard only with -listen set), so
+// "token" would name an access mode for a surface that is not served.
 func debugAccessMode() string {
-	if strings.TrimSpace(*debugToken) != "" {
-		return "token"
-	}
 	if *listen == "" {
 		return "(no -listen)"
+	}
+	if strings.TrimSpace(*debugToken) != "" {
+		return "token"
 	}
 	return "local-only"
 }
@@ -180,10 +177,11 @@ func (g *debugGuard) refuse(r *http.Request) string {
 		// A credential exists and this request did not carry a valid one.
 		return "unauthenticated"
 	}
-	if debugForwardedVia(r) != "" {
+	if peerip.ForwardingHeader(r.Header) != "" {
 		// Local address, relayed request: the address is the relay's, so it
 		// proves nothing about the caller, and the local exemption is the only
-		// thing that would have admitted it.
+		// thing that would have admitted it. The same evidence, by PRESENCE,
+		// that /v1/self refuses on (peerip owns the list).
 		return "forwarded"
 	}
 	if !debugLocalHost(r.Host) {
@@ -293,14 +291,4 @@ func debugLocalHost(host string) bool {
 	// normalisation in this repo, not two that agree until they do not.
 	addr, err := netip.ParseAddr(peerip.Canonical(h))
 	return err == nil && addr.IsLoopback()
-}
-
-// debugForwardedVia names the forwarding header the request carries, or "".
-func debugForwardedVia(r *http.Request) string {
-	for _, h := range debugForwardedHeaders {
-		if r.Header.Get(h) != "" {
-			return h
-		}
-	}
-	return ""
 }

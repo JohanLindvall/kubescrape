@@ -8,35 +8,19 @@ package servicemonitors
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/labels"
 )
 
 // PodGVR is the PodMonitor resource.
 var PodGVR = GVR.GroupVersion().WithResource("podmonitors")
 
-// PodMonitor is one parsed PodMonitor: a pod label selector plus container
-// port endpoints.
-type PodMonitor struct {
-	Namespace string
-	Name      string
-	// resourceVersion is the object this record was parsed from; see
-	// upsertMonitor. Not part of the model and never served.
-	resourceVersion string
-	Selector        labels.Selector // selects PODS by label
-	NamespaceAny    bool
-	Namespaces      []string
-	Endpoints       []Endpoint // Port names a CONTAINER port
-}
-
-// version reports the resourceVersion this record was parsed from; see
-// upsertMonitor, whose constraint it satisfies.
-func (m *PodMonitor) version() string { return m.resourceVersion }
+// PodMonitor is one parsed PodMonitor: the shared monitorBase record, whose
+// Selector selects PODS by label and whose endpoints' Port names a CONTAINER
+// port.
+type PodMonitor struct{ monitorBase }
 
 // PodNamespaces returns the namespaces the monitor selects pods in; nil
 // means all.
-func (m *PodMonitor) PodNamespaces() []string {
-	return namespaceSelector{Any: m.NamespaceAny, MatchNames: m.Namespaces}.resolve(m.Namespace)
-}
+func (m *PodMonitor) PodNamespaces() []string { return m.namespaces() }
 
 // pmSpec mirrors the PodMonitor spec fields we interpret.
 type pmSpec struct {
@@ -60,34 +44,30 @@ func ParsePodMonitor(u *unstructured.Unstructured) (*PodMonitor, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &PodMonitor{
-		Namespace:       b.Namespace,
-		Name:            b.Name,
-		resourceVersion: b.ResourceVersion,
-		Selector:        b.Selector,
-		NamespaceAny:    b.NamespaceAny,
-		Namespaces:      b.Namespaces,
-		Endpoints:       b.Endpoints,
-	}, nil
+	return &PodMonitor{b}, nil
 }
 
 // UpsertPodMonitor parses and stores a PodMonitor (see upsertMonitor for the
 // invalid-update-removes policy — which matters doubly here, because the
-// endpoints being dropped carry the bearerTokenSecret refs AuthSecretRefs
-// allowlists, so a stale monitor would keep /v1/scrape-auth willing to serve
+// endpoints being dropped carry the secret refs (bearer, basicAuth,
+// authorization, TLS CA/cert/key) AuthSecretRefs allowlists, so a stale monitor would keep /v1/scrape-auth willing to serve
 // a Secret the live spec no longer names).
 func (ix *Index) UpsertPodMonitor(u *unstructured.Unstructured) error {
-	_, err := ix.UpsertPodMonitorChanged(u)
+	_, _, err := ix.UpsertPodMonitorChanged(u)
 	return err
 }
 
 // UpsertPodMonitorChanged is UpsertPodMonitor, additionally reporting whether
-// the delivery was news — Index.UpsertChanged's mirror, and for the same
-// caller.
-func (ix *Index) UpsertPodMonitorChanged(u *unstructured.Unstructured) (bool, error) {
+// the delivery was news, with the parsed endpoints — Index.UpsertChanged's
+// mirror, and for the same caller.
+func (ix *Index) UpsertPodMonitorChanged(u *unstructured.Unstructured) (eps []Endpoint, news bool, err error) {
 	m, err := ParsePodMonitor(u)
-	return upsertMonitor(ix, ix.podMonitors, ix.rejectedPodMonitors,
+	news, err = upsertMonitor(ix, ix.podMonitors, ix.rejectedPodMonitors,
 		u.GetNamespace()+"/"+u.GetName(), u.GetResourceVersion(), m, err)
+	if err != nil {
+		return nil, news, err
+	}
+	return m.Endpoints, news, nil
 }
 
 // DeletePodMonitor removes one.
@@ -107,5 +87,5 @@ func (ix *Index) DeletePodMonitor(namespace, name string) {
 func (ix *Index) PodMonitors() []*PodMonitor {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
-	return sortedMonitors(ix.podMonitors, func(m *PodMonitor) (string, string) { return m.Namespace, m.Name })
+	return sortedMonitors(ix.podMonitors)
 }

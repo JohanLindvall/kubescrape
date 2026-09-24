@@ -2,18 +2,21 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/slogtest"
 	"time"
-	"unicode/utf8"
 
 	"github.com/JohanLindvall/logfmt"
-	"google.golang.org/grpc/grpclog"
+	"k8s.io/klog/v2"
 )
 
 // The guarantee behind dropping -log-format: the one format that is left IS
@@ -145,10 +148,6 @@ func TestEveryLoggedValueShapeRoundTripsAsLogfmt(t *testing.T) {
 	}
 }
 
-// TestUnsafeKeysAreSanitizedRatherThanCorruptingTheRecord pins the one thing
-// TextHandler alone gets wrong. Without safeKey, `"my key"=v` parses as the key
-// `"my` with a bare-key value plus a second pair `key"=v`: one attribute
-// silently becomes two wrong ones, and nothing downstream can tell.
 // The ONE shape that does not round-trip byte-for-byte, pinned here so it is a
 // known property rather than a surprise: a control byte other than \n, \r or \t.
 //
@@ -179,6 +178,10 @@ func TestControlBytesRenderAsEscapesTheReaderDoesNotDecode(t *testing.T) {
 	}
 }
 
+// TestUnsafeKeysAreSanitizedRatherThanCorruptingTheRecord pins the one thing
+// TextHandler alone gets wrong. Without safeKey, `"my key"=v` parses as the key
+// `"my` with a bare-key value plus a second pair `key"=v`: one attribute
+// silently becomes two wrong ones, and nothing downstream can tell.
 func TestUnsafeKeysAreSanitizedRatherThanCorruptingTheRecord(t *testing.T) {
 	t.Parallel()
 	cases := []struct{ key, want string }{
@@ -192,6 +195,15 @@ func TestUnsafeKeysAreSanitizedRatherThanCorruptingTheRecord(t *testing.T) {
 		{"dotted.key", "dotted.key"},
 		{"-flag-shaped", "-flag-shaped"},
 		{"nöde", "nöde"},
+		// Beyond ASCII, TextHandler quotes what is a Unicode space, what is not
+		// printable, and invalid UTF-8 — and a quoted key comes back from the
+		// reader with the quotes and escapes inside its NAME. Printable
+		// non-ASCII ("nöde" above) must stay untouched.
+		{"a\u00a0b", "a_b"}, // no-break space
+		{"a\u2028b", "a_b"}, // line separator
+		{"a\u200bb", "a_b"}, // zero-width space: not printable
+		{"a\xffb", "a_b"},   // invalid UTF-8
+		{"a\ufffdb", "a_b"}, // a literal replacement character, which TextHandler quotes too
 	}
 	for _, c := range cases {
 		line := logLine(t, "m", c.key, "v")
@@ -296,6 +308,170 @@ func TestGroupNamesAreSanitizedAtEveryDepthAndEveryDoor(t *testing.T) {
 	}
 }
 
+// groupValuer is a slog.LogValuer that resolves to a group — the shape klog's
+// ObjectRef has, and client-go's records reach this handler through klog.
+// calls counts LogValue invocations.
+type groupValuer struct {
+	name  string
+	calls *atomic.Int32
+}
+
+func (g groupValuer) LogValue() slog.Value {
+	if g.calls != nil {
+		g.calls.Add(1)
+	}
+	return slog.GroupValue(slog.Group(g.name, slog.String("x", "1")))
+}
+
+// The fourth door: a LogValuer that resolves to a group. TextHandler resolves
+// it and then skips ReplaceAttr because the result is a group, so neither the
+// attr's own key nor any group name inside the resolved value was ever judged —
+// `"bad top.bad key.x"=1` shipped, and the reader split it into two wrong pairs.
+// Every door a LogValuer can arrive through is covered: a record's own args, a
+// logger's With, nested under a safe group, and inlined under an empty key.
+func TestLogValuerGroupKeysAreSanitized(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		log  func(*slog.Logger)
+		want string
+	}{
+		{
+			name: "under a safe key",
+			log:  func(l *slog.Logger) { l.Info("m", slog.Any("ok", groupValuer{name: "bad key"})) },
+			want: "ok.bad_key.x",
+		},
+		{
+			name: "under an unsafe key",
+			log:  func(l *slog.Logger) { l.Info("m", slog.Any("bad top", groupValuer{name: "bad key"})) },
+			want: "bad_top.bad_key.x",
+		},
+		{
+			name: "passed to With",
+			log:  func(l *slog.Logger) { l.With(slog.Any("bad top", groupValuer{name: "bad key"})).Info("m") },
+			want: "bad_top.bad_key.x",
+		},
+		{
+			name: "nested under a safe group",
+			log: func(l *slog.Logger) {
+				l.Info("m", slog.Group("ok", slog.Any("v", groupValuer{name: "bad inner"})))
+			},
+			want: "ok.v.bad_inner.x",
+		},
+		{
+			// An empty key inlines the resolved group, exactly as slog does for
+			// a literal group — it does not become a group named "_".
+			name: "under an empty key",
+			log:  func(l *slog.Logger) { l.Info("m", slog.Any("", groupValuer{name: "bad key"})) },
+			want: "bad_key.x",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var buf bytes.Buffer
+			tc.log(slog.New(NewLogfmtHandler(&buf, slog.LevelDebug)))
+			line := bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
+			got := pairs(t, line)
+			if len(got) != 4 || got[3] != [2]string{tc.want, "1"} {
+				t.Errorf("got %v, want one attribute %s=1 (line %q)", got, tc.want, line)
+			}
+		})
+	}
+}
+
+// The rebuild RESOLVES a LogValuer and hands TextHandler the resolved value, so
+// LogValue runs once per record — resolving it in the scan to decide whether a
+// rebuild was needed would have run it twice, on every client-go record that
+// carries a klog.KObj.
+func TestLogValuerIsResolvedOnce(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	var buf bytes.Buffer
+	log := slog.New(NewLogfmtHandler(&buf, slog.LevelDebug))
+	log.Info("m", slog.Any("obj", groupValuer{name: "pod", calls: &calls}))
+	if n := calls.Load(); n != 1 {
+		t.Errorf("LogValue ran %d times for one record, want 1", n)
+	}
+	calls.Store(0)
+	log.With(slog.Any("obj", groupValuer{name: "pod", calls: &calls})).Info("m")
+	if n := calls.Load(); n != 1 {
+		t.Errorf("LogValue ran %d times for one With and one record, want 1", n)
+	}
+}
+
+// Two slog.Handler rules the sanitizer used to break by treating an empty key
+// as one more unsafe key: the ZERO Attr must be ignored (it rendered `_=<nil>`,
+// because TextHandler elides it only when the key is still empty after
+// ReplaceAttr), and a group with an empty key must be INLINED (it rendered
+// `_.a=1`). An empty key on a real value is a different thing and still becomes
+// "_" — TestUnsafeKeysAreSanitizedRatherThanCorruptingTheRecord pins that.
+//
+// slogtest (below) covers the inline half but only checks that the key "" is
+// absent, which `_=<nil>` satisfies — so the zero Attr is asserted here.
+func TestEmptyKeysKeepTheirSlogMeaning(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		log  func(*slog.Logger)
+		want [][2]string // after time/level/msg
+	}{
+		{"zero attr", func(l *slog.Logger) { l.Info("m", slog.Attr{}) }, nil},
+		{"zero attr via LogAttrs", func(l *slog.Logger) {
+			l.LogAttrs(context.Background(), slog.LevelInfo, "m", slog.Attr{}, slog.String("k", "v"))
+		}, [][2]string{{"k", "v"}}},
+		{"zero attr via With", func(l *slog.Logger) { l.With(slog.Attr{}).Info("m") }, nil},
+		{"inline group", func(l *slog.Logger) { l.Info("m", slog.Group("", slog.String("a", "1"))) }, [][2]string{{"a", "1"}}},
+		{"inline group via With", func(l *slog.Logger) { l.With(slog.Group("", slog.String("b", "2"))).Info("m") }, [][2]string{{"b", "2"}}},
+		{"inline group holding an unsafe one", func(l *slog.Logger) {
+			l.Info("m", slog.Group("", slog.Group("bad key", slog.String("c", "3"))))
+		}, [][2]string{{"bad_key.c", "3"}}},
+		{"empty WithGroup on the handler", func(l *slog.Logger) {
+			slog.New(l.Handler().WithGroup("")).Info("m", "d", "4")
+		}, [][2]string{{"d", "4"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var buf bytes.Buffer
+			tc.log(slog.New(NewLogfmtHandler(&buf, slog.LevelDebug)))
+			line := bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
+			got := pairs(t, line)
+			if len(got) < 3 {
+				t.Fatalf("got %v, want at least time/level/msg (line %q)", got, line)
+			}
+			if fmt.Sprint(got[3:]) != fmt.Sprint(tc.want) {
+				t.Errorf("attributes = %v, want %v (line %q)", got[3:], tc.want, line)
+			}
+		})
+	}
+}
+
+// The handler is a slog.Handler, so the standard library's own conformance
+// suite applies to it. Each line is read back with this repo's logfmt reader and
+// nested on '.', which is how slog flattens a group into a key.
+func TestHandlerConformsToSlogtest(t *testing.T) {
+	var buf *bytes.Buffer
+	slogtest.Run(t, func(*testing.T) slog.Handler {
+		buf = new(bytes.Buffer)
+		return NewLogfmtHandler(buf, slog.LevelDebug)
+	}, func(t *testing.T) map[string]any {
+		m := map[string]any{}
+		for _, kv := range pairs(t, bytes.TrimSuffix(buf.Bytes(), []byte("\n"))) {
+			path := strings.Split(kv[0], ".")
+			cur := m
+			for _, seg := range path[:len(path)-1] {
+				next, ok := cur[seg].(map[string]any)
+				if !ok {
+					next = map[string]any{}
+					cur[seg] = next
+				}
+				cur = next
+			}
+			cur[path[len(path)-1]] = kv[1]
+		}
+		return m
+	})
+}
+
 // The sanitizing rewrite is a COPY: slog.Handler's contract is that WithAttrs
 // neither retains nor modifies the caller's slice, and the caller here is
 // ordinary logging code that may well be reusing the attrs it passed.
@@ -338,10 +514,13 @@ func TestDanglingArgumentStaysParseable(t *testing.T) {
 }
 
 // An attribute named msg/time/level does not break the format — it appends a
-// SECOND pair with that key, and the reader's duplicate rule (first non-empty
-// wins) then hands consumers the record's own field. Both pairs are on the
-// line, which is why the vocabulary in cli.go reserves those three names: this
-// test documents the shadowing rather than blessing it.
+// SECOND pair with that key. This repo's logfmt reader keeps the first
+// non-empty pair, so logfmt.Get hands back the record's own field; a consumer
+// that builds a map from the pairs typically keeps the LAST and reads the
+// attribute instead. Both pairs are on the line, which is why the vocabulary
+// in cli.go reserves those three names and TestNoLogCallUsesASlogReservedKey
+// refuses a call that uses one: this test documents the shadowing rather than
+// blessing it.
 func TestBuiltinKeyCollisionShadowsRatherThanCorrupts(t *testing.T) {
 	t.Parallel()
 	line := logLine(t, "the real message", "msg", "shadow")
@@ -365,7 +544,7 @@ func TestLevelsRenderAsTheirNames(t *testing.T) {
 	log.Warn("w")
 	log.Error("e")
 	var levels []string
-	for _, line := range bytes.Split(bytes.TrimSuffix(buf.Bytes(), []byte("\n")), []byte("\n")) {
+	for line := range bytes.SplitSeq(bytes.TrimSuffix(buf.Bytes(), []byte("\n")), []byte("\n")) {
 		v, _ := logfmt.Get(line, "level")
 		levels = append(levels, string(v))
 	}
@@ -374,27 +553,19 @@ func TestLevelsRenderAsTheirNames(t *testing.T) {
 	}
 }
 
-func TestNewLoggerRejectsAnUnknownLevel(t *testing.T) {
+func TestUnknownLogLevelIsRejected(t *testing.T) {
 	t.Parallel()
-	if _, err := NewLogger("chatty"); err == nil {
-		t.Fatal("NewLogger(chatty) = nil error, want a refusal naming the value")
+	if _, err := newLogger("chatty"); err == nil {
+		t.Fatal("newLogger(chatty) = nil error, want a refusal naming the value")
 	} else if !strings.Contains(err.Error(), `"chatty"`) {
 		t.Errorf("error %q does not name the value the operator typed", err)
 	}
 	for _, lvl := range []string{"debug", "info", "warn", "error", "INFO", "WARN"} {
-		if _, err := NewLogger(lvl); err != nil {
-			t.Errorf("NewLogger(%q) = %v", lvl, err)
+		if _, err := newLogger(lvl); err != nil {
+			t.Errorf("newLogger(%q) = %v", lvl, err)
 		}
 	}
 }
-
-// The last hole the "one format" guarantee had: grpc-go's grpclog. Its DEFAULT
-// logger writes stdlib log lines straight to os.Stderr at its default severity
-// — no env var needed — so on the collector-misconfiguration path (the OTLP
-// exporter's client, the ingest listeners, the trace tier's three) the stream
-// carried records with no time=, no level= and no msg= at all. These tests run
-// the REAL wiring, through the package global grpclog.SetLoggerV2 writes, so
-// they fail if SetupLogging stops routing it.
 
 // captureStderr swaps os.Stderr for a pipe, runs f, and returns what was
 // written. SetupLogging binds os.Stderr at construction, so the swap has to
@@ -407,14 +578,25 @@ func captureStderr(t *testing.T, f func()) []byte {
 		t.Fatal(err)
 	}
 	old, oldDefault := os.Stderr, slog.Default()
+	oldLogOut, oldLogFlags := log.Writer(), log.Flags()
+	// SetLogLoggerLevel has no getter either; setting it returns the old value.
+	oldBridge := slog.SetLogLoggerLevel(slog.LevelInfo)
+	slog.SetLogLoggerLevel(oldBridge)
 	os.Stderr = w
 	t.Cleanup(func() {
 		os.Stderr = old
 		slog.SetDefault(oldDefault)
+		// SetDefault re-points the stdlib log package only for a NON-default
+		// handler, so restoring the original default leaves it writing into
+		// the pipe; put it back by hand, with the bridge level SetupLogging set.
+		log.SetOutput(oldLogOut)
+		log.SetFlags(oldLogFlags)
+		slog.SetLogLoggerLevel(oldBridge)
 		// klog and grpclog have no getter, so their globals cannot be restored
 		// — re-point them at a logger writing to the real stderr, or every
 		// later test in this binary logs into a closed pipe.
-		SetGRPCLogger(oldDefault)
+		klog.SetSlogLogger(oldDefault)
+		setGRPCLogger(oldDefault)
 	})
 	f()
 	if err := w.Close(); err != nil {
@@ -427,265 +609,69 @@ func captureStderr(t *testing.T, f func()) []byte {
 	return bytes.TrimSuffix(out, []byte("\n"))
 }
 
-// The line an operator reads on a first live run when the collector address is
-// wrong. Before the routing it was
-//
-//	2026/08/29 12:49:08 ERROR: [core] ... connection refused
-//
-// which has no fields at all.
-func TestGRPCLogsGoThroughTheProcessLoggerAsLogfmt(t *testing.T) {
+// client-go logs through klog, klog through logr, and logr's slog bridge keys an
+// error `err` — so the reflector's watch errors, runtime.HandleError and leader
+// election rendered `err=boom`, and a grep for `error=`, which the vocabulary
+// says finds every failure, missed exactly the failures of the API-server
+// plumbing. This runs the REAL wiring: SetupLogging, then klog.
+func TestKlogIsRoutedAsLogfmtWithTheErrorKey(t *testing.T) {
 	line := captureStderr(t, func() {
 		if _, err := SetupLogging("info"); err != nil {
 			t.Fatal(err)
 		}
-		grpclog.Errorf("[core] [Channel #1 SubChannel #2] grpc: addrConn.createTransport failed to connect to %s. Err: %v",
-			"{collector.monitoring:4317}", errors.New("connection refused"))
+		klog.ErrorS(errors.New("boom"), "watch failed", "resource", "pods")
+		klog.Flush()
 	})
 	if len(line) == 0 {
-		t.Fatal("grpclog wrote nothing to the routed stderr: it is still writing through its own default logger")
+		t.Fatal("klog wrote nothing to the routed stderr: it is not going through the process logger")
 	}
+	got := pairs(t, line)
+	want := map[string]string{"level": "ERROR", "msg": "watch failed", "error": "boom", "resource": "pods"}
+	seen := map[string]string{}
+	for _, p := range got {
+		if p[0] == "err" {
+			t.Errorf("klog's error rendered as err= rather than the vocabulary's error=: %q", line)
+		}
+		seen[p[0]] = p[1]
+	}
+	for k, v := range want {
+		if seen[k] != v {
+			t.Errorf("%s = %q, want %q (line %q)", k, seen[k], v, line)
+		}
+	}
+}
+
+// Only a TOP-LEVEL err is the dependency's error key; "g.err" is a key nothing
+// in the vocabulary claims, and renaming it would be guessing.
+func TestOnlyATopLevelErrKeyIsRenamed(t *testing.T) {
+	t.Parallel()
+	got := pairs(t, logLine(t, "m", "err", "top", slog.Group("g", "err", "nested")))
+	if got[3] != [2]string{"error", "top"} || got[4] != [2]string{"g.err", "nested"} {
+		t.Errorf("got %v, want error=top then g.err=nested", got)
+	}
+}
+
+// slog.SetDefault routes the stdlib log package into the process logger, at
+// the bridge's default level — INFO. What arrives there is net/http's own
+// reports (nothing here sets http.Server.ErrorLog): the "http: panic serving"
+// stack that is the only record of a handler panic net/http recovered, a
+// superfluous WriteHeader, an Accept error, a peer's unsolicited response. They
+// are handled surprises, i.e. WARN — not steady-state INFO.
+func TestStdlibLogLinesArriveAtWarn(t *testing.T) {
+	line := captureStderr(t, func() {
+		if _, err := SetupLogging("info"); err != nil {
+			t.Fatal(err)
+		}
+		log.Printf("http: panic serving 10.0.0.1:34512: %v", "boom")
+	})
 	got := pairs(t, line)
 	if len(got) != 3 {
 		t.Fatalf("record has %d pairs, want time/level/msg: %q", len(got), line)
 	}
-	if got[1] != [2]string{"level", "ERROR"} {
-		t.Errorf("level pair = %v, want level=ERROR", got[1])
+	if got[1] != [2]string{"level", "WARN"} {
+		t.Errorf("level pair = %v, want level=WARN (line %q)", got[1], line)
 	}
-	if k, v := got[2][0], got[2][1]; k != "msg" ||
-		!strings.Contains(v, "addrConn.createTransport failed") || !strings.Contains(v, "connection refused") {
-		t.Errorf("message pair = %v; the formatted grpc message must survive intact", got[2])
-	}
-}
-
-// The severity mapping, against what the stream ALREADY carried rather than
-// against the class names. grpc's Info is per-channel state chatter that its
-// default logger discards, so it maps to DEBUG — promoting it would make every
-// agent's steady state noisier for something nobody reads until an incident.
-// Warning maps to DEBUG for the same baseline reason plus a sharper one: grpc's
-// default logger discards that class too, and part of it is peer-driven (see
-// TestGRPCPeerDrivenWarningsAreNotWarn). Only the Error class was ever on
-// stderr, so only it stays at a level the default prints.
-func TestGRPCSeveritiesMapOntoTheProcessLevels(t *testing.T) {
-	for _, tc := range []struct {
-		level string
-		want  string // levels, in call order
-	}{
-		{"info", "ERROR"},
-		{"debug", "DEBUG,DEBUG,ERROR"},
-	} {
-		t.Run(tc.level, func(t *testing.T) {
-			out := captureStderr(t, func() {
-				if _, err := SetupLogging(tc.level); err != nil {
-					t.Fatal(err)
-				}
-				grpclog.Infof("[core] Channel created")
-				grpclog.Warningf("[core] grpc: addrConn.createTransport failed")
-				grpclog.Errorln("[transport]", "connection error")
-			})
-			var levels []string
-			for _, line := range bytes.Split(out, []byte("\n")) {
-				if len(line) == 0 {
-					continue
-				}
-				v, _ := logfmt.Get(line, "level")
-				levels = append(levels, string(v))
-			}
-			if got := strings.Join(levels, ","); got != tc.want {
-				t.Errorf("at -log-level=%s grpc levels = %q, want %q", tc.level, got, tc.want)
-			}
-		})
-	}
-}
-
-// An *ln message must not carry Println's trailing newline into the record: it
-// would be escaped into msg="...\n" — parseable, and noise in every grep.
-func TestGRPCLineMethodsDoNotCarryATrailingNewline(t *testing.T) {
-	line := captureStderr(t, func() {
-		if _, err := SetupLogging("info"); err != nil {
-			t.Fatal(err)
-		}
-		grpclog.Errorln("[transport]", "connection error:", "desc = transport is closing")
-	})
-	v, ok := logfmt.Get(line, "msg")
-	if !ok {
-		t.Fatalf("no msg pair in %q", line)
-	}
-	if got := string(logfmt.AppendUnescape(nil, v)); got != "[transport] connection error: desc = transport is closing" {
-		t.Errorf("msg = %q, want Println spacing with no trailing newline", got)
-	}
-}
-
-// spyArg reports whether it was rendered. fmt renders a Stringer only when it
-// actually formats the verb, so this is how "the argument was evaluated" is
-// observed.
-type spyArg struct{ rendered *bool }
-
-func (s spyArg) String() string {
-	*s.rendered = true
-	return "rendered"
-}
-
-// slog evaluates arguments eagerly, so a Debug whose arguments cost more than a
-// field read has to be guarded — grpc's Infof is exactly that call, made per
-// channel state change, and it maps to Debug. Unguarded, every agent would pay
-// the Sprintf at the DEFAULT level for a record the handler throws away.
-func TestGRPCVerboseArgumentsAreNotFormattedWhenNothingWouldPrintThem(t *testing.T) {
-	var rendered bool
-	arg := spyArg{&rendered}
-	out := captureStderr(t, func() {
-		if _, err := SetupLogging("info"); err != nil {
-			t.Fatal(err)
-		}
-		grpclog.Infof("channel state %v", arg)
-		grpclog.Info("channel state ", arg)
-		grpclog.Infoln("channel state", arg)
-	})
-	if rendered {
-		t.Error("grpc's Info arguments were formatted at -log-level=info, where the record is discarded")
-	}
-	if len(out) != 0 {
-		t.Errorf("grpc Info reached the stream at -log-level=info: %q", out)
-	}
-	// And at debug it is genuinely delivered — the guard must gate the cost,
-	// not the feature.
-	rendered = false
-	out = captureStderr(t, func() {
-		if _, err := SetupLogging("debug"); err != nil {
-			t.Fatal(err)
-		}
-		grpclog.Infof("channel state %v", arg)
-	})
-	if !rendered {
-		t.Error("grpc's Info arguments were not formatted at -log-level=debug")
-	}
-	if v, _ := logfmt.Get(out, "msg"); string(v) != "channel state rendered" {
-		t.Errorf("msg = %q at -log-level=debug", v)
-	}
-}
-
-// V is the only thing between the stream and grpc's per-RPC chatter: its
-// verbose sites are `if logger.V(n)` guards. The default must answer no, debug
-// must answer yes up to the level grpc actually uses, and a hypothetical V(9)
-// site must not be able to make a debug capture unreadable.
-func TestGRPCVerbosityGateIsQuietByDefaultAndBoundedAtDebug(t *testing.T) {
-	var buf bytes.Buffer
-	at := func(l slog.Level) grpcLogger {
-		return grpcLogger{slog.New(NewLogfmtHandler(&buf, l))}
-	}
-	if at(slog.LevelInfo).V(1) {
-		t.Error("V(1) is true at -log-level=info: grpc's verbose sites would format on every RPC")
-	}
-	if !at(slog.LevelDebug).V(1) || !at(slog.LevelDebug).V(maxGRPCVerbosity) {
-		t.Errorf("V(1..%d) is false at -log-level=debug: the verbose sites an incident needs are gated off", maxGRPCVerbosity)
-	}
-	if at(slog.LevelDebug).V(maxGRPCVerbosity + 1) {
-		t.Errorf("V(%d) is true at -log-level=debug: nothing bounds a future high-verbosity site", maxGRPCVerbosity+1)
-	}
-}
-
-// grpc's Warning class is PEER-DRIVEN in part, and the members that are cost
-// nothing to trigger: internal/transport/http2_server.go renders "Failed to
-// decode metadata header (%q, %q)" — the header NAME and VALUE verbatim — for
-// any header any client sends, before any application code runs, on listeners
-// this repo documents as unauthenticated and whose grpc-go default header list
-// size is 16 MiB.
-//
-// So the class must not reach a level the default prints: at -log-level=info
-// the record must not be written AND the peer's bytes must not even be
-// formatted, which is the eager-argument rule applied to somebody else's input.
-// grpc's own default logger discards this class, so nothing an operator had is
-// lost — the line is one -log-level=debug away.
-func TestGRPCPeerDrivenWarningsAreNotWarn(t *testing.T) {
-	var rendered bool
-	arg := spyArg{&rendered}
-	out := captureStderr(t, func() {
-		if _, err := SetupLogging("info"); err != nil {
-			t.Fatal(err)
-		}
-		grpclog.Warningf("Failed to decode metadata header (%q, %q): %v", "x-junk-bin", arg, "illegal base64")
-		grpclog.Warning("Encountered http2.StreamError: ", arg)
-		grpclog.Warningln("Encountered http2.StreamError:", arg)
-	})
-	if rendered {
-		t.Error("a peer's header bytes were formatted at -log-level=info: an unauthenticated sender pays for the Sprintf")
-	}
-	if len(out) != 0 {
-		t.Errorf("grpc's peer-driven Warning class reached the stream at -log-level=info: %q", out)
-	}
-	// And at debug it is genuinely delivered: the mapping moves the level, it
-	// does not remove the line an operator turns debug on to read.
-	out = captureStderr(t, func() {
-		if _, err := SetupLogging("debug"); err != nil {
-			t.Fatal(err)
-		}
-		grpclog.Warningf("[core] grpc: addrConn.createTransport failed to connect to %s", "{collector:4317}")
-	})
-	v, ok := logfmt.Get(out, "level")
-	if !ok || string(v) != "DEBUG" {
-		t.Errorf("level = %q at -log-level=debug, want the connection line at DEBUG", v)
-	}
-	if v, _ := logfmt.Get(out, "msg"); !bytes.Contains(v, []byte("addrConn.createTransport failed")) {
-		t.Errorf("msg = %q: the connection-failure line must survive the level change", v)
-	}
-}
-
-// grpc hands this adapter an already-rendered string, and several of the
-// strings it renders embed bytes that came off the wire with nothing in this
-// process bounding them. Debug is a level an operator turns ON during an
-// incident, which is exactly when a 16 MiB msg= would stop the stream being a
-// stream — so the record is clipped whatever the level.
-//
-// This one routes through the grpclog global into a BUFFER rather than through
-// captureStderr's pipe: an unclipped megabyte fills the pipe's 64 KiB and
-// blocks the writer forever, since captureStderr only reads after f returns —
-// so a regression here would HANG the package's tests instead of failing them.
-func TestGRPCMessagesAreClippedIntoTheRecord(t *testing.T) {
-	var buf bytes.Buffer
-	old := slog.Default()
-	SetGRPCLogger(slog.New(NewLogfmtHandler(&buf, slog.LevelDebug)))
-	t.Cleanup(func() { SetGRPCLogger(old) })
-
-	// A header value the size the default header list bound permits, with a
-	// distinctive tail so the assertion can prove the tail did NOT ship.
-	huge := strings.Repeat("A", 1<<20) + "TAILOFTHEPEERSBYTES"
-	grpclog.Warningf("Failed to decode metadata header (%q, %q): %v", "x-junk-bin", huge, "illegal base64")
-
-	out := bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
-	if len(out) > 4<<10 {
-		t.Errorf("record is %d bytes: a peer chose the size of a log line", len(out))
-	}
-	v, ok := logfmt.Get(out, "msg")
-	if !ok {
-		t.Fatalf("no msg pair in %q", out[:min(len(out), 200)])
-	}
-	msg := logfmt.AppendUnescape(nil, v)
-	if bytes.Contains(msg, []byte("TAILOFTHEPEERSBYTES")) {
-		t.Error("the peer's bytes reached the record whole: the message was not clipped")
-	}
-	if !bytes.Contains(msg, []byte("clipped")) {
-		t.Errorf("a clipped message does not say so, so it cannot be told from a short one: %q", msg[:min(len(msg), 120)])
-	}
-	// The head is what carries the diagnosis, so it must still be there.
-	if !bytes.Contains(msg, []byte("Failed to decode metadata header")) {
-		t.Error("clipping ate the head of the message, which is the half that says what happened")
-	}
-}
-
-// The clip cuts on a RUNE boundary: half a rune is a replacement character in
-// whatever reads the line, and the message goes into a logfmt value.
-func TestGRPCMessageClipCutsOnARuneBoundary(t *testing.T) {
-	// Multi-byte runes straddling the ceiling from every offset.
-	for pad := range 4 {
-		s := strings.Repeat("x", pad) + strings.Repeat("é", maxGRPCMessageBytes)
-		got := clipMessage(s)
-		if !utf8.ValidString(got) {
-			t.Fatalf("clipMessage cut a rune in half at pad=%d", pad)
-		}
-		if len(got) >= len(s) {
-			t.Fatalf("clipMessage did not cut an over-budget message at pad=%d: %d bytes in, %d out", pad, len(s), len(got))
-		}
-	}
-	if got := clipMessage("short"); got != "short" {
-		t.Errorf("clipMessage(short) = %q, want it untouched", got)
+	if got[2][0] != "msg" || !strings.Contains(got[2][1], "http: panic serving") {
+		t.Errorf("message pair = %v; the stdlib message must survive intact", got[2])
 	}
 }

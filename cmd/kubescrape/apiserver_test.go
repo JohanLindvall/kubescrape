@@ -178,15 +178,15 @@ func TestOutageLogLinesCountOnlyTheCurrentOutage(t *testing.T) {
 	h.reset()
 	fail.Store(true)
 	w.probeOnce(ctx)
-	if got := h.attr(slog.LevelWarn, "failedProbes"); got != "1" {
-		t.Errorf("transition warn failedProbes = %q, want 1 (this outage), not the lifetime total", got)
+	if got := h.attr(slog.LevelWarn, "failures"); got != "1" {
+		t.Errorf("transition warn failures = %q, want 1 (this outage), not the lifetime total", got)
 	}
 	w.probeOnce(ctx)
 	h.reset()
 	fail.Store(false)
 	w.probeOnce(ctx)
-	if got := h.attr(slog.LevelInfo, "failedProbes"); got != "2" {
-		t.Errorf("recovery failedProbes = %q, want 2 (this outage), not the lifetime total", got)
+	if got := h.attr(slog.LevelInfo, "failures"); got != "2" {
+		t.Errorf("recovery failures = %q, want 2 (this outage), not the lifetime total", got)
 	}
 
 	// The lifetime total is still complete — it is just not what the log says.

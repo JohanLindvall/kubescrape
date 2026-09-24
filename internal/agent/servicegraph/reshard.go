@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -404,20 +405,37 @@ func (c *ReshardConfig) clientConfig(t shardTarget, base otlpexport.Config) otlp
 
 // Resharder routes spans to the shard owning their trace.
 //
-// It holds no queue and starts no goroutine: Reshard runs entirely on the
-// calling handler's goroutine, so the bound on concurrent internal hops is the
-// entry listener's in-flight semaphore (-ingest-max-in-flight) and the memory
-// bound is that semaphore times one payload. That is deliberate — see the file
-// header on why the hop cannot shed.
+// It holds no queue, and no goroutine it starts outlives the call that started
+// it: Reshard sends a push's remote shares to their owners concurrently and
+// joins them before it returns. So the bound on concurrent internal hops is the
+// entry listener's in-flight semaphore (-ingest-max-in-flight) times the owners
+// one push spans (at most the shard count minus one), and the memory bound is
+// still that semaphore times one payload — the shares are split OUT of the
+// push, never copied beside it. That is deliberate — see the file header on why
+// the hop cannot shed.
 type Resharder struct {
 	ring    *Ring
 	self    string
 	clients map[string]TracesExporter
+	// failing records, per peer, that its LAST send failed; Reshard sends such
+	// a shard its share FIRST (see Reshard's "# Failure"). One entry per client,
+	// built with the client map and never written as a map afterwards, so the
+	// concurrent Reshard calls read it without a lock.
+	failing map[string]*atomic.Bool
 	closers []func() error
 	log     *slog.Logger
 
 	warnGate logdedupe.Throttle
 	counters reshardCounters
+}
+
+// failingFlags builds Resharder.failing for a client set.
+func failingFlags(clients map[string]TracesExporter) map[string]*atomic.Bool {
+	m := make(map[string]*atomic.Bool, len(clients))
+	for name := range clients {
+		m[name] = new(atomic.Bool)
+	}
+	return m
 }
 
 type reshardCounters struct {
@@ -454,8 +472,8 @@ func (r *Resharder) tally() *reshardCounters {
 // of each hop is already counted by otlpexport
 // (kubescrape_export_requests_total{signal="traces"}); these are the numbers only
 // the resharder knows. They are exposed as a struct rather than registered here
-// because every kubescrape metric is declared in internal/obs/obs.go, from which
-// docs/METRICS.md is generated.
+// because every kubescrape metric is declared in internal/obs, from whose
+// registrations docs/METRICS.md is generated.
 type ReshardStats struct {
 	// SpansForwarded is spans handed to ANOTHER shard and accepted by it.
 	SpansForwarded uint64
@@ -465,8 +483,8 @@ type ReshardStats struct {
 	// kept locally — they can never pair, and piling every zero id onto the one
 	// shard that owns the zero token would be a hot spot for no gain.
 	SpansUnkeyed uint64
-	// SendsFailed is failed internal sends (one per shard per batch). The
-	// application's push fails with them.
+	// SendsFailed is failed internal sends: one per owning shard that refused
+	// its share, per push. The application's push fails with them.
 	SendsFailed uint64
 	// LoopsBlocked is SPANS refused off application pushes carrying
 	// ForwardedMarker (CountLoopBlocked tallies the push's span count) —
@@ -510,7 +528,11 @@ func NewResharder(cfg ReshardConfig, base otlpexport.Config, log *slog.Logger) (
 			// is also what makes a one-shard tier cost nothing.
 			continue
 		}
-		c, err := otlpexport.New(cfg.clientConfig(t, base))
+		// Named in its health lines: a sibling shard is not "the OTLP
+		// collector", and a line saying so sends an operator to the wrong
+		// workload during exactly the outage it reports.
+		c, err := otlpexport.New(cfg.clientConfig(t, base),
+			otlpexport.WithReport(log, "a trace-tier shard", "shard", t.name))
 		if err != nil {
 			_ = r.Close()
 			return nil, shardClientErr(t, err)
@@ -519,6 +541,7 @@ func NewResharder(cfg ReshardConfig, base otlpexport.Config, log *slog.Logger) (
 		r.closers = append(r.closers, c.Close)
 	}
 	r.ring = NewRing(names, cfg.TokensPerShard)
+	r.failing = failingFlags(r.clients)
 	if cfg.Self == "" || !seen[cfg.Self] {
 		// Not fatal — every share simply becomes remote and this pod sends its
 		// own traces to itself through the internal receiver, which is correct,
@@ -548,6 +571,7 @@ func NewResharderWithClients(self string, clients map[string]TracesExporter, tok
 		ring:    NewRing(names, tokensPerShard),
 		self:    self,
 		clients: clients,
+		failing: failingFlags(clients),
 		log:     log,
 	}
 }
@@ -615,56 +639,125 @@ func (r *Resharder) Close() error {
 // only the return value — reading td afterwards, or resharding it twice, reads
 // an emptied payload.
 //
+// # Concurrency
+//
+// The remote shares go to their owners CONCURRENTLY, one goroutine per owner
+// (the last one inline), joined before the local share is returned. A hop is
+// synchronous all the way to the collector — the owner answers only once its
+// own owner chain has exported — so sending them one after another cost a push
+// spanning every shard the SUM of N-1 such round trips while it held an entry
+// in-flight slot; concurrently it costs the slowest one. And every owner that
+// refuses its share is counted and reported, where the serial loop stopped at
+// the first and could never count more than one failed hop per push.
+//
 // # Failure
 //
 // An error means at least one owner did not accept its share, and the caller
-// must fail the application's push so the sender re-pushes. Shares sent BEFORE
-// the failing one have already landed; the sender's retry re-splits
-// deterministically (the ring is a pure function of the trace id) and those
-// owners see them a second time. That is at-least-once — the same trade
-// agent/route makes for tenancy fan-out — and it is why the owner's taps count
-// only after a SUCCESSFUL export: a re-delivered batch that was never counted
-// costs nothing.
+// must fail the application's push so the sender re-pushes. The retry re-splits
+// deterministically (the ring is a pure function of the trace id), so every
+// owner that DID accept receives its share again — and it has already exported
+// AND COUNTED it: the owner chain's pairing and span-metrics taps count after a
+// successful export OF THEIR OWN, which protects against the owner's own
+// failure and not against a sibling's. A part-way fan-out therefore re-delivers
+// and RE-COUNTS the healthy owners' shares. That is at-least-once — the same
+// trade agent/route makes for tenancy fan-out — but it is not free, and the
+// ORDER is what keeps the common case from paying it: a shard whose last send
+// failed is sent its share FIRST, before any other, and a failure there refuses
+// the push before a healthy owner has been handed anything. So while one shard
+// is down, every push touching it fails and nothing is re-delivered anywhere;
+// the re-count is confined to the push that first DISCOVERS a failure (its
+// healthy shares were already in flight beside it) and to several shards being
+// down at once (a recovered one among them may land a share twice). A
+// suspected shard that answers is cleared and the rest follow as usual, which
+// costs that one push a second round trip. What the ordering deliberately does
+// NOT do is keep a dead shard's traces anywhere else: handing its arc to the
+// entry shard would pair their halves on the wrong shard and feed the tail
+// sampler fragments — see Ring on why membership follows the config.
 //
-// Remote shares go first, deliberately: the most common correlated failure is
-// the collector being unreachable, which fails every owner including this one,
-// and returning on the first remote error costs less than discovering it after
-// the local chain has run.
+// Remote shares go before the local one, deliberately: the most common
+// correlated failure is the collector being unreachable, which fails every
+// owner including this one, and returning on a remote error costs less than
+// discovering it after the local chain has run.
 func (r *Resharder) Reshard(ctx context.Context, td ptrace.Traces) (ptrace.Traces, error) {
+	// Counted here, once per push and on every path, and BEFORE split: split
+	// moves each span out of td and leaves a zeroed one behind, which would
+	// read as unkeyed.
+	r.countUnkeyed(td)
 	if r == nil || len(r.clients) == 0 {
 		// Single-shard tier (or every shard is us): everything is already local.
-		// The unkeyable tally still has to happen — neither counting pass runs on
-		// this path, and a metric whose help text promises "a moving rate means an
-		// SDK is emitting malformed spans" must not be frozen at zero on the
-		// commonest topology there is.
-		r.countUnkeyed(td)
 		r.countLocal(td.SpanCount())
 		return td, nil
 	}
 	local, remote := r.split(td)
-	for name, g := range remote {
-		client, ok := r.clients[name]
-		if !ok {
+	// Partition the owners ONCE, reading each failure flag once: suspects (last
+	// send failed) go first and alone. Re-reading the flags for the second
+	// group would re-send a suspect the first group just cleared. Stack
+	// scratch covers any realistic tier; a wider one grows onto the heap.
+	var suspectBuf, healthyBuf [16]string
+	suspects, healthy := suspectBuf[:0], healthyBuf[:0]
+	for name := range remote {
+		if _, ok := r.clients[name]; !ok {
 			// Unreachable: the ring is built from the client map's keys plus
 			// self. If it ever happens it happens for every push, and the
 			// caller only sees a failed export — indistinguishable from a shard
-			// that is down, which is the wrong thing to go and look at.
+			// that is down, which is the wrong thing to go and look at. Checked
+			// before ANY share is sent, so this refusal delivers nothing.
 			r.warn("a service-graph ring owner has no client, so its share cannot be forwarded and the push is refused; this is a bug in the ring construction, not an unreachable shard",
 				"shard", name, "ring", strings.Join(r.ring.Shards(), ","))
 			return ptrace.NewTraces(), fmt.Errorf("service-graph shard %q has no client", name)
 		}
-		n := uint64(g.SpanCount())
-		markForwarded(g)
-		if err := client.ExportTraces(ctx, g); err != nil {
-			r.counters.sendsFailed.Add(1)
-			r.warn("re-sharding spans to a service-graph shard failed; the push is refused so the sender retries",
-				"shard", name, "spans", n, "error", err)
-			return ptrace.NewTraces(), fmt.Errorf("service-graph shard %s: %w", name, err)
+		if r.failing[name].Load() {
+			suspects = append(suspects, name)
+		} else {
+			healthy = append(healthy, name)
 		}
-		r.counters.spansForwarded.Add(n)
+	}
+	if err := r.sendShares(ctx, remote, suspects); err != nil {
+		return ptrace.NewTraces(), err
+	}
+	if err := r.sendShares(ctx, remote, healthy); err != nil {
+		return ptrace.NewTraces(), err
 	}
 	r.countLocal(local.SpanCount())
 	return local, nil
+}
+
+// sendShares sends each named owner its share, concurrently when there is more
+// than one, and returns every failure joined (nil when all landed).
+func (r *Resharder) sendShares(ctx context.Context, remote map[string]ptrace.Traces, names []string) error {
+	switch len(names) {
+	case 0:
+		return nil
+	case 1:
+		return r.sendShare(ctx, names[0], remote[names[0]])
+	}
+	errs := make([]error, len(names))
+	var wg sync.WaitGroup
+	last := len(names) - 1
+	for i, name := range names[:last] {
+		g := remote[name]
+		wg.Go(func() { errs[i] = r.sendShare(ctx, name, g) })
+	}
+	// The last one on this goroutine: it would otherwise only wait.
+	errs[last] = r.sendShare(ctx, names[last], remote[names[last]])
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+// sendShare sends one owner its share, counting and flagging the outcome.
+func (r *Resharder) sendShare(ctx context.Context, name string, g ptrace.Traces) error {
+	n := uint64(g.SpanCount())
+	markForwarded(g)
+	if err := r.clients[name].ExportTraces(ctx, g); err != nil {
+		r.counters.sendsFailed.Add(1)
+		r.failing[name].Store(true)
+		r.warn("re-sharding spans to a service-graph shard failed; the push is refused so the sender retries",
+			"shard", name, "spans", n, "error", err)
+		return fmt.Errorf("service-graph shard %s: %w", name, err)
+	}
+	r.failing[name].Store(false)
+	r.counters.spansForwarded.Add(n)
+	return nil
 }
 
 func (r *Resharder) countLocal(n int) {
@@ -674,17 +767,24 @@ func (r *Resharder) countLocal(n int) {
 	r.tally().spansLocal.Add(uint64(n))
 }
 
-// countUnkeyed tallies the spans of td that carry no trace id — the single-shard
-// path's version of what singleOwner and owner do for the sharded one, and the
-// only walk that path makes (one id check per span, no copy, no hash).
+// countUnkeyed tallies the spans of td that carry no trace id: the ONE place the
+// unkeyable counter moves, on the single-shard and the sharded path alike. It
+// used to be spread over three sites — this one for the single-shard path, a
+// local tally in singleOwner published only when that pass won, and a per-span
+// bump in split — with exactly-once resting on a rule written into
+// singleOwner's doc; the extra walk on the sharded path costs ~1.9 ns/span
+// against the hundreds a split spends per span, and removes the rule.
 //
-// The walk is UNCONDITIONAL and pays for it: this path goes from O(1) to
-// O(spans), ~1.9 ns/span (BenchmarkReshardSingleOwner, 4.7 ns -> 169 ns on a
-// 20-span batch, 0 allocs). That is 0.19% of one core at a million spans a
-// second, a rate one shard cannot reach — decoding those spans costs orders of
-// magnitude more. Gating it on whether anything reads the counter would buy the
-// walk back and make a zero mean two things, "no malformed spans" and "nobody
-// asked", which is the ambiguity an SDK-health signal must not have.
+// The walk is UNCONDITIONAL and pays for it on the single-shard path too: that
+// path goes from O(1) to O(spans), ~1.9 ns/span (BenchmarkReshardSingleOwner,
+// 4.7 ns -> 169 ns on a 20-span batch, 0 allocs). That is 0.19% of one core at a
+// million spans a second, a rate one shard cannot reach — decoding those spans
+// costs orders of magnitude more. Gating it on whether anything reads the
+// counter would buy the walk back and make a zero mean two things, "no
+// malformed spans" and "nobody asked", which is the ambiguity an SDK-health
+// signal must not have — and the commonest topology, the single-shard tier, is
+// exactly where a metric whose help text promises "a moving rate means an SDK is
+// emitting malformed spans" must not be frozen at zero.
 func (r *Resharder) countUnkeyed(td ptrace.Traces) {
 	var unkeyed uint64
 	rss := td.ResourceSpans()
@@ -739,7 +839,7 @@ func (r *Resharder) split(td ptrace.Traces) (local ptrace.Traces, remote map[str
 			spans := ss.Spans()
 			for k := 0; k < spans.Len(); k++ {
 				span := spans.At(k)
-				owner := r.owner(span)
+				owner := r.ownerOf(span)
 				dst, ok := cur[owner]
 				if !ok {
 					nrs, ok := res[owner]
@@ -784,27 +884,18 @@ func (r *Resharder) split(td ptrace.Traces) (local ptrace.Traces, remote map[str
 
 // singleOwner reports the one shard owning every span in td, if there is one. It
 // walks the spans without allocating; the split path re-walks them, which is the
-// price of never copying a payload that did not need it.
-//
-// The unkeyable tally is local and is only published when this pass WINS (a
-// single owner, so the split pass never runs). Bailing out early publishes
-// nothing and leaves the counting to split's own owner(), so a span is tallied
-// exactly once however many times the two passes look at it.
+// price of never copying a payload that did not need it. It counts nothing
+// (Reshard's countUnkeyed does).
 func (r *Resharder) singleOwner(td ptrace.Traces) (string, bool) {
 	first := ""
 	seen := false
-	var unkeyed uint64
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
 		sss := rss.At(i).ScopeSpans()
 		for j := 0; j < sss.Len(); j++ {
 			spans := sss.At(j).Spans()
 			for k := 0; k < spans.Len(); k++ {
-				span := spans.At(k)
-				if span.TraceID().IsEmpty() {
-					unkeyed++
-				}
-				o := r.ownerOf(span)
+				o := r.ownerOf(spans.At(k))
 				if !seen {
 					first, seen = o, true
 					continue
@@ -815,24 +906,12 @@ func (r *Resharder) singleOwner(td ptrace.Traces) (string, bool) {
 			}
 		}
 	}
-	if unkeyed > 0 {
-		r.counters.spansUnkeyed.Add(unkeyed)
-	}
 	if !seen {
 		// No spans at all: treat it as ours, so an empty push is acked without a
 		// hop.
 		return r.self, true
 	}
 	return first, true
-}
-
-// owner is ownerOf plus the unkeyable counter, for the SPLIT pass (see
-// singleOwner on why exactly one of the two passes counts).
-func (r *Resharder) owner(span ptrace.Span) string {
-	if span.TraceID().IsEmpty() {
-		r.counters.spansUnkeyed.Add(1)
-	}
-	return r.ownerOf(span)
 }
 
 // ownerOf is the shard owning span's trace, or this shard for a span that cannot

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+
 # Shared helpers for the chaos scenarios in this directory.
 #
 # Every scenario runs against the SHIPPED deployment that hack/e2e.sh creates

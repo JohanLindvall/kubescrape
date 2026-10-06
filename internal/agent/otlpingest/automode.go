@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The auto metrics mode's decision (MetricsAuto): whether enriching each

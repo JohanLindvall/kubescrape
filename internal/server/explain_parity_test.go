@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // /v1/explain promises one thing above all: it walks the SAME decision chain

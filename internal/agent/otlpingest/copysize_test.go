@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // Regression test for what maxSplitCopyBytes actually bounds. The estimators

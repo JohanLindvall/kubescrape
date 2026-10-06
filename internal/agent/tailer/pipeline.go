@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // Line ingestion: the per-file two-stage multiline pipeline (CRI rejoin +

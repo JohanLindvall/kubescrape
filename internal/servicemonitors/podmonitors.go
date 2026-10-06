@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package servicemonitors
 
 // PodMonitor support: prometheus-operator's pod-selecting discovery CRD.

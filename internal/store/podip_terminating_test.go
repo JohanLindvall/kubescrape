@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package store
 
 // The pod-IP index's precedence where a TERMINATING pod is involved, on the two

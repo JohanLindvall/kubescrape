@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // Ownership: which side of the export seam still holds a copy.

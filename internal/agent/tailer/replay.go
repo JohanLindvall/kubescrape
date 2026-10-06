@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // Segment replay: re-reading the owed ranges of rotated-away incarnations

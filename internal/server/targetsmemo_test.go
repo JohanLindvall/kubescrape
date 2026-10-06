@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // Ceilings for the repeated work on GET /v1/nodes/{node}/targets.

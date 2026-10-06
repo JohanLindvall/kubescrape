@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpsplit
 
 // The splitter's contract was pinned by fixed shape tables, and a shape table

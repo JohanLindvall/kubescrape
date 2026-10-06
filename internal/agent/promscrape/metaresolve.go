@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The ONE identity path. Every object an enriched pipeline describes — a

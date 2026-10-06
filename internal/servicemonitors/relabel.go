@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package servicemonitors
 
 // The metricRelabelings walk (relabelChain): which keep/drop rules are applied,

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+
 # Deletes the kind test cluster created by hack/cluster-up.sh.
 set -euo pipefail
 

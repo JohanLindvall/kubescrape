@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package tracesample drops ingested spans before they are forwarded: a
 // consistent probabilistic sampler plus guard rails (always keep errors,
 // always keep slow spans, cap total spans/second). It runs in the trace tier's

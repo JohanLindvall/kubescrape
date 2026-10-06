@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package debugtap is the agent's on-demand equivalent of a collector debug
 // exporter: GET /debug/otlp streams a text (OTLP JSON Lines) representation
 // of the payloads flowing through the export chain to any attached HTTP

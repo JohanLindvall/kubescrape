@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // The one-shot compressed (gzip) archive path: bounded incremental reads

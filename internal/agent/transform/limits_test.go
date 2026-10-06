@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package transform
 
 // What these pin: a transforms file is an operator-edited ConfigMap, and

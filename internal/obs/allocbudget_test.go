@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package obs_test
 
 // The self-metrics allocation budgets.

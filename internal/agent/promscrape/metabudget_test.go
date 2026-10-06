@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // Tests for the per-scrape metadata allowance (metabudget.go).

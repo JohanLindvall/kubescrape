@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The agent's half of the self-metadata feature (internal/selfmeta): how it

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The OTLP/HTTP request seam, shared by every receiver in this repo.

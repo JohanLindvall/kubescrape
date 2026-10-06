@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package transform
 
 // Bounding the two amplifiers that are OPERATORS.

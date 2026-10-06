@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // -kubelet-endpoint normalisation: the one place the kubelet base URL is

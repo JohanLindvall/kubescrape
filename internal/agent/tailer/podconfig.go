@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // Per-workload log configuration via a pod annotation: the workload declares

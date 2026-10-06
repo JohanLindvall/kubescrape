@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package tailsample is the POLICY ENGINE half of tail sampling: the pure
 // decision logic that looks at an ASSEMBLED trace and says keep or drop, and
 // which rule said so. It holds no traces, opens no sockets, knows nothing about

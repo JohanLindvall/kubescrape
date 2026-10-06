@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package services
 
 // InNamespaces memoises its per-namespace sorted snapshot against the index's

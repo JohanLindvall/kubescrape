@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package transform
 
 // Lazy Starlark host objects over pdata. A script sees:

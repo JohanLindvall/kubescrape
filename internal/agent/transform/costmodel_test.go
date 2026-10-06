@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package transform
 
 // The package doc's cost model is load-bearing prose: it is what an operator

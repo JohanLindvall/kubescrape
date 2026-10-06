@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package route
 
 // The all-default fast path is documented as "forwards untouched (no copy)".

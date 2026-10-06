@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package spanmetrics derives RED (Request/Error/Duration) metrics from ingested
 // OTLP trace spans, following the OpenTelemetry spanmetrics conventions: a
 // monotonic `calls` counter, a `size` counter (span bytes), and a `duration`

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package logenrich applies github.com/JohanLindvall/enrich to exported log
 // records: metadata parsed from the line itself (JSON, logfmt, or common
 // plain-text formats) is promoted into the OTLP first-class fields and

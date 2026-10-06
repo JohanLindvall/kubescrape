@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package events
 
 // The batch's way out: the count trigger and the paced retry (flushIfFull,

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 import "github.com/JohanLindvall/kubescrape/pkg/promparse"

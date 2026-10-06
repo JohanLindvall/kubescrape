@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // One payload the collector will never accept must not hold the QUEUE HEAD —

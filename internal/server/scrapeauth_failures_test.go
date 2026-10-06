@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // GET /v1/scrape-auth is the only route that hard-fails on EXTERNAL state (an

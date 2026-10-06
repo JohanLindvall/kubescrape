@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package azurediag
 
 // End-to-end over kfake: a real kgo consumer group against an in-memory

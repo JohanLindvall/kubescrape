@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package azurediag
 
 // ARM resource-ID parsing. The diagnostic stream reports resource IDs

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package logline is the log-line matching and field-extraction DSL shared
 // by the log-derived metrics engine (internal/metrics) and the keep/drop log
 // rules every log producer and the ingest path apply: label selectors (exact

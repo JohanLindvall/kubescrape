@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Command nhexporter is an e2e FIXTURE: a scrape target serving a Prometheus
 // NATIVE (sparse) histogram, so hack/e2e.sh can exercise the agent's protobuf
 // scrape path against a real exposition rather than a hand-built fake.

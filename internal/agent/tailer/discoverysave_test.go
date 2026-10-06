@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // The positions save is the tailer's one unbounded-cost operation on the SINGLE

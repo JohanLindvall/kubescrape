@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package logscrub
 
 // The secret-kv built-in in one place: its vocabulary, the regex rendered from

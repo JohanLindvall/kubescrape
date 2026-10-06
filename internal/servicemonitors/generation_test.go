@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package servicemonitors
 
 // The index's change token, for the same reason as internal/services': the

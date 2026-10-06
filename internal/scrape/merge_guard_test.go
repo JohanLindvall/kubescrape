@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package scrape
 
 // merge_guard_test.go holds MergeMonitorEndpoint's hand-written field lists —

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package azurediag
 
 // franz-go's own logging, routed through slog.

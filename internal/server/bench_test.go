@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // Benchmarks for GET /v1/nodes/{node}/targets, the one route every agent in the

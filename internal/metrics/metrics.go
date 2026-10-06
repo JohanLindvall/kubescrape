@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package metrics holds TWO products that share one storage type. Neither is
 // the other, and the differences are exactly the ones a reader trips over:
 //

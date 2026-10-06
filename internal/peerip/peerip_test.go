@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for the canonical form the pod-IP index is keyed by. Both users — the
 // metadata service attributing a /v1/self caller and the agent's peer-IP ingest
 // fallback — look the result up in that one index, so they have to agree byte

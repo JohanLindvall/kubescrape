@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // Cross-package proof of the server's per-URL monitor merge: when two monitors

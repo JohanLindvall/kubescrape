@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // The GET /v1/scrape-auth handler — the one route that serves Secret

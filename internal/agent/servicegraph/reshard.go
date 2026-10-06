@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package servicegraph
 
 // Re-sharding: the tier's own internal hop.

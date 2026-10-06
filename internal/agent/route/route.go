@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package route fans exported payloads out to multiple destinations/tenants
 // by Kubernetes namespace: each route matches `k8s.namespace.name` globs and
 // forwards to its own OTLP client (different endpoint and/or extra headers,

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package owners resolves related-object metadata for pods from
 // metadata-only informer caches: the full ownership chain
 // (Pod -> ReplicaSet -> Deployment, Pod -> Job -> CronJob, and the

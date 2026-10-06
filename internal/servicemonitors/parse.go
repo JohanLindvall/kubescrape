@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package servicemonitors
 
 // The monitor kinds' shared record (monitorBase), the ServiceMonitor kind, the

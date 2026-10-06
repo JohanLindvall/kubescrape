@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The logAttributes half of the ingest log chain's wiring.

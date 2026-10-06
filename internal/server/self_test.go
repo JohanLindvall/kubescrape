@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for GET /v1/self: the CALLER's own pod, attributed by the connection's
 // source address. The httptest client connects over loopback, so a pod whose
 // PodIP is 127.0.0.1 is "the caller".

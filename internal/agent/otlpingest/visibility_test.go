@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // What an operator can see when the receiver refuses or degrades a push. These

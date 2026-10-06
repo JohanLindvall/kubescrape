@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package services
 
 // The change token is what the metadata service's monitor→Service cross

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // kubescrape_ingest_rejected_total means one thing: a push refused because an

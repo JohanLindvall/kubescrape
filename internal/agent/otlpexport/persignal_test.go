@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for the per-signal destination mux (persignal.go).
 package otlpexport
 

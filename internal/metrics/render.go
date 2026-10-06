@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package metrics
 
 // The OTLP output half BOTH products share: the Exporter they send through, the

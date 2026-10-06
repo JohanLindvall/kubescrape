@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // Vanished files: draining what the unlinked inode still holds behind our fd,

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // Refusals at the OTLP/HTTP door. A malformed body, an oversize body, a wrong

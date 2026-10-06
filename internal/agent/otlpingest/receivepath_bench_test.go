@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // Benchmarks for the RECEIVE path against the payload shapes real senders

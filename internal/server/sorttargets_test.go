@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // sortTargets replaced a sort.Slice over the served list with an index

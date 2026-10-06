@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package metrics
 
 // Regression tests for the export retention (retryBy) semantics: retained

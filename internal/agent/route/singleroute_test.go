@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package route
 
 // A payload whose every resource goes to ONE route is the usual shape of a

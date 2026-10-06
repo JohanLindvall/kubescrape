@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for the read-side lookups and indexes (lookup.go): container-ID,
 // pod-UID/name/IP and node indexes, including pod-IP claim precedence.
 package store

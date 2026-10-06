@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package azurediag
 
 // What a REJECTED or unreachable credential costs.

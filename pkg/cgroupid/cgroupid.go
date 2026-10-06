@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package cgroupid extracts Kubernetes pod and container identity from
 // cgroup paths, understanding both the cgroupfs and the systemd cgroup
 // driver layouts. It is the parsing behind cadvisor's `id` label but has no

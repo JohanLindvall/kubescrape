@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // Wire-supplied copies of kubescrape's reserved plumbing keys die at first

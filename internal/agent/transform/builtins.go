@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package transform
 
 // The predeclared environment every script compiles against. Deliberately

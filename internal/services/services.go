@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package services maintains an in-memory index of Services so pods can be
 // matched against the Services that select them (for service-annotation
 // based scrape discovery).

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The keep/drop subset of Prometheus metric_relabel_configs, applied per

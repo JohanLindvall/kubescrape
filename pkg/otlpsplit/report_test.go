@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpsplit
 
 // Report is what kubescrape_export_oversize_parts_total{reason="item"|"framing"}

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package metrics
 
 // Compilation of Dynamic specs into metricRules: type/action/bucket

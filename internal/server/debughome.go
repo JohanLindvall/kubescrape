@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // GET /debug: the metadata service's debug homepage. The agent has one

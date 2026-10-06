@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package logscrub redacts sensitive values from log bodies before export:
 // a curated set of built-in patterns (tokens, credentials, keys) plus
 // user-defined regexes, applied in the tailer, journald and OTLP-ingest log

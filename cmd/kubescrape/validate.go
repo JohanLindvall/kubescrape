@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The metadata service's pre-flight, and the dry run that runs it: -check-config.

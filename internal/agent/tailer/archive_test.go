@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for compressed archives (archive.go): one-shot gzip reads, retained
 // fds, in-place replacement detection and rate-limit interplay.
 package tailer

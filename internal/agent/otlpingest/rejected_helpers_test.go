@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 import "github.com/JohanLindvall/kubescrape/internal/obs"

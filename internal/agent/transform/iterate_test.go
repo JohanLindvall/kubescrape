@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package transform
 
 // The batch iterators are LAZY PER RECORD, not just per field.

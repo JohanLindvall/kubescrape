@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailbuffer
 
 // The memory bounds, seen from the operator's side.

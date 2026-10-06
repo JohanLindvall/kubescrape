@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // What a sender is answered when its push could not be forwarded, on both

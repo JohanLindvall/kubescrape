@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // One signal's durable queue (Buffer) and the recovery of a latched I/O

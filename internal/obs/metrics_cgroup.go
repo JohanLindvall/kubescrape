@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package obs
 
 // High-frequency cgroup sampler (agent, -cgroup-stats).

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package store maintains an in-memory view of pod and container metadata:
 // pod records keyed by UID, indexed by container runtime ID, by node name, by
 // namespace/name and by pod IP.

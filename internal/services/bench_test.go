@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package services
 
 // InNamespaces is called once per GET /v1/nodes/{node}/targets — the route

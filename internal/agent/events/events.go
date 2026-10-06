@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package events watches Kubernetes Events and exports them as OTLP log
 // records, enriched with the involved object's Kubernetes identity so an
 // OOMKilled or FailedScheduling event lands on the SAME resource attributes

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package tailer tails log files selected by configurable sources (see
 // sources.go) and exports the entries as OTLP logs. The default source is
 // containerd container logs under /var/log/containers, whose resource

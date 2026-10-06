@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The "same Kubernetes object" predicate and the payload that told its two

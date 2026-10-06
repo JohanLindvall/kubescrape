@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The cadvisor scrape batcher: cgroup-identity routing of kubelet series

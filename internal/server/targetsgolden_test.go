@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // The byte-for-byte contract of GET /v1/nodes/{node}/targets.

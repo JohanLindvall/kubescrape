@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tracesample
 
 // The spans/second cap, seen from the operator's side. The probability decision

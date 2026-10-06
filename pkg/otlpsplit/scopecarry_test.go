@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpsplit
 
 // Part-count regressions for the big-resource split.

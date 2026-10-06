@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package events
 
 // Event -> OTLP log record. The involved object's identity becomes the

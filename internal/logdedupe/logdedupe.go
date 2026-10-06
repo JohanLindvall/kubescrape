@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package logdedupe is the one implementation of "throttle a log line that
 // would otherwise repeat forever".
 //

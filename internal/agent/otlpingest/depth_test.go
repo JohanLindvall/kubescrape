@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The wire-SHAPE guard (depth.go): a body that is inside every size cap and

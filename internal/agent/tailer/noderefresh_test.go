@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // Regressions for the node-metadata half of a file's resource: it is rendered

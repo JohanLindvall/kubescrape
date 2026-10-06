@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package transform
 
 // The handoff contract's pins: the marker survives the shutdown-context

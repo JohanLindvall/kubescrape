@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // What a scrape cycle reports that is NOT a scrape failure (failures.go owns

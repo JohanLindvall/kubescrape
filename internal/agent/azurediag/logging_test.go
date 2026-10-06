@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package azurediag
 
 // What the operator can SEE when the Event Hubs consumer degrades. The three

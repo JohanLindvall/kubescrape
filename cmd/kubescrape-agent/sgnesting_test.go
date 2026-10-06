@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The wire-SHAPE guard on the trace tier's INTERNAL receiver.

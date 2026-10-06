@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // Tests for the bearer-token authentication guarding GET /v1/scrape-auth —

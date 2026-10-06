@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // The /v1/scrape-auth allowlist is a flat "namespace/name/key" join checked

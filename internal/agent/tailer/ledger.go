@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // The byte-offset durability accounting: segment-qualified positions

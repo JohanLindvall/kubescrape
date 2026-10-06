@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // Two pods on one node can legitimately produce the SAME scrape URL: hostNetwork

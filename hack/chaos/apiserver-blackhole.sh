@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+
 # CHAOS: the API server is BLACKHOLED (not refused).
 #
 # `"$CRI" pause` freezes the control-plane container, so connections hang

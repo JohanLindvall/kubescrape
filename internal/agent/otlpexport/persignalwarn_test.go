@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // CONFIGURATION.md promises that a start and -check-config WARN when an

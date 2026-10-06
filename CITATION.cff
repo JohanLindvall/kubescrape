@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: >-
+  If you use kubescrape in your work, please cite it using the metadata
+  from this file.
+type: software
+title: kubescrape
+abstract: >-
+  Kubernetes container logs and Prometheus metrics, shipped as OTLP with
+  every record attributed to its pod, workload and namespace. A cluster
+  metadata service watches the API server once for the whole cluster; a
+  per-node agent tails container logs with at-least-once delivery, scrapes
+  Prometheus targets, the kubelet and the systemd journal, and exports
+  OpenTelemetry (OTLP).
+authors:
+  - family-names: Lindvall
+    given-names: Johan
+repository-code: "https://github.com/JohanLindvall/kubescrape"
+url: "https://github.com/JohanLindvall/kubescrape"
+license: MIT
+keywords:
+  - kubernetes
+  - observability
+  - opentelemetry
+  - otlp
+  - logging
+  - log-collector
+  - prometheus
+  - metrics
+  - daemonset
+  - go

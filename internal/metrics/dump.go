@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package metrics
 
 // A non-mutating, point-in-time read of a Registry, for serving the same

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package debugtap
 
 // The tap sits in EVERY export chain, so what it costs with nobody attached is

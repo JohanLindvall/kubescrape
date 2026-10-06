@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package servicemonitors
 
 // The two monitor kinds share one skeleton — parseMonitorSpec (decode, selector

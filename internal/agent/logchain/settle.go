@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package logchain
 
 // The poison-batch settle policy's PERMANENT arm, shared by the batching

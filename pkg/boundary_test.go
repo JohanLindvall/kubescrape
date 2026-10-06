@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package pkg_test enforces the one structural rule of the public packages.
 package pkg_test
 

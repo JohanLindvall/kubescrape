@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // A rule the disk-buffer drain states in comments and has to keep whole: a

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package transform
 
 // The Starlark engine. Each signal's script defines transform(batch); batch

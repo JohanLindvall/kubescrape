@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // Bearer-token authentication for GET /v1/scrape-auth — the ONE route that

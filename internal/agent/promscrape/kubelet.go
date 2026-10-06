@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The KUBELET: what all three kubelet scrapes share — the endpoint and the URLs

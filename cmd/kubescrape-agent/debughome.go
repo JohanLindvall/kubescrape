@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The /debug homepage: one place that links every debug surface this agent

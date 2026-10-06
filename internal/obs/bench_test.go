@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package obs_test
 
 // What this measures, and why these four shapes.

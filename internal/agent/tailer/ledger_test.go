@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for file identity (fingerprint.go, ledger.go): fingerprints and
 // checkpoint identity guards.
 package tailer

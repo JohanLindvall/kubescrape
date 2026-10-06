@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package backoff is the restart/retry backoff the agent's long-running
 // consumers (journald, the events watch, the azurediag Kafka loop) share:
 // sleep the current delay, double it to a 30s cap, and reset it when a run

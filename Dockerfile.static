@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 # Static image variant: the agent WITHOUT the journald pipeline.
 #
 # journald is the sole reason the default image exists in the shape it does —

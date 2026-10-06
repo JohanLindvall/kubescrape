@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The API-server reachability watchdog: the ACTIVE signal that the served

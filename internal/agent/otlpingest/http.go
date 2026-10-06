@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The OTLP/HTTP arm of the ingest receiver: the one push handler body

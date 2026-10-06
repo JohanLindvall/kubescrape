@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package otlpexport sends OTLP payloads to a collector over gRPC or HTTP.
 package otlpexport
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The header-block bound on the trace tier's INTERNAL receiver.

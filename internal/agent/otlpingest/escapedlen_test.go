@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The rendering-size estimate (logchain.go) may never UNDER-charge: it decides

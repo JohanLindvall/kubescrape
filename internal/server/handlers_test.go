@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for the lookup handlers (handlers.go): wait budgets, and the
 // metadata response caching (Cache-Control/ETag, httpcache.go) they serve
 // through.

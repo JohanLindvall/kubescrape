@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // Sending a payload that is ALREADY the wire bytes.

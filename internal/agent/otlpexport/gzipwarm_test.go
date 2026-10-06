@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // The warm gzip-writer slot: what it guarantees, and what it costs.

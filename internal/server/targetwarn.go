@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // The target derivation's throttled warnings and their counters: monitor

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package peerip canonicalises a connection's remote address into the form the
 // store's pod-IP index is keyed by — and, through Canonical, is what the store
 // keys that index WITH, so the two cannot disagree.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The decoded-structure ESTIMATE, read off the WIRE bytes before the decode.

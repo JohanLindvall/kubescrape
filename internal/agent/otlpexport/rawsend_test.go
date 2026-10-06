@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // The disk-buffer drain sends SPOOLED BYTES, not a pdata round trip.

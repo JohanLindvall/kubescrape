@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // A remediation hint is copied into DaemonSet args by the operator it helps, so

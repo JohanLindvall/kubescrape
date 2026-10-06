@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package azurediag
 
 // Resolving the -azure-eventhub-* flags into the list of consumers to run.

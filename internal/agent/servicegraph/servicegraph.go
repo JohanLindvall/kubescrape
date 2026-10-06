@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package servicegraph derives service-graph EDGE metrics from ingested trace
 // spans: for each request, one series describing the call from the CLIENT
 // service to the SERVER service, with both sides' latency, the error count and

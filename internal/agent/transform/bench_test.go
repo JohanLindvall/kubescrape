@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package transform
 
 // Reporting benchmarks for the package's cost-model claim (~1µs per TOUCHED

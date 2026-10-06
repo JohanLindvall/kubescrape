@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The decoded-structure ESTIMATE (decodedsize.go) and the two doors that charge

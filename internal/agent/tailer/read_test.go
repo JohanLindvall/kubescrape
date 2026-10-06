@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for reading and metadata resolution (read.go, resolve.go): readFile
 // truncation decisions, copytruncate guards and resolve backoff.
 package tailer

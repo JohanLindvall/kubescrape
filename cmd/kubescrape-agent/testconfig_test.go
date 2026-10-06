@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for the -test-config harness (testconfig.go).
 package main
 

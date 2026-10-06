@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+
 # Creates a three-node kind cluster (one control plane, two workers) for
 # testing kubescrape and deploys sample workloads that exercise both
 # endpoints (Deployment-owned pods with prometheus.io annotations, and a

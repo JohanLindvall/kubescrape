@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The ingest: admission hook (ServerConfig.Admit) on the TRACES arm. The

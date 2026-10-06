@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package store
 
 // The address enumeration runs on the informer goroutine holding the store's

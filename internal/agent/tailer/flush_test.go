@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for flushing and export (flush.go): record building, enrichment,
 // grouping, log rules, log-metrics resolution and commit clamping.
 package tailer

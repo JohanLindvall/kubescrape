@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package azurediag
 
 // Decoding of Azure diagnostic-settings payloads. Each Event Hubs message

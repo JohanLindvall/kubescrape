@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for the series store (series.go): hashing/fold guards, expiry
 // and cardinality caps, and gauge actions/windowed aggregations.
 package metrics

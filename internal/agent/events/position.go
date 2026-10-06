@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package events
 
 // The stream position, stored in a ConfigMap.

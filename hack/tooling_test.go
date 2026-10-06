@@ -1,9 +1,13 @@
+// SPDX-License-Identifier: MIT
+
 // Package hack holds the tests for the repository's build and development
 // tooling — the Makefile and the hack/*.sh scripts — which have no Go package
 // of their own to sit beside. Each test runs the REAL file: `make -n` from the
 // repository root, and each script as a copy in a temporary directory (the
 // scripts locate hack/bin from their own path, so the checkout's hack/bin is
-// never touched) against stub tools on a PATH that holds nothing else.
+// never touched) against stub tools on a PATH that holds nothing else. It also
+// holds the one repository-wide rule about every source file, the license
+// header (spdx_test.go).
 package hack
 
 import (

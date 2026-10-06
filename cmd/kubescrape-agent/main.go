@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Command kubescrape-agent is one binary deployed as three workloads, selected
 // by its pipeline flags (agentRole names which one a process is):
 //

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package pdatacheck holds shape assertions about OTLP payloads that more
 // than one package's tests need.
 //

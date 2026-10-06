@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package metaclient
 
 // The cache HIT path is the inner loop of the agent's concurrent ingest

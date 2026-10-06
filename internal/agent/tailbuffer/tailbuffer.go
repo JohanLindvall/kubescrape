@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package tailbuffer is the BUFFERING/DECISION half of tail sampling: the layer
 // that holds the spans arriving for a trace, calls the policy engine once the
 // trace has had long enough to arrive, and then exports the whole trace or

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package route
 
 // "Why did this tenant's logs go to the default chain instead of route X?" was

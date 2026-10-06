@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The run/shutdown skeleton shared by kubescrape's OTLP receivers.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The decoded-pdata budget (admit.go): the bound on what admitted BYTES inflate

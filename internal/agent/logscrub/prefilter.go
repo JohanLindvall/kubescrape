@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package logscrub
 
 // The zero-allocation prefilter primitives the built-in patterns gate their

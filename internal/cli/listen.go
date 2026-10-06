@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package cli
 
 // The listen-address checks both binaries run in -check-config (and at every

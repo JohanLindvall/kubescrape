@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package store
 
 // Tombstone expiry: the pending list every stamp is recorded on, and the sweep

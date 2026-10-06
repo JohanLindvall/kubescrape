@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The per-scrape METADATA BUDGET: the bound that stops a hung metadata service

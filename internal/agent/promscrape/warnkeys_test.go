@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The warnOnce dedupe table is the one table in this repo with a ZERO re-warn

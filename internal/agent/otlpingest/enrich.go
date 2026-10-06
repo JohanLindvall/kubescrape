@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package otlpingest receives OTLP pushed by applications — logs and metrics on
 // the node agent's -ingest listeners, traces on the trace tier's application
 // ports (ServerConfig.Traces) — and enriches each resource with Kubernetes

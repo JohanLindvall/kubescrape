@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // What an unauthenticated listener gives back, and what it allocates on the way

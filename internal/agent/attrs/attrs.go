@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package attrs maps kubescrape metadata onto OpenTelemetry resource
 // attributes, following the k8s semantic conventions (and the
 // k8sattributes-processor conventions for labels).

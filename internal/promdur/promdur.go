@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package promdur parses prometheus-operator's duration syntax: the CRD
 // language (`y`, `w`, `d`, `h`, `m`, `s`, `ms`, largest unit first, e.g.
 // "1d12h"), with Go's parser as the fallback so plain "30s"/"1m30s" and the

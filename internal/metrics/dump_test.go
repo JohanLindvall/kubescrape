@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for the non-mutating Registry read (dump.go) behind the /metrics
 // scrape bridge.
 package metrics

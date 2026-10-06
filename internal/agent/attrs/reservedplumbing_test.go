@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package attrs_test
 
 // This external test package imports internal/agent/route and

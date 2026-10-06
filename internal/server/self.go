@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // GET /v1/self: the pod-IP lookup applied to the caller's own connection.

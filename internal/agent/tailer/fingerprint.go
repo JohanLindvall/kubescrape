@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // Content identity: the head fingerprint that, with the inode, tells one

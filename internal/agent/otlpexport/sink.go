@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // One signal's spool DRAIN: enqueue, the write-side refusal warnings, and the

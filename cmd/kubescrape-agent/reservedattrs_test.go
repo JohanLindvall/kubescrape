@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The reserved-plumbing strip wiring. otlpingest deliberately does not know

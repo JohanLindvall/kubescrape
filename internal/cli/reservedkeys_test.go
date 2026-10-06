@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package cli_test
 
 // The structural guard behind the logfmt guarantee: no log call may use a key

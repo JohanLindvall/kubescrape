@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package journald
 
 // Tests for the reader's OBSERVABILITY contracts: the repairs it makes to an

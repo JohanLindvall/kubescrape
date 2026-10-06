@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package logchain holds the pieces every log-producing pipeline shares.
 //
 // The tailer, journald, the Kubernetes-events reader and the Azure-diagnostics

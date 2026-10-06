@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // gRPC admission (admit.go argues the three bounds): the pre-decode byte

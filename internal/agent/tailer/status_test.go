@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for the status snapshot (status.go).
 package tailer
 

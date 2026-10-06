@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // The rotation of the shared /v1/scrape-auth token, end to end over the route

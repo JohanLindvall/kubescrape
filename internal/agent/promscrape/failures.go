@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // Why a scrape failed, as a metric label value and as a log key.

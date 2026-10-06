@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // ServiceMonitor/PodMonitor wiring (-servicemonitors): CRD discovery, the

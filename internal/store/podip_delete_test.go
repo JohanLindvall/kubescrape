@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package store
 
 // Regression tests for the pod-IP index across deletion: what the delete path

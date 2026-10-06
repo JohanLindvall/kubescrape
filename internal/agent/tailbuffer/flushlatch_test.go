@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailbuffer
 
 // The flushed latch: after the shutdown Flush has drained the buffer, nothing

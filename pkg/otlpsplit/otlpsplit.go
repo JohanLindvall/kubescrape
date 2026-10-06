@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package otlpsplit splits OTLP payloads (logs, metrics, traces) into parts
 // whose encoded protobuf size stays within a byte cap, preserving
 // resource/scope grouping. A collector's default gRPC receive limit applies

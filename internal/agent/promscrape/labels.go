@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The package's label-slice helpers. A sample's labels are a []Label in

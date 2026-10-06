@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // Regressions for the drain's circuit breaker and the torn-final-line report:

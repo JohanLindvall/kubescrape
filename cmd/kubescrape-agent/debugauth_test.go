@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // These tests ARE the attack: a neighbour pod on the cluster network opening a

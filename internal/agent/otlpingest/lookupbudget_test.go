@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // Regression tests bounding the serial in-handler metadata lookups one push

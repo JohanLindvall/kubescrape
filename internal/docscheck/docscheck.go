@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package docscheck keeps the configuration documentation and the code it
 // documents from drifting apart. Two of its guards are about FLAGS, in both
 // directions; the third is about the agent's -config file:

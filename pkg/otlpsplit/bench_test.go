@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpsplit
 
 // The COMMON path here is the one that does not split: every export measures

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // A terminating pod (deletionTimestamp set, phase still Running for the whole

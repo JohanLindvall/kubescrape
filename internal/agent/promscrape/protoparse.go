@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // Prometheus protobuf exposition parsing — the only format that carries

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package metrics
 
 // The start timestamp of a cumulative point, and the instrumentation scope it

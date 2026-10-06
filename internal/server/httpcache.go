@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // HTTP caching for the metadata routes: Cache-Control and ETag rendering, the

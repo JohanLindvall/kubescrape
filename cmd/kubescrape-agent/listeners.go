@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The addresses this process binds, derived once from the flags: the collision

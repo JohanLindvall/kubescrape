@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package azurediag
 
 // Tests for resolving the flag surface into consumers (sources.go): how many

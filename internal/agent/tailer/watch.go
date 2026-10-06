@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // fsnotify plumbing: event dispatch, the per-file watch on the resolved

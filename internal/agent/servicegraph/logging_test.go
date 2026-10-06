@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package servicegraph
 
 // The pairing store's back-pressure, seen from the operator's side.

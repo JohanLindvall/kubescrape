@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package logchain
 
 // Attribute keys marking a record whose body was cut at a size cap. Every

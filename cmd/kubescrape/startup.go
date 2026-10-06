@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The metadata service's startup visibility: the effective-configuration dump

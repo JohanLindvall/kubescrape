@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Shared fixtures and drivers for the tailer tests: the fake metadata
 // client and exporter, tailer constructors, file writers and sweep drivers.
 package tailer

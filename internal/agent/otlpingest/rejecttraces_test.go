@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The receive-path refusal seam (ServerConfig.RejectTraces).

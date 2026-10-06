@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package route
 
 // match used to glob every pattern of every route against every resource's

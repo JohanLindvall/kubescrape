@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The once-per-process CONFIGURATION complaints (warnOnce) and the identity they

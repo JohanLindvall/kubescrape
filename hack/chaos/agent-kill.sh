@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+
 # CHAOS: SIGKILL the agent mid-stream.
 #
 # What must hold: log offsets are checkpointed, so the replacement resumes where

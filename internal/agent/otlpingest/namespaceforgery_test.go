@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // k8s.namespace.name is what internal/agent/route keys TENANCY on, so on a

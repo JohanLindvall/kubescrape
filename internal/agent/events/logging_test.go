@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package events
 
 // What the operator can SEE when the events pipeline degrades. Every case here

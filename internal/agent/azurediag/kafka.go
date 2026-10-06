@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package azurediag
 
 // The franz-go consumer behind the source interface. Event Hubs' Kafka

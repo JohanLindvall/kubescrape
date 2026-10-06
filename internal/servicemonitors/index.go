@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package servicemonitors
 
 // The Index: the monitor store the informer feeds, its change token, and the

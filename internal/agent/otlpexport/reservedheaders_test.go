@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // Static headers vs the headers the transport sets itself. The two protocols

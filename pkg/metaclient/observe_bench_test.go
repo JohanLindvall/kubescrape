@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package metaclient
 
 // observe() runs once per metadata lookup — on the concurrent ingest

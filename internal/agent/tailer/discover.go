@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // File discovery: source scanning, the claim decision per globbed path,

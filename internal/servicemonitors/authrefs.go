@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package servicemonitors
 
 // The /v1/scrape-auth allowlist: the secret references indexed monitors name,

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The startup summary: the "effective ..." Info lines every real start and

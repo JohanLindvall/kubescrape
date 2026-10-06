@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+
 # CHAOS: the kubelet rotates a container log out from under the tailer, repeatedly.
 #
 # What must hold: the tailer follows a rename rotation without losing the

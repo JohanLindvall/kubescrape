@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for exposition-to-OTLP conversion (convert.go): family shape
 // handling and the point/byte-bounded chunker.
 package promscrape

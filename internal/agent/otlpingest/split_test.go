@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The datapoint/split path (split.go): regrouping every data point into one

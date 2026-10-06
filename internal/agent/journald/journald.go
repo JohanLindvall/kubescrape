@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package journald reads the systemd journal through libsystemd (via
 // github.com/coreos/go-systemd/v22/sdjournal — cgo) and exports the entries as
 // OTLP log records. Delivery is at-least-once: the cursor of the newest

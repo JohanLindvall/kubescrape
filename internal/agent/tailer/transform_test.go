@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // The tailer's transform seam (Config.Transform): the script runs ONCE per

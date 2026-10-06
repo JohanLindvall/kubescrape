@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package logchain
 
 import "go.opentelemetry.io/collector/pdata/plog"

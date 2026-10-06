@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package bearer
 
 // The first failure of a RUN warns; the repeats drop to Debug. The transition

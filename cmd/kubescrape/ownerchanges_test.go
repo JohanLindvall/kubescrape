@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The owner change token feeds the node-targets ETag memo, and what it counts

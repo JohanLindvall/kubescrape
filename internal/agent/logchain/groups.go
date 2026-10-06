@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package logchain
 
 // Flush-time grouping for the COLD producers (journald, events, azurediag):

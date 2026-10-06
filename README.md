@@ -1,6 +1,63 @@
 [![CI](https://github.com/JohanLindvall/kubescrape/actions/workflows/ci.yml/badge.svg)](https://github.com/JohanLindvall/kubescrape/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/JohanLindvall/kubescrape.svg)](https://pkg.go.dev/github.com/JohanLindvall/kubescrape)
+[![License: MIT](https://img.shields.io/github/license/JohanLindvall/kubescrape)](LICENSE)
+[![Go version](https://img.shields.io/github/go-mod/go-version/JohanLindvall/kubescrape)](go.mod)
 
 # kubescrape
+
+**Kubernetes container logs and Prometheus metrics, shipped as OTLP with every
+record already attributed to its pod, workload and namespace.**
+
+kubescrape is a cluster **metadata service** plus a per-node **agent**. The
+service watches the API server on behalf of the whole cluster (one LIST + WATCH
+per resource, no per-request API traffic); the agents ask it over HTTP with
+ETag caching and never talk to the API server themselves. A log file is not
+read until its container is attributed — the lookup waits for the kubelet to
+report the container ID — so even a CronJob container that lives for seconds
+ships fully labelled. File offsets commit only after the collector acknowledges
+the batch, multi-line stack traces stay whole across log rotation and agent
+restarts, and CRI-parsing, multiline-joining and offset-tracking a line
+allocates nothing — a budget the test suite enforces. Kubernetes-only,
+Linux-only and OTLP-only, by design.
+
+```yaml
+# One container log line, as the agent exports it (abridged)
+resource:
+  k8s.namespace.name: shop
+  k8s.deployment.name: checkout            # the owner chain, resolved
+  k8s.replicaset.name: checkout-7d9c8b6f5
+  k8s.pod.name: checkout-7d9c8b6f5-x2x4k
+  k8s.container.name: checkout
+  container.image.name: registry.example.com/shop/checkout:1.42.0
+  k8s.node.name: worker-2
+  service.name: checkout                   # derived from the Deployment
+  service.namespace: shop
+  k8s.pod.label.app.kubernetes.io/name: checkout   # every pod and namespace label
+  # … plus k8s.pod.uid, k8s.pod.ip, container.id and service.instance.id
+log_record:
+  body: '{"level":"error","msg":"payment declined","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7"}'
+  severity_text: error                     # parsed from the line
+  severity_number: 17                      # ERROR
+  trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+  span_id: 00f067aa0ba902b7
+  attributes:
+    log.iostream: stdout
+```
+
+**Try it** on a local [kind](https://kind.sigs.k8s.io/) cluster: `make e2e`
+creates three nodes, builds and deploys both components with sample workloads
+and a debug OpenTelemetry collector, and asserts that logs and metrics arrive.
+It needs Docker, Go, Python 3 and curl; `kind` and `kubectl` are fetched into
+`hack/bin` when missing, and the cluster is left running:
+
+```sh
+git clone https://github.com/JohanLindvall/kubescrape && cd kubescrape
+make e2e
+export PATH="$PWD/hack/bin:$PATH"   # the fetched kind and kubectl, if any
+kubectl --context kind-kubescrape -n monitoring logs deploy/otel-collector | tail
+```
+
+## Overview
 
 Two cooperating services:
 
@@ -1920,3 +1977,16 @@ curl -s "localhost:8080/v1/containers/${cid#containerd://}" | jq .
 
 `make cluster-down` deletes the cluster again. Set `CLUSTER_NAME` to use a
 different cluster name for both scripts.
+
+## Star history
+
+Stars measure reach rather than adoption. The chart tracks kubescrape beside
+the agents [docs/COMPARISON.md](docs/COMPARISON.md) compares it with, on a log
+scale:
+
+<a href="https://www.star-history.com/#johanlindvall/kubescrape&grafana/alloy&open-telemetry/opentelemetry-collector-contrib&vectordotdev/vector&fluent/fluent-bit&elastic/beats&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=johanlindvall/kubescrape,grafana/alloy,open-telemetry/opentelemetry-collector-contrib,vectordotdev/vector,fluent/fluent-bit,elastic/beats&type=Date&logscale&theme=dark">
+    <img alt="GitHub star history of kubescrape beside Grafana Alloy, the OpenTelemetry Collector (contrib), Vector, Fluent Bit and Elastic Beats" src="https://api.star-history.com/svg?repos=johanlindvall/kubescrape,grafana/alloy,open-telemetry/opentelemetry-collector-contrib,vectordotdev/vector,fluent/fluent-bit,elastic/beats&type=Date&logscale">
+  </picture>
+</a>

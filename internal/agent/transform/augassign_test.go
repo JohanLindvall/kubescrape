@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package transform
 
 // What these pin: `r.body += " tag"`, `r.attributes["n"] += 1` and `a[i] *= 2`

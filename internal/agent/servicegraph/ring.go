@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package servicegraph
 
 // The shard ring: which shard owns a trace.

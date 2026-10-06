@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // Per-target SCHEDULING: the loop's tick (Run, at the finest cadence any target

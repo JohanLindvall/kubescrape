@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 BINARY  := kubescrape
 IMAGE   ?= ghcr.io/johanlindvall/kubescrape
 TAG     ?= latest

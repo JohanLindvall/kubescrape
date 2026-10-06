@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // -test-config: offline unit tests for the log pipeline configuration. An

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package scrape derives Prometheus scrape targets from pod and Service
 // metadata. It is pure functions over kubemeta, services and servicemonitors
 // values — no store, no locks, no logging — which is what lets /v1/explain

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // The lookup handlers for the v1 metadata endpoints — containers, pods (by

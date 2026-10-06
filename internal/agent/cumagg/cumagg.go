@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package cumagg is the cumulative-series state machine behind the agent's two
 // self-contained OTLP aggregators: agent/spanmetrics (per-span RED metrics) and
 // agent/servicegraph (paired edge metrics).

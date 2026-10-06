@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package metaclient
 
 // The response cache: the entry (cacheEntry), the hit path (lookupEntry), the

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // /v1/scrape-auth is the ONE authenticated route, and its warning tables are

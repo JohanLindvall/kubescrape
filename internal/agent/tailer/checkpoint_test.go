@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for offset persistence (checkpoint.go + agent/positions).
 package tailer
 

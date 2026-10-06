@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // Header names are case-insensitive on BOTH transports — gRPC lowercases

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package scrape
 
 // The explain half of the package: per-decision diagnostics for the

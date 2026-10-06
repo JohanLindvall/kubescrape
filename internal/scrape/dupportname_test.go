@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package scrape
 
 // A pod declaring ONE container-port name on two containers. Kubernetes only

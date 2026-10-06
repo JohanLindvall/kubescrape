@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package store
 
 // The pod-IP index: which live pod holds an address (byPodIP), every record

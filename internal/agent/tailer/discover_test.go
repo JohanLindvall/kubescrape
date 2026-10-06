@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for file discovery (discover.go, watch.go): scanning, watching,
 // source claiming and initial checkpoint state.
 package tailer

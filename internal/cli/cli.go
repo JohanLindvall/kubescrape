@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package cli holds the small startup helpers both binaries' mains share: the
 // process logger built from -log-level, the comma-separated list splitter
 // behind several flags, the GOMEMLIMIT derivation, the signal-driven process

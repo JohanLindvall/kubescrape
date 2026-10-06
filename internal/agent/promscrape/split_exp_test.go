@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // The splitter's exponential-histogram path: native points route through the
 // same groupBy/dropLabels machinery as every other kind, so splitter-backed
 // targets can accept the protobuf exposition.

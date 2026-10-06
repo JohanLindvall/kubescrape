@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package route
 
 // What an operator can see when a tenant's destination is not working. Routing

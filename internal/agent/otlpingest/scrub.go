@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // Redaction of pushed log bodies (ServerConfig.Scrub), whatever shape the body has:

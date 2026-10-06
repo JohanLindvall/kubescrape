@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The identity rule the two kubelet endpoints share: whether a pod the metadata

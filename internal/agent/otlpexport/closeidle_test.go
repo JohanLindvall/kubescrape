@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // Client.Close on the OTLP/HTTP protocol.

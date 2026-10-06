@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+
 # End-to-end smoke test against a kind cluster (`make e2e`).
 #
 # AGENTS.md has always said informer/store/API changes should be verified

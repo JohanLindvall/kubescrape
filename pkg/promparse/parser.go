@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package promparse is a streaming parser for the Prometheus text exposition
 // format, classic and OpenMetrics, including the Prometheus 3 quoted UTF-8
 // name syntax ({"my.metric",code="200"} 1, quoted label names, and quoted

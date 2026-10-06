@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The OTLP side every batcher shares: a family's descriptor (metricMeta), the

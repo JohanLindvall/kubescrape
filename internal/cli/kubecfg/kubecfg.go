@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package kubecfg builds a *rest.Config with this repo's kubeconfig
 // precedence: an explicit path, then in-cluster credentials, then the default
 // loading rules.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package transform
 
 // The four hook points beyond the per-signal batch transforms, each an

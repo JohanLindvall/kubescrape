@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package cli
 
 // grpc-go's own logger, routed into the process logger.

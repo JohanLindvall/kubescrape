@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpsplit
 
 // An identity-bearing EMPTY scope must not blind the leaf-level cap check.

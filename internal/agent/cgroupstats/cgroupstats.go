@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package cgroupstats samples container cgroups directly, at a far higher
 // frequency than the cadvisor scrape, and exports the DISTRIBUTION of what it
 // saw instead of the raw series.

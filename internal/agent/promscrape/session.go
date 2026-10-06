@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The scrape SESSION: the per-scrape harness every exposition pipeline runs on

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package clip is the one implementation of "cut a string to a byte bound on a
 // rune boundary" for log lines, error strings and diagnostic documents.
 //

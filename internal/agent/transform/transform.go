@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package transform runs user-defined transformations over OTLP payloads at
 // the exporter seam: every batch a pipeline exports passes through the active
 // program before buffering, so spooled bytes are final and replays are

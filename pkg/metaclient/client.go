@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package metaclient is the HTTP client for the kubescrape metadata service:
 // it resolves a container ID, pod UID or pod IP to the pod/container metadata
 // the service derives from its informer caches.

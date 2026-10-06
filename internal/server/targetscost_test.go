@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // The cost side of GET /v1/nodes/{node}/targets. Every agent in the fleet

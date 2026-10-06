@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // Regression tests for the SEAMS between the per-request budgets: the lookup

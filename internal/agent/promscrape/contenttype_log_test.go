@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The response Content-Type is the TARGET's bytes: a header a workload chooses,

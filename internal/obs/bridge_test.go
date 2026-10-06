@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for the /metrics bridge: kubescrape_* served exactly when the OTLP
 // push is off.
 package obs

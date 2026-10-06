@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package journald
 
 // sanitize is the whole read-side per-entry cost of this pipeline and runs on

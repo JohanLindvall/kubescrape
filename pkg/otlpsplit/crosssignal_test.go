@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpsplit
 
 // One table-driven test asserting the FIVE properties every splitter shares,

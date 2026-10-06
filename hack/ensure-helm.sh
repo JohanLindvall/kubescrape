@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+
 # Prints the path of a helm binary at the PINNED version, downloading it into
 # hack/bin when the machine has no matching one — the same pattern cluster-up.sh
 # uses for kind and kubectl. Everything that needs helm (make helm-lint, the

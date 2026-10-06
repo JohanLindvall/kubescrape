@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package azurediag
 
 // Record → OTLP conversion. The ARM resource the diagnostics are ABOUT

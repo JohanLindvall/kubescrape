@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package logattrs lifts configured keys out of a structured log line (JSON
 // or logfmt) onto the exported record — as resource, scope, or log-record
 // attributes. Resource and scope attributes affect how records group into

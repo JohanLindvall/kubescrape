@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package cgroupstats
 
 // Finding the container cgroups, without assuming a layout.

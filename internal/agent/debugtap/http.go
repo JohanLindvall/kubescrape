@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package debugtap
 
 // The HTTP half: GET /debug/otlp (the stream) and GET /debug/otlp/ui (a

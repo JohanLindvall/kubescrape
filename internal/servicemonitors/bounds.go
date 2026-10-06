@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package servicemonitors
 
 // The ceilings on the tenant-supplied endpoint strings scrape copies onto every

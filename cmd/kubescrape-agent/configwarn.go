@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The legal-but-surprising half of config validation: the warnings -check-config

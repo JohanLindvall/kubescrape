@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package chartcheck pins the RENDERED output of the Helm chart with golden
 // files, one per value fixture. internal/manifestcheck asserts that the
 // static manifests' flags exist; this covers the half it cannot — the chart's

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package config holds the primitives every YAML config section needs.
 //
 // The agent's config decodes through sigs.k8s.io/yaml, i.e. encoding/json,

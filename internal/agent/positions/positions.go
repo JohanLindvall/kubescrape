@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package positions is the agent's unified, on-disk position store. A single
 // file holds both the log tailer's per-file read offsets and the journald
 // reader's cursor, so a restart resumes every input from one mounted file.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package promscrape is the agent's Prometheus scraper: it fetches the targets
 // the metadata service derives for this node (annotation-discovered pods and
 // Services, ServiceMonitor and PodMonitor endpoints), scrapes them on their own

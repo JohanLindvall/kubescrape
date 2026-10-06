@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // A REPEATED attribute key must not survive the receipt-time strip.

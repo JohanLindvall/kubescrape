@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // Informer transforms: what the cached objects are stripped to before they are

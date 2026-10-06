@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package selfmeta answers "which pod am I, and what surrounds me" for a
 // kubescrape process, and stamps that pod's Kubernetes resource attributes
 // onto the metrics the process generates about ITSELF — the agent's

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package tracehash owns the nesting-critical trace-ID sampling arithmetic
 // shared by the head sampler (agent/tracesample) and the tail sampler's
 // probabilistic policy (agent/tailsample), plus the token bucket both spans/

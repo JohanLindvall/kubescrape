@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Command kubescrape serves Kubernetes pod and container metadata over HTTP.
 //
 // It builds an in-memory view of all pods via a single LIST followed by a

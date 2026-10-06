@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package scrape
 
 // appendTargetURL restates net.JoinHostPort's rule rather than calling it, to

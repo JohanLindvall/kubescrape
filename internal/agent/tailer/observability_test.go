@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // Tests for the tailer's OBSERVABILITY contracts: the paths that decide not to

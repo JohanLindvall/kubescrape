@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package scrape
 
 // A NATIVE SIDECAR — an initContainer with restartPolicy: Always, the

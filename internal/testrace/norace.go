@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //go:build !race
 
 // Package testrace reports whether the enclosing binary was built with the

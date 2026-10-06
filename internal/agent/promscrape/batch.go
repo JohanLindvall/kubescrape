@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The plain batcher — its lifecycle, and its emission half: how a converted

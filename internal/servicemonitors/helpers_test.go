@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package servicemonitors
 
 // Fixture helpers shared by this package's tests. The builders in the other

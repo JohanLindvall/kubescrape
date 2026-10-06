@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The two bounded per-target caches evict silently by design: nothing is lost,

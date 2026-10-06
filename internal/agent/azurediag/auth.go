@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package azurediag
 
 // Event Hubs authentication over the Kafka surface, two ways:

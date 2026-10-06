@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The kubelet's /stats/summary scrape: the THIRD kubelet endpoint, and the one

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // What the gRPC client makes of peers that are not a healthy gRPC collector,

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for the per-file pipeline (pipeline.go): CRI parsing, multiline
 // joining, oversize/truncation handling and rate limiting.
 package tailer

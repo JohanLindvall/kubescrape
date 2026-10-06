@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The trace tier's INTERNAL receiver (sgReceiver): the bearer-authenticated

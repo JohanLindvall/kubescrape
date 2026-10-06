@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package events
 
 // Benchmarks for the events pipeline's per-event cost: ingest (newEventMeta +

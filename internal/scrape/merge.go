@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package scrape
 
 // Two monitors resolving to ONE URL on one pod are served as ONE target that

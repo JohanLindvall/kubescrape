@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // Every command-line flag the agent registers (plus the blocks shared with the

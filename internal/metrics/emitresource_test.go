@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package metrics
 
 // The resource an emit_metric observation is keyed on is the one the caller

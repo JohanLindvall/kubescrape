@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package scrape
 
 // A note's REMEDY has to fit the verdict it hangs on. The duplicate-name

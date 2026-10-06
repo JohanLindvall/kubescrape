@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // Who may READ the agent's data-bearing debug surfaces on -listen.

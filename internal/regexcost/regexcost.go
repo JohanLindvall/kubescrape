@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package regexcost estimates what a regular expression compiles INTO, from its
 // parse tree and before anything is compiled.
 //

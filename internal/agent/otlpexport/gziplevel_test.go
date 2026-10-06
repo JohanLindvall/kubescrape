@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // The gzip level is a PER-DESTINATION config field, and New is called once per

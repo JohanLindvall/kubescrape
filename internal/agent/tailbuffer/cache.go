@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailbuffer
 
 // The decision cache: what a span arriving AFTER its trace was judged is

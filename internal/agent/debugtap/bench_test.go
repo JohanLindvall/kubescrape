@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package debugtap
 
 // The tap is in the export chain unconditionally, so its ZERO-SUBSCRIBER cost

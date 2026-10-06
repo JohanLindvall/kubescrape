@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // The merge is exercised HERE, against the real nodeTargets loop, because the

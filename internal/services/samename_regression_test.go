@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package services
 
 // A Service deleted and recreated under the SAME name gets a fresh UID. The

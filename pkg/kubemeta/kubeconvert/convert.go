@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package kubeconvert converts Kubernetes API objects into the kubemeta wire
 // model. It lives apart from kubemeta so that clients which only decode the
 // model (pkg/metaclient and anything like it) do not compile k8s.io/api and

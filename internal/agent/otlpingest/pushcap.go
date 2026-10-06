@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // EffectiveMaxInFlight is the concurrency bound a Server built with

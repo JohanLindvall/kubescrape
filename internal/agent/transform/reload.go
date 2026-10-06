@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package transform
 
 // Hot reload: the transforms file lives in its OWN ConfigMap (mounted as a

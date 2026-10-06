@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // The drain's poison-payload machinery: how a batch the collector keeps

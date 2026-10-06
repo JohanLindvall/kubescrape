@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package debugtap
 
 // A stream with no filter and no sampling — the default GET /debug/otlp and

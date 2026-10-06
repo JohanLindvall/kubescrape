@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package route
 
 // Reoffer: whether a split payload's DEFAULT share may be held back while a

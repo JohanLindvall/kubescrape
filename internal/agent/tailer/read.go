@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // The incremental read path for live (non-archive) files: the per-sweep read

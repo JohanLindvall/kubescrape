@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // Wire-SHAPE admission: how deeply a pushed payload nests, decided BEFORE the

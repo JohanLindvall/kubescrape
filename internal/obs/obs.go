@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package obs holds the internal (self-observability) metrics of both
 // binaries. They are produced through internal/metrics' Registry and, by
 // default, pushed over OTLP alongside everything else (Registry.Run). With

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // Allocation budgets for the ingest request path, ENFORCED here rather than

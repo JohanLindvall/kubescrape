@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package servicemonitors
 
 // The per-monitor report of fields kubescrape parsed but does not interpret.

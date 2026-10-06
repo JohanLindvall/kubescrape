@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The /stats/summary batcher: the metric set, the resource each statistic lands

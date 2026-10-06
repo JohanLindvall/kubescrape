@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package metrics
 
 // A cumulative point's StartTimeUnixNano must never be AFTER its own

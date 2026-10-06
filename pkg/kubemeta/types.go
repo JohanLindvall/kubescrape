@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package kubemeta is the metadata model the kubescrape service serves over
 // HTTP — the wire contract for its API, so clients can decode responses
 // without redeclaring the types (pkg/metaclient does exactly that).

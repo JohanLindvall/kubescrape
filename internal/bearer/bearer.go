@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package bearer is the one implementation of "a bearer token lives in a
 // mounted file that rotates under us".
 //

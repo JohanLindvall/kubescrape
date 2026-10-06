@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package cli
 
 // Reading THIS CONTAINER'S OWN cgroup memory limit: the one reader behind

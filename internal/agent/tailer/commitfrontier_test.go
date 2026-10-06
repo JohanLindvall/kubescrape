@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for the commit frontier over bytes the read CONSUMED but never FED
 // (file.skipEnd in file.go, absorbSkipped in ledger.go) — rate-DROPPED lines, blank lines
 // and fully discarded oversized ones. `committed` only ever advances to an

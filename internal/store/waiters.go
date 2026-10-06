@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package store
 
 // Blocked container lookups: the memory budget that caps them, the parking

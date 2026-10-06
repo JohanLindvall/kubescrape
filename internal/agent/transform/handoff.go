@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package transform
 
 // Handoff: which side of the transform seam still needs the payload OBJECT.

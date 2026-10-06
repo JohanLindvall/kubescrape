@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package cumagg
 
 // The cardinality cap, seen from the operator's side.

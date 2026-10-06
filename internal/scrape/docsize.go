@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package scrape
 
 import "github.com/JohanLindvall/kubescrape/pkg/kubemeta"

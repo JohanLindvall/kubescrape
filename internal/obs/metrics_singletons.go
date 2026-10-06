@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package obs
 
 // Kubernetes events (the cluster-singleton events collector).

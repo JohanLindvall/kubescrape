@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The per-request metadata lookup layer: the kind-tagged id tokens, the request

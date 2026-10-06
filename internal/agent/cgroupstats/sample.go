@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package cgroupstats
 
 // The sample path: the per-interval sweep over every tracked container, three

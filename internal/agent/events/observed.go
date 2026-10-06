@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package events
 
 // The observed set: the positional proof that lets a re-delivered event tell

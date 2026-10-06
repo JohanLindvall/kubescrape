@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // The raw send path hands the SPOOLED BYTES to the wire, and those bytes are

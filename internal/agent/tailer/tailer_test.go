@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for the tailer core (tailer.go): Config/New, sweep scheduling and
 // idle-close fd management.
 package tailer

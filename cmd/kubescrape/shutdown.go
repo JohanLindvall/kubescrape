@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The shutdown sequence's budgets and joins: the HTTP drain, and the bounded

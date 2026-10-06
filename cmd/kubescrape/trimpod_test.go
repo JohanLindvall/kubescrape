@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The pod informer's transform drops most of the pod SPEC and most of the

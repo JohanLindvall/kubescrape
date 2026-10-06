@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package cli
 
 // The flag blocks both binaries register identically. Each main used to

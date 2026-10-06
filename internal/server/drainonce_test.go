@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // Drain's COUNT is idempotent, not just its close. main logs the number —

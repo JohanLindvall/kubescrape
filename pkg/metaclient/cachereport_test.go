@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package metaclient
 
 // reportCache runs once per lookup on the concurrent ingest and cadvisor paths,

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The agent's /readyz: the startup gates each pipeline registers and satisfies,

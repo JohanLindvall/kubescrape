@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package leader
 
 // "Which pod is the leader?" and "did we just fail over?" must both be

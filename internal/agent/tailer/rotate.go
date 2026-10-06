@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailer
 
 // Rotation and rewind: draining a rotated-away inode, closing the tail into a

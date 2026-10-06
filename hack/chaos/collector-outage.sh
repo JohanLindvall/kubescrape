@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+
 # CHAOS: the collector goes away mid-stream.
 #
 # What must hold: no line the writer produced is lost. Without -buffer-dir the

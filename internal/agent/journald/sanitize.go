@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package journald
 
 // Read-side repairs: what makes one journal message exportable — valid UTF-8,

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package store
 
 // The store's change tokens are what internal/server's node-targets ETag memo

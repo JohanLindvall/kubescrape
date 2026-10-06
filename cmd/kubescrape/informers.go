@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // Informer wiring: the pod and Service handlers that fill the store and the

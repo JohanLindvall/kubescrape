@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The ingest log chain's body bound (chainBody, logchain.go): what a nested

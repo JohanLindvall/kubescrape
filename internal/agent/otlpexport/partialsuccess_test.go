@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // The OTLP/HTTP partial-success flow lives ONCE (Client.httpExport) and is

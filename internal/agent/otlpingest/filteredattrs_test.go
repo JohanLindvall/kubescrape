@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The operator's resourceAttributes config changes what the builder RENDERS,

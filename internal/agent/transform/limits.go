@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package transform
 
 // What bounds one Starlark invocation, and why the step limit alone does not.

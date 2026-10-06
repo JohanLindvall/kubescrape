@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // startNodeInfo carries the readiness gate a DaemonSet rolling update advances

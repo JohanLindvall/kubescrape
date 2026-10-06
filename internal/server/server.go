@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package server exposes the metadata store over HTTP.
 package server
 

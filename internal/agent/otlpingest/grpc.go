@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The gRPC arm of the ingest receiver: one Export wrapper per signal around the

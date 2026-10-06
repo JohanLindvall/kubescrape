@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package promscrape
 
 // The split batcher: the per-scrape runtime of a Splitter (split.go holds the

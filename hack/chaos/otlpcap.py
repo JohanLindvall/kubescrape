@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+
 """Questions the chaos scenarios ask of the collector's captured self-metrics.
 
 hack/otel-collector.yaml's file exporter writes one OTLP/JSON push per line, and

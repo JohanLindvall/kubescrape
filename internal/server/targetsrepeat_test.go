@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // The targets route's REPEATED work: the four things it used to recompute per

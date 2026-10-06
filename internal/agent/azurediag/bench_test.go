@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package azurediag
 
 // Benchmarks for the azurediag hot path. The reader is a cluster-singleton

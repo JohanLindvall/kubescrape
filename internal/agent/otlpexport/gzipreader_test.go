@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // The gRPC gzip codec pools its READERS as well as its writers. A gzip reader

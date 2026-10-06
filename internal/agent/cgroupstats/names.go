@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package cgroupstats
 
 // The metric names, units and descriptions, and the gauge tables build renders

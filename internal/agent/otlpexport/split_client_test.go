@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // Client-side integration of the payload splitter (pkg/otlpsplit): one

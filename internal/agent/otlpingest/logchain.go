@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The logs.rules / logMetrics / line-enrichment half of the ingest LOG path.

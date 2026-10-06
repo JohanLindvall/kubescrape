@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package events
 
 // The backlog REPLAY: how the reader recovers a position the API server no

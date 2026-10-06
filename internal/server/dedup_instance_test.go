@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // The URL dedup keeps two targets apart that the EXPORTED identity cannot:

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // The SERVER-SIDE cost of GET /v1/nodes/{node}/targets, measured without the

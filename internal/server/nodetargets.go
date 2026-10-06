@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // GET /v1/nodes/{node}/targets: the node-local scrape-target derivation and

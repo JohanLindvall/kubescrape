@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package spanmetrics
 
 // What New decides for itself, and says. Both cases silently changed what the

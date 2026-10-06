@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package journald
 
 // Benchmarks for the journal's per-entry convert cost (batch -> OTLP grouping

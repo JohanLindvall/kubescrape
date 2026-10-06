@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package journald
 
 // Journal entries -> OTLP log records. What is journald's own is the unit's

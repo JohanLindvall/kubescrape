@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 # Debian build stage: the agent links libsystemd (journald) via cgo, so it needs
 # a glibc toolchain and the libsystemd headers (alpine/musl has no systemd).
 # Move the Go minor together with go.mod's floor (the version CI installs), and

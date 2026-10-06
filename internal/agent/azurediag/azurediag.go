@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package azurediag consumes Azure diagnostic-settings output — resource
 // logs AND platform metrics — from an Event Hubs namespace over its Kafka
 // surface (franz-go) and exports it as OTLP: logs through the same shared

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpingest
 
 // The operator's ingest admission hook (ServerConfig.Admit — the transforms

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package manifestcheck reads the shipped Kubernetes manifests (the Helm chart
 // templates and deploy/) and extracts the command-line flags they pass to each
 // binary, so a test in each binary's package can assert that every one of them

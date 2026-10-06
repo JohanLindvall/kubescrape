@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // targetDedup, the per-pod target accumulator nodeTargets and /v1/explain

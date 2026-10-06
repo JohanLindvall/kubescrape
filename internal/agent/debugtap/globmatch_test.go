@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package debugtap
 
 // An attribute filter is matched on the EXPORTING goroutine against names and

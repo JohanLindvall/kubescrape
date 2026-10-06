@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package servicemonitors
 
 // The Endpoint model, the CRD's endpoint decode shape (endpointSpec) and the

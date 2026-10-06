@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 // Per-signal export destinations — the piece that makes COLLECTORLESS

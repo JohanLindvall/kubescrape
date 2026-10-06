@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package servicemonitors indexes Prometheus-Operator ServiceMonitor and
 // PodMonitor custom resources so their targets can be served alongside
 // annotation-discovered ones. Only pod-backed Services are supported: targets

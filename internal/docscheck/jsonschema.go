@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package docscheck
 
 // JSON-Schema generation for the agent's -config YAML, by reflection over the

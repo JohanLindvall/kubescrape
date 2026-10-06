@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The k8sSecretReader caches FAILURES so one broken monitor ref cannot turn

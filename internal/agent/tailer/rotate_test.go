@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for rotation (rotate.go, replay.go, gone.go): drains, segments,
 // carried prefixes and crash/outage recovery.
 package tailer

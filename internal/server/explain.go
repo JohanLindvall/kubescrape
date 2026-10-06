@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // GET /v1/explain/{namespace}/{name}: why is this pod (not) scraped?

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package cgroupstats
 
 // The export path: rendering each window into its distribution (snapshot,

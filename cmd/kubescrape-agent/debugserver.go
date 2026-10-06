@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The -listen server: health, readiness and the /debug surfaces (debugMux),

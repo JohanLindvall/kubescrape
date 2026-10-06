@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Tests for rule compilation and validation (compile.go).
 package metrics
 

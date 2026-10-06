@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package cli
 
 // GOMEMLIMIT: turning an OOMKill into GC pressure.

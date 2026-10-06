@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package otlpexport
 
 import "github.com/JohanLindvall/kubescrape/internal/cli"

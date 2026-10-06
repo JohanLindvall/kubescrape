@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package scrape
 
 // mergeCadence short-circuits when both sides spell the interval identically,

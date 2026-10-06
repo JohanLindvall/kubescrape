@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package main
 
 // The Secret reader behind /v1/scrape-auth (-scrape-auth-secrets), with its

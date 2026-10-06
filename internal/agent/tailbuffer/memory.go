@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package tailbuffer
 
 // Sizing maxSpans against memory that actually exists.

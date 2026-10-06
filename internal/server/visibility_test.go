@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // The metadata service is a fleet-wide dependency, so every refusal it makes

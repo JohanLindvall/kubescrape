@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // An informer RESYNC re-delivers every object it holds, byte-identical, on the

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package obs
 
 // The process itself: its own-pod lookup and its readiness gates (both

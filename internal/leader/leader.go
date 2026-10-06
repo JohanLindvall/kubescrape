@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package leader runs cluster-singleton work under a coordination.k8s.io
 // Lease, so exactly one replica does it at a time.
 //

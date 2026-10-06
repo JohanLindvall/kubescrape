@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package attrs
 
 // SenderIdentityKeys is a SECURITY-relevant list in two consumers — the ingest

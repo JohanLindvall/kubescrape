@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package metaclient
 
 // The Cache-Control max-age is the SERVER's number, and time.Duration is int64

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package server
 
 // The unresolved-endpoint warning's dedupe key is a security boundary, for the

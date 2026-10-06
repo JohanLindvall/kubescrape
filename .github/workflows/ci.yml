@@ -106,29 +106,25 @@ jobs:
       - run: make lint
 
   # Both images, built exactly as `make image` and `make image-static` build
-  # them, and then each binary STARTED inside its own runtime base. Nothing else
-  # in CI builds either Dockerfile — `make e2e` (never run here) builds only the
-  # one its TAGS select, and before this job nothing at all built
-  # Dockerfile.static — so a Dockerfile or .dockerignore break reached main
-  # unseen. -check-config acquires nothing (no listeners, no
-  # API server, no kubeconfig), so it runs anywhere; the exec itself is the
-  # point: it resolves the agent's shared libraries against distroless/base's
-  # glibc and the .so files the Dockerfile stages from a HAND-KEPT list, which a
-  # base-image bump can outgrow without failing the build.
+  # them, and then each binary STARTED inside its own runtime base and asked
+  # which version it is (hack/check-image.sh, which the release workflow runs
+  # on what it publishes). Nothing else in CI builds either Dockerfile — `make
+  # e2e` (never run here) builds only the one its TAGS select, and before this
+  # job nothing at all built Dockerfile.static — so a Dockerfile or
+  # .dockerignore break reached main unseen. The VERSION is a fixed probe
+  # rather than `git describe`, so the check is exact: the image build cannot
+  # see .git, and a VERSION that stops reaching the link step would ship
+  # binaries reporting "unknown".
   image:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - name: build both images
-        run: make image image-static IMAGE=kubescrape-ci TAG=ci
+        run: make image image-static IMAGE=kubescrape-ci TAG=ci VERSION=v0.0.0-ci
       - name: start every binary in its runtime base
         run: |
-          set -eu
-          for img in kubescrape-ci:ci kubescrape-ci:ci-static; do
-            echo "== $img"
-            docker run --rm --entrypoint /kubescrape "$img" -check-config
-            docker run --rm --entrypoint /kubescrape-agent "$img" -check-config -node-name=ci
-          done
+          hack/check-image.sh kubescrape-ci:ci v0.0.0-ci
+          hack/check-image.sh kubescrape-ci:ci-static v0.0.0-ci
 
   vulncheck:
     runs-on: ubuntu-latest

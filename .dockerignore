@@ -6,9 +6,9 @@
 .github
 bin
 charts
+dist
 deploy
 docs
-todo
 *.md
 Dockerfile
 Dockerfile.static

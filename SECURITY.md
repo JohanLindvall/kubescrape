@@ -29,8 +29,9 @@ A report showing that one of them is worse than that section says is welcome.
 
 ## Supported versions
 
-There are no tagged releases yet. Fixes land on `main`; run a build of the
-latest commit.
+Only the [latest release](https://github.com/JohanLindvall/kubescrape/releases/latest)
+is supported. Fixes land on `main` and ship in the next release; there are no
+backports to older ones.
 
 ## Dependencies
 

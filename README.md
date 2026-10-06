@@ -1,3 +1,4 @@
+[![Release](https://img.shields.io/github/v/release/JohanLindvall/kubescrape)](https://github.com/JohanLindvall/kubescrape/releases/latest)
 [![CI](https://github.com/JohanLindvall/kubescrape/actions/workflows/ci.yml/badge.svg)](https://github.com/JohanLindvall/kubescrape/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/JohanLindvall/kubescrape.svg)](https://pkg.go.dev/github.com/JohanLindvall/kubescrape)
 [![License: MIT](https://img.shields.io/github/license/JohanLindvall/kubescrape)](LICENSE)
@@ -57,6 +58,24 @@ export PATH="$PWD/hack/bin:$PATH"   # the fetched kind and kubectl, if any
 kubectl --context kind-kubescrape -n monitoring logs deploy/otel-collector | tail
 ```
 
+**Install a release.** Every
+[release](https://github.com/JohanLindvall/kubescrape/releases) publishes the
+image for linux/amd64 and linux/arm64 as
+`ghcr.io/johanlindvall/kubescrape:<version>`, and attaches the Helm chart and
+the manifests with that image pinned, static binaries and `SHA256SUMS`:
+
+```sh
+helm install kubescrape \
+  https://github.com/JohanLindvall/kubescrape/releases/download/v0.1.0/kubescrape-0.1.0.tgz \
+  --namespace monitoring --create-namespace \
+  --set agent.otlp.endpoint=my-collector.observability:4317 \
+  --set service.otlp.endpoint=my-collector.observability:4317
+# or the plain manifests of the latest release, which expect the collector at
+# otel-collector.monitoring:4317:
+kubectl apply -f https://github.com/JohanLindvall/kubescrape/releases/latest/download/kubernetes.yaml \
+  -f https://github.com/JohanLindvall/kubescrape/releases/latest/download/agent.yaml
+```
+
 ## Overview
 
 Two cooperating services:
@@ -79,9 +98,10 @@ the PromQL), a symptom→cause table, and which counters are worth an alert.
 **Security posture**, and the residuals this project deliberately does *not*
 close, are in
 [docs/CONFIGURATION.md#accepted-security-residuals](docs/CONFIGURATION.md#accepted-security-residuals)
-— read it before exposing the ingest listeners, and pin the chart's `image.tag`
-(or `image.digest`) to a release: a floating `latest` makes an upgrade roll
-nothing.
+— read it before exposing the ingest listeners. A release's chart pins the
+image to its own version; the chart in this repository defaults to the floating
+`latest`, which makes an upgrade roll nothing, so pin `image.tag` (or
+`image.digest`) when installing from a checkout.
 
 Full flag and config-file reference with examples:
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md); the exhaustive generated
@@ -1938,6 +1958,12 @@ every later entry), and renders the `agent.config` value verbatim into the singl
 ```sh
 helm install kubescrape charts/kubescrape -n monitoring -f my-values.yaml
 ```
+
+That is the chart on `main`, whose image defaults to the floating `latest`.
+Each [release](https://github.com/JohanLindvall/kubescrape/releases) attaches
+the chart packaged with its own version, image pinned
+(`helm install kubescrape <the release's kubescrape-X.Y.Z.tgz URL>`), and
+`make dist VERSION=vX.Y.Z` builds those assets locally.
 
 Values are validated against the chart's `values.schema.json` at
 install/template time, so a misspelled key is an immediate error rather than

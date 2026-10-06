@@ -22,6 +22,11 @@ COPY . .
 # journald (and `make image-static` is that case); only a direct `docker build`
 # of this file needs telling.
 ARG TAGS=journald,azure,events
+# The version both binaries report (internal/obs.Version: the startup line's
+# version= and the service.version resource attribute). .dockerignore keeps
+# .git out of the build context, so without it they cannot derive one and say
+# "unknown"; `make image` passes `git describe`, a release passes its tag.
+ARG VERSION=""
 # The metadata service is fully static; the agent is cgo when it carries the
 # journald pipeline (it links libsystemd) and static otherwise.
 # -ldflags="-s -w" strips the symbol table and DWARF (~30% smaller image):
@@ -29,9 +34,11 @@ ARG TAGS=journald,azure,events
 # traces are UNAFFECTED — the runtime reads pclntab, which -s/-w never remove
 # (only external debuggers like delve/gdb lose out). `make build` stays
 # unstripped for local debugging.
-RUN CGO_ENABLED=0 go build -trimpath -tags "$TAGS" -ldflags="-s -w" -o /kubescrape ./cmd/kubescrape
+RUN CGO_ENABLED=0 go build -trimpath -tags "$TAGS" \
+	-ldflags="-s -w -X github.com/JohanLindvall/kubescrape/internal/obs.Version=$VERSION" -o /kubescrape ./cmd/kubescrape
 RUN case "$TAGS" in *journald*) CGO=1 ;; *) CGO=0 ;; esac; \
-	CGO_ENABLED=$CGO go build -trimpath -tags "$TAGS" -ldflags="-s -w" -o /kubescrape-agent ./cmd/kubescrape-agent
+	CGO_ENABLED=$CGO go build -trimpath -tags "$TAGS" \
+	-ldflags="-s -w -X github.com/JohanLindvall/kubescrape/internal/obs.Version=$VERSION" -o /kubescrape-agent ./cmd/kubescrape-agent
 
 # Stage libsystemd and its runtime dependencies under a MIRRORED tree instead of
 # COPYing /usr/lib/x86_64-linux-gnu/* straight across: Debian's multiarch path is

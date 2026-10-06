@@ -47,6 +47,17 @@ TAGS_STATIC ?= azure,events
 # The agent needs cgo only for journald; without that tag it builds static.
 AGENT_CGO := $(if $(findstring journald,$(TAGS)),1,0)
 
+# The version both binaries report (internal/obs.Version: the startup line's
+# version= and the service.version resource attribute), stamped at link time by
+# `build`, `image` and `dist`. A release passes its tag (VERSION=v1.2.3); unset,
+# it is `git describe`: the nearest tag plus the commits since, or the bare
+# commit before the first tag. The image build cannot derive it for itself:
+# .dockerignore keeps .git out of the build context.
+ifeq ($(origin VERSION),undefined)
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null)
+endif
+LDFLAGS_VERSION := -X github.com/JohanLindvall/kubescrape/internal/obs.Version=$(VERSION)
+
 # The linter analyzes the standard library of the INSTALLED Go, not go.mod's, so
 # a toolchain upgrade can break lint on its own: v2.12's staticcheck panics
 # parsing Go 1.27's internal/poll ("buildir: unexpected expr *ast.KeyValueExpr").
@@ -56,7 +67,7 @@ GOLANGCI_LINT_VERSION := v2.13.2
 # gets replaced.
 GOLANGCI_LINT         := hack/bin/golangci-lint
 
-.PHONY: all build test race vet vulncheck fmt fmt-check tidy lint run image image-static verify-tags helm-lint check cluster-up cluster-down e2e chaos clean
+.PHONY: all build test race vet vulncheck fmt fmt-check tidy lint run image image-static dist verify-tags helm-lint check cluster-up cluster-down e2e chaos clean
 
 all: build
 
@@ -80,8 +91,8 @@ check: fmt-check vet lint helm-lint test verify-tags
 # -ldflags="-s -w" (see Dockerfile) for a ~30% smaller binary; that does not
 # affect Go panic stack traces (the runtime reads pclntab, which -s/-w keep).
 build:
-	CGO_ENABLED=0 go build $(GOFLAGS) $(TAGFLAGS) -o bin/$(BINARY) ./cmd/kubescrape
-	CGO_ENABLED=$(AGENT_CGO) go build $(GOFLAGS) $(TAGFLAGS) -o bin/$(BINARY)-agent ./cmd/kubescrape-agent
+	CGO_ENABLED=0 go build $(GOFLAGS) $(TAGFLAGS) -ldflags "$(LDFLAGS_VERSION)" -o bin/$(BINARY) ./cmd/kubescrape
+	CGO_ENABLED=$(AGENT_CGO) go build $(GOFLAGS) $(TAGFLAGS) -ldflags "$(LDFLAGS_VERSION)" -o bin/$(BINARY)-agent ./cmd/kubescrape-agent
 
 # The tags are passed here too, deliberately: without them the cmd tests would
 # exercise the stub halves only, and every variant's tests would look green
@@ -181,7 +192,7 @@ run: build
 # Each Dockerfile still decides the same thing for itself, because a direct
 # `docker build` never sees this variable.
 image:
-	docker build -f $(if $(filter 1,$(AGENT_CGO)),Dockerfile,Dockerfile.static) --build-arg TAGS=$(TAGS) -t $(IMAGE):$(TAG) .
+	docker build -f $(if $(filter 1,$(AGENT_CGO)),Dockerfile,Dockerfile.static) --build-arg TAGS=$(TAGS) --build-arg VERSION=$(VERSION) -t $(IMAGE):$(TAG) .
 
 # Static variant: no journald, hence no cgo, hence no libsystemd — so both
 # binaries fit distroless/static instead of distroless/base + seven .so files.
@@ -201,6 +212,43 @@ image:
 image-static:
 	$(if $(findstring journald,$(TAGS_STATIC)),$(error image-static cannot carry journald (TAGS_STATIC=$(TAGS_STATIC)): it needs cgo and libsystemd; build that image with make image))
 	$(MAKE) image TAGS=$(TAGS_STATIC) TAG=$(TAG)-static
+
+# The release assets, into dist/: what .github/workflows/release.yml attaches
+# to a GitHub release, buildable here to inspect exactly that. VERSION must be
+# the release tag, vMAJOR.MINOR.PATCH with an optional -prerelease: it is the
+# image tag everything below pins, and a Helm chart version must be SemVer,
+# which `git describe` output is not.
+#
+#   - the Helm chart, packaged as version MAJOR.MINOR.PATCH with appVersion
+#     VERSION, so its default image is $(IMAGE):VERSION rather than the
+#     floating `latest` that main's chart defaults to;
+#   - deploy/*.yaml with the image pinned the same way;
+#   - per DIST_ARCHES, a tarball of both binaries in the TAGS_STATIC variant
+#     (no journald, so no cgo: they run on any Linux), stripped like the images;
+#   - SHA256SUMS over all of them.
+DIST_ARCHES ?= amd64 arm64
+dist:
+	$(if $(shell printf '%s' '$(VERSION)' | grep -Ex 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'),,$(error dist needs VERSION=vMAJOR.MINOR.PATCH (the release tag) but got "$(VERSION)"))
+	rm -rf dist && mkdir dist
+	"$$(./hack/ensure-helm.sh)" package charts/kubescrape --version $(patsubst v%,%,$(VERSION)) --app-version $(VERSION) --destination dist
+	set -e; for f in deploy/*.yaml; do \
+		out="dist/$$(basename "$$f")"; \
+		sed 's#$(IMAGE):latest#$(IMAGE):$(VERSION)#' "$$f" > "$$out"; \
+		if ! grep -q 'image: $(IMAGE):$(VERSION)$$' "$$out" || grep -q 'kubescrape:latest' "$$out"; then \
+			echo "$$out: the image is not pinned to $(IMAGE):$(VERSION)" >&2; exit 1; \
+		fi; \
+	done
+	set -e; for arch in $(DIST_ARCHES); do \
+		d="dist/$(BINARY)_$(VERSION)_linux_$$arch"; mkdir "$$d"; \
+		for cmd in $(BINARY) $(BINARY)-agent; do \
+			CGO_ENABLED=0 GOOS=linux GOARCH=$$arch go build $(GOFLAGS) -tags "$(TAGS_STATIC)" \
+				-ldflags "-s -w $(LDFLAGS_VERSION)" -o "$$d/$$cmd" "./cmd/$$cmd"; \
+		done; \
+		cp LICENSE "$$d/"; \
+		tar -C dist -czf "$$d.tar.gz" "$$(basename "$$d")"; \
+		rm -r "$$d"; \
+	done
+	cd dist && sha256sum -- * > SHA256SUMS
 
 # Three-node kind test cluster (see hack/).
 cluster-up:
@@ -234,4 +282,4 @@ chaos:
 	@echo; echo "all chaos scenarios PASSED"
 
 clean:
-	rm -rf bin
+	rm -rf bin dist

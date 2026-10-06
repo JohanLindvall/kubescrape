@@ -50,7 +50,7 @@ func TestImageTargetsBuildTheDockerfileTheirTagsNeed(t *testing.T) {
 			// A `make test` running this test exports its own MAKEFLAGS — its
 			// jobserver, and command-line variables such as CI's `TAGS=` — which
 			// the child would otherwise inherit as if they were typed here.
-			cmd.Env = withoutEnv(os.Environ(), "MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "MAKELEVEL", "MAKEOVERRIDES", "TAGS", "TAGS_STATIC", "IMAGE", "TAG")
+			cmd.Env = withoutEnv(os.Environ(), "MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "MAKELEVEL", "MAKEOVERRIDES", "TAGS", "TAGS_STATIC", "IMAGE", "TAG", "VERSION")
 			out, err := cmd.CombinedOutput()
 			builds := dockerBuilds(string(out))
 			if tc.wantRefusal != "" {

@@ -28,10 +28,14 @@ RUN case "$TAGS" in *journald*) \
 	echo "Dockerfile.static cannot build the journald pipeline: it needs cgo and libsystemd. Use the default Dockerfile (make image)." >&2; \
 	exit 1 ;; \
 	esac
+# The version both binaries report; see the default Dockerfile.
+ARG VERSION=""
 # Both binaries static. -ldflags="-s -w" as in the default image (panic traces
 # are unaffected; the runtime reads pclntab).
-RUN CGO_ENABLED=0 go build -trimpath -tags "$TAGS" -ldflags="-s -w" -o /kubescrape ./cmd/kubescrape \
-	&& CGO_ENABLED=0 go build -trimpath -tags "$TAGS" -ldflags="-s -w" -o /kubescrape-agent ./cmd/kubescrape-agent
+RUN CGO_ENABLED=0 go build -trimpath -tags "$TAGS" \
+	-ldflags="-s -w -X github.com/JohanLindvall/kubescrape/internal/obs.Version=$VERSION" -o /kubescrape ./cmd/kubescrape \
+	&& CGO_ENABLED=0 go build -trimpath -tags "$TAGS" \
+	-ldflags="-s -w -X github.com/JohanLindvall/kubescrape/internal/obs.Version=$VERSION" -o /kubescrape-agent ./cmd/kubescrape-agent
 
 # No glibc, no shared libraries, no shell. The agent still needs root to read
 # container logs, so this is the root variant (not :nonroot); the metadata

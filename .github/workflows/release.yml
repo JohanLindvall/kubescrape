@@ -1,0 +1,150 @@
+name: release
+
+# A release is an ANNOTATED TAG on a commit whose CI is green:
+#
+#   git tag -a --cleanup=verbatim -F notes.md v1.2.3 && git push origin v1.2.3
+#
+# The tag message becomes the release notes, so it is written verbatim: git's
+# default cleanup strips every line starting with '#' — every markdown heading —
+# as a comment. Everything else is derived from the tag: the version both
+# binaries report, the image tags, the chart's version and appVersion, the image
+# the attached manifests pin, and the archive names. A tag with a -suffix
+# (v1.2.3-rc.1) is a prerelease: it is published as one and does not move
+# `latest`.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/johanlindvall/kubescrape
+
+jobs:
+  # One NATIVE runner per architecture: the agent links libsystemd through cgo,
+  # and building that under QEMU emulation is slow and fragile. Each pushes its
+  # image by digest only; `image` below joins the two under the tags, so no tag
+  # ever names a half-built release.
+  build:
+    name: build ${{ matrix.platform }}
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: VERSION=${{ github.ref_name }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+      # On the architecture it was built for, before anything is tagged.
+      - name: start both binaries and check the version they report
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: hack/check-image.sh "$IMAGE@$DIGEST" "$GITHUB_REF_NAME"
+      - name: record the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.runner }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  image:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: tag the multi-architecture image
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -eu
+          tags=(--tag "$IMAGE:$GITHUB_REF_NAME")
+          case "$GITHUB_REF_NAME" in
+            *-*) ;; # a prerelease does not move latest
+            *) tags+=(--tag "$IMAGE:latest") ;;
+          esac
+          sources=()
+          for d in *; do sources+=("$IMAGE@sha256:$d"); done
+          if [ "${#sources[@]}" -ne 2 ]; then
+            echo "want one image per architecture, got ${#sources[@]}: ${sources[*]}" >&2
+            exit 1
+          fi
+          docker buildx imagetools create "${tags[@]}" \
+            --annotation "index:org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --annotation "index:org.opencontainers.image.version=$GITHUB_REF_NAME" \
+            --annotation "index:org.opencontainers.image.revision=$GITHUB_SHA" \
+            --annotation "index:org.opencontainers.image.licenses=MIT" \
+            "${sources[@]}"
+          docker buildx imagetools inspect "$IMAGE:$GITHUB_REF_NAME"
+
+  release:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      # checkout fetches the tagged COMMIT; --notes-from-tag needs the annotated
+      # tag object itself, message included.
+      - name: fetch the annotated tag
+        run: git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: build the release assets
+        run: make dist VERSION="$GITHUB_REF_NAME"
+      - name: publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          flags=()
+          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" --verify-tag --notes-from-tag \
+            --title "$GITHUB_REF_NAME" "${flags[@]}" dist/*

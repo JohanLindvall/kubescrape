@@ -3,22 +3,22 @@ module github.com/JohanLindvall/kubescrape
 go 1.27.3
 
 require (
-	github.com/JohanLindvall/bufpool v0.2.7
-	github.com/JohanLindvall/diskqueue v0.0.13
-	github.com/JohanLindvall/enrich v0.1.17
-	github.com/JohanLindvall/haste v0.1.38
-	github.com/JohanLindvall/lightning v0.0.104
-	github.com/JohanLindvall/logfmt v0.0.24
-	github.com/JohanLindvall/multiline v0.0.13
-	github.com/bmatcuk/doublestar/v4 v4.10.2
+	github.com/JohanLindvall/bufpool v0.2.9
+	github.com/JohanLindvall/diskqueue v0.0.15
+	github.com/JohanLindvall/enrich v0.1.19
+	github.com/JohanLindvall/haste v0.1.40
+	github.com/JohanLindvall/lightning v0.0.109
+	github.com/JohanLindvall/logfmt v0.0.26
+	github.com/JohanLindvall/multiline v0.0.16
+	github.com/bmatcuk/doublestar/v4 v4.10.3
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/fsnotify/fsnotify v1.10.1
-	github.com/klauspost/compress v1.20.0
-	github.com/prometheus/client_golang v1.24.1
+	github.com/klauspost/compress v1.20.3
+	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
-	github.com/twmb/franz-go v1.22.0
+	github.com/twmb/franz-go v1.22.2
 	github.com/twmb/franz-go/pkg/kfake v0.0.0-20260816150254-beb096adff00
-	github.com/twmb/franz-go/pkg/kmsg v1.14.0
+	github.com/twmb/franz-go/pkg/kmsg v1.15.0
 	go.opentelemetry.io/collector/pdata v1.67.0
 	go.starlark.net v0.0.0-20260908191801-89a6a09411d5
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260921155816-b14227669459
@@ -60,9 +60,9 @@ require (
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/pierrec/lz4/v4 v4.1.30 // indirect
+	github.com/pierrec/lz4/v4 v4.1.33 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/prometheus/common v0.71.0 // indirect
+	github.com/prometheus/common v0.72.0 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/x448/float16 v0.8.4 // indirect

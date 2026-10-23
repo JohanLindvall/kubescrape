@@ -100,7 +100,7 @@ spec:
     spec:
       containers:
         - name: collector
-          image: otel/opentelemetry-collector-contrib:0.115.1
+          image: otel/opentelemetry-collector-contrib:0.163.1-386
           args: ["--config=/etc/otelcol/config.yaml"]
           ports:
             - name: otlp-grpc
@@ -116,7 +116,7 @@ spec:
         # collector image is distroless (no shell, no tar), so exec/cp into it
         # fail. `kubectl exec -c reader -- cat /data/<signal>.json` works.
         - name: reader
-          image: busybox:1.36
+          image: busybox:1.38
           command: ["/bin/sh", "-c", "sleep infinity"]
           volumeMounts:
             - name: data

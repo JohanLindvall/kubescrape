@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: First-run and troubleshooting guide
+    url: https://github.com/JohanLindvall/kubescrape/blob/main/docs/FIRST-RUN.md
+    about: Check installation, telemetry delivery and common symptoms.
+  - name: Report a security vulnerability privately
+    url: https://github.com/JohanLindvall/kubescrape/security/advisories/new
+    about: Use private reporting for security issues; do not disclose them in public issues.

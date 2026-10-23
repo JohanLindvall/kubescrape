@@ -298,7 +298,7 @@ offsets advance, counted in `kubescrape_log_permanent_dropped_total`. With
 `-buffer-dir` the commit gate is the durable enqueue instead of the collector's
 ack, and that loss surfaces as
 `kubescrape_buffer_dropped_batches_total{signal="logs"}`
-([README](../README.md#the-node-agent)). Multi-line groups survive rename
+([technical reference](REFERENCE.md#the-node-agent)). Multi-line groups survive rename
 rotations *and* crashes mid-rotation (rotated-away files are recorded in the
 checkpoint and re-read in order). The disk buffer fsyncs every frame, checksums its cursor, rolls
 back partial writes (ENOSPC), and classifies permanent rejections so a poison
@@ -405,8 +405,8 @@ Two things are **deliberately out of scope** — host/node system metrics
 (node_exporter's job) and kube-state-metrics *generation* (the splitters still
 re-attribute KSM's output) — and the systemd journal is the deliberate
 **in-scope** exception to that host/node line, worth its cgo dependency on
-libsystemd; the argument is in the README's
-[Out of scope](../README.md#out-of-scope).
+libsystemd; the argument is in the technical reference's
+[Out of scope](REFERENCE.md#out-of-scope).
 
 Every pipeline a given workload may never run is also a build-time option: the
 `journald`, `azure` and `events` build tags compile out the journal reader (the

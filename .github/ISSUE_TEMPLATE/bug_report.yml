@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a reproducible failure or unexpected behavior.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve kubescrape. Search existing issues before opening a report.
+        For security vulnerabilities, use [private reporting](https://github.com/JohanLindvall/kubescrape/security/advisories/new).
+        Remove credentials and private telemetry from anything you share.
+  - type: input
+    id: version
+    attributes:
+      label: kubescrape version
+      description: Release tag or commit, and image tag/digest if available. The startup logs include the version.
+      placeholder: Release tag or commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Kubernetes version, node OS/architecture, Helm or manifest install, affected component, and collector/backend. Include build tags for a custom build.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: What did you expect, what happened, and what is the impact?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include the smallest example that shows the problem. If it is intermittent, describe what you have observed so far.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: Sanitized Helm values, agent configuration, flags or annotations. Omit secrets.
+      render: yaml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or diagnostics
+      description: A short sanitized excerpt, including the error or startup settings if relevant.
+      render: text

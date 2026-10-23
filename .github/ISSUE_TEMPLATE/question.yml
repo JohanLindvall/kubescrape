@@ -1,0 +1,27 @@
+name: Question
+description: Get help with installation, configuration or understanding behavior.
+labels: [question]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the [first-run guide](https://github.com/JohanLindvall/kubescrape/blob/main/docs/FIRST-RUN.md)
+        and search existing issues first. Share only sanitized configuration and log excerpts.
+        For security concerns, use [private reporting](https://github.com/JohanLindvall/kubescrape/security/advisories/new).
+  - type: textarea
+    id: question
+    attributes:
+      label: What are you trying to do?
+      description: Explain the outcome you want and where you are stuck.
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Include relevant documentation, commands or observations.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Version and configuration
+      description: kubescrape version or commit, Kubernetes version, installation method and relevant sanitized configuration.

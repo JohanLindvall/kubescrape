@@ -94,6 +94,14 @@ CI also exercises the tag-less build, race detector, vulnerability scan and
 both container images. In your pull request, state what you ran and any checks
 you could not run; do not describe an unrun check as passing.
 
+Dependabot checks Go modules, GitHub Actions and Docker images weekly through
+[its configuration](.github/dependabot.yml), including the collector and
+workload fixtures. Kubernetes and OpenTelemetry modules are grouped so related
+packages move together. When reviewing a Go toolchain update, keep `go.mod`,
+both Dockerfiles and the documented build requirements aligned as described
+in the [development guide](docs/AGENTS-DEVELOPMENT.md#toolchain-and-optional-builds).
+Tool versions pinned in the Makefile and shell scripts still need manual updates.
+
 ## Submit a pull request
 
 Push your branch to your fork and open a pull request against `main`. A draft

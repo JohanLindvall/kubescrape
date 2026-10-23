@@ -236,6 +236,7 @@ type Scraper struct {
 	// run on concurrent goroutines, hence authMu.
 	authMu    sync.Mutex
 	authCache map[string]authCacheEntry
+	authNow   func() time.Time // fixed at construction; injectable for expiry tests
 	// authStaleWarn throttles the "serving a retained credential" warning. One
 	// keyless gate: the condition is a metadata-service or API-server OUTAGE,
 	// and every ref on the node takes the path at once.
@@ -287,6 +288,7 @@ func New(cfg Config) *Scraper {
 		kubeletURLs:  newKubeletURLs(cfg.Kubelet.Endpoint),
 		podCache:     make(map[string]podCacheEntry),
 		authCache:    make(map[string]authCacheEntry),
+		authNow:      time.Now,
 		warned:       logdedupe.New(maxWarnKeys, 0),
 		failWarned:   logdedupe.New(maxScrapeFailKeys, scrapeFailWarnEvery),
 	}

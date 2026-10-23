@@ -230,6 +230,23 @@ func copyDecoded(dst, src any) {
 	reflect.ValueOf(dst).Elem().Set(reflect.ValueOf(src).Elem())
 }
 
+// refreshEntry updates only the snapshot this request validated. A concurrent
+// fetch may have replaced it, even with the same ETag but a different policy.
+// A response without a usable TTL also revokes the old stored representation.
+func (c *Client) refreshEntry(key string, entry cacheEntry, expires time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cur, ok := c.cache[key]; ok && cur.decoded == entry.decoded {
+		if expires.IsZero() {
+			delete(c.cache, key)
+			return
+		}
+		cur.used = c.now()
+		cur.expires = expires
+		c.cache[key] = cur
+	}
+}
+
 // maxCacheTTL caps the freshness lifetime this client will honour. The header
 // is the SERVER's, and time.Duration is int64 NANOseconds: 1.85e10 seconds
 // overflows it, so an unclamped `secs * time.Second` turns a large max-age into
@@ -254,27 +271,72 @@ const maxCacheTTL = 24 * time.Hour
 // `No-Store, max-age=60` for a minute — the unsafe direction — and let a proxy
 // that appends `no-store` as its own header line be ignored.
 //
-// The value is clamped to maxCacheTTL BEFORE the multiply (see the constant).
+// Quoted values and commas in extension values are parsed as such. Ambiguous
+// lifetimes are refused, Age is subtracted, and the remaining lifetime is
+// clamped to maxCacheTTL BEFORE the multiply (see the constant).
 func maxAge(resp *http.Response) time.Duration {
-	var ttl time.Duration
+	var seconds uint64
+	seen := false
 	for _, line := range resp.Header.Values("Cache-Control") {
-		for part := range strings.SplitSeq(line, ",") {
-			part = strings.TrimSpace(part)
-			if strings.EqualFold(part, "no-store") || strings.EqualFold(part, "no-cache") {
+		for line != "" {
+			var part string
+			part, line = nextDirective(line)
+			name, value, _ := strings.Cut(part, "=")
+			name = strings.TrimSpace(name)
+			if strings.EqualFold(name, "no-store") || strings.EqualFold(name, "no-cache") {
 				return 0
 			}
-			const prefix = "max-age="
-			if len(part) <= len(prefix) || !strings.EqualFold(part[:len(prefix)], prefix) {
+			if !strings.EqualFold(name, "max-age") {
 				continue
 			}
-			if secs, err := strconv.Atoi(part[len(prefix):]); err == nil && secs > 0 {
-				if secs > int(maxCacheTTL/time.Second) {
-					ttl = maxCacheTTL
-					continue
-				}
-				ttl = time.Duration(secs) * time.Second
+			// Conflicting or malformed lifetimes cannot authorize a cache hit.
+			if seen {
+				return 0
+			}
+			seen = true
+			value = strings.TrimSpace(value)
+			if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+				value = value[1 : len(value)-1]
+			}
+			var err error
+			seconds, err = strconv.ParseUint(value, 10, 63)
+			if err != nil {
+				return 0
 			}
 		}
 	}
-	return ttl
+	// A proxy's Age has already spent part (or all) of max-age. Starting a
+	// fresh full TTL here would keep serving metadata past its promised expiry.
+	if ages := resp.Header.Values("Age"); len(ages) > 0 {
+		if len(ages) != 1 {
+			return 0
+		}
+		age, err := strconv.ParseUint(strings.TrimSpace(ages[0]), 10, 64)
+		if err != nil || age >= seconds {
+			return 0
+		}
+		seconds -= age
+	}
+	return time.Duration(min(seconds, uint64(maxCacheTTL/time.Second))) * time.Second
+}
+
+// nextDirective splits a Cache-Control list without interpreting a comma in
+// a quoted extension value as the start of a new directive.
+func nextDirective(line string) (part, rest string) {
+	quoted := false
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '\\':
+			if quoted {
+				i++ // quoted-pair: the next byte cannot close the string
+			}
+		case '"':
+			quoted = !quoted
+		case ',':
+			if !quoted {
+				return line[:i], line[i+1:]
+			}
+		}
+	}
+	return line, ""
 }

@@ -143,7 +143,7 @@ use the documentation at your release tag when checking a deployed version.
 The demo creates a three-node [kind](https://kind.sigs.k8s.io/) cluster,
 deploys sample workloads and a debug OpenTelemetry collector, then verifies
 readiness, discovery, log delivery and metric delivery, including native
-histograms. It needs Docker, Go 1.27.1 or newer, GNU Make, Python 3 and curl.
+histograms. It needs Docker, Go 1.27.3 or newer, GNU Make, Python 3 and curl.
 The scripts fetch pinned `kind` and `kubectl` binaries when needed.
 
 ```sh
@@ -197,7 +197,7 @@ See the [package guide](docs/REFERENCE.md#reusable-packages) for details.
 
 ## Running
 
-Building needs **Go 1.27.1 or newer**, GNU Make, and a C compiler with
+Building needs **Go 1.27.3 or newer**, GNU Make, and a C compiler with
 libsystemd development headers for the default journald-enabled agent.
 See [Contributing](CONTRIBUTING.md) for setup and the required checks.
 

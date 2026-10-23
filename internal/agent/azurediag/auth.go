@@ -18,6 +18,7 @@ package azurediag
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -33,8 +34,6 @@ import (
 	"github.com/twmb/franz-go/pkg/sasl"
 	"github.com/twmb/franz-go/pkg/sasl/oauth"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
-
-	ljson "github.com/JohanLindvall/lightning/pkg/json"
 
 	"github.com/JohanLindvall/kubescrape/internal/clip"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
@@ -210,6 +209,9 @@ func (t *tokenSource) get(ctx context.Context) (string, error) {
 	}
 	tok, ttl, err := t.fetch(ctx)
 	if err != nil {
+		// The request may have consumed the token's remaining lifetime. Check
+		// expiry and start the retry backoff when it finishes, not when it began.
+		now = t.now()
 		obs.AzureTokenRefreshes.WithLabelValues("error").Inc()
 		// The failure that OPENS a run always logs, on whichever line it
 		// takes: a throttle alone fires once per interval, so a second outage
@@ -385,12 +387,17 @@ func imdsFetch(endpoint, resource, clientID string, hc *http.Client) func(ctx co
 }
 
 func roundTripToken(hc *http.Client, req *http.Request, what string) (string, time.Duration, error) {
-	resp, err := hc.Do(req)
+	// A 307/308 replays the POST body, including the federated assertion, to
+	// the redirect destination. Apply the rule to both token protocols without
+	// modifying a caller's client or its shared transport.
+	client := *hc
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", 0, fmt.Errorf("%s: %w", what, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTokenResponseBytes+1))
 	if err != nil {
 		return "", 0, fmt.Errorf("%s: %w", what, err)
 	}
@@ -399,24 +406,33 @@ func roundTripToken(hc *http.Client, req *http.Request, what string) (string, ti
 		// and put invalid UTF-8 into the error string.
 		return "", 0, fmt.Errorf("%s: HTTP %d: %s", what, resp.StatusCode, clip.Ellipsis(string(body), 200))
 	}
+	if len(body) > maxTokenResponseBytes {
+		return "", 0, fmt.Errorf("%s: response exceeds %d bytes", what, maxTokenResponseBytes)
+	}
 	return parseTokenResponse(body, what)
 }
+
+const maxTokenResponseBytes = 1 << 20
 
 // parseTokenResponse pulls access_token and expires_in out of the response.
 // IMDS returns expires_in as a STRING ("3599"), the token endpoint as a
 // number; both are handled.
 func parseTokenResponse(body []byte, what string) (string, time.Duration, error) {
-	raws, err := ljson.GetMany(body, []string{"access_token", "expires_in"}, nil)
-	if err != nil || len(raws) < 2 || len(raws[0]) == 0 {
+	var response struct {
+		AccessToken string          `json:"access_token"`
+		ExpiresIn   json.RawMessage `json:"expires_in"`
+	}
+	// Decode the complete document and require a string token. A selective
+	// field lookup accepted boolean/numeric tokens and ignored trailing junk.
+	if err := json.Unmarshal(body, &response); err != nil {
+		return "", 0, fmt.Errorf("%s: decoding token response: %w", what, err)
+	}
+	if response.AccessToken == "" {
 		return "", 0, fmt.Errorf("%s: response carries no access_token", what)
 	}
-	tok, ok := logline.RawScalarString(raws[0])
-	if !ok || tok == "" {
-		return "", 0, fmt.Errorf("%s: malformed access_token", what)
-	}
 	ttl := time.Hour // a sane default when expires_in is absent
-	if len(raws[1]) > 0 {
-		if s, ok := logline.RawScalarString(raws[1]); ok {
+	if len(response.ExpiresIn) > 0 {
+		if s, ok := logline.RawScalarString(response.ExpiresIn); ok {
 			// strconv.ParseFloat accepts "Inf"/"NaN" without error. NaN fails
 			// secs > 0 (falls back to the default), but +Inf PASSES it and
 			// time.Duration(+Inf) overflows to a large NEGATIVE duration, so
@@ -443,5 +459,5 @@ func parseTokenResponse(body []byte, what string) (string, time.Duration, error)
 			}
 		}
 	}
-	return tok, ttl, nil
+	return response.AccessToken, ttl, nil
 }

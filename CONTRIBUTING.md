@@ -24,7 +24,7 @@ vulnerabilities belong in the [private reporting channel](SECURITY.md).
 
 ## Set up a development environment
 
-Use Linux with Git, GNU Make and **Go 1.27.1 or newer** (the enforced floor is
+Use Linux with Git, GNU Make and **Go 1.27.3 or newer** (the enforced floor is
 in [go.mod](go.mod)). The default agent build also needs a C compiler and
 libsystemd headers. On Debian or Ubuntu:
 

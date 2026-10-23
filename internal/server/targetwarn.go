@@ -554,10 +554,8 @@ func collisionWarnKey(c scrape.InstanceCollision) string {
 // portOf is the port half of a host:port. The host half is a pod IP, which is
 // an incarnation rather than configuration; the port was annotated.
 func portOf(address string) string {
-	if i := strings.LastIndexByte(address, ':'); i >= 0 {
-		return address[i+1:]
-	}
-	return ""
+	_, port, _ := strings.CutLast(address, ":")
+	return port
 }
 
 // splitAtAddress cuts a member's URL around the address the whole group shares,

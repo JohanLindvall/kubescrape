@@ -1014,7 +1014,9 @@ func TestServiceGraphHTTPOversizedGzipIs413(t *testing.T) {
 	}
 
 	cancel()
-	<-errc
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
 }
 
 // One ConfigMap is shared by the DaemonSet, the events/Azure singleton and the
@@ -1326,5 +1328,7 @@ func TestInternalPortStripsTheMarkerAndAccepts(t *testing.T) {
 	}
 
 	cancel()
-	<-errc
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
 }

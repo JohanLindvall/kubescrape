@@ -122,7 +122,7 @@ type authCacheEntry struct {
 // value and fails as before, so revocation takes effect immediately rather than
 // after the grace.
 func (s *Scraper) authToken(ctx context.Context, ref string) (string, error) {
-	now := time.Now()
+	now := s.authNow()
 	s.authMu.Lock()
 	s.sweepAuthCacheLocked(now)
 	retained, have := s.authCache[ref]
@@ -161,18 +161,31 @@ func (s *Scraper) authToken(ctx context.Context, ref string) (string, error) {
 		}
 		if definitiveAuthRefusal(err) {
 			s.authMu.Lock()
-			delete(s.authCache, ref)
+			if cur, ok := s.authCache[ref]; ok && cur.fetched.Equal(retained.fetched) && cur.token == retained.token {
+				delete(s.authCache, ref)
+			}
 			s.authMu.Unlock()
+			return "", err
+		}
+		// The refresh released authMu and may have taken the rest of the
+		// grace window. Re-read the cache: another request may also have
+		// revoked or replaced the credential while this request was in flight.
+		s.authMu.Lock()
+		now = s.authNow()
+		s.sweepAuthCacheLocked(now)
+		retained, have = s.authCache[ref]
+		s.authMu.Unlock()
+		if !have {
 			return "", err
 		}
 		if s.authStaleWarn.Allow(authStaleWarnEvery) {
 			s.log.Warn("could not refresh a scrape credential; serving the value last resolved until the metadata service answers",
-				"key", ref, "error", err, "outage", time.Since(retained.fetched).Round(time.Second), "grace", authStaleGrace)
+				"key", ref, "error", err, "outage", now.Sub(retained.fetched).Round(time.Second), "grace", authStaleGrace)
 		}
 		return retained.token, nil
 	}
 	s.authMu.Lock()
-	now = time.Now()
+	now = s.authNow()
 	s.sweepAuthCacheLocked(now)
 	// The cap is the second bound, because expiry alone bounds nothing under
 	// churn: a monitor edited in a loop mints a fresh ref each time, and every
@@ -195,8 +208,8 @@ func (s *Scraper) authToken(ctx context.Context, ref string) (string, error) {
 // to its absence (a transport failure, a timeout, a 5xx). Only the absence may
 // be bridged with a retained value.
 func definitiveAuthRefusal(err error) bool {
-	var se *metaclient.StatusError
-	return errors.As(err, &se) && se.Code < 500
+	se, ok := errors.AsType[*metaclient.StatusError](err)
+	return ok && se.Code < 500
 }
 
 // maxAuthCacheEntries bounds the resolved-secret cache. One monitor endpoint
@@ -232,7 +245,7 @@ func (s *Scraper) sweepAuthCacheLocked(now time.Time) {
 // again.
 func (s *Scraper) sweepAuthCache() {
 	s.authMu.Lock()
-	s.sweepAuthCacheLocked(time.Now())
+	s.sweepAuthCacheLocked(s.authNow())
 	s.authMu.Unlock()
 }
 

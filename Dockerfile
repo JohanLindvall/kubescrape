@@ -6,7 +6,7 @@
 # keep the Debian suffix equal to the runtime's (bookworm =
 # distroless/base-debian12): the agent's glibc linkage and the .so files staged
 # below both come from this stage.
-FROM golang:1.27-bookworm AS build
+FROM golang:1.27.3-bookworm AS build
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends libsystemd-dev \
 	&& rm -rf /var/lib/apt/lists/*

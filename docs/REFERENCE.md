@@ -446,9 +446,9 @@ They carry no `internal/` dependencies, so they are usable outside this module.
 
 ## Running
 
-**Building needs Go 1.27.1 or newer.** That is a security and CI-parity
-floor, not a language one: 1.27 carries the fixes for the ten reachable
-standard-library advisories that first raised it (see
+**Building needs Go 1.27.3 or newer.** That is a security and CI-parity
+floor, not a language one: it includes the standard-library security fixes
+reported by the current vulnerability scan (see
 [Toolchain and build floor](CONFIGURATION.md#toolchain-and-build-floor)
 for the list and what each is reached from), and the patch level is the one
 the container image builds with, which CI installs from `go.mod`. An older

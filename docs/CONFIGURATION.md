@@ -76,7 +76,7 @@ bounds, templates).
 
 ## Toolchain and build floor
 
-**Building kubescrape needs Go 1.27.1 or newer.** `go.mod` says `go 1.27.1`,
+**Building kubescrape needs Go 1.27.3 or newer.** `go.mod` says `go 1.27.3`,
 and nothing in the source needs that language version — it is a **security
 and CI-parity floor**. It was first raised (to 1.26.6) because `govulncheck` at
 `go 1.26.3` reported ten reachable standard-library advisories, six of them
@@ -92,12 +92,24 @@ with no earlier fix:
 | [GO-2026-6091](https://pkg.go.dev/vuln/GO-2026-6091) | `html/template` | only `hack/nhexporter`, the e2e fixture — not a shipped binary |
 
 The other four (`GO-2026-5856`, `GO-2026-5039`, `GO-2026-5038`,
-`GO-2026-5037`) were fixed in 1.26.4/1.26.5. Go 1.27.0 carries all ten fixes:
-`govulncheck -tags journald,azure,events ./...` reports no reachable
-standard-library advisory at 1.27.0 or 1.27.1. The `.1` is therefore parity,
-not a CVE: `actions/setup-go` installs exactly the version the directive names,
-and 1.27.1 is what the images' `golang:1.27-bookworm` build stage runs, so CI
-tests the toolchain that ships. Re-run `govulncheck` (`make vulncheck` runs
+`GO-2026-5037`) were fixed in 1.26.4/1.26.5. Go 1.27.0 carried all ten fixes.
+The 2026-10-23 scan found twelve subsequent reachable advisories on 1.27.1:
+
+| Advisory | Package | Reached from |
+|---|---|---|
+| [GO-2026-6809](https://pkg.go.dev/vuln/GO-2026-6809) | `crypto/x509` — compromised intermediate certificates | TLS certificate verification |
+| [GO-2026-6617](https://pkg.go.dev/vuln/GO-2026-6617), [GO-2026-6612](https://pkg.go.dev/vuln/GO-2026-6612), [GO-2026-6611](https://pkg.go.dev/vuln/GO-2026-6611), [GO-2026-6610](https://pkg.go.dev/vuln/GO-2026-6610), [GO-2026-6603](https://pkg.go.dev/vuln/GO-2026-6603) | HTTP/2 races, flow control, framing and memory bounds | `net/http` clients and servers, plus gRPC's `golang.org/x/net/http2` dependency |
+| [GO-2026-6613](https://pkg.go.dev/vuln/GO-2026-6613), [GO-2026-6605](https://pkg.go.dev/vuln/GO-2026-6605) | `net/http` — CONNECT connection desynchronization | HTTP clients and servers |
+| [GO-2026-6608](https://pkg.go.dev/vuln/GO-2026-6608) | `net/textproto` — MIME header memory bounds | HTTP header parsing |
+| [GO-2026-6607](https://pkg.go.dev/vuln/GO-2026-6607) | `crypto/tls` — ECH extension validation | TLS listeners and dialers |
+| [GO-2026-6600](https://pkg.go.dev/vuln/GO-2026-6600), [GO-2026-6599](https://pkg.go.dev/vuln/GO-2026-6599) | `html/template` — JavaScript context tracking | `hack/nhexporter`, the e2e fixture |
+
+These are static reachability results; protocol-specific exposure also depends
+on the listener and transport configuration. Go 1.27.3 fixes the standard-library
+findings, and `golang.org/x/net` v0.60.0 fixes the separate HTTP/2 dependency.
+`actions/setup-go` installs exactly the version the directive names, and both
+images build from `golang:1.27.3-bookworm`, so CI tests the toolchain that ships.
+Re-run `govulncheck` (`make vulncheck` runs
 exactly that, over the build's `TAGS`) rather than trusting the directive.
 `go.mod` is the only ENFORCED statement of the floor, but not the only one:
 move it together with the Dockerfiles' `golang:` tag, README's build line and
@@ -111,10 +123,10 @@ is opt-in via `GRPC_GO_SERVER_GOROUTINE_LABELS`). Read the release's `GODEBUG`
 history (`$(go env GOROOT)/doc/godebug.md`) whenever the minor version moves.
 
 **The directive is enforced, and it fails loudly rather than silently.** Under
-the default `GOTOOLCHAIN=auto` a machine holding an older Go downloads 1.27.1
+the default `GOTOOLCHAIN=auto` a machine holding an older Go downloads 1.27.3
 and re-execs into it; with `GOTOOLCHAIN=local` the build is refused outright
-(`go.mod requires go >= 1.27.1`). There is no configuration in which an older
-toolchain quietly produces a binary carrying those ten. What the directive does
+(`go.mod requires go >= 1.27.3`). There is no configuration in which an older
+toolchain quietly produces a binary carrying those standard-library issues. What the directive does
 **not** govern is everything that is not Go — see
 [Accepted security residuals](#accepted-security-residuals) for the floating
 base-image tags, which are how a stale glibc or libsystemd can still reach a
@@ -623,14 +635,14 @@ least loud — every render becomes `additional properties … not allowed`, and
 loose is caught by nothing until a cluster rejects the object.
 
 **4. The container base images float.** Both `Dockerfile` and
-`Dockerfile.static` build `FROM golang:1.27-bookworm`, and the runtime is
+`Dockerfile.static` build `FROM golang:1.27.3-bookworm`, and the runtime is
 `gcr.io/distroless/base-debian12` (`static-debian12` for the static image) —
 tags, not digests. The **Go** half of the supply chain is nailed down anyway by
-`go.mod`'s `go 1.27.1` (see [Toolchain and build floor](#toolchain-and-build-floor)):
+`go.mod`'s `go 1.27.3` (see [Toolchain and build floor](#toolchain-and-build-floor)):
 an older toolchain either upgrades itself or refuses to build. The half that
 floats is everything else, and it is not only the runtime base: the default
 (journald) image COPIES `libsystemd` plus its six transitive `.so` files out of
-the **build** stage, so a cached or mirrored `golang:1.27-bookworm` layer puts
+the **build** stage, so a cached or mirrored `golang:1.27.3-bookworm` layer puts
 that library into a shipped image whose Go binary is current, while glibc and
 the CA bundle come from the equally floating distroless base. Two builds of the
 same commit are therefore not guaranteed to produce the same image. Pin the bases by digest in your own build
@@ -846,7 +858,7 @@ code.
 | `-listen` | `:8081` | serves `/debug` (homepage linking the debug surfaces), `/healthz`, `/readyz`, `/debug/tailer` (per-file positions/lag, malformed pod annotations), `/debug/targets` (per-target last outcomes, failures first), `/debug/transforms` (active transform program hash), `/debug/otlp` (live stream of exported OTLP as JSON lines; `signal`/`attr`/`sample` query params — `attr` is capped at 16 ANDed globs per stream and 512 bytes per glob, since every filter is walked against every resource of every export on the exporting goroutine and a glob's cost is linear in its length — UI at `/debug/otlp/ui`); empty disables. NOT `/metrics` — the Prometheus endpoint lives on its own `-metrics-listen` port |
 | `-debug-token-file` | — | file with a shared bearer token gating the **data-bearing** debug surfaces on `-listen`: `/debug/otlp`, `/debug/otlp/ui` and `/debug/tailer`. Those three stream (or enumerate) everything this process exports — on the DaemonSet that is every container log line on the node, from every namespace scheduled there, selectable by resource-attribute glob — and the port is reachable from every pod in the cluster, so they are **not** open. **Without this flag they are served only to a LOCAL connection**: `kubectl port-forward` (the kubelet dials `127.0.0.1` inside the pod, so port-forward *is* the loopback address, and reaching it already requires `pods/portforward` on the namespace), a container in the agent's own pod, or — on an agent deliberately put on `hostNetwork` — the node itself. Set the flag to read them from anywhere else with `Authorization: Bearer <token>`; it is re-read periodically with the previous value accepted for a grace window, exactly like `-scrape-auth-token-file`, so rotating the Secret needs no restart. A local connection must **also** carry a loopback `Host` header (`localhost`, `127.0.0.1`, `::1`, or none at all): every client that dialled the port directly sends one, and a page in a browser whose DNS name has been rebound to `127.0.0.1` — the classic attack on a local debug UI, which reaches an operator's own `kubectl port-forward` and, being same-origin, can read the answer — keeps sending its own name. A refusal names the flag and counts `kubescrape_debug_refused_total{reason}` (`no_token`, `unauthenticated`, `forwarded`, `host`). `/healthz`, `/readyz`, `/debug`, `/debug/targets` and `/debug/transforms` are never gated: probes must answer, and target/transform state is what the metadata service's `/v1` routes already serve unauthenticated. Residual: the `/debug/otlp/ui` page cannot present a token from its own `fetch`, so with a token configured the UI is reachable through port-forward or a header-adding proxy — a token is deliberately NOT accepted in a query parameter, which would write a credential into every access log |
 | `-self-metrics-interval` | `1m` | export the agent's own metrics over OTLP at this interval (0 disables); both binaries have this flag |
-| `-metadata-endpoint` | `http://kubescrape.monitoring` | base URL of the metadata service |
+| `-metadata-endpoint` | `http://kubescrape.monitoring` | base URL of the metadata service; must serve directly (HTTP redirects are refused to keep credentials and caller attribution on this endpoint) |
 | `-metadata-wait` | `5s` | server-side wait for not-yet-known containers (covers the gap between container start and the kubelet posting its status) |
 | `-node-metadata-refresh` | `1m` | refresh interval for the node's labels/annotations used in attribute templates (0 disables) |
 | `-self-attributes` | `true` | add THIS pod's Kubernetes resource attributes (namespace, pod, uid, pod IP, owners, labels, plus the `resourceAttributes` section's `self` pipeline) to the metrics the agent generates about itself — its self-metrics, span metrics and service-graph edge metrics. Resolved from the metadata service's `GET /v1/self`, which attributes the request by its connection's source address, falling back to a lookup by name (`$POD_NAME` or the hostname, in `$POD_NAMESPACE` or the ServiceAccount projection's namespace) when that cannot work — hostNetwork agents share the node IP, a NAT hop replaces the source address, and a dual-stack pod may connect from the family `status.podIP` does not carry. Fill-if-absent: `service.name` stays `kubescrape-agent` and `service.instance.id` stays the node, but `service.namespace` becomes the pod's namespace — so the agent's own job reads `<namespace>/kubescrape-agent`. A caller the service cannot attribute to a live pod (hostNetwork, an address-rewriting hop, no Kubernetes) simply gets no extra attributes; nothing waits on the lookup, and `kubescrape_self_metadata_resolved` reports whether it succeeded |

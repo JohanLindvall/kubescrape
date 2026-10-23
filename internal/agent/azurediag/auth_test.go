@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -90,6 +92,50 @@ func TestIMDSFetch(t *testing.T) {
 	}
 }
 
+func TestTokenResponseSizeBoundary(t *testing.T) {
+	const body = `{"access_token":"token","expires_in":3600}`
+	for _, extra := range []string{"", "x"} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(body + strings.Repeat(" ", (1<<20)-len(body)) + extra))
+		}))
+		t.Cleanup(srv.Close)
+		fetch := imdsFetch(srv.URL, "resource", "client", srv.Client())
+		tok, _, err := fetch(t.Context())
+		if extra == "" {
+			if err != nil || tok != "token" {
+				t.Fatalf("exact limit: token=%q error=%v", tok, err)
+			}
+		} else if err == nil || tok != "" {
+			t.Fatalf("oversized response: token=%q error=%v", tok, err)
+		}
+	}
+}
+
+func TestTokenExchangeRefusesRedirects(t *testing.T) {
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var forwarded atomic.Int32
+			destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				forwarded.Add(1)
+				_, _ = w.Write([]byte(`{"access_token":"token"}`))
+			}))
+			t.Cleanup(destination.Close)
+			source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, destination.URL, status)
+			}))
+			t.Cleanup(source.Close)
+			path := filepath.Join(t.TempDir(), "token")
+			if err := os.WriteFile(path, []byte("federated-credential"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			fetch := workloadIdentityFetch(source.URL, "tenant", "client", path, "scope", source.Client())
+			if tok, _, err := fetch(t.Context()); err == nil || tok != "" || forwarded.Load() != 0 {
+				t.Fatalf("redirect: token=%q error=%v forwarded requests=%d", tok, err, forwarded.Load())
+			}
+		})
+	}
+}
+
 func TestTokenSourceCachesAndRefreshes(t *testing.T) {
 	fetches := 0
 	now := time.Unix(1000, 0)
@@ -149,8 +195,34 @@ func TestTokenSourceServesStaleOnRefreshFailure(t *testing.T) {
 	}
 }
 
+func TestTokenSourceExpiryDuringFailedRefresh(t *testing.T) {
+	now := time.Unix(1000, 0)
+	want := errors.New("token endpoint timed out")
+	ts := &tokenSource{
+		now:    func() time.Time { return now },
+		token:  "old-token",
+		expiry: now.Add(time.Second),
+		fetch: func(context.Context) (string, time.Duration, error) {
+			now = now.Add(10 * time.Second)
+			return "", 0, want
+		},
+	}
+	if tok, err := ts.get(t.Context()); tok != "" || !errors.Is(err, want) {
+		t.Fatalf("get after expiry: token=%q, error=%v", tok, err)
+	}
+	if wantRetry := now.Add(tokenRetryBackoff); !ts.nextRetry.Equal(wantRetry) {
+		t.Errorf("retry at %v, want %v (backoff starts when the fetch fails)", ts.nextRetry, wantRetry)
+	}
+}
+
 func TestParseTokenResponseRejectsGarbage(t *testing.T) {
-	for _, bad := range []string{``, `{}`, `{"access_token":""}`, `not json`} {
+	for _, bad := range []string{
+		``, `{}`, `{"access_token":""}`, `not json`,
+		`{"access_token":true,"expires_in":3600}`,
+		`{"access_token":123,"expires_in":3600}`,
+		`{"access_token":"token","expires_in":3600} trailing garbage`,
+		`{"access_token":"token","expires_in":3600}{}`,
+	} {
 		if _, _, err := parseTokenResponse([]byte(bad), "test"); err == nil {
 			t.Errorf("%q: want an error", bad)
 		}

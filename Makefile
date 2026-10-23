@@ -59,9 +59,9 @@ endif
 LDFLAGS_VERSION := -X github.com/JohanLindvall/kubescrape/internal/obs.Version=$(VERSION)
 
 # The linter analyzes the standard library of the INSTALLED Go, not go.mod's, so
-# a toolchain upgrade can break lint on its own: v2.12's staticcheck panics
-# parsing Go 1.27's internal/poll ("buildir: unexpected expr *ast.KeyValueExpr").
-GOLANGCI_LINT_VERSION := v2.13.2
+# a toolchain upgrade can break lint on its own: v2.13.2 cannot decode Go
+# 1.27.3's version-5 export data (its importer supports only version 4).
+GOLANGCI_LINT_VERSION := v2.15.0
 # Under hack/bin like helm, never GOPATH/bin: the pin is enforced by
 # reinstalling, and a developer's own golangci-lint must not be the binary that
 # gets replaced.

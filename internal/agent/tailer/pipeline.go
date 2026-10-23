@@ -200,10 +200,8 @@ func (t *Tailer) emit(f *file, e entry) {
 // streamOf extracts the stream from a pipeline key ("<id>/<stream>"); ""
 // for non-CRI passthrough lines.
 func streamOf(key string) string {
-	if i := strings.LastIndexByte(key, '/'); i >= 0 {
-		return key[i+1:]
-	}
-	return ""
+	_, stream, _ := strings.CutLast(key, "/")
+	return stream
 }
 
 // plainKey keys a plain file's single logical stream. It has no '/', so

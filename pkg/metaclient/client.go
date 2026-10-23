@@ -14,6 +14,8 @@
 // response without such a max-age is not cached at all. The client has no
 // metrics dependency; set Config.Observe to feed lookup outcomes into whatever
 // metrics library the caller uses.
+// Redirects are returned as status errors: the configured endpoint must serve
+// metadata directly, so credentials and peer attribution stay on that endpoint.
 //
 // # Results are shared: treat them as read-only
 //
@@ -282,9 +284,16 @@ func New(cfg Config) *Client {
 		rt = NewTransport()
 	}
 	return &Client{
-		log:       cfg.Log,
-		base:      strings.TrimRight(cfg.Base, "/"),
-		http:      &http.Client{Timeout: cfg.Timeout, Transport: rt},
+		log:  cfg.Log,
+		base: strings.TrimRight(cfg.Base, "/"),
+		http: &http.Client{
+			Timeout: cfg.Timeout, Transport: rt,
+			// Redirects can forward scrape-auth credentials to another path or
+			// port on the same host, or change the peer /v1/self identifies.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		now:       time.Now,
 		cache:     make(map[string]cacheEntry),
 		observeFn: cfg.Observe,
@@ -473,6 +482,7 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 			req.Header.Set("Authorization", "Bearer "+tok)
 		}
 	}
+	requestedAt := c.now()
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.observe(OutcomeError)
@@ -482,27 +492,29 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
 	}()
+	// Network and body-reading time spend the advertised lifetime too. Anchor
+	// it before Do; starting it after decoding would freshen a slow response.
+	var expires time.Time
+	if ttl := maxAge(resp); ttl > 0 {
+		expires = requestedAt.Add(ttl)
+	}
 
 	switch {
-	case resp.StatusCode == http.StatusNotModified && cached:
+	case resp.StatusCode == http.StatusNotModified && cached && entry.etag != "":
 		// Unchanged: extend the cached entry's freshness and serve it. Only
 		// refresh the entry that this request actually validated — a
 		// concurrent goroutine may have stored a newer 200 body under the
 		// same key while the lock was released, which must not be clobbered
 		// with the pre-request entry.
-		expires := c.now().Add(maxAge(resp))
-		c.mu.Lock()
-		if cur, ok := c.cache[key]; ok && cur.etag == entry.etag {
-			cur.expires = expires
-			cur.used = c.now()
-			c.cache[key] = cur
-		}
-		c.mu.Unlock()
+		c.refreshEntry(key, entry, expires)
 		c.observe(OutcomeNotModified)
 		// lookupEntry only reports cached for an entry of v's type.
 		copyDecoded(v, entry.decoded)
 		return nil
 	case resp.StatusCode == http.StatusOK:
+		if expires.IsZero() {
+			c.refreshEntry(key, entry, expires)
+		}
 		// BOUNDED. The error path already caps its read; the success path did
 		// not, so an endpoint pointed at something that streams (a log tail, a
 		// proxy error page, another service entirely) could grow the agent's
@@ -516,12 +528,15 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 		// reaches this cap: the decode then fails and that node's agent
 		// schedules no annotation or monitor target at all (an accepted
 		// residual, docs/CONFIGURATION.md).
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 		if err != nil {
 			c.observe(OutcomeError)
 			return fmt.Errorf("metaclient: reading %s: %w", u, err)
 		}
-		if ttl := maxAge(resp); ttl > 0 {
+		if len(body) > maxResponseBytes {
+			return c.undecodable(u, body, fmt.Errorf("response exceeds %d bytes", maxResponseBytes))
+		}
+		if !expires.IsZero() {
 			// Decode into a value the CACHE owns, not into v: the caller may
 			// overwrite its struct after the call, which must not reach the
 			// cached copy. v gets a shallow copy of the owned value.
@@ -530,7 +545,7 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 				return c.undecodable(u, body, err)
 			}
 			c.mu.Lock()
-			c.cache[key] = cacheEntry{decoded: dec.Interface(), etag: resp.Header.Get("ETag"), expires: c.now().Add(ttl), used: c.now()}
+			c.cache[key] = cacheEntry{decoded: dec.Interface(), etag: resp.Header.Get("ETag"), expires: expires, used: c.now()}
 			dropped, held := c.evictLocked()
 			c.mu.Unlock()
 			// Emitted with the lock RELEASED. c.mu is the EXCLUSIVE lock every
@@ -599,7 +614,7 @@ func (c *Client) undecodable(u string, body []byte, err error) error {
 // produced a rising kubescrape_metadata_requests_total{outcome="error"} and
 // not one line saying what came back.
 //
-// truncated is the tell for the other shape: a body at exactly the read cap
+// truncated is the tell for the other shape: a body past the read cap
 // was CUT, so the JSON error is a consequence of the cap rather than of the
 // payload, and "unexpected end of JSON input" would otherwise send an operator
 // looking for a malformed document.
@@ -608,7 +623,7 @@ func (c *Client) warnUndecodable(u string, body []byte, err error) {
 		return
 	}
 	c.logger().Warn("the metadata service's response could not be decoded; this endpoint is probably not a kubescrape metadata service",
-		"url", u, "error", err, "bytes", len(body), "truncated", len(body) >= maxResponseBytes)
+		"url", u, "error", err, "bytes", len(body), "truncated", len(body) > maxResponseBytes)
 }
 
 // maxResponseBytes caps a metadata response body. The biggest legitimate one

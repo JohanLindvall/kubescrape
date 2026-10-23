@@ -71,6 +71,16 @@ func TestMaxAgeDirectivesAreCaseInsensitiveAndMultiLine(t *testing.T) {
 		{[]string{"NO-CACHE, max-age=60"}, 0},
 		{[]string{"public", "MAX-AGE=120"}, 2 * time.Minute},
 		{[]string{"max-age="}, 0},
+		{[]string{`max-age="60"`}, time.Minute},
+		{[]string{`max-age=60, no-cache="ETag, X-Metadata"`}, 0},
+		{[]string{`extension="ignored, max-age=3600", max-age=60`}, time.Minute},
+		{[]string{`extension="ignored, max-age=3600"`}, 0},
+		{[]string{`extension="ignored, max-age=3600, ignored"`}, 0},
+		{[]string{`extension="escaped\", max-age=3600, ignored", max-age=60`}, time.Minute},
+		{[]string{"max-age=60, max-age=0"}, 0},
+		{[]string{"max-age=0", "max-age=60"}, 0},
+		{[]string{"max-age=garbage, max-age=60"}, 0},
+		{[]string{"max-age=+60"}, 0},
 	} {
 		resp := &http.Response{Header: http.Header{}}
 		for _, l := range tc.lines {
@@ -78,6 +88,29 @@ func TestMaxAgeDirectivesAreCaseInsensitiveAndMultiLine(t *testing.T) {
 		}
 		if got := maxAge(resp); got != tc.want {
 			t.Errorf("maxAge(%q) = %v, want %v", tc.lines, got, tc.want)
+		}
+	}
+}
+
+func TestMaxAgeSubtractsAge(t *testing.T) {
+	for _, tc := range []struct {
+		age  string
+		want time.Duration
+	}{
+		{"0", time.Minute},
+		{"45", 15 * time.Second},
+		{"60", 0},
+		{"120", 0},
+		{"9223372036854775807", 0},
+		{"invalid", 0},
+		{"-1", 0},
+	} {
+		resp := &http.Response{Header: http.Header{
+			"Cache-Control": {"max-age=60"},
+			"Age":           {tc.age},
+		}}
+		if got := maxAge(resp); got != tc.want {
+			t.Errorf("Age=%q: maxAge = %v, want %v", tc.age, got, tc.want)
 		}
 	}
 }

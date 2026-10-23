@@ -40,9 +40,10 @@ goldens.
 
 ## Toolchain and optional builds
 
-Go **1.27.1** is the security and CI-parity floor, enforced by `go.mod`.
-When changing it, update both Dockerfiles' `golang:` tags, the README build
-requirement and [Toolchain and build floor](CONFIGURATION.md#toolchain-and-build-floor)
+Go **1.27.3** is the security and CI-parity floor, enforced by `go.mod`.
+When changing it, update both Dockerfiles' `golang:` tags, the README,
+CONTRIBUTING.md and REFERENCE.md build requirements, this guide and
+[Toolchain and build floor](CONFIGURATION.md#toolchain-and-build-floor)
 together. Review the selected toolchain's `doc/godebug.md` and run
 `make vulncheck`. Container base tags float; a current Go binary alone does
 not ensure current native libraries in cached image layers.

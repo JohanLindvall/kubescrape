@@ -56,7 +56,10 @@ func TestGracefulStopReportsAReleaseNotALoss(t *testing.T) {
 	}
 	cancel()
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return")
 	}

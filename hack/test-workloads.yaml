@@ -41,7 +41,7 @@ spec:
     spec:
       containers:
         - name: web
-          image: nginx:1.27-alpine
+          image: nginx:1.29-alpine
           ports:
             - name: http
               containerPort: 80
@@ -65,7 +65,7 @@ spec:
     spec:
       containers:
         - name: web
-          image: nginx:1.27-alpine
+          image: nginx:1.29-alpine
           ports:
             - name: http
               containerPort: 80
@@ -100,7 +100,7 @@ spec:
           restartPolicy: Never
           containers:
             - name: tick
-              image: busybox:1.37
+              image: busybox:1.38
               command: ["sh", "-c", "date; sleep 5"]
 ---
 # Multi-port pod annotation (comma-separated numbers AND a port name), plus a
@@ -128,12 +128,12 @@ spec:
     spec:
       initContainers:
         - name: sidecar
-          image: busybox:1.37
+          image: busybox:1.38
           restartPolicy: Always
           command: ["sh", "-c", "while true; do echo sidecar tick; sleep 30; done"]
       containers:
         - name: app
-          image: busybox:1.37
+          image: busybox:1.38
           command: ["sh", "-c", "while true; do echo multi tick; sleep 30; done"]
           ports:
             - name: extra
@@ -191,5 +191,5 @@ spec:
         - operator: Exists
       containers:
         - name: hostnet
-          image: busybox:1.37
+          image: busybox:1.38
           command: ["sh", "-c", "while true; do echo hostnet tick; sleep 60; done"]
